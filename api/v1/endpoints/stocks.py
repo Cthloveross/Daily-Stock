@@ -8,7 +8,8 @@
 1. POST /api/v1/stocks/extract-from-image 从图片提取股票代码
 2. POST /api/v1/stocks/parse-import 解析 CSV/Excel/剪贴板
 3. GET /api/v1/stocks/{code}/quote 实时行情接口
-4. GET /api/v1/stocks/{code}/history 历史行情接口
+4. GET /api/v1/stocks/{code}/history 历史行情接口（支持日/周/月/分钟级）
+5. GET /api/v1/stocks/{code}/news    新闻接口（按 ticker 检索）
 """
 
 import logging
@@ -20,7 +21,11 @@ from api.v1.schemas.stocks import (
     ExtractFromImageResponse,
     ExtractItem,
     KLineData,
+    NewsSentimentItem,
     StockHistoryResponse,
+    StockNewsDigestResponse,
+    StockNewsItem,
+    StockNewsResponse,
     StockQuote,
 )
 from api.v1.schemas.common import ErrorResponse
@@ -321,8 +326,17 @@ def get_stock_quote(stock_code: str) -> StockQuote:
 )
 def get_stock_history(
     stock_code: str,
-    period: str = Query("daily", description="K 线周期", pattern="^(daily|weekly|monthly)$"),
-    days: int = Query(30, ge=1, le=365, description="获取天数")
+    period: str = Query(
+        "daily",
+        description="K 线周期：daily/weekly/monthly 或 1m/5m/15m/30m/60m/90m/1h（分钟级仅美股）",
+        pattern="^(1m|5m|15m|30m|60m|90m|1h|daily|weekly|monthly)$",
+    ),
+    days: int = Query(
+        30,
+        ge=1,
+        le=1000,
+        description="回看天数（周/月会按聚合因子放大，分钟级受 yfinance 上限约束）",
+    ),
 ) -> StockHistoryResponse:
     """
     获取股票历史行情
@@ -386,4 +400,134 @@ def get_stock_history(
                 "error": "internal_error",
                 "message": f"获取历史行情失败: {str(e)}"
             }
+        )
+
+
+@router.get(
+    "/{stock_code}/news",
+    response_model=StockNewsResponse,
+    responses={
+        200: {"description": "按 ticker 检索的可跳转新闻"},
+        500: {"description": "服务器错误", "model": ErrorResponse},
+    },
+    summary="获取股票相关新闻",
+    description=(
+        "按 ticker 实时检索新闻，返回带 http(s) 链接的条目。"
+        "底层复用 SearchService（SerpAPI / Tavily / Brave 等）；"
+        "若未配置任何 provider，则返回空列表（不会 500）。"
+    ),
+)
+def get_stock_news(
+    stock_code: str,
+    limit: int = Query(10, ge=1, le=30, description="返回条数上限"),
+) -> StockNewsResponse:
+    try:
+        items, provider = _fetch_stock_news(stock_code, limit)
+        return StockNewsResponse(
+            stock_code=stock_code,
+            total=len(items),
+            items=items,
+            provider=provider,
+        )
+    except Exception as e:
+        logger.error(f"获取股票新闻失败 ({stock_code}): {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "message": f"获取新闻失败: {str(e)}",
+            },
+        )
+
+
+def _fetch_stock_news(stock_code: str, limit: int) -> tuple[list[StockNewsItem], Optional[str]]:
+    """Shared helper: return (items, provider) for /news and /news/digest."""
+    from src.search_service import get_search_service
+    from data_provider.base import DataFetcherManager
+
+    search_service = get_search_service()
+    manager = DataFetcherManager()
+    stock_name = manager.get_stock_name(stock_code) or stock_code
+
+    resp = search_service.search_stock_news(
+        stock_code=stock_code,
+        stock_name=stock_name,
+        max_results=limit,
+    )
+
+    items: list[StockNewsItem] = []
+    if resp and getattr(resp, "results", None):
+        for r in resp.results:
+            url = getattr(r, "url", None) or ""
+            if not url.startswith(("http://", "https://")):
+                continue
+            items.append(
+                StockNewsItem(
+                    title=getattr(r, "title", "") or "",
+                    snippet=getattr(r, "snippet", "") or "",
+                    url=url,
+                    source=getattr(r, "source", None) or None,
+                    published_at=getattr(r, "published_date", None) or None,
+                )
+            )
+    provider = getattr(resp, "provider", None) if resp else None
+    return items, provider
+
+
+@router.get(
+    "/{stock_code}/news/digest",
+    response_model=StockNewsDigestResponse,
+    responses={
+        200: {"description": "按 ticker 生成的 LLM 中文新闻摘要 + 每条 sentiment"},
+        500: {"description": "服务器错误", "model": ErrorResponse},
+    },
+    summary="获取股票新闻中文摘要 + sentiment",
+    description=(
+        "复用 /news 接口的新闻条目，调用 LLM 一次产出："
+        "每条新闻的 sentiment 打分 (-2..+2)、整体分数 + 中文标签、"
+        "一句话总评、3-5 条 bullet。默认 10 分钟缓存；"
+        "LLM 调用失败时返回兜底中性摘要，不会 500。"
+    ),
+)
+def get_stock_news_digest(
+    stock_code: str,
+    limit: int = Query(10, ge=1, le=30, description="参与总结的新闻条数"),
+    refresh: bool = Query(False, description="是否强制跳过缓存重新生成"),
+) -> StockNewsDigestResponse:
+    try:
+        news_items, _provider = _fetch_stock_news(stock_code, limit)
+        news_dicts = [it.model_dump() for it in news_items]
+
+        from data_provider.base import DataFetcherManager
+        from src.services.news_digest_service import get_news_digest_service
+
+        manager = DataFetcherManager()
+        stock_name = manager.get_stock_name(stock_code) or stock_code
+        service = get_news_digest_service()
+        digest = service.build_digest(
+            stock_code=stock_code,
+            stock_name=stock_name,
+            news_items=news_dicts,
+            force_refresh=refresh,
+        )
+
+        return StockNewsDigestResponse(
+            stock_code=digest.stock_code,
+            news_count=digest.news_count,
+            overall_score=digest.overall_score,
+            overall_label=digest.overall_label,
+            summary=digest.summary,
+            bullets=list(digest.bullets),
+            items=[NewsSentimentItem(**it) for it in digest.items],
+            cached=digest.cached,
+            generated_at=digest.generated_at,
+        )
+    except Exception as e:
+        logger.error(f"获取新闻摘要失败 ({stock_code}): {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "message": f"获取新闻摘要失败: {str(e)}",
+            },
         )

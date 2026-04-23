@@ -1,4 +1,11 @@
 import apiClient from './index';
+import { toCamelCase } from './utils';
+import type {
+  StockHistory,
+  StockNewsDigestResponse,
+  StockNewsResponse,
+  Timeframe,
+} from '../types/stockHistory';
 
 export type ExtractItem = {
   code?: string | null;
@@ -33,6 +40,38 @@ export const stocksApi = {
       items: data.items,
       rawText: data.raw_text,
     };
+  },
+
+  async getHistory(
+    code: string,
+    period: Timeframe = 'daily',
+    days = 180,
+  ): Promise<StockHistory> {
+    const response = await apiClient.get<Record<string, unknown>>(
+      `/api/v1/stocks/${encodeURIComponent(code)}/history`,
+      { params: { period, days } },
+    );
+    return toCamelCase<StockHistory>(response.data);
+  },
+
+  async getNews(code: string, limit = 15): Promise<StockNewsResponse> {
+    const response = await apiClient.get<Record<string, unknown>>(
+      `/api/v1/stocks/${encodeURIComponent(code)}/news`,
+      { params: { limit } },
+    );
+    return toCamelCase<StockNewsResponse>(response.data);
+  },
+
+  async getNewsDigest(
+    code: string,
+    opts: { limit?: number; refresh?: boolean } = {},
+  ): Promise<StockNewsDigestResponse> {
+    const { limit = 10, refresh = false } = opts;
+    const response = await apiClient.get<Record<string, unknown>>(
+      `/api/v1/stocks/${encodeURIComponent(code)}/news/digest`,
+      { params: { limit, refresh }, timeout: 60000 },
+    );
+    return toCamelCase<StockNewsDigestResponse>(response.data);
   },
 
   async parseImport(file?: File, text?: string): Promise<ExtractFromImageResponse> {

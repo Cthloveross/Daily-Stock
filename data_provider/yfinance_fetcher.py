@@ -202,6 +202,136 @@ class YfinanceFetcher(BaseFetcher):
                 raise
             raise DataFetchError(f"Yahoo Finance 获取数据失败: {e}") from e
 
+    # Yahoo Finance 官方 interval 上限：
+    #   1m          -> 最多回看 7 天
+    #   5m/15m/30m  -> 最多回看 60 天
+    #   60m/90m     -> 最多回看 60 天
+    #   1h          -> 最多回看 730 天
+    _INTRADAY_MAX_DAYS = {
+        "1m": 7,
+        "5m": 60,
+        "15m": 60,
+        "30m": 60,
+        "60m": 60,
+        "90m": 60,
+        "1h": 730,
+    }
+
+    def fetch_intraday(
+        self,
+        stock_code: str,
+        interval: str,
+        days: int = 30,
+    ) -> pd.DataFrame:
+        """
+        获取分钟级 K 线数据（yfinance intraday）。
+
+        Args:
+            stock_code: 股票代码（走 `_convert_stock_code`）
+            interval: K 线周期（1m/5m/15m/30m/60m/90m/1h）
+            days: 回看天数，内部会按 yfinance 上限截断
+
+        Returns:
+            标准化的 DataFrame：列 ['code', 'date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
+            其中 `date` 为 ISO 8601 datetime 字符串（含时区）
+
+        Raises:
+            DataFetchError: 接口失败或返回空
+            ValueError: interval 不支持
+        """
+        if interval not in self._INTRADAY_MAX_DAYS:
+            raise ValueError(
+                f"不支持的 intraday interval '{interval}'，仅支持: {sorted(self._INTRADAY_MAX_DAYS)}"
+            )
+
+        import yfinance as yf
+
+        yf_code = self._convert_stock_code(stock_code)
+        max_days = self._INTRADAY_MAX_DAYS[interval]
+        effective_days = max(1, min(days, max_days))
+        yf_period = f"{effective_days}d"
+
+        logger.info(
+            f"[{self.name}] 获取 intraday: code={yf_code}, interval={interval}, period={yf_period}"
+        )
+
+        try:
+            df = yf.download(
+                tickers=yf_code,
+                period=yf_period,
+                interval=interval,
+                progress=False,
+                auto_adjust=True,
+                multi_level_index=True,
+            )
+        except Exception as e:
+            raise DataFetchError(f"Yahoo Finance intraday 获取失败: {e}") from e
+
+        # 多 ticker 列筛选
+        if isinstance(df.columns, pd.MultiIndex) and len(df.columns) > 1:
+            ticker_level = df.columns.get_level_values(1)
+            mask = ticker_level == yf_code
+            if mask.any():
+                df = df.loc[:, mask].copy()
+
+        if df is None or df.empty:
+            raise DataFetchError(
+                f"Yahoo Finance 未查询到 {stock_code} 的 intraday 数据（interval={interval}）"
+            )
+
+        return self._normalize_intraday(df, stock_code)
+
+    def _normalize_intraday(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
+        """Normalize intraday DataFrame: preserve ISO 8601 datetime in `date` column."""
+        df = df.copy()
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df = df.reset_index()
+
+        # intraday 的索引列可能叫 Datetime / Date / index（取决于 yfinance 版本）
+        ts_col = None
+        for candidate in ("Datetime", "Date", "index"):
+            if candidate in df.columns:
+                ts_col = candidate
+                break
+        if ts_col is None:
+            raise DataFetchError("intraday 返回缺少时间索引列")
+
+        # 转成带时区的 ISO 8601 字符串；如果没有时区，按 UTC 处理
+        ts = pd.to_datetime(df[ts_col], utc=False, errors="coerce")
+        if getattr(ts.dt, "tz", None) is None:
+            ts = ts.dt.tz_localize("UTC")
+        df["date"] = ts.apply(lambda x: x.isoformat() if pd.notna(x) else None)
+
+        column_mapping = {
+            "Open": "open",
+            "High": "high",
+            "Low": "low",
+            "Close": "close",
+            "Volume": "volume",
+        }
+        df = df.rename(columns=column_mapping)
+
+        if "close" in df.columns:
+            df["pct_chg"] = (df["close"].pct_change() * 100).fillna(0).round(2)
+        if "volume" in df.columns and "close" in df.columns:
+            df["amount"] = df["volume"] * df["close"]
+        else:
+            df["amount"] = 0
+
+        df["code"] = stock_code
+
+        keep_cols = ["code"] + STANDARD_COLUMNS
+        existing_cols = [col for col in keep_cols if col in df.columns]
+        df = df[existing_cols]
+
+        # 清理空 close 行（intraday 常见尾部空 bar）
+        df = df.dropna(subset=["close"]).reset_index(drop=True)
+
+        return df
+
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
         """
         标准化 Yahoo Finance 数据

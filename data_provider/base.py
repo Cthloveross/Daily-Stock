@@ -1035,7 +1035,65 @@ class DataFetcherManager:
         elapsed = time.time() - request_start
         logger.error(f"[数据源终止] {stock_code} 获取失败: elapsed={elapsed:.2f}s\n{error_summary}")
         raise DataFetchError(error_summary)
-    
+
+    def get_intraday_data(
+        self,
+        stock_code: str,
+        interval: str,
+        days: int = 30,
+    ) -> Tuple[pd.DataFrame, str]:
+        """
+        获取分钟级 K 线（目前仅支持美股，走 YfinanceFetcher）。
+
+        Args:
+            stock_code: 股票代码
+            interval: 周期（1m/5m/15m/30m/60m/90m/1h）
+            days: 回看天数（由 fetcher 按各 interval 上限截断）
+
+        Returns:
+            (DataFrame, source_name)
+
+        Raises:
+            DataFetchError: 未找到 yfinance fetcher 或获取失败
+        """
+        from .us_index_mapping import is_us_index_code, is_us_stock_code
+
+        stock_code = normalize_stock_code(stock_code)
+
+        is_us_index = is_us_index_code(stock_code)
+        is_us = is_us_index or is_us_stock_code(stock_code)
+        if not is_us:
+            raise DataFetchError(
+                f"intraday K 线目前仅支持美股，{stock_code} 不在支持范围内"
+            )
+
+        fetchers = self._get_fetchers_snapshot()
+        yf_fetcher = next(
+            (f for f in fetchers if f.name == "YfinanceFetcher"),
+            None,
+        )
+        if yf_fetcher is None or not hasattr(yf_fetcher, "fetch_intraday"):
+            raise DataFetchError("YfinanceFetcher 未配置，无法获取 intraday 数据")
+
+        try:
+            df = yf_fetcher.fetch_intraday(
+                stock_code=stock_code,
+                interval=interval,
+                days=days,
+            )
+        except ValueError:
+            # interval 不支持 → 上层转 422
+            raise
+        except Exception as e:
+            raise DataFetchError(f"YfinanceFetcher intraday 失败: {e}") from e
+
+        if df is None or df.empty:
+            raise DataFetchError(
+                f"YfinanceFetcher 未返回 {stock_code} 的 intraday 数据（interval={interval}）"
+            )
+
+        return df, yf_fetcher.name
+
     @property
     def available_fetchers(self) -> List[str]:
         """返回可用数据源名称列表"""

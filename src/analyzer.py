@@ -18,8 +18,15 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple, Callable
 
 import litellm
-from json_repair import repair_json
 from litellm import Router
+
+# json_repair 是可选依赖：没装时 fallback 为原样返回，让内置 json.loads 自行处理
+try:
+    from json_repair import repair_json as _repair_json
+except ImportError:  # pragma: no cover
+    def _repair_json(s: str) -> str:
+        return s
+repair_json = _repair_json
 
 from src.agent.llm_adapter import get_thinking_extra_body
 from src.agent.skills.defaults import CORE_TRADING_SKILL_POLICY_ZH

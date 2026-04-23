@@ -23,7 +23,6 @@ from typing import List, Dict, Any, Optional, Tuple
 from itertools import cycle
 from urllib.parse import parse_qsl, unquote, urlparse
 import requests
-from newspaper import Article, Config
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -80,6 +79,13 @@ def fetch_url_content(url: str, timeout: int = 5) -> str:
     获取 URL 网页正文内容 (使用 newspaper3k)
     """
     try:
+        # newspaper3k 是可选依赖；未安装则直接返回空
+        try:
+            from newspaper import Article, Config
+        except ImportError:
+            logger.debug("newspaper3k 未安装，跳过 fetch_url_content")
+            return ""
+
         # 配置 newspaper3k
         config = Config()
         config.browser_user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
