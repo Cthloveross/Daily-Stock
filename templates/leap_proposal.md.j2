@@ -1,0 +1,19 @@
+{# LEAP Proposal template -#}
+# {{ symbol }} · LEAP Candidates
+
+## Thesis
+{{ thesis }}
+
+## Candidates
+{% for c in candidates %}
+- **{{ c.occ }}** · expiry {{ c.expiry }} · Δ {{ "%.2f"|format(c.delta) }} · IV {{ "%.1f"|format(c.iv * 100) }}% · cost ${{ "%.2f"|format(c.cost) }} · leverage {{ "%.1f"|format(c.leverage) }}x vs 正股
+{%- endfor %}
+
+## Disqualifier（若命中即放弃）
+{{ disqualifier }}
+
+## Execution plan
+{{ execution_plan }}
+
+## Reality check
+{{ reality_check }}

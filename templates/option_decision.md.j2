@@ -1,0 +1,27 @@
+{# Option Decision output template -#}
+# {{ symbol }} · Option Decision
+
+**Decision:** {{ decision }}
+**Regime:** {{ regime_score }} ({{ regime_label }})
+
+## Entry plan
+{{ entry_plan }}
+
+## Exit plan
+{{ exit_plan }}
+
+## Breakout filter
+{{ breakout_context }}
+
+## Counter evidence (必读)
+{% for line in counter_evidence %}
+- {{ line }}
+{% endfor %}
+
+## Journal context
+{{ journal_context }}
+
+## Risks
+{% for r in risks %}
+- {{ r }}
+{% endfor %}

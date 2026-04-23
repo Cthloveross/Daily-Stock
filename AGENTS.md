@@ -19,7 +19,7 @@
 - 新增配置项时，必须同步更新 `.env.example` 和相关文档。
 - 涉及用户可见能力、CLI/API 行为、部署方式、通知方式、报告结构变化时，必须同步更新相关文档与 `docs/CHANGELOG.md`。
 - `docs/CHANGELOG.md` 的 `[Unreleased]` 段使用**扁平格式**：每条独立一行，格式为 `- [类型] 描述`，类型取值：`新功能`/`改进`/`修复`/`文档`/`测试`/`chore`；**禁止在 `[Unreleased]` 内新增 `### 类目标题`**，以减少并发 PR 的 merge 冲突。发版时由 maintainer 汇总整理成带标题的正式格式。
-- `README.md` 用于入门、运行、部署、核心能力总览；更细的模块行为、页面交互、专题配置与排障说明，优先更新对应 `docs/*.md` 或专题文档。
+- `README.md` 用于入门、运行、部署、核心能力总览；更细的模块行为、页面交互、专题配置与排障说明，优先更新对应 `New-docs/**` 下对应子目录（见 §3 仓库速览）或专题文档。
 - 若未更新 `README.md`，需在交付说明或 PR 描述中写明原因，以及本次信息实际落到的文档位置。
 - 变更中英双语文档之一时，需评估另一份是否需要同步；若未同步，交付说明里要写明原因。
 - 注释、docstring、日志文案以清晰准确为准，不强制要求英文，但应与文件语境保持一致。
@@ -30,7 +30,7 @@
 - `CLAUDE.md` 必须是指向 `AGENTS.md` 的软链接，用于兼容 Claude 生态。
 - `.github/copilot-instructions.md` 与 `.github/instructions/*.instructions.md` 是 GitHub Copilot / Coding Agent 的镜像或分层补充；若与本文件冲突，以 `AGENTS.md` 为准。
 - 仓库协作 skill 存放在 `.claude/skills/`，分析产物存放在 `.claude/reviews/`；前者可以入库，后者默认视为本地产物。
-- 根目录 `SKILL.md` 与 `docs/openclaw-skill-integration.md` 属于产品或外部集成说明，不是仓库协作规则真源。
+- 根目录 `SKILL.md` 与 `New-docs/integrations/openclaw-skill-integration.md` 属于产品或外部集成说明，不是仓库协作规则真源。
 - 若未来新增 `.agents/skills/` 或其他 agent 专用目录，必须先明确单一真源，再通过脚本或镜像同步；禁止手工长期维护多份同义内容。
 - 修改 AI 协作治理资产时，执行：
 
@@ -60,7 +60,17 @@ python scripts/check_ai_assets.py
   - `scripts/`：本地脚本
   - `.github/scripts/`：GitHub 自动化脚本
   - `tests/`：pytest 测试
-  - `docs/`：文档与说明
+  - `New-docs/`：项目文档集中营（架构/模块/设计/使用手册/部署/配置/贡献/集成/Phase0/归档）
+  - `docs/CHANGELOG.md`：变更日志（仅此文件留在 `docs/`，AGENTS.md §1 硬规则 + 自动化依赖此路径）
+- **Phase 0 v4 Mirror 层**（美股期权 / LEAP / 趋势流陪跑系统，2026-04 落地）：
+  - `src/journal/`：Moomoo CSV 导入 + FIFO 配对 + Reality Test + 月度复盘
+  - `src/regime/`：六维度 Regime Score + 晨报
+  - `src/breakout/`：Q1-Q5 四层过滤 + 历史 trade_style 回填
+  - `src/options/`：OCC 解析 + Black-Scholes + IV rank
+  - `src/lab/`：LEAP Explorer / Shadow Trades / Backtest Replayer（Phase 1 启用）
+  - `.claude/skills/option_trader|leap_explorer|trend_follower/`：三个 Agent skill bundle
+  - 前端 `/journal` 与 `/regime` 路由 + 首页 Reality Test / Regime Score 卡片
+  - 详细分 stage 文档见 `New-docs/phase0/`，改造设计源自 `New-docs/architecture/01-03` + `New-docs/modules/04-08`
 
 ## 4. 常用命令
 
@@ -157,7 +167,7 @@ gh run view <run_id> --log-failed
   - 若涉及 API 联调、路由、状态管理、Markdown/图表渲染或认证状态，交付说明中要明确说明联动面和未覆盖风险。
 
 - 桌面端改动：
-  - 适用范围：`apps/dsa-desktop/`、`scripts/run-desktop.ps1`、`scripts/build-desktop*.ps1`、`scripts/build-*.sh`、`docs/desktop-package.md`
+  - 适用范围：`apps/dsa-desktop/`、`scripts/run-desktop.ps1`、`scripts/build-desktop*.ps1`、`scripts/build-*.sh`、`New-docs/deployment/desktop-package.md`
   - 默认执行：先构建 Web，再构建桌面端
   - 如受平台限制未能完整验证，需要明确说明是否验证了 Web 构建产物、Electron 构建以及 Release 工作流影响。
 

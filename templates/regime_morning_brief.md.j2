@@ -1,0 +1,36 @@
+{# Regime Morning Brief -- Telegram 推送模板 -#}
+🌅 *Regime Brief* · {{ date }}
+
+*Score:* `{{ "%+d"|format(score) }}`  ·  *Label:* `{{ label }}`
+
+_{{ action_hint }}_
+
+📊 *Breakdown*
+• d1 市场方向  `{{ "%+d"|format(d1_direction) }}` / 30
+• d2 波动率    `{{ "%+d"|format(d2_volatility) }}` / 20
+• d3 宏观惩罚  `{{ "%+d"|format(d3_macro_penalty) }}` / 0
+• d4 板块轮动  `{{ "%+d"|format(d4_sector) }}` / 15
+• d5 前日结构  `{{ "%+d"|format(d5_prev_day) }}` / 13
+• d6 盘前活跃  `{{ "%+d"|format(d6_premarket) }}` / 20
+
+{% if macro_events -%}
+📰 *今日宏观事件*
+{% for ev in macro_events %}
+• {{ ev }}
+{%- endfor %}
+{%- endif %}
+{% if spy -%}
+📈 *SPY*
+• close `${{ "%.2f"|format(spy.get('close', 0)) }}`
+{%- if spy.get('ma20') %} · MA20 `${{ "%.2f"|format(spy.get('ma20')) }}`{% endif -%}
+{%- if spy.get('pct_change_5d') is not none %} · 5d `{{ "%+.2f"|format(spy.get('pct_change_5d')) }}%`{% endif %}
+{%- endif %}
+{% if vix and vix.get('level') -%}
+• VIX `{{ "%.2f"|format(vix.get('level')) }}`
+{%- endif %}
+{% if warnings -%}
+⚠️ *Warnings*
+{% for w in warnings %}
+• {{ w }}
+{%- endfor %}
+{%- endif %}

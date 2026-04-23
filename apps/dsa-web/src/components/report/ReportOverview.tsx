@@ -4,7 +4,8 @@ import type {
   ReportMeta,
   ReportSummary as ReportSummaryType,
 } from '../../types/analysis';
-import { Badge, Card, ScoreGauge } from '../common';
+import { Badge, Card } from '../common';
+import { getSentimentLabel } from '../../types/analysis';
 import { formatDateTime } from '../../utils/format';
 import { getReportText, normalizeReportLanguage } from '../../utils/reportLanguage';
 
@@ -271,8 +272,15 @@ export const ReportOverview: React.FC<ReportOverviewProps> = ({
         <div className="flex flex-col self-stretch min-h-full">
           <Card variant="bordered" padding="md" className="home-panel-card home-rail-card !overflow-visible flex-1 flex flex-col min-h-0">
             <div className="text-center flex-1 flex flex-col justify-center">
-              <h3 className="mb-5 text-sm font-medium tracking-wide text-foreground">{text.marketSentiment}</h3>
-              <ScoreGauge score={summary.sentimentScore} size="lg" language={reportLanguage} />
+              <h3 className="mb-5 text-label uppercase tracking-[0.08em] text-text-3">{text.marketSentiment}</h3>
+              <div className="flex flex-col items-center gap-1">
+                <span className="font-mono text-mono-lg text-text-1 tabular-nums">
+                  {summary.sentimentScore}
+                </span>
+                <span className="text-body-sm uppercase text-text-2">
+                  {getSentimentLabel(summary.sentimentScore, reportLanguage)}
+                </span>
+              </div>
             </div>
           </Card>
         </div>

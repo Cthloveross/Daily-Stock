@@ -1,0 +1,8 @@
+Side,Symbol,Name,Order Price,Order Qty,Order Amount,Status,Filled@Avg Price,Order Time,Order Type,Time-in-Force,Allow Pre-Market,Session,Trigger price,Position Opening,Markets,Currency,Order Source,Fill Qty,Fill Price,Fill Amount,Fill Time,Markets,Currency,Counterparty,Remarks,Commission,Platform Fees,Trading Activity Fees,Options Regulatory Fees,OCC Fees,Contract Fees,SEC Fees,Settlement Fees,Total
+Buy,NVDA260417C200000,NVDA 04/17 $200 C,2.50,10,2500.00,Filled,2.55,"Apr 16, 2026 10:00:00 ET",Limit,Day,No,Regular,,Open,US,USD,API,5,2.50,1250.00,"Apr 16, 2026 10:00:15 ET",US,USD,,,0.00,0.30,0.03,0.06,0.05,0.00,0.02,0.00,0.46
+,,,,,,,,,,,,,,,,,,5,2.60,1300.00,"Apr 16, 2026 10:00:20 ET",US,USD,,,,,,,,,,,
+Sell,NVDA260417C200000,NVDA 04/17 $200 C,3.00,10,3000.00,Filled,3.00,"Apr 16, 2026 14:30:00 ET",Limit,Day,No,Regular,,Close,US,USD,API,10,3.00,3000.00,"Apr 16, 2026 14:30:05 ET",US,USD,,,0.00,0.60,0.05,0.10,0.10,0.00,0.03,0.00,0.88
+Buy,TSLA260417P382500,TSLA 04/17 $382.5 P,1.00,1,100.00,Filled,1.00,"Apr 16, 2026 11:00:00 ET",Limit,Day,No,Regular,,Open,US,USD,API,1,1.00,100.00,"Apr 16, 2026 11:00:10 ET",US,USD,,,0.00,0.06,0.01,0.01,0.01,0.00,0.00,0.00,0.09
+Buy,AAPL,Apple Inc,180.00,100,18000.00,Cancelled,,,"Apr 16, 2026 11:30:00 ET",Limit,Day,No,Regular,,Open,US,USD,Manual,,,,,US,USD,,,,,,,,,,,
+Buy,NVDA,NVIDIA Corp,500.00,50,25000.00,Filled,500.50,"Apr 15, 2026 09:45:00 ET",Market,Day,No,Regular,,Open,US,USD,API,50,500.50,25025.00,"Apr 15, 2026 09:45:05 ET",US,USD,,,0.00,0.75,0.00,0.00,0.00,0.00,0.05,0.00,0.80
+Sell,NVDA,NVIDIA Corp,510.00,50,25500.00,Filled,510.00,"Apr 15, 2026 14:00:00 ET",Limit,Day,No,Regular,,Close,US,USD,API,50,510.00,25500.00,"Apr 15, 2026 14:00:02 ET",US,USD,,,0.00,0.75,0.01,0.00,0.00,0.00,0.06,0.00,0.82

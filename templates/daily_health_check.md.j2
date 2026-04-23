@@ -1,0 +1,18 @@
+{# Daily Health Check summary (Telegram-friendly Markdown) -#}
+📋 *Daily Health Check* · {{ check_date }}
+
+*Orders:* {{ total_orders }}  ({{ orders_0dte }} × 0DTE, {{ orders_1_3dte }} × 1-3DTE)
+*Opening-hour orders:* {{ orders_opening_hour }}
+{% if top_underlying -%}
+*Most traded:* `{{ top_underlying }}` ({{ "%.1f"|format(top_underlying_pct or 0) }}%)
+{%- endif %}
+*Estimated PnL:* {% if pnl_estimate is not none %}{% if pnl_estimate >= 0 %}+{% endif %}${{ "%.2f"|format(pnl_estimate) }}{% else %}—{% endif %}
+{% if regime_score is not none -%}
+*Regime Score at open:* {{ regime_score }}
+{%- endif %}
+{% if warnings_json -%}
+⚠️ *Warnings*
+{% for w in warnings_json %}
+• {{ w }}
+{%- endfor %}
+{%- endif %}

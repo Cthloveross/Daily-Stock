@@ -1,0 +1,17 @@
+{# Final container for the AI-generated monthly retrospective. The LLM already
+   produces Markdown with the five required sections; this template adds a
+   header and footer so downstream renderers have consistent metadata. -#}
+# 月度复盘 · {{ year }}-{{ "%02d"|format(month) }}
+
+> Phase {{ current_phase }} · Generated {{ generated_at }}
+> Trades: {{ total_trades }} · Net PnL: ${{ "%.2f"|format(total_pnl_net) }}
+
+{{ ai_body }}
+
+---
+
+**原始统计快照**（便于核对）
+
+```json
+{{ stats_json }}
+```

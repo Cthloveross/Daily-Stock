@@ -8,6 +8,15 @@ syntax_check() {
   python -m py_compile src/storage.py src/scheduler.py src/search_service.py
   python -m py_compile src/market_analyzer.py src/stock_analyzer.py
   python -m py_compile data_provider/*.py
+  # Phase 0 v4 Mirror layer
+  python -m py_compile src/options/*.py src/journal/*.py src/journal/brokers/*.py
+  python -m py_compile src/regime/*.py src/breakout/*.py
+  python -m py_compile src/agent/tools/get_regime_score_tool.py \
+      src/agent/tools/get_option_chain_tool.py \
+      src/agent/tools/check_breakout_tool.py \
+      src/agent/tools/get_journal_snapshot_tool.py
+  python -m py_compile api/v1/endpoints/journal.py \
+      api/v1/endpoints/regime.py api/v1/endpoints/breakout.py
 }
 
 flake8_checks() {

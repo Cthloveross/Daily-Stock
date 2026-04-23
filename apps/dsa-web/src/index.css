@@ -1,6 +1,17 @@
 @import "tailwindcss";
-@config "../tailwind.config.js";
-/* Tailwind v4 strategy: keep theme extensions in tailwind.config.js via @config until a dedicated @theme/@utility migration. */
+@import "./styles/tokens.css";
+@import "./styles/globals.css";
+@import "@fontsource/geist-sans/400.css";
+@import "@fontsource/geist-sans/500.css";
+@import "@fontsource/geist-sans/600.css";
+@import "@fontsource/geist-mono/400.css";
+@import "@fontsource/geist-mono/500.css";
+
+@config "../tailwind.config.ts";
+
+/* tokens.css + globals.css (Design_system.md v1.0) load before the legacy block below.
+   @fontsource imports provide Geist until self-hosted woff2 files under public/fonts/ ship.
+   Legacy token system below — retained during migration; removed in Step 8. */
 
 /* =========================================
    1. THEME VARIABLES (Base/Classic)

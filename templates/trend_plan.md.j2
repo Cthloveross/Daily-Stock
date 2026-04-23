@@ -1,0 +1,23 @@
+{# Trend Follower output template -#}
+# {{ symbol }} · Trend Plan
+
+## Thesis
+{{ thesis }}
+
+## Entry (分批建仓)
+{% for leg in entry_plan_staged %}
+- Batch {{ loop.index }} ({{ leg.pct }}%): {{ leg.trigger }} → size {{ leg.size }}
+{%- endfor %}
+
+## Exit rules
+{% for rule in exit_rules %}
+- {{ rule }}
+{%- endfor %}
+
+## Comparison vs 短期期权
+{{ comparison_vs_short_options }}
+
+## Review checkpoints
+{% for cp in review_checkpoints %}
+- {{ cp }}
+{%- endfor %}

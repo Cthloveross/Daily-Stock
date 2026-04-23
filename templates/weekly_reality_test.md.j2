@@ -1,0 +1,22 @@
+{# Weekly Reality Test digest (human-readable Markdown) -#}
+# 📊 Weekly Reality Test · {{ week_label }}
+
+## 核心数字
+- 本周 closed trades: **{{ total_trades }}**
+- 净 PnL: **{% if total_pnl_net >= 0 %}+{% endif %}${{ "%.2f"|format(total_pnl_net) }}**
+- 胜率: {% if win_rate is not none %}{{ "%.1f"|format(win_rate * 100) }}%{% else %}—{% endif %}
+
+## Reality Test
+- Top {{ top_n }} PnL: **${{ "%.2f"|format(top_n_pnl_net) }}**
+- 去掉 Top {{ top_n }} 后: **${{ "%.2f"|format(pnl_without_top_n) }}**
+- Top {{ top_n }} 占总盈亏: {% if top_n_pct_of_total is not none %}{{ "%.1f"|format(top_n_pct_of_total) }}%{% else %}—{% endif %}
+
+## DTE 分布
+{% for bucket, count in dte_distribution.items() -%}
+- {{ bucket }}: {{ count }}
+{% endfor %}
+
+## 本周回答三个问题
+1. 去掉 Top {{ top_n }} 我还盈利吗？ **{% if pnl_without_top_n >= 0 %}是{% else %}不，亏 ${{ "%.2f"|format(pnl_without_top_n | abs) }}{% endif %}**
+2. 0-3DTE 胜率 vs 4+ DTE？（看下方 bucket 胜率）
+3. 下周该做什么改变？（见 Monthly Retrospective）

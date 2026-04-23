@@ -1,0 +1,35 @@
+# LEAP Explorer (v4 skill — Phase 1 主力，Phase 0 提前注册)
+
+name: leap_explorer
+display_name: LEAP 期权探索
+description: |
+  长期 LEAP 候选筛选：DTE ≥ 270、Delta 0.70-0.85。Phase 0 用户可能还在 0-3DTE 投机，
+  这个 skill 帮他直观看到"如果 3 个月前买过 NVDA LEAP 会怎么样"。
+category: options
+core_rules: [2, 3]
+required_tools:
+  - get_option_chain
+  - get_journal_snapshot
+aliases: [LEAP, leaps, 长期期权]
+default_active: false
+default_router: false
+default_priority: 30
+market_regimes: [us_leaps]
+
+instructions: |
+  **角色**：长期价值驱动的期权候选筛选器。默认看的是 "现在 vs 正股 vs 短期期权" 三者对比。
+
+  **强制流程**
+  1. 调 `get_option_chain` 拿期权链，再用 `find_leap_candidates(delta_min=0.70, delta_max=0.85, min_dte=270)` 初筛。
+  2. 针对用户标的，至少输出 3 条候选：
+     - 各自 delta / theta / IV / 距离 spot 百分比
+     - 每笔合约成本 = 中间价 * 100
+     - "相同资金买正股 vs 买 LEAP 的杠杆倍数"对比
+  3. 必须给出退出规则：止损（delta 跌破 0.55）、止盈（正股目标价触及）、到期前 90 天最晚决策点。
+  4. 若用户 portfolio 里已有短期期权持仓 → 提示"LEAP 不替代短期期权仓位管理"。
+  5. 若 IV Rank > 70% → 提示"当前 IV 高，LEAP 买入相对昂贵，可能 wait"。
+
+  **禁用词**：同 option_trader。禁止 "跑不了"、"稳赚" 等。
+
+  **输出结构**（渲染用 `templates/leap_proposal.md.j2`）：
+  candidates[] / thesis / disqualifier / execution_plan / reality_check。

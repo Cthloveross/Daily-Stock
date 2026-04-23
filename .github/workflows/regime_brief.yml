@@ -1,0 +1,92 @@
+name: Regime Morning Brief
+
+on:
+  schedule:
+    # 09:00 America/New_York maps to 13:00 UTC under EDT (Mar–Nov) and
+    # 14:00 UTC under EST (Nov–Mar). We fire both and the job itself
+    # guards against double-sending by checking the current ET hour.
+    - cron: '0 13 * * 1-5'
+    - cron: '0 14 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Target date (YYYY-MM-DD, empty = today ET)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'If true, compute + format but do NOT send to Telegram.'
+        required: false
+        default: 'false'
+
+concurrency:
+  group: regime-brief-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
+      APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
+      FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      DATABASE_PATH: ./data/daily_stock.db
+      STOCK_LIST: ${{ vars.WATCHLIST }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Guard by ET hour (skip duplicate cron)
+        id: guard
+        shell: bash
+        run: |
+          # Use TZ=America/New_York to turn UTC into local wall clock; skip unless 09:xx.
+          et_hour=$(TZ="America/New_York" date +%H)
+          echo "ET hour is $et_hour"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "skip=false" >> $GITHUB_OUTPUT
+          elif [ "$et_hour" = "09" ]; then
+            echo "skip=false" >> $GITHUB_OUTPUT
+          else
+            echo "skip=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Python
+        if: steps.guard.outputs.skip == 'false'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        if: steps.guard.outputs.skip == 'false'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Ensure data dir
+        if: steps.guard.outputs.skip == 'false'
+        run: mkdir -p data
+
+      - name: Compute regime score
+        if: steps.guard.outputs.skip == 'false'
+        run: |
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            python -m src.regime.cli --date "${{ github.event.inputs.date }}"
+          else
+            python -m src.regime.cli
+          fi
+
+      - name: Send brief
+        if: steps.guard.outputs.skip == 'false'
+        env:
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            python -m src.regime.morning_brief --format-only
+          else
+            python -m src.regime.morning_brief --send
+          fi

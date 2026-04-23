@@ -1,0 +1,67 @@
+name: Monthly Journal Retrospective
+
+on:
+  schedule:
+    # Every month on the 1st at 05:00 UTC (~ 00:00 ET winter / 01:00 ET summer).
+    - cron: '0 5 1 * *'
+  workflow_dispatch:
+    inputs:
+      year_month:
+        description: 'YYYY-MM (empty = previous month)'
+        required: false
+      dry_run:
+        description: 'If true, skip LLM and persist stats-only placeholder.'
+        required: false
+        default: 'false'
+
+concurrency:
+  group: monthly-review-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DATABASE_PATH: ./data/daily_stock.db
+      # LLM credentials (either Gemini or Claude is enough to produce output).
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      LITELLM_MODEL: ${{ vars.LITELLM_MODEL }}
+      PERSONAL_TRADING_STYLE: ${{ vars.PERSONAL_TRADING_STYLE }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Ensure data dir
+        run: mkdir -p data
+
+      - name: Resolve target month
+        id: target
+        shell: bash
+        run: |
+          ym="${{ github.event.inputs.year_month }}"
+          if [ -z "$ym" ]; then
+            ym=$(date -u -d "$(date -u +%Y-%m-01) -1 day" +%Y-%m 2>/dev/null \
+              || python -c "import datetime as d; t=d.date.today().replace(day=1)-d.timedelta(days=1); print(t.strftime('%Y-%m'))")
+          fi
+          echo "year_month=$ym" >> $GITHUB_OUTPUT
+
+      - name: Generate review
+        env:
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            python -m scripts.generate_monthly_review --month "${{ steps.target.outputs.year_month }}" --dry-run
+          else
+            python -m scripts.generate_monthly_review --month "${{ steps.target.outputs.year_month }}"
+          fi

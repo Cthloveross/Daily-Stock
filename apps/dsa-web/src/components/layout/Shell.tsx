@@ -1,80 +1,47 @@
 import type React from 'react';
 import { useEffect, useState } from 'react';
-import { Menu } from 'lucide-react';
 import { Outlet } from 'react-router-dom';
-import { Drawer } from '../common/Drawer';
-import { SidebarNav } from './SidebarNav';
-import { cn } from '../../utils/cn';
-import { ThemeToggle } from '../theme/ThemeToggle';
+import { useHotkeys } from 'react-hotkeys-hook';
+import { NavSidebar } from './NavSidebar';
+import { TopBar } from './TopBar';
+import { CommandMenu } from './CommandMenu';
+import { Toaster } from '../ui/Toast';
 
-type ShellProps = {
-  children?: React.ReactNode;
-};
+export const Shell: React.FC = () => {
+  const [cmdOpen, setCmdOpen] = useState(false);
 
-export const Shell: React.FC<ShellProps> = ({ children }) => {
-  const [mobileOpen, setMobileOpen] = useState(false);
-  const collapsed = false;
+  useHotkeys(
+    'mod+k',
+    (e) => {
+      e.preventDefault();
+      setCmdOpen((v) => !v);
+    },
+    { enableOnFormTags: true, enableOnContentEditable: true },
+  );
 
   useEffect(() => {
-    if (!mobileOpen) {
-      return undefined;
-    }
-
-    const handleResize = () => {
-      if (window.innerWidth >= 1024) {
-        setMobileOpen(false);
-      }
+    // Close command menu when navigating away via keyboard gestures
+    const handler = (e: PopStateEvent) => {
+      void e;
+      setCmdOpen(false);
     };
-
-    window.addEventListener('resize', handleResize);
-    return () => {
-      window.removeEventListener('resize', handleResize);
-    };
-  }, [mobileOpen]);
+    window.addEventListener('popstate', handler);
+    return () => window.removeEventListener('popstate', handler);
+  }, []);
 
   return (
-    <div className="min-h-screen bg-background text-foreground">
-      <div className="pointer-events-none fixed inset-x-0 top-3 z-40 flex items-start justify-between px-3 lg:hidden">
-        <button
-          type="button"
-          onClick={() => setMobileOpen(true)}
-          className="pointer-events-auto inline-flex h-10 w-10 items-center justify-center rounded-xl border border-border/70 bg-card/85 text-secondary-text shadow-soft-card backdrop-blur-md transition-colors hover:bg-hover hover:text-foreground"
-          aria-label="打开导航菜单"
-        >
-          <Menu className="h-5 w-5" />
-        </button>
-        <div className="pointer-events-auto">
-          <ThemeToggle />
-        </div>
-      </div>
-
-      <div className="mx-auto flex min-h-screen w-full max-w-[1680px] px-3 py-3 sm:px-4 sm:py-4 lg:px-5">
-        <aside
-          className={cn(
-            'sticky top-3 z-40 hidden shrink-0 overflow-visible rounded-[1.5rem] border border-[var(--shell-sidebar-border)] bg-card/72 p-2 shadow-soft-card backdrop-blur-sm transition-[width] duration-200 lg:flex',
-            'max-h-[calc(100vh-1.5rem)] self-start sm:top-4 sm:max-h-[calc(100vh-2rem)]',
-            collapsed ? 'w-[64px]' : 'w-[116px]'
-          )}
-          aria-label="桌面侧边导航"
-        >
-          <SidebarNav collapsed={collapsed} onNavigate={() => setMobileOpen(false)} />
-        </aside>
-
-        <main className="min-h-0 min-w-0 flex-1 pt-14 lg:pl-3 lg:pt-0 touch-pan-y">
-          {children ?? <Outlet />}
+    <div className="flex min-h-screen bg-bg-0 text-text-1">
+      <NavSidebar />
+      <div className="flex min-h-screen min-w-0 flex-1 flex-col">
+        <TopBar onSearchOpen={() => setCmdOpen(true)} />
+        <main className="min-h-0 min-w-0 flex-1 overflow-auto">
+          <Outlet />
         </main>
       </div>
-
-      <Drawer
-        isOpen={mobileOpen}
-        onClose={() => setMobileOpen(false)}
-        title="导航菜单"
-        width="max-w-xs"
-        zIndex={90}
-        side="left"
-      >
-        <SidebarNav onNavigate={() => setMobileOpen(false)} />
-      </Drawer>
+      <CommandMenu open={cmdOpen} onOpenChange={setCmdOpen} />
+      <Toaster />
     </div>
   );
 };
+
+export default Shell;

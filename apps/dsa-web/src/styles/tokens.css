@@ -1,0 +1,151 @@
+/* apps/dsa-web/src/styles/tokens.css */
+/* Daily-Stock design tokens — generated from New-docs/design/Design_system.md v1.0 */
+/* Do not edit values here. Edit the doc, then regenerate. */
+
+:root {
+  /* ============================================================ */
+  /* COLOR — BACKGROUND                                           */
+  /* ============================================================ */
+  --bg-0: #08090a;
+  --bg-1: #0e0f11;
+  --bg-2: #16171a;
+  --bg-3: #1e1f23;
+
+  /* ============================================================ */
+  /* COLOR — BORDER                                               */
+  /* ============================================================ */
+  --border-subtle:  #1d1e22;
+  --border-default: #26272c;
+  --border-strong:  #3a3b41;
+
+  /* ============================================================ */
+  /* COLOR — TEXT                                                 */
+  /* ============================================================ */
+  --text-1: #e9e9ec;
+  --text-2: #a5a5ad;
+  --text-3: #6f6f78;
+  --text-4: #4a4a52;
+
+  /* ============================================================ */
+  /* COLOR — ACCENT (violet-blue, Linear-inspired)               */
+  /* ============================================================ */
+  --accent:                #7170ff;
+  --accent-hover:          #8584ff;
+  --accent-active:         #5e5dff;
+  --accent-subtle-bg:      rgba(113, 112, 255, 0.12);
+  --accent-subtle-border:  rgba(113, 112, 255, 0.24);
+
+  /* ============================================================ */
+  /* COLOR — SEMANTIC                                             */
+  /* ============================================================ */
+  --up-strong:  #3fb950;
+  --up-muted:   #238636;
+  --up-subtle:  rgba(63, 185, 80, 0.12);
+
+  --down-strong: #f85149;
+  --down-muted:  #da3633;
+  --down-subtle: rgba(248, 81, 73, 0.12);
+
+  --warn-strong: #d29922;
+  --warn-muted:  #9e6a03;
+  --warn-subtle: rgba(210, 153, 34, 0.12);
+
+  /* ============================================================ */
+  /* COLOR — CHART SERIES (multi-series only)                    */
+  /* ============================================================ */
+  --chart-1: #7170ff;
+  --chart-2: #3fb950;
+  --chart-3: #f85149;
+  --chart-4: #d29922;
+  --chart-5: #06b6d4;
+  --chart-6: #a855f7;
+
+  /* ============================================================ */
+  /* TYPOGRAPHY — FONT STACKS                                    */
+  /* ============================================================ */
+  --font-sans: "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+
+  /* ============================================================ */
+  /* TYPOGRAPHY — SIZE                                           */
+  /* ============================================================ */
+  --text-display: 28px;
+  --text-h1:      20px;
+  --text-h2:      16px;
+  --text-h3:      13px;
+  --text-body:    13px;
+  --text-body-sm: 12px;
+  --text-label:   11px;
+  --text-caption: 11px;
+
+  --text-mono-lg: 20px;
+  --text-mono-md: 13px;
+  --text-mono-sm: 12px;
+  --text-mono-xs: 11px;
+
+  /* ============================================================ */
+  /* TYPOGRAPHY — LINE HEIGHT                                    */
+  /* ============================================================ */
+  --leading-tight:   1.15;
+  --leading-snug:    1.25;
+  --leading-normal:  1.4;
+  --leading-relaxed: 1.5;
+
+  /* ============================================================ */
+  /* TYPOGRAPHY — LETTER SPACING                                 */
+  /* ============================================================ */
+  --tracking-tight:  -0.02em;
+  --tracking-normal: 0;
+  --tracking-label:  0.08em;
+
+  /* ============================================================ */
+  /* SPACING                                                     */
+  /* ============================================================ */
+  --space-0:  0;
+  --space-1:  4px;
+  --space-2:  8px;
+  --space-3:  12px;
+  --space-4:  16px;
+  --space-5:  20px;
+  --space-6:  24px;
+  --space-8:  32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+
+  /* ============================================================ */
+  /* RADIUS                                                      */
+  /* ============================================================ */
+  --radius-none: 0;
+  --radius-sm:   3px;
+  --radius-md:   6px;
+  --radius-lg:   8px;
+  --radius-full: 9999px;
+
+  /* ============================================================ */
+  /* SHADOW (minimal use — popovers/modals only)                 */
+  /* ============================================================ */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.5), 0 0 0 1px var(--border-default);
+
+  /* ============================================================ */
+  /* MOTION                                                      */
+  /* ============================================================ */
+  --duration-fast:  120ms;
+  --duration-mid:   180ms;
+  --duration-slow:  240ms;
+
+  --ease-out:   cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in:    cubic-bezier(0.7, 0, 0.84, 0);
+  --ease-inout: cubic-bezier(0.87, 0, 0.13, 1);
+
+  /* ============================================================ */
+  /* Z-INDEX                                                     */
+  /* ============================================================ */
+  --z-sticky:   10;
+  --z-dropdown: 20;
+  --z-popover:  30;
+  --z-modal:    40;
+  --z-toast:    50;
+  --z-cmdk:     60;
+}
