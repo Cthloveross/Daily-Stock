@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { Search, Command, User } from 'lucide-react';
 import { cn } from '../../utils/cn';
 import { useRegimeStore } from '../../stores/regimeStore';
+import { MoomooBadge } from '../system/MoomooBadge';
 
 interface TopBarProps {
   onSearchOpen: () => void;
@@ -41,23 +42,26 @@ export const TopBar: React.FC<TopBarProps> = ({ onSearchOpen }) => {
     : '';
 
   return (
-    <header className="flex h-12 w-full items-center gap-3 border-b border-subtle bg-bg-0 px-4">
+    <header className="flex h-14 w-full items-center gap-3 border-b border-subtle bg-bg-0 px-4">
       <button
         type="button"
         onClick={onSearchOpen}
         className={cn(
-          'inline-flex h-8 w-80 max-w-full items-center gap-2 rounded-ds-sm border border-subtle bg-bg-1 px-2.5 text-body-sm text-text-3 transition-colors hover:border-default hover:text-text-2 focus-visible:outline-2 focus-visible:outline-accent focus-visible:outline-offset-2',
+          'inline-flex h-[34px] w-80 max-w-full items-center gap-2 rounded-ds-sm border border-subtle bg-bg-1 px-3 text-body-sm text-text-3 transition-colors hover:border-default hover:text-text-2 focus-visible:outline-2 focus-visible:outline-accent focus-visible:outline-offset-2',
         )}
       >
-        <Search size={14} strokeWidth={1.5} />
+        <Search size={16} strokeWidth={1.5} />
         <span className="flex-1 text-left">Search tickers, actions…</span>
         <span className="inline-flex items-center gap-0.5 text-text-3">
-          <Command size={11} strokeWidth={1.5} />
+          <Command size={12} strokeWidth={1.5} />
           <span className="font-mono text-mono-xs">K</span>
         </span>
       </button>
 
       <div className="flex-1" />
+
+      {/* Moomoo OpenD live status — green=live, amber=offline, grey=disabled */}
+      <MoomooBadge />
 
       <button
         type="button"
@@ -77,9 +81,9 @@ export const TopBar: React.FC<TopBarProps> = ({ onSearchOpen }) => {
       <button
         type="button"
         aria-label="Account"
-        className="inline-flex h-8 w-8 items-center justify-center rounded-ds-sm text-text-2 hover:bg-bg-2 hover:text-text-1"
+        className="inline-flex h-9 w-9 items-center justify-center rounded-ds-sm text-text-2 hover:bg-bg-2 hover:text-text-1"
       >
-        <User size={16} strokeWidth={1.5} />
+        <User size={18} strokeWidth={1.5} />
       </button>
     </header>
   );

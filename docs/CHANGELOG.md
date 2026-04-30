@@ -12,6 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 
+- [新功能] Moomoo OpenAPI Phase B 实时交割单同步：新建 `src/journal/brokers/moomoo_live.py`（`history_deal_list_query` / `history_order_list_query` → `MoomooOrder`，复用 CSV 路径的 hash 去重）+ `src/services/moomoo_sync_service.py`（`record_import` → `insert_events_from_orders` → `match_legs_fifo` → `replace_trades` 全链路）+ `scripts/sync_moomoo_live.py` cron CLI + `POST /api/v1/journal/sync-live` 端点。默认 `SIMULATE`（paper），LIVE 需 `MOOMOO_TRADE_ENV=LIVE`。
+- [新功能] Moomoo OpenAPI Phase C 期权链：新建 `data_provider/moomoo_options.py`，调 `get_option_chain` / `get_option_expiration_date`，IV 直接使用 Moomoo 服务端值（无需 BS 反推）。`src/options/iv_rank.py::compute_atm_iv` 在 `MOOMOO_OPEND_ENABLED=true` 时优先走 Moomoo，失败回落 yfinance。
+- [新功能] Moomoo OpenAPI Phase D 实时突破检测：新建 `src/breakout/live_runner.py`（KLine_1M 订阅 + 60 bar 环形缓冲 + range_high 突破触发 + Q1-Q5 过滤）+ `scripts/run_breakout_live.py` 长进程 CLI（JSON 行输出，可接 Telegram bot 等下游）。
+- [修复] `/regime` watchlist 现在合并 `useUserWatchlistStore` 的本地自选（regime snapshot 里原本没有 watchlist key，导致该区块永远为空）；每行带 source dot（accent=本地自选 / grey=regime snapshot）。
+- [修复] `/regime` Macro / Prev Day / Sector / Premarket 维度在数据源未配置或无数据时显示 `—` 并加 caption，区分「评分 0」与「没数据」；`ContributionList` 新增 `status: 'no_data' | 'computed'` prop。
+- [改进] `/stocks/:ticker` 对无效 ticker（K 线 + 新闻 + digest 同时为空且都加载完）展示带拼写建议的引导卡片；`中文总结` tab 条件门修正，`DigestView` 在 `newsCount === 0` 时给出明确说明，不再互斥遮蔽。
+- [新功能] `/journal` 新增 Analysis / Framework / Ask AI 三个 tab：Analysis 拉 `/api/v1/journal/stats-by-style` 渲染 `StyleBreakdown` 堆叠条 + 表 + `PnLByDte` 柱图 + Best/Worst 3；Framework 把用户的交易大前提保存到 `localStorage`（`dsa-journal-framework` key）；Ask AI 新建 `AskJournalChat` 聊天组件，对接 `POST /api/v1/journal/qa` 单轮 LLM，chat history 持久化。
+- [新功能] 后端新增 `GET /api/v1/journal/stats-by-style`（按 `trade_style` + DTE 分桶汇总 PnL + worst/best）和 `POST /api/v1/journal/qa`（用户 framework + 最近 N 天 closed trades → LLM 单轮中文 Markdown 分析）；抽出 `stats_by_style` 到 `src/journal/analytics.py`；新建 `src/services/journal_qa_service.py`。
 - [新功能] dsa-web `/stocks/:ticker` 详情页接入真实 K 线与可跳转新闻：合成数据替换为 `/api/v1/stocks/{code}/history` 与新增的 `/api/v1/stocks/{code}/news`，MA overlay 改为 8 / 13 / 144 / 169，新增 5m/15m/1h/1D/1W/1M 六档时间线切换（pills Tabs）。
 - [新功能] `/api/v1/stocks/{code}/history` 支持 weekly / monthly（基于日线 `resample('W-FRI' / 'ME')` 聚合）与 1m/5m/15m/30m/60m/90m/1h 分钟级周期（仅美股，走 `YfinanceFetcher.fetch_intraday`，受 yfinance 官方上限约束）。
 - [新功能] 新增 `GET /api/v1/stocks/{code}/news`：按 ticker 检索新闻，复用 `SearchService.search_stock_news`（SerpAPI / Tavily / Brave / Bocha / Anspire / MiniMax / SearXNG），返回 `StockNewsItem(title, snippet, url, source, published_at)`，过滤掉非 http(s) 链接，未配置 provider 时返回空列表不报错。

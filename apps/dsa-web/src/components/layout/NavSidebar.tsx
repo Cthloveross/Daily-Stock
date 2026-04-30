@@ -51,7 +51,7 @@ export const NavSidebar: React.FC<NavSidebarProps> = ({ onNavigate }) => {
     <>
       <nav
         aria-label="Primary navigation"
-        className="flex h-full w-14 flex-col items-center border-r border-subtle bg-bg-1 py-3"
+        className="flex h-full w-[72px] flex-col items-center border-r border-subtle bg-bg-1 py-4"
       >
         <ul className="flex flex-col items-center gap-1">
           {ITEMS.map((it) => (
@@ -61,7 +61,7 @@ export const NavSidebar: React.FC<NavSidebarProps> = ({ onNavigate }) => {
                 onClick={onNavigate}
                 className={({ isActive }) =>
                   cn(
-                    'group relative flex h-9 w-9 items-center justify-center rounded-ds-sm transition-colors',
+                    'group relative flex h-11 w-11 items-center justify-center rounded-ds-md transition-colors',
                     isActive
                       ? 'bg-bg-3 text-accent'
                       : 'text-text-2 hover:bg-bg-2 hover:text-text-1',
@@ -72,9 +72,9 @@ export const NavSidebar: React.FC<NavSidebarProps> = ({ onNavigate }) => {
                 {({ isActive }) => (
                   <>
                     {isActive && (
-                      <span className="absolute left-0 top-1/2 h-5 w-0.5 -translate-y-1/2 rounded-r bg-accent" />
+                      <span className="absolute left-0 top-1/2 h-[26px] w-[3px] -translate-y-1/2 rounded-r bg-accent" />
                     )}
-                    <it.icon size={16} strokeWidth={1.5} />
+                    <it.icon size={20} strokeWidth={1.5} />
                     <span className="sr-only">{it.label}</span>
                   </>
                 )}
@@ -90,9 +90,9 @@ export const NavSidebar: React.FC<NavSidebarProps> = ({ onNavigate }) => {
               onClick={() => setShowLogoutConfirm(true)}
               aria-label="Logout"
               title="Logout"
-              className="flex h-9 w-9 items-center justify-center rounded-ds-sm text-text-2 transition-colors hover:bg-bg-2 hover:text-down-strong"
+              className="flex h-11 w-11 items-center justify-center rounded-ds-md text-text-2 transition-colors hover:bg-bg-2 hover:text-down-strong"
             >
-              <LogOut size={16} strokeWidth={1.5} />
+              <LogOut size={20} strokeWidth={1.5} />
             </button>
           )}
         </div>

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any, Optional
+from typing import Any, Optional, Dict, List
 
 from pydantic import BaseModel, Field
 
@@ -107,3 +107,94 @@ class MonthlyReviewListResponse(BaseModel):
 
 class MonthlyReviewGenerateRequest(BaseModel):
     dry_run: bool = False
+
+
+# ============================================================
+# Stats-by-style + Journal QA (user-defined framework analysis)
+# ============================================================
+
+
+class StyleBucketStat(BaseModel):
+    """Aggregated stats for trades of one `trade_style` label."""
+    style: str
+    count: int
+    win_rate: float = Field(..., description="0..1")
+    avg_pnl_net: float
+    sum_pnl_net: float
+    median_hold_seconds: Optional[int] = None
+    avg_pnl_pct: Optional[float] = None
+
+
+class DteBucketStat(BaseModel):
+    """Aggregated stats for trades in one DTE bucket."""
+    bucket: str
+    count: int
+    win_rate: float = Field(..., description="0..1")
+    avg_pnl_net: float
+    sum_pnl_net: float
+
+
+class JournalStatsByStyleResponse(BaseModel):
+    """Style + DTE P&L breakdown for a date window."""
+    period: Dict[str, Optional[str]] = Field(
+        ..., description="{'start': YYYY-MM-DD, 'end': YYYY-MM-DD}",
+    )
+    total_count: int
+    total_pnl_net: float
+    by_style: List[StyleBucketStat] = Field(default_factory=list)
+    by_dte: List[DteBucketStat] = Field(default_factory=list)
+    worst_trades: List[Dict[str, Any]] = Field(default_factory=list)
+    best_trades: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class JournalQaRequest(BaseModel):
+    framework: str = Field(..., max_length=10000, description="用户自定义交易框架文本")
+    question: str = Field(..., max_length=2000)
+    trade_window_days: int = Field(30, ge=1, le=365)
+    trade_limit: int = Field(50, ge=1, le=200)
+
+
+class JournalQaResponse(BaseModel):
+    answer: str = Field(..., description="LLM 返回的中文 Markdown 回答")
+    trades_considered: int
+    framework_hash: str = Field(..., description="sha256(framework) 前 16 位")
+    generated_at: str
+
+
+# ============================================================
+# Moomoo live trade-account sync
+# ============================================================
+
+
+class MoomooSyncRequest(BaseModel):
+    """Trigger a one-shot sync of the Moomoo live trade account into the journal."""
+
+    start: Optional[str] = Field(
+        None,
+        description="Window start (ISO 8601). When omitted, end - window_days.",
+    )
+    end: Optional[str] = Field(
+        None,
+        description="Window end (ISO 8601). When omitted, current UTC time.",
+    )
+    window_days: int = Field(
+        7, ge=1, le=180, description="Lookback window when `start` is omitted."
+    )
+    trd_env: Optional[str] = Field(
+        None,
+        description="Override MOOMOO_TRADE_ENV. Allowed: 'SIMULATE' (default) or 'LIVE'.",
+    )
+    market: str = Field("US", description="Trade market filter: US / HK / CN.")
+
+
+class MoomooSyncResponse(BaseModel):
+    window_start: str
+    window_end: str
+    trd_env: str
+    market: str
+    fetched: int
+    inserted: int
+    skipped: int
+    trades_rebuilt: int
+    message: str
+    note: Optional[str] = None

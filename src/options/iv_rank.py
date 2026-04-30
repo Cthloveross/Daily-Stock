@@ -53,7 +53,23 @@ def compute_atm_iv(symbol: str, ref_date: Optional[date] = None) -> tuple[Option
     """Return ``(atm_iv, ref_expiry_str)`` for the nearest expiry >= ref_date.
 
     Returns ``(None, "")`` on failure (missing data, no options, etc.).
+
+    Resolution order:
+        1. Moomoo OpenAPI (if MOOMOO_OPEND_ENABLED=true and SDK installed)
+           — returns server-computed IV, no Black-Scholes reverse solve.
+        2. yfinance fallback (legacy path).
     """
+    # Phase C: prefer Moomoo when configured. Silent no-op when not enabled.
+    try:
+        from data_provider.moomoo_options import compute_atm_iv_moomoo
+
+        iv_m, exp_m = compute_atm_iv_moomoo(symbol, ref_date)
+        if iv_m and iv_m > 0:
+            return iv_m, exp_m
+    except Exception as exc:  # noqa: BLE001
+        # Never let Moomoo's transport failures kill the IV calc — fall through to yfinance.
+        logger.debug("moomoo IV path failed for %s: %s — falling back to yfinance", symbol, exc)
+
     tkr = _get_yfinance_ticker(symbol)
     if tkr is None:
         return None, ""

@@ -97,3 +97,67 @@ export interface TradeUpdateRequest {
   emotionalState?: string | null;
   tradeStyle?: string | null;
 }
+
+// ---------- stats-by-style + journal QA ----------
+
+export interface StyleBucketStat {
+  style: string;
+  count: number;
+  winRate: number;
+  avgPnlNet: number;
+  sumPnlNet: number;
+  medianHoldSeconds?: number | null;
+  avgPnlPct?: number | null;
+}
+
+export interface DteBucketStat {
+  bucket: string;
+  count: number;
+  winRate: number;
+  avgPnlNet: number;
+  sumPnlNet: number;
+}
+
+export interface CompactTradeItem {
+  id?: number | null;
+  underlying?: string | null;
+  direction?: string | null;
+  isOption?: boolean | null;
+  dteBucket?: string | null;
+  tradeStyle?: string | null;
+  pnlNet?: number | null;
+  pnlPct?: number | null;
+  holdSeconds?: number | null;
+  entryTime?: string | null;
+  exitTime?: string | null;
+}
+
+export interface JournalStatsByStyleResponse {
+  period: { start: string | null; end: string | null };
+  totalCount: number;
+  totalPnlNet: number;
+  byStyle: StyleBucketStat[];
+  byDte: DteBucketStat[];
+  worstTrades: CompactTradeItem[];
+  bestTrades: CompactTradeItem[];
+}
+
+export interface JournalQaRequest {
+  framework: string;
+  question: string;
+  tradeWindowDays?: number;
+  tradeLimit?: number;
+}
+
+export interface JournalQaResponse {
+  answer: string;
+  tradesConsidered: number;
+  frameworkHash: string;
+  generatedAt: string;
+}
+
+export interface ChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  ts: string; // ISO 8601
+}

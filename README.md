@@ -25,15 +25,24 @@
 > **🧭 v4 Phase 0 — Mirror 层 · 已完工（2026-04-20）**
 >
 > 本 fork 在原仓库之上扩展了 **"美股期权 / LEAP / 趋势流" 陪跑系统**，不侵入 A 股 / 港股原链路：
-> - 🪞 **Journal**：Moomoo US CSV 自动导入 → FIFO 配对 → **Reality Test**（去掉 Top-N 看真实业绩）
-> - 📊 **Regime Classifier**：六维度每日市场评分 + Telegram 晨报（GitHub Actions 每日 09:00 ET 推送）
-> - 🚨 **Breakout Filter**：Q1-Q5 四层假突破过滤 + 历史 trade_style 回填
-> - 🎯 **AI 月度复盘**：LiteLLM 生成中文行为复盘（禁 emoji / 加油话）
-> - 🤖 **3 个 Agent Skill**：`option_trader` / `leap_explorer` / `trend_follower`
-> - 前端：`/journal` + `/regime` 新页面 · 首页 Reality Test + Regime Score 双卡
+> - 🪞 **Phase 0 Mirror 层**（2026-04-20 完工）：Journal (Moomoo CSV → FIFO → **Reality Test**) · Regime 6 维度速度表 + Telegram 晨报 · Breakout Q1-Q5 假突破过滤 · AI 月度复盘 · 3 Agent Skills (`option_trader` / `leap_explorer` / `trend_follower`)
+> - 🟢 **Moomoo OpenAPI 集成 A/B/C/D**（2026-04-29 完工）：A 实时行情（K 线 / 报价）· B 真实账户**交割单自动同步**（每 15 分钟）· C 期权链 IV/Greeks 服务端值 · D KLine_1M push **实时突破检测** · _不规划下单 (Phase E)_
+> - ⚙️ **macOS LaunchAgent always-on 部署**：`bash scripts/install_launchagents.sh` 把 uvicorn + 同步 + 突破 daemon 全部纳入开机自启 + 崩溃自重启 + OpenD 断线自动重连。开机自动跑，**不再每天手动启**。
+> - 🎨 **Linear-Dark 终端化前端**：`/regime` 半圆速度表 (Fear & Greed 风) + 内联 TradingView · `/stocks/:ticker` Moomoo 实时 K 线 + MA 8/13/144/169 + 5 档新闻 sentiment 箭头 + LLM 中文摘要 · `/journal` 8 tab (Overview / Analysis / Trades / Reality / Framework / Ask AI / Reviews / Import) · 自动补全 + did-you-mean (`amaz` → `AMZN`) · sessionStorage TTL 缓存 · TopBar Moomoo Live 状态徽章
 >
-> **🚀 怎么用 → [New-docs/phase0/HOW_TO_USE.md](New-docs/phase0/HOW_TO_USE.md)**（TL;DR + 每日/每周/每月流程 + CLI/API/bot 速查 + FAQ）
-> 分 stage 落地细节：[New-docs/phase0/](New-docs/phase0/README.md) · 战略文档：[New-docs/](New-docs/)
+> **🚀 一行启动（Moomoo 用户）**：
+> ```bash
+> pip install -r requirements.txt && pip install moomoo-api
+> echo 'MOOMOO_OPEND_ENABLED=true' >> .env       # 然后开 OpenD GUI 登录
+> bash scripts/install_launchagents.sh           # 后端 + 同步 + 突破 daemon 全自动跑
+> open http://localhost:8000                     # 完事
+> ```
+>
+> **没有 Moomoo 账号也能用**：保持 `MOOMOO_OPEND_ENABLED=false`（默认）→ 系统全程走 yfinance 兜底，所有功能不变只是有 15 分钟延迟。
+>
+> **入门 / 完整架构 / 路由速查 → [`New-docs/architecture/04_CURRENT_STATE.md`](New-docs/architecture/04_CURRENT_STATE.md)** ←推荐先读这个
+>
+> 其它专题：[Moomoo 路线图](New-docs/integrations/moomoo-roadmap.md) · [Moomoo 订阅 API](New-docs/integrations/moomoo-subscription.md) · [Phase 0 各 stage](New-docs/phase0/README.md) · [HOW_TO_USE](New-docs/phase0/HOW_TO_USE.md) · [设计系统](New-docs/design/Design_system.md)
 
 ## 💖 赞助商 (Sponsors)
 <div align="center">

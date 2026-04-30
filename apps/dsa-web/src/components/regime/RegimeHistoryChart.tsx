@@ -83,7 +83,14 @@ export const RegimeHistoryChart: React.FC<RegimeHistoryChartProps> = ({
   if (items.length < 2) {
     return (
       <div className={className}>
-        <EmptyState title="Not enough history to chart." size="sm" />
+        <EmptyState
+          title={items.length === 0 ? '还没有 regime 历史记录' : '历史只有 1 天，无法绘图'}
+          description={
+            '每天 14:00 UTC 的 GitHub Action 会自动算当日 regime，手动触发请点 RegimeGauge 卡上的 Recompute，' +
+            '或在终端跑 `python -m src.regime.cli`。第 2 次 compute 后折线会出来。'
+          }
+          size="sm"
+        />
       </div>
     );
   }

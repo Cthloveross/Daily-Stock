@@ -1,8 +1,8 @@
 import type React from 'react';
 import { useEffect, useMemo, useState } from 'react';
-import { useParams } from 'react-router-dom';
-import { Play, Plus, MoreHorizontal } from 'lucide-react';
-import { Button, IconButton, Tabs, toast } from '../components/ui';
+import { useNavigate, useParams } from 'react-router-dom';
+import { AlertTriangle, Play, Plus, Trash2 } from 'lucide-react';
+import { Button, Tabs, toast } from '../components/ui';
 import { ApiErrorAlert, Loading } from '../components/common';
 import { CandlestickChart, type Candle, type MAOverlay } from '../components/charts/CandlestickChart';
 import { TradePlan } from '../components/trade/TradePlan';
@@ -11,6 +11,7 @@ import { PriceCell } from '../components/data/PriceCell';
 import { ChangeCell } from '../components/data/ChangeCell';
 import { stocksApi } from '../api/stocks';
 import { parseApiError, type ParsedApiError } from '../api/error';
+import { useUserWatchlistStore } from '../stores/userWatchlistStore';
 import type {
   StockKLine,
   StockNewsItem,
@@ -89,6 +90,14 @@ const OVERALL_COLOR: Record<number, string> = {
 };
 
 const DigestView: React.FC<{ digest: StockNewsDigestResponse }> = ({ digest }) => {
+  if (digest.newsCount === 0) {
+    return (
+      <div className="py-6 text-body-sm text-text-3">
+        该 ticker 最近没抓到相关新闻，无法生成 sentiment 与中文摘要。
+        <span className="ml-1">请确认 ticker 拼写、或过一会儿重试。</span>
+      </div>
+    );
+  }
   const color = OVERALL_COLOR[digest.overallScore] ?? '#9ca3af';
   return (
     <div className="space-y-3">
@@ -115,6 +124,34 @@ const DigestView: React.FC<{ digest: StockNewsDigestResponse }> = ({ digest }) =
   );
 };
 
+// Hand-curated typo map for common US tickers. Edit distance 1-2 suggests
+// the user probably meant a neighbor; if none matches we just fall through
+// to the generic tip.
+const COMMON_TYPOS: Record<string, string> = {
+  AMAZ: 'AMZN',
+  APPL: 'AAPL',
+  APLE: 'AAPL',
+  GOOG: 'GOOGL',
+  GOOLG: 'GOOGL',
+  MICROSOFT: 'MSFT',
+  MICR: 'MSFT',
+  MSFR: 'MSFT',
+  TESL: 'TSLA',
+  TLSA: 'TSLA',
+  META1: 'META',
+  FACBOOK: 'META',
+  NVDA1: 'NVDA',
+  NVIDIA: 'NVDA',
+  QQQQ: 'QQQ',
+  SPYY: 'SPY',
+  VIXX: 'VIX',
+  BRKA: 'BRK.A',
+  BRKB: 'BRK.B',
+};
+function suggestTicker(ticker: string): string | null {
+  return COMMON_TYPOS[ticker.toUpperCase()] ?? null;
+}
+
 function toNewsItems(items: StockNewsItem[]): NewsItem[] {
   return items.map((it, idx) => ({
     id: `${idx}-${it.url}`,
@@ -128,7 +165,13 @@ function toNewsItems(items: StockNewsItem[]): NewsItem[] {
 
 const StockDetailPage: React.FC = () => {
   const params = useParams<{ ticker: string }>();
+  const navigate = useNavigate();
   const ticker = (params.ticker ?? '').toUpperCase();
+
+  const userTickers = useUserWatchlistStore((s) => s.tickers);
+  const addTicker = useUserWatchlistStore((s) => s.add);
+  const removeTicker = useUserWatchlistStore((s) => s.remove);
+  const inWatchlist = userTickers.includes(ticker);
 
   const [tab, setTab] = useState<'news' | 'summary' | 'events' | 'history' | 'trace'>('news');
   const [timeframe, setTimeframe] = useState<Timeframe>('daily');
@@ -245,6 +288,17 @@ const StockDetailPage: React.FC = () => {
       .map((c) => ({ period: c.period, color: c.color, data: computeMA(candles, c.period) }));
   }, [candles]);
 
+  // "ticker 可能不存在"的判定：K 线 + 新闻 + digest 三条都空，且都加载完、没 error。
+  // 只有三个同时空才报错，避免停牌/节假日误伤。
+  const invalidTicker = useMemo(() => {
+    if (chartLoading || newsLoading || digestLoading) return false;
+    if (chartError || newsError) return false;
+    if (candles.length > 0) return false;
+    if (news.length > 0) return false;
+    if (digest && digest.newsCount > 0) return false;
+    return true;
+  }, [chartLoading, newsLoading, digestLoading, chartError, newsError, candles.length, news.length, digest]);
+
   const last = candles[candles.length - 1];
   const prev = candles[candles.length - 2];
   const chgAbs = last && prev ? last.close - prev.close : 0;
@@ -317,10 +371,43 @@ const StockDetailPage: React.FC = () => {
           >
             Run analysis
           </Button>
-          <Button variant="secondary" size="md" iconLeft={Plus}>
-            Add
+          {inWatchlist ? (
+            <Button
+              variant="secondary"
+              size="md"
+              iconLeft={Trash2}
+              onClick={() => {
+                removeTicker(ticker);
+                toast.info(`${ticker} 已从自选移出`);
+              }}
+              title="从自选移除"
+            >
+              已自选
+            </Button>
+          ) : (
+            <Button
+              variant="secondary"
+              size="md"
+              iconLeft={Plus}
+              onClick={() => {
+                const ok = addTicker(ticker);
+                toast[ok ? 'success' : 'info'](
+                  ok ? `${ticker} 已加入自选` : `${ticker} 已在自选里`,
+                );
+              }}
+              title="加入自选（本地保存，刷新不丢）"
+            >
+              Add
+            </Button>
+          )}
+          <Button
+            variant="ghost"
+            size="md"
+            onClick={() => navigate('/watchlist')}
+            title="查看自选列表"
+          >
+            Watchlist →
           </Button>
-          <IconButton icon={MoreHorizontal} aria-label="More actions" variant="ghost" size="md" />
         </div>
       </header>
 
@@ -345,9 +432,45 @@ const StockDetailPage: React.FC = () => {
               onDismiss={() => setChartError(null)}
             />
           )}
-          {!chartLoading && !chartError && candles.length === 0 && (
+          {!chartLoading && !chartError && candles.length === 0 && invalidTicker && (
+            <div className="mx-auto max-w-xl px-4 py-8 text-center">
+              <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-full bg-warn-subtle text-warn-strong">
+                <AlertTriangle size={20} strokeWidth={1.5} />
+              </div>
+              <div className="text-body text-text-1">
+                未找到 <span className="font-mono">{ticker}</span> 的数据
+              </div>
+              {suggestTicker(ticker) ? (
+                <p className="mt-2 text-body-sm text-text-2">
+                  你是不是想输入{' '}
+                  <button
+                    type="button"
+                    className="font-mono text-accent underline-offset-2 hover:underline"
+                    onClick={() => navigate(`/stocks/${suggestTicker(ticker)}`)}
+                  >
+                    {suggestTicker(ticker)}
+                  </button>
+                  ？
+                </p>
+              ) : (
+                <p className="mt-2 text-body-sm text-text-2">
+                  请检查拼写（常见：<span className="font-mono">AMAZ → AMZN</span>、
+                  <span className="font-mono">GOOGL / GOOG</span>、
+                  <span className="font-mono">BRK.A / BRK.B</span>）。
+                  若是港股或 A 股请用完整代码，如 <span className="font-mono">hk00700</span>、
+                  <span className="font-mono">600519</span>。
+                </p>
+              )}
+              <div className="mt-3">
+                <Button variant="secondary" size="sm" onClick={() => navigate('/watchlist')}>
+                  Browse watchlist
+                </Button>
+              </div>
+            </div>
+          )}
+          {!chartLoading && !chartError && candles.length === 0 && !invalidTicker && (
             <div className="px-4 py-12 text-center text-body-sm text-text-3">
-              暂无 K 线数据
+              暂无 K 线数据（停牌 / 非交易时段 / 数据源延迟）
             </div>
           )}
           {!chartLoading && candles.length > 0 && (
@@ -424,12 +547,12 @@ const StockDetailPage: React.FC = () => {
               {digestError && (
                 <ApiErrorAlert error={digestError} onDismiss={() => setDigestError(null)} />
               )}
-              {!digestLoading && !digestError && !digest && news.length === 0 && (
+              {!digestLoading && !digestError && digest && <DigestView digest={digest} />}
+              {!digestLoading && !digestError && !digest && (
                 <div className="py-8 text-center text-body-sm text-text-3">
-                  暂无新闻可供总结
+                  切换到该标签页时会按需生成中文摘要，请稍候…
                 </div>
               )}
-              {!digestLoading && digest && <DigestView digest={digest} />}
             </div>
           )}
           {tab === 'events' && (

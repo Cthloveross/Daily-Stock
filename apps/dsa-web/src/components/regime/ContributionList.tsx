@@ -5,6 +5,14 @@ export interface ContributionItem {
   label: string;
   value: number;
   description?: string;
+  /**
+   * `no_data`: the upstream data feed (Finnhub / yfinance / etc.) didn't provide
+   *   anything computable — render `—` instead of `0` and surface an
+   *   informative caption. `computed` (default): value is real, render as-is.
+   */
+  status?: 'no_data' | 'computed';
+  /** Optional caption shown in place of description when `status === 'no_data'`. */
+  noDataHint?: string;
 }
 
 export interface ContributionListProps {
@@ -38,6 +46,7 @@ export const ContributionList: React.FC<ContributionListProps> = ({
   return (
     <div className={cn('space-y-1', className)}>
       {ordered.map((it) => {
+        const noData = it.status === 'no_data';
         const pct = Math.min(100, (Math.abs(it.value) / effectiveMax) * 50);
         const zero = it.value === 0;
         const isPositive = it.value > 0;
@@ -46,12 +55,14 @@ export const ContributionList: React.FC<ContributionListProps> = ({
           : isPositive
             ? 'bg-up-strong'
             : 'bg-down-strong';
+        const displayedValue = noData ? '—' : formatSignedInt(it.value);
+        const caption = noData ? (it.noDataHint ?? '数据源未配置 / 暂无数据') : it.description;
         return (
           <div key={it.label} className="flex h-7 items-center gap-3 py-1.5">
             <div className="w-24 shrink-0 text-body text-text-1">{it.label}</div>
             <div className="relative h-1.5 flex-1 rounded-ds-sm bg-bg-2">
               <span className="absolute left-1/2 top-0 h-full w-px bg-[color:var(--border-subtle)]" />
-              {!zero && (
+              {!zero && !noData && (
                 <span
                   className={cn('absolute top-0 h-full rounded-ds-sm', color)}
                   style={{
@@ -64,14 +75,20 @@ export const ContributionList: React.FC<ContributionListProps> = ({
             <div
               className={cn(
                 'w-10 shrink-0 text-right font-mono text-mono-sm tabular-nums',
-                zero ? 'text-text-3' : 'text-text-1',
+                zero || noData ? 'text-text-3' : 'text-text-1',
               )}
+              title={noData ? '数据源未返回数据' : undefined}
             >
-              {formatSignedInt(it.value)}
+              {displayedValue}
             </div>
-            {it.description && (
-              <div className="hidden lg:block w-56 shrink-0 text-caption text-text-3">
-                {it.description}
+            {caption && (
+              <div
+                className={cn(
+                  'hidden lg:block w-56 shrink-0 text-caption',
+                  noData ? 'italic text-text-3' : 'text-text-3',
+                )}
+              >
+                {caption}
               </div>
             )}
           </div>

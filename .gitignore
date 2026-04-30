@@ -80,3 +80,9 @@ static/
 /apps/dsa-desktop/node_modules/
 /apps/dsa-web/node_modules/
 /apps/dsa-web/dist/
+
+# User's exported Moomoo broker CSVs — contain account ID + real trade
+# history; never commit these. Only push the parser, not the data.
+moomoo_csv_archive/
+History-Margin*.csv
+History-Cash*.csv

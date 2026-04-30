@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dailystock.breakout-live</string>
+
+    <!-- Live breakout detector: subscribe to KLine_1M for the configured tickers
+         and emit JSON-line signals to logs/breakout-live.jsonl.
+
+         Tickers come from WATCHLIST_TICKERS env var (set in your .env).
+         If unset, the runner will exit immediately — non-fatal. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__PROJECT_DIR__/scripts/run_breakout_live.py</string>
+        <string>--passed-only</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+
+    <!-- Auto-start + restart with backoff. Internal reconnect handles OpenD
+         bouncing; this only relaunches if the process itself dies. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__PROJECT_DIR__/logs/breakout-live.jsonl</string>
+
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_DIR__/logs/launchagent.breakout-live.err.log</string>
+</dict>
+</plist>

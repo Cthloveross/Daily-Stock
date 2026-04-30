@@ -4,6 +4,8 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import apiClient from '../../api';
 import { toCamelCase } from '../../api/utils';
+import { parseApiError } from '../../api/error';
+import { toast } from '../ui';
 
 interface ReviewItem {
   yearMonth: string;
@@ -17,11 +19,16 @@ interface ReviewListResponse {
   items: ReviewItem[];
 }
 
+// LLM monthly review takes 30-180 s. apiClient default 30s timeout would
+// always abort. Use a generous 4-minute window matching backend limits.
+const REGENERATE_TIMEOUT_MS = 240_000;
+
 export const MonthlyReviewPanel: React.FC = () => {
   const [items, setItems] = useState<ReviewItem[]>([]);
   const [selected, setSelected] = useState<ReviewItem | null>(null);
   const [generating, setGenerating] = useState(false);
   const [generateYm, setGenerateYm] = useState('');
+  const [error, setError] = useState<string | null>(null);
 
   const load = async () => {
     const { data } = await apiClient.get('/api/v1/journal/reviews');
@@ -37,14 +44,29 @@ export const MonthlyReviewPanel: React.FC = () => {
 
   const regenerate = async () => {
     if (!generateYm) return;
+    if (!/^\d{4}-\d{2}$/.test(generateYm)) {
+      setError('格式应为 YYYY-MM，例如 2026-04');
+      return;
+    }
     setGenerating(true);
+    setError(null);
     try {
       const [year, month] = generateYm.split('-');
       await apiClient.post(
         `/api/v1/journal/reviews/${year}/${month}/generate`,
         { dry_run: false },
+        { timeout: REGENERATE_TIMEOUT_MS },
       );
+      toast.success(`${generateYm} 复盘已生成`);
+      // Refresh + auto-select the new review.
       await load();
+      // After load, find and select the just-generated month.
+      const target = `${year}-${month}`;
+      setSelected((prev) => prev?.yearMonth === target ? prev : (items.find((i) => i.yearMonth === target) ?? prev));
+    } catch (e) {
+      const parsed = parseApiError(e);
+      setError(parsed.message || '生成失败，请稍后再试');
+      toast.error(`生成失败: ${parsed.message ?? '请查看后端日志'}`);
     } finally {
       setGenerating(false);
     }
@@ -75,9 +97,12 @@ export const MonthlyReviewPanel: React.FC = () => {
           <h4 className="text-sm font-semibold">Generate</h4>
           <input
             className="input-base w-full text-xs"
-            placeholder="YYYY-MM"
+            placeholder="YYYY-MM (e.g. 2026-04)"
             value={generateYm}
-            onChange={(e) => setGenerateYm(e.target.value)}
+            onChange={(e) => {
+              setGenerateYm(e.target.value);
+              setError(null);
+            }}
           />
           <button
             type="button"
@@ -85,8 +110,18 @@ export const MonthlyReviewPanel: React.FC = () => {
             disabled={generating || !generateYm}
             onClick={() => void regenerate()}
           >
-            {generating ? 'Running…' : 'Run retrospective'}
+            {generating ? '生成中…30-180 秒' : 'Run retrospective'}
           </button>
+          {generating && (
+            <p className="text-[10px] text-text-3">
+              LLM 调用要等一会儿，别关 tab。
+            </p>
+          )}
+          {error && (
+            <p className="rounded-ds-sm border border-down-strong/30 bg-down-strong/10 p-2 text-[11px] text-down-strong">
+              {error}
+            </p>
+          )}
         </div>
       </div>
       <div className="card-base p-4">

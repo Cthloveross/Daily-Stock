@@ -1,13 +1,16 @@
 import type React from 'react';
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Columns3, Download, Search, SlidersHorizontal } from 'lucide-react';
-import { DataTable, EmptyState, Input, Tabs, type ColumnDef } from '../components/ui';
+import { Columns3, Download, Search, SlidersHorizontal, X } from 'lucide-react';
+import { DataTable, EmptyState, Input, Tabs, toast, type ColumnDef } from '../components/ui';
 import { PriceCell } from '../components/data/PriceCell';
 import { ChangeCell } from '../components/data/ChangeCell';
 import { Sparkline } from '../components/data/Sparkline';
 import { MASlopeCell, type MATrend } from '../components/data/MASlopeCell';
+import { TickerPicker } from '../components/data/TickerPicker';
 import { useRegimeStore } from '../stores/regimeStore';
+import { useUserWatchlistStore } from '../stores/userWatchlistStore';
+import { useTickerQuotes } from '../hooks/useTickerQuotes';
 import { exportCsv } from '../utils/exportCsv';
 import { cn } from '../utils/cn';
 
@@ -25,9 +28,11 @@ interface WatchlistRow {
   ma13: MATrend;
   nextEvent: string | undefined;
   sparkline: number[];
+  /** 是否来自本地自选（而非 regime snapshot） */
+  isUserAdded: boolean;
 }
 
-function derive(raw: Record<string, unknown>): Omit<WatchlistRow, 'ticker'> {
+function derive(raw: Record<string, unknown>): Omit<WatchlistRow, 'ticker' | 'isUserAdded'> {
   const num = (k: string): number | undefined =>
     typeof raw[k] === 'number' ? (raw[k] as number) : undefined;
   const trend = (k: string): MATrend => {
@@ -59,6 +64,20 @@ const DEFAULT_VISIBLE: Record<string, boolean> = {
   ma: true,
   nextEvent: true,
   sparkline: true,
+  actions: true,
+};
+
+const EMPTY_ROW: Omit<WatchlistRow, 'ticker' | 'isUserAdded'> = {
+  last: undefined,
+  chgPct: undefined,
+  chgAbs: undefined,
+  premkt: undefined,
+  volRatio: undefined,
+  ma3: 'flat',
+  ma5: 'flat',
+  ma13: 'flat',
+  nextEvent: undefined,
+  sparkline: [],
 };
 
 const WatchlistPage: React.FC = () => {
@@ -66,6 +85,9 @@ const WatchlistPage: React.FC = () => {
   const today = useRegimeStore((s) => s.today);
   const loadToday = useRegimeStore((s) => s.loadToday);
   const todayLoading = useRegimeStore((s) => s.todayLoading);
+  const userTickers = useUserWatchlistStore((s) => s.tickers);
+  const addTicker = useUserWatchlistStore((s) => s.add);
+  const removeTicker = useUserWatchlistStore((s) => s.remove);
 
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<FilterKey>('all');
@@ -76,14 +98,51 @@ const WatchlistPage: React.FC = () => {
     if (!today) void loadToday();
   }, [today, loadToday]);
 
+  const { quotes } = useTickerQuotes(userTickers);
+
   const rows = useMemo<WatchlistRow[]>(() => {
-    const wl = (today?.snapshot?.watchlist ?? {}) as Record<string, unknown>;
+    const snapshot = (today?.snapshot?.watchlist ?? {}) as Record<string, unknown>;
+    const snapshotByKey = new Map<string, Record<string, unknown>>();
+    for (const [k, v] of Object.entries(snapshot)) {
+      snapshotByKey.set(k.toUpperCase(), (v ?? {}) as Record<string, unknown>);
+    }
+
     const out: WatchlistRow[] = [];
-    for (const [ticker, raw] of Object.entries(wl)) {
-      out.push({ ticker: ticker.toUpperCase(), ...derive((raw ?? {}) as Record<string, unknown>) });
+    const userSet = new Set(userTickers);
+
+    // 1) 用户自选优先展示（保留添加顺序）
+    for (const t of userTickers) {
+      const snap = snapshotByKey.get(t);
+      const base = snap ? derive(snap) : EMPTY_ROW;
+      const q = quotes[t] ?? null;
+      out.push({
+        ticker: t,
+        isUserAdded: true,
+        ...base,
+        // Prefer live quote when the snapshot didn't contain this ticker.
+        last: base.last ?? q?.currentPrice,
+        chgPct: base.chgPct ?? q?.changePercent ?? undefined,
+        chgAbs: base.chgAbs ?? q?.change ?? undefined,
+      });
+    }
+    // 2) 追加 regime snapshot 里、不在自选里的条目
+    for (const [t, raw] of snapshotByKey.entries()) {
+      if (userSet.has(t)) continue;
+      out.push({ ticker: t, isUserAdded: false, ...derive(raw) });
     }
     return out;
-  }, [today]);
+  }, [today, userTickers, quotes]);
+
+  const handlePickerAdd = (canonicalCode: string, name?: string) => {
+    const ok = addTicker(canonicalCode);
+    const label = name ? `${canonicalCode} · ${name}` : canonicalCode;
+    toast[ok ? 'success' : 'info'](ok ? `已加入自选: ${label}` : `${canonicalCode} 已在自选里`);
+  };
+
+  const handleRemoveTicker = (t: string) => {
+    removeTicker(t);
+    toast.info(`已移除: ${t}`);
+  };
 
   const filtered = useMemo(() => {
     let r = rows;
@@ -165,6 +224,28 @@ const WatchlistPage: React.FC = () => {
           <span className="text-text-3 text-mono-xs">—</span>
         ),
     },
+    {
+      id: 'actions',
+      header: '',
+      size: 36,
+      cell: ({ row }) =>
+        row.original.isUserAdded ? (
+          <button
+            type="button"
+            aria-label={`Remove ${row.original.ticker}`}
+            title="移出自选"
+            onClick={(e) => {
+              e.stopPropagation();
+              handleRemoveTicker(row.original.ticker);
+            }}
+            className="inline-flex h-6 w-6 items-center justify-center rounded-ds-sm text-text-3 transition-colors hover:bg-bg-3 hover:text-down-strong"
+          >
+            <X size={14} strokeWidth={1.5} />
+          </button>
+        ) : (
+          <span aria-hidden className="inline-block h-6 w-6" />
+        ),
+    },
   ];
 
   const columns = allColumns.filter((c) => visible[c.id as string] ?? true);
@@ -190,19 +271,21 @@ const WatchlistPage: React.FC = () => {
 
   return (
     <div className="mx-auto max-w-7xl p-4">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-3">
         <div>
           <div className="text-label uppercase text-text-3">Watchlist</div>
           <h1 className="text-h1 text-text-1">Tickers</h1>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <TickerPicker onAdd={handlePickerAdd} className="w-[360px]" />
+          <div className="mx-1 h-5 w-px bg-[color:var(--border-subtle)]" aria-hidden />
           <Input
             value={query}
             onChange={setQuery}
             placeholder="Filter…"
             iconLeft={Search}
             size="sm"
-            className="w-48"
+            className="w-44"
           />
           <div className="relative">
             <button
@@ -276,10 +359,10 @@ const WatchlistPage: React.FC = () => {
       >
         {filtered.length === 0 ? (
           <EmptyState
-            title={rows.length === 0 ? 'No watchlist data available.' : 'No rows match current filters.'}
+            title={rows.length === 0 ? '自选列表为空' : 'No rows match current filters.'}
             description={
               rows.length === 0
-                ? 'Watchlist data comes from the latest regime snapshot. Compute regime on /regime first.'
+                ? '在上方输入框输入 ticker（比如 AMZN / TSLA），点 Add 加入自选。自选保存在本地，刷新不会丢。Regime 里配置过的 ticker 也会显示在这里。'
                 : undefined
             }
             size="md"

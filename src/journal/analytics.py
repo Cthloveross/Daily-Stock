@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from datetime import date, datetime, time
-from typing import Iterable, Optional
+from statistics import fmean, median
+from typing import Iterable, List, Optional
 
 from src.journal.matcher import dte_bucket_of
 
@@ -18,6 +19,7 @@ __all__ = [
     "dte_distribution",
     "dte_bucket_win_rates",
     "daily_health_check",
+    "stats_by_style",
 ]
 
 
@@ -111,6 +113,39 @@ def dte_bucket_win_rates(trades: Iterable[dict]) -> dict[str, dict]:
             "avg_pnl_net": (sum(r["pnl_net"] for r in rows) / len(rows)) if rows else None,
             "sum_pnl_net": sum(r["pnl_net"] for r in rows),
         }
+    return out
+
+
+def stats_by_style(trades: Iterable[dict]) -> List[dict]:
+    """Per-trade_style aggregate stats for closed trades.
+
+    Each bucket keeps count / win_rate / avg+sum pnl_net / median hold / avg pnl%.
+    Buckets returned sorted by count desc (common styles first).
+    """
+    buckets: dict[str, list[dict]] = defaultdict(list)
+    for t in trades:
+        if t.get("status") != "closed" or t.get("pnl_net") is None:
+            continue
+        style = t.get("trade_style") or "unknown"
+        buckets[style].append(t)
+
+    out: List[dict] = []
+    for style, items in buckets.items():
+        wins = sum(1 for r in items if r["pnl_net"] > 0)
+        holds = [r.get("hold_seconds") for r in items if r.get("hold_seconds") is not None]
+        pcts = [r.get("pnl_pct") for r in items if r.get("pnl_pct") is not None]
+        out.append(
+            {
+                "style": style,
+                "count": len(items),
+                "win_rate": (wins / len(items)) if items else 0.0,
+                "avg_pnl_net": (fmean(r["pnl_net"] for r in items)) if items else 0.0,
+                "sum_pnl_net": float(sum(r["pnl_net"] for r in items)),
+                "median_hold_seconds": int(median(holds)) if holds else None,
+                "avg_pnl_pct": float(fmean(pcts)) if pcts else None,
+            }
+        )
+    out.sort(key=lambda x: x["count"], reverse=True)
     return out
 
 

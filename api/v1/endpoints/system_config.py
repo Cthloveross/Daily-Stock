@@ -385,3 +385,102 @@ def get_system_config_schema(
                 "message": "Failed to load system configuration schema",
             },
         )
+
+
+# --- Moomoo OpenD live status (Phase A/B/C/D indicator for the UI) ---
+
+
+@router.get(
+    "/moomoo-status",
+    summary="Moomoo OpenD live status",
+    description=(
+        "Lightweight probe used by the frontend TopBar badge. Returns whether "
+        "the Moomoo OpenD daemon is reachable and whether the SDK is wired up. "
+        "Cheap (~1-2 ms) — no quota cost. Safe to poll every 30 s."
+    ),
+)
+def get_moomoo_status() -> dict:
+    """Return a small dict describing the live Moomoo integration health."""
+    import os
+
+    enabled = (os.environ.get("MOOMOO_OPEND_ENABLED") or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    host = (os.environ.get("MOOMOO_OPEND_HOST") or "127.0.0.1").strip()
+    try:
+        port = int((os.environ.get("MOOMOO_OPEND_PORT") or "11111").strip())
+    except ValueError:
+        port = 11111
+    trd_env = (os.environ.get("MOOMOO_TRADE_ENV") or "SIMULATE").upper()
+
+    if not enabled:
+        return {
+            "enabled": False,
+            "sdk_installed": False,
+            "connected": False,
+            "host": host,
+            "port": port,
+            "trd_env": trd_env,
+            "message": "MOOMOO_OPEND_ENABLED is false; using yfinance fallback",
+        }
+
+    # SDK probe — check for a real symbol, not just `import moomoo` (which can
+    # resolve to an empty namespace package — see MoomooFetcher comment).
+    try:
+        from moomoo import OpenQuoteContext  # noqa: F401
+        sdk_ok = True
+    except ImportError:
+        return {
+            "enabled": True,
+            "sdk_installed": False,
+            "connected": False,
+            "host": host,
+            "port": port,
+            "trd_env": trd_env,
+            "message": "moomoo-api SDK not installed",
+        }
+
+    # Reuse the MoomooFetcher singleton so we don't open/close a fresh OpenD
+    # socket on every UI poll.
+    connected = False
+    sdk_version = None
+    try:
+        from data_provider.base import DataFetcherManager
+
+        manager = DataFetcherManager()
+        for f in manager._get_fetchers_snapshot():
+            if f.name == "MoomooFetcher" and getattr(f, "_sdk_ok", False):
+                try:
+                    f._get_ctx()  # creates if missing
+                    connected = f._is_ctx_alive()
+                except Exception:  # noqa: BLE001
+                    connected = False
+                break
+        try:
+            import moomoo as _m
+
+            sdk_version = getattr(_m, "__version__", None)
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "enabled": True,
+            "sdk_installed": sdk_ok,
+            "connected": False,
+            "host": host,
+            "port": port,
+            "trd_env": trd_env,
+            "sdk_version": sdk_version,
+            "message": f"manager probe failed: {exc}",
+        }
+
+    return {
+        "enabled": True,
+        "sdk_installed": sdk_ok,
+        "connected": connected,
+        "host": host,
+        "port": port,
+        "trd_env": trd_env,
+        "sdk_version": sdk_version,
+        "message": "live" if connected else "OpenD daemon not reachable — open the OpenD app and log in",
+    }

@@ -24,10 +24,15 @@ from sqlalchemy import and_, func, select
 from api.v1.schemas.journal import (
     HealthCheckItem,
     ImportResponse,
+    JournalQaRequest,
+    JournalQaResponse,
+    JournalStatsByStyleResponse,
     JournalStatsResponse,
     MonthlyReviewGenerateRequest,
     MonthlyReviewItem,
     MonthlyReviewListResponse,
+    MoomooSyncRequest,
+    MoomooSyncResponse,
     RealityTestResponse,
     TradeItem,
     TradeListResponse,
@@ -37,6 +42,7 @@ from src.journal.analytics import (
     dte_bucket_win_rates,
     dte_distribution,
     reality_test,
+    stats_by_style,
 )
 from src.journal.brokers.moomoo_us import parse as parse_moomoo
 from src.journal.matcher import match_legs_fifo
@@ -397,3 +403,162 @@ def generate_review_endpoint(
     if result is None:
         raise HTTPException(status_code=500, detail="review missing after generation")
     return result
+
+
+# --- stats-by-style + QA -----------------------------------------------------
+
+
+_DTE_BUCKET_ORDER = ["0DTE", "1-3DTE", "4-7DTE", "8-30DTE", "30+DTE", "equity", "unknown"]
+
+
+def _filter_trades_by_window(
+    trades: list[dict],
+    start_date: Optional[date],
+    end_date: Optional[date],
+) -> list[dict]:
+    out = []
+    for t in trades:
+        ref = t.get("exit_time") or t.get("entry_time")
+        if ref is None:
+            continue
+        ref_date = ref.date() if isinstance(ref, datetime) else ref
+        if start_date and ref_date < start_date:
+            continue
+        if end_date and ref_date > end_date:
+            continue
+        out.append(t)
+    return out
+
+
+def _compact_trade_for_api(t: dict) -> dict:
+    """Minimal trade row for `worst_trades` / `best_trades` transport."""
+    return {
+        "id": t.get("id"),
+        "underlying": t.get("underlying"),
+        "direction": t.get("direction"),
+        "is_option": t.get("is_option"),
+        "dte_bucket": t.get("dte_bucket"),
+        "trade_style": t.get("trade_style"),
+        "pnl_net": t.get("pnl_net"),
+        "pnl_pct": t.get("pnl_pct"),
+        "hold_seconds": t.get("hold_seconds"),
+        "entry_time": t.get("entry_time").isoformat() if t.get("entry_time") else None,
+        "exit_time": t.get("exit_time").isoformat() if t.get("exit_time") else None,
+    }
+
+
+@router.get("/stats-by-style", response_model=JournalStatsByStyleResponse)
+def get_stats_by_style(
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+    top_n: int = Query(5, ge=1, le=20),
+    portfolio: str = Query(DEFAULT_PORTFOLIO_LABEL),
+) -> JournalStatsByStyleResponse:
+    """P&L breakdown by trade_style + DTE bucket across an optional date window."""
+    trades = _load_trades(portfolio)
+    trades = _filter_trades_by_window(trades, start_date, end_date)
+
+    closed = [t for t in trades if t.get("status") == "closed" and t.get("pnl_net") is not None]
+
+    by_style_rows = stats_by_style(closed)
+    dte_win = dte_bucket_win_rates(closed)
+    by_dte_rows = []
+    for bucket in _DTE_BUCKET_ORDER:
+        info = dte_win.get(bucket)
+        if not info or not info.get("count"):
+            continue
+        by_dte_rows.append(
+            {
+                "bucket": bucket,
+                "count": int(info["count"]),
+                "win_rate": float(info.get("win_rate") or 0.0),
+                "avg_pnl_net": float(info.get("avg_pnl_net") or 0.0),
+                "sum_pnl_net": float(info.get("sum_pnl_net") or 0.0),
+            }
+        )
+
+    worst = sorted(closed, key=lambda t: t["pnl_net"])[: top_n]
+    best = sorted(closed, key=lambda t: t["pnl_net"], reverse=True)[: top_n]
+
+    return JournalStatsByStyleResponse(
+        period={
+            "start": start_date.isoformat() if start_date else None,
+            "end": end_date.isoformat() if end_date else None,
+        },
+        total_count=len(closed),
+        total_pnl_net=float(sum(t["pnl_net"] for t in closed)) if closed else 0.0,
+        by_style=by_style_rows,
+        by_dte=by_dte_rows,
+        worst_trades=[_compact_trade_for_api(t) for t in worst],
+        best_trades=[_compact_trade_for_api(t) for t in best],
+    )
+
+
+@router.post("/qa", response_model=JournalQaResponse)
+def journal_qa(payload: JournalQaRequest) -> JournalQaResponse:
+    """Single-turn LLM Q&A over the user's trade journal, anchored on their framework."""
+    from src.services.journal_qa_service import generate_answer
+
+    portfolio = DEFAULT_PORTFOLIO_LABEL
+    since = date.today() - timedelta(days=payload.trade_window_days)
+    trades = _load_trades(portfolio, since=since)
+    closed = [t for t in trades if t.get("status") == "closed" and t.get("pnl_net") is not None]
+    closed.sort(key=lambda t: t.get("exit_time") or t.get("entry_time") or datetime.min, reverse=True)
+    closed = closed[: payload.trade_limit]
+
+    try:
+        answer, fw_hash = generate_answer(
+            framework=payload.framework,
+            question=payload.question,
+            trades=closed,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("journal qa failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return JournalQaResponse(
+        answer=answer,
+        trades_considered=len(closed),
+        framework_hash=fw_hash,
+        generated_at=datetime.utcnow().isoformat() + "Z",
+    )
+
+
+# --- moomoo live sync (Phase B) ---------------------------------------------
+
+
+@router.post("/sync-live", response_model=MoomooSyncResponse)
+def sync_live(payload: MoomooSyncRequest) -> MoomooSyncResponse:
+    """Pull Moomoo trade-account history and ingest into the journal pipeline.
+
+    Idempotent: re-running the same window is a no-op (external_id hash
+    dedup). Requires ``MOOMOO_OPEND_ENABLED=true`` and a logged-in OpenD.
+    """
+    from src.journal.brokers.moomoo_live import MoomooLiveError
+    from src.services.moomoo_sync_service import sync_live_orders
+
+    def _parse_dt(s: Optional[str]) -> Optional[datetime]:
+        if not s:
+            return None
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"invalid datetime: {s!r}") from exc
+
+    try:
+        result = sync_live_orders(
+            start=_parse_dt(payload.start),
+            end=_parse_dt(payload.end),
+            window_days=payload.window_days,
+            trd_env=payload.trd_env,
+            market=payload.market,
+            portfolio=DEFAULT_PORTFOLIO_LABEL,
+        )
+    except MoomooLiveError as exc:
+        # 503 because this is an upstream-not-available kind of failure
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("moomoo sync-live failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return MoomooSyncResponse(**result.to_dict())

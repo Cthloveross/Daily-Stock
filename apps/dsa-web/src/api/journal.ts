@@ -1,8 +1,12 @@
 import apiClient from './index';
 import { toCamelCase } from './utils';
+import { sessionCache } from '../utils/sessionCache';
 import type {
   HealthCheckItem,
   ImportResponse,
+  JournalQaRequest,
+  JournalQaResponse,
+  JournalStatsByStyleResponse,
   JournalStatsResponse,
   RealityTestResponse,
   TradeItem,
@@ -66,9 +70,58 @@ export async function fetchJournalStats(days = 90): Promise<JournalStatsResponse
 export async function importJournalCsv(file: File, broker = 'moomoo_us'): Promise<ImportResponse> {
   const form = new FormData();
   form.append('file', file);
-  // Leave Content-Type unset so axios/browser add the multipart boundary correctly.
+  // apiClient defaults to `Content-Type: application/json`. For multipart
+  // uploads we MUST unset it so the browser writes the correct
+  // `multipart/form-data; boundary=...` header — otherwise the backend
+  // sees a JSON body and FastAPI raises `File field required`.
+  const headers: { [key: string]: string | undefined } = { 'Content-Type': undefined };
   const { data } = await apiClient.post(`${BASE}/import`, form, {
     params: { broker },
+    headers,
+    timeout: 60000,
   });
   return toCamelCase<ImportResponse>(data);
+}
+
+export async function fetchStatsByStyle(params: {
+  startDate?: string;
+  endDate?: string;
+  topN?: number;
+  refresh?: boolean;
+} = {}): Promise<JournalStatsByStyleResponse> {
+  const topN = params.topN ?? 5;
+  // Cache-key includes inputs; "no inputs" is the typical case (whole-history
+  // breakdown) so it consistently hits the same key across page-mounts.
+  const key = `journal:stats-by-style:${params.startDate ?? ''}:${params.endDate ?? ''}:${topN}`;
+  if (!params.refresh) {
+    const cached = sessionCache.get<JournalStatsByStyleResponse>(key);
+    if (cached) return cached;
+  }
+  const { data } = await apiClient.get(`${BASE}/stats-by-style`, {
+    params: {
+      start_date: params.startDate,
+      end_date: params.endDate,
+      top_n: topN,
+    },
+  });
+  const camel = toCamelCase<JournalStatsByStyleResponse>(data);
+  // Only cache when there's real content — empty buckets get re-fetched.
+  if (camel.totalCount > 0 || camel.byStyle.length > 0) {
+    sessionCache.set(key, camel);
+  }
+  return camel;
+}
+
+export async function askJournalQa(req: JournalQaRequest): Promise<JournalQaResponse> {
+  const { data } = await apiClient.post(
+    `${BASE}/qa`,
+    {
+      framework: req.framework,
+      question: req.question,
+      trade_window_days: req.tradeWindowDays ?? 30,
+      trade_limit: req.tradeLimit ?? 50,
+    },
+    { timeout: 60000 },
+  );
+  return toCamelCase<JournalQaResponse>(data);
 }

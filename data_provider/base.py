@@ -863,6 +863,7 @@ class DataFetcherManager:
         from .baostock_fetcher import BaostockFetcher
         from .yfinance_fetcher import YfinanceFetcher
         from .longbridge_fetcher import LongbridgeFetcher
+        from .moomoo_fetcher import MoomooFetcher
         # 创建所有数据源实例（优先级在各 Fetcher 的 __init__ 中确定）
         efinance = EfinanceFetcher()
         akshare = AkshareFetcher()
@@ -871,6 +872,7 @@ class DataFetcherManager:
         baostock = BaostockFetcher()
         yfinance = YfinanceFetcher()
         longbridge = LongbridgeFetcher()  # 长桥（美股/港股兜底，懒加载）
+        moomoo = MoomooFetcher()    # Moomoo OpenAPI (off by default, MOOMOO_OPEND_ENABLED=true to enable)
 
         # 初始化数据源列表
         self._ensure_concurrency_guards()
@@ -883,6 +885,7 @@ class DataFetcherManager:
                 baostock,
                 yfinance,
                 longbridge,
+                moomoo,
             ]
 
             # 按优先级排序（Tushare 如果配置了 Token 且初始化成功，优先级为 0）
@@ -1068,31 +1071,55 @@ class DataFetcherManager:
             )
 
         fetchers = self._get_fetchers_snapshot()
+
+        # Build the candidate chain: prefer enabled MoomooFetcher (priority < 99
+        # means it actually loaded the SDK), then fall back to yfinance.
+        candidates: List[BaseFetcher] = []
+        moomoo_fetcher = next(
+            (f for f in fetchers if f.name == "MoomooFetcher" and f.priority < 99),
+            None,
+        )
+        if moomoo_fetcher is not None and hasattr(moomoo_fetcher, "fetch_intraday"):
+            candidates.append(moomoo_fetcher)
         yf_fetcher = next(
             (f for f in fetchers if f.name == "YfinanceFetcher"),
             None,
         )
-        if yf_fetcher is None or not hasattr(yf_fetcher, "fetch_intraday"):
-            raise DataFetchError("YfinanceFetcher 未配置，无法获取 intraday 数据")
+        if yf_fetcher is not None and hasattr(yf_fetcher, "fetch_intraday"):
+            candidates.append(yf_fetcher)
 
-        try:
-            df = yf_fetcher.fetch_intraday(
-                stock_code=stock_code,
-                interval=interval,
-                days=days,
-            )
-        except ValueError:
-            # interval 不支持 → 上层转 422
-            raise
-        except Exception as e:
-            raise DataFetchError(f"YfinanceFetcher intraday 失败: {e}") from e
+        if not candidates:
+            raise DataFetchError("没有可用的 intraday 数据源（既无 Moomoo 也无 Yfinance）")
 
-        if df is None or df.empty:
-            raise DataFetchError(
-                f"YfinanceFetcher 未返回 {stock_code} 的 intraday 数据（interval={interval}）"
-            )
+        last_error: Optional[Exception] = None
+        for fetcher in candidates:
+            try:
+                df = fetcher.fetch_intraday(
+                    stock_code=stock_code,
+                    interval=interval,
+                    days=days,
+                )
+                if df is not None and not df.empty:
+                    return df, fetcher.name
+                last_error = DataFetchError(
+                    f"{fetcher.name} 未返回 {stock_code} 的 intraday 数据"
+                )
+            except ValueError:
+                # interval 不支持 → 直接抛，所有源都不会接受
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[%s] intraday %s %s failed: %s",
+                    fetcher.name,
+                    stock_code,
+                    interval,
+                    exc,
+                )
+                last_error = exc
 
-        return df, yf_fetcher.name
+        raise DataFetchError(
+            f"所有 intraday 数据源都失败 ({stock_code} {interval}): {last_error}"
+        )
 
     @property
     def available_fetchers(self) -> List[str]:
