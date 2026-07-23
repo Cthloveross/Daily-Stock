@@ -13,6 +13,17 @@
     <key>ProgramArguments</key>
     <array>
         <string>__PYTHON__</string>
+        <string>__PROJECT_DIR__/scripts/run_with_rotating_logs.py</string>
+        <string>--stdout-log</string>
+        <string>__PROJECT_DIR__/logs/breakout-live.jsonl</string>
+        <string>--stderr-log</string>
+        <string>__PROJECT_DIR__/logs/launchagent.breakout-live.err.log</string>
+        <string>--max-bytes</string>
+        <string>10485760</string>
+        <string>--backup-count</string>
+        <string>3</string>
+        <string>--</string>
+        <string>__PYTHON__</string>
         <string>__PROJECT_DIR__/scripts/run_breakout_live.py</string>
         <string>--passed-only</string>
     </array>
@@ -41,9 +52,9 @@
     </dict>
 
     <key>StandardOutPath</key>
-    <string>__PROJECT_DIR__/logs/breakout-live.jsonl</string>
+    <string>/dev/null</string>
 
     <key>StandardErrorPath</key>
-    <string>__PROJECT_DIR__/logs/launchagent.breakout-live.err.log</string>
+    <string>/dev/null</string>
 </dict>
 </plist>

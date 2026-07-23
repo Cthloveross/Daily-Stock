@@ -15,7 +15,8 @@
 const DEFAULT_TTL_MS = 10 * 60 * 1000;
 // Bump this suffix to invalidate every cached entry across all tabs when
 // cache-write semantics change (e.g. when we added "don't cache empty").
-const STORAGE_PREFIX = 'dsa-cache:v2:';
+// v4 invalidates pre-pagination minute history that may only contain page one.
+const STORAGE_PREFIX = 'dsa-cache:v4:';
 
 // In-memory mirror so we don't pay JSON.parse for every hot read. Also lets
 // the cache keep working on SSR / embedded webviews without sessionStorage.

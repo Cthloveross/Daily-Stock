@@ -5,6 +5,7 @@
 # Usage:
 #   bash scripts/install_launchagents.sh                  # install all 3
 #   bash scripts/install_launchagents.sh --skip breakout  # skip the breakout agent
+#   bash scripts/install_launchagents.sh --only uvicorn   # install Web/API only
 #
 # Re-running this script just overwrites + reloads the agents. Safe to repeat.
 
@@ -26,12 +27,41 @@ AGENTS=(
 )
 
 skip_filter=""
+only_label=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --skip) skip_filter="$2"; shift 2 ;;
+        --skip)
+            [[ $# -ge 2 ]] || { echo "--skip requires a value" >&2; exit 2; }
+            skip_filter="$2"
+            shift 2
+            ;;
+        --only)
+            [[ $# -ge 2 ]] || { echo "--only requires a value" >&2; exit 2; }
+            case "$2" in
+                uvicorn|com.dailystock.uvicorn)
+                    only_label="com.dailystock.uvicorn"
+                    ;;
+                moomoo-sync|com.dailystock.moomoo-sync)
+                    only_label="com.dailystock.moomoo-sync"
+                    ;;
+                breakout-live|breakout|com.dailystock.breakout-live)
+                    only_label="com.dailystock.breakout-live"
+                    ;;
+                *)
+                    echo "unknown agent for --only: $2" >&2
+                    exit 2
+                    ;;
+            esac
+            shift 2
+            ;;
         *) echo "unknown arg: $1"; exit 2 ;;
     esac
 done
+
+if [[ -n "${skip_filter}" && -n "${only_label}" ]]; then
+    echo "--skip and --only cannot be used together" >&2
+    exit 2
+fi
 
 echo "==> daily_stock_analysis @ ${PROJECT_DIR}"
 echo "==> python              @ ${PYTHON}"
@@ -52,6 +82,10 @@ fi
 mkdir -p "${TARGET_DIR}" "${LOGS_DIR}"
 
 for label in "${AGENTS[@]}"; do
+    if [[ -n "${only_label}" && "${label}" != "${only_label}" ]]; then
+        echo "[skip] ${label} (--only ${only_label})"
+        continue
+    fi
     if [[ -n "${skip_filter}" && "${label}" == *"${skip_filter}"* ]]; then
         echo "[skip] ${label}"
         continue

@@ -62,7 +62,11 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
             "RUN_IMMEDIATELY": "false",
         }
 
-        with patch.dict(os.environ, env, clear=True):
+        with patch.object(
+            Config,
+            "_get_env_file_value",
+            return_value=None,
+        ), patch.dict(os.environ, env, clear=True):
             config = Config._load_from_env()
 
         self.assertFalse(config.schedule_run_immediately)
@@ -97,7 +101,11 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
             "RUN_IMMEDIATELY": "",
         }
 
-        with patch.dict(os.environ, env, clear=True):
+        with patch.object(
+            Config,
+            "_get_env_file_value",
+            return_value=None,
+        ), patch.dict(os.environ, env, clear=True):
             config = Config._load_from_env()
 
         self.assertFalse(config.schedule_run_immediately)

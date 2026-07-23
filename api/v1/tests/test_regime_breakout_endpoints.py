@@ -32,10 +32,10 @@ def _client():
 
 
 def _seed_regime():
-    from src.regime.classifier import RegimeResult
+    from src.regime.classifier import RegimeResult, current_market_date
     from src.regime.storage import save_regime_score
 
-    today = date.today()
+    today = current_market_date()
     save_regime_score(
         RegimeResult(
             date=today,
@@ -100,6 +100,41 @@ class TestRegimeToday:
         assert body["score"] == 70
         assert body["label"] == "standard"
         assert body["action_hint"]
+        assert body["quality_state"] == "unavailable"
+        assert body["authoritative"] is False
+        assert {"spy", "vix"}.issubset(set(body["incomplete_domains"]))
+        assert "not a trading signal" in body["action_hint"]
+
+    def test_uses_new_york_market_date_for_lookup(self):
+        from unittest.mock import patch
+
+        market_date = date(2026, 7, 22)
+        row = {
+            "date": market_date,
+            "score": 0,
+            "label": "unavailable",
+            "action_hint": None,
+            "d1_direction": 0,
+            "d2_volatility": 0,
+            "d3_macro_penalty": 0,
+            "d4_sector": 0,
+            "d5_prev_day": 0,
+            "d6_premarket": 0,
+            "snapshot": {},
+            "version": "v2",
+            "generated_at": None,
+        }
+        c = _client()
+        with patch(
+            "api.v1.endpoints.regime.current_market_date",
+            return_value=market_date,
+        ), patch(
+            "api.v1.endpoints.regime.get_regime_score",
+            return_value=row,
+        ) as get_score:
+            resp = c.get("/api/v1/regime/today")
+        assert resp.status_code == 200
+        get_score.assert_called_once_with(market_date)
 
 
 class TestRegimeHistory:

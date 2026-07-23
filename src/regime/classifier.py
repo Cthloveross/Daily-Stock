@@ -2,13 +2,14 @@
 """Regime Classifier main entry: compose fetchers + scorers -> RegimeResult."""
 from __future__ import annotations
 
-import json
 import logging
-from dataclasses import asdict, dataclass, field
-from datetime import date
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from src.regime.fetchers import RegimeDataFetcher
+from src.regime.quality import assess_regime_snapshot
 from src.regime.scorers import (
     score_macro_penalty,
     score_market_direction,
@@ -18,9 +19,16 @@ from src.regime.scorers import (
     score_volatility,
 )
 
-__all__ = ["RegimeResult", "RegimeDataFetcher", "classify", "compute_regime_score"]
+__all__ = [
+    "RegimeResult",
+    "RegimeDataFetcher",
+    "classify",
+    "compute_regime_score",
+    "current_market_date",
+]
 
 logger = logging.getLogger(__name__)
+_NEW_YORK = ZoneInfo("America/New_York")
 
 
 @dataclass
@@ -52,6 +60,14 @@ def classify(score: int, *, aggressive: int = 75, standard: int = 55, cautious: 
     return "no_trade", "Stand aside today; paper-trade instead."
 
 
+def current_market_date(now: Optional[datetime] = None) -> date:
+    """Return the US equity market date, independent of server timezone."""
+    instant = now or datetime.now(timezone.utc)
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=timezone.utc)
+    return instant.astimezone(_NEW_YORK).date()
+
+
 def compute_regime_score(
     target_date: Optional[date] = None,
     watchlist: Optional[list[str]] = None,
@@ -63,17 +79,24 @@ def compute_regime_score(
     Thresholds default to (75, 55, 35) but can be overridden for backtesting.
     """
     if target_date is None:
-        target_date = date.today()
+        target_date = current_market_date()
     if watchlist is None:
         watchlist = _default_watchlist()
 
     fetcher = RegimeDataFetcher()
-    spy = fetcher.get_spy_snapshot(target_date)
-    vix = fetcher.get_vix(target_date)
-    events = fetcher.get_macro_events(target_date, watchlist)
-    sectors = fetcher.get_sector_performance(target_date)
-    prev_day = fetcher.get_prev_day_structure(target_date)
-    premarket = fetcher.get_premarket_activity(watchlist, target_date)
+    try:
+        # Local price inputs first.  Supporting remote calendars/premarket
+        # cannot consume the request budget before SPY/VIX are observed.
+        spy = fetcher.get_spy_snapshot(target_date)
+        vix = fetcher.get_vix(target_date)
+        sectors = fetcher.get_sector_performance(target_date)
+        prev_day = fetcher.get_prev_day_structure(target_date)
+        premarket = fetcher.get_premarket_activity(watchlist, target_date)
+        events = fetcher.get_macro_events(target_date, watchlist)
+    finally:
+        close_fetcher = getattr(fetcher, "close", None)
+        if callable(close_fetcher):
+            close_fetcher()
 
     d1 = score_market_direction(spy)
     d2 = score_volatility(vix)
@@ -81,15 +104,46 @@ def compute_regime_score(
     d4 = score_sector_rotation(sectors)
     d5 = score_prev_day_structure(prev_day)
     d6 = score_premarket_activity(premarket)
-    total = d1 + d2 + d3 + d4 + d5 + d6
+    component_total = d1 + d2 + d3 + d4 + d5 + d6
 
-    th = thresholds or {}
-    label, action_hint = classify(
-        total,
-        aggressive=int(th.get("aggressive", 75)),
-        standard=int(th.get("standard", 55)),
-        cautious=int(th.get("cautious", 35)),
-    )
+    snapshot = {
+        "spy": spy,
+        "vix": vix,
+        "events": events,
+        "sectors": sectors,
+        "prev_day": prev_day,
+        "premarket": premarket,
+    }
+    quality = assess_regime_snapshot(snapshot)
+    if quality["state"] == "unavailable":
+        # Keep the database's non-null integer contract and make existing
+        # score-only safety gates fail closed.  Consumers must use the quality
+        # metadata rather than interpret this sentinel as a bearish reading.
+        total = 0
+        label = "unavailable"
+        action_hint = (
+            "Regime unavailable: core SPY/VIX inputs are incomplete. "
+            "Do not use this value as a trading gate."
+        )
+        quality["partial_total_suppressed"] = component_total
+    else:
+        total = component_total
+
+        th = thresholds or {}
+        label, action_hint = classify(
+            total,
+            aggressive=int(th.get("aggressive", 75)),
+            standard=int(th.get("standard", 55)),
+            cautious=int(th.get("cautious", 35)),
+        )
+        if quality["state"] == "degraded":
+            action_hint = (
+                "Provisional Regime: supporting inputs are incomplete. "
+                "Treat the numeric bucket as context only; it must not "
+                "authorize or block a trade."
+            )
+
+    snapshot["quality"] = quality
 
     result = RegimeResult(
         date=target_date,
@@ -102,14 +156,8 @@ def compute_regime_score(
         d4_sector=d4,
         d5_prev_day=d5,
         d6_premarket=d6,
-        snapshot={
-            "spy": spy,
-            "vix": vix,
-            "events": events,
-            "sectors": sectors,
-            "prev_day": prev_day,
-            "premarket": premarket,
-        },
+        snapshot=snapshot,
+        version="v2",
     )
 
     if save_to_db:

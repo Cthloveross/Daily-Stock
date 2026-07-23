@@ -1,6 +1,8 @@
 # 03 · Migration Plan（改造路线图）
 
 > **目的**：把 12 个文档的改造工作组织成 4 个 Phase，每个 Phase 有明确交付物和退出条件  
+> **历史状态（2026-07-20）**：本文记录 Phase 0 时期的原始改造设想，其中不少清单已实现、部分假设已变化。新的交付顺序和验收标准以 `05_PRODUCT_CHARTER_AND_ROADMAP.md` 为准。
+>
 > **前置**：`01_PROJECT_VISION_v4.md`、`02_ARCHITECTURE_OVERVIEW.md`
 
 ---

@@ -161,7 +161,10 @@ class TushareFetcher(BaseFetcher):
         config = get_config()
 
         if not config.tushare_token:
-            logger.warning("Tushare Token 未配置，此数据源不可用")
+            # Tushare is optional. Missing configuration is an expected
+            # capability state, not an operational warning; repeated manager
+            # construction must not flood production logs.
+            logger.debug("Tushare Token 未配置，跳过此可选数据源")
             return
 
         try:

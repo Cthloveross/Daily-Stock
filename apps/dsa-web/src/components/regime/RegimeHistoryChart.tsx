@@ -32,7 +32,13 @@ export const RegimeHistoryChart: React.FC<RegimeHistoryChartProps> = ({
     void loadHistory(days);
   }, [loadHistory, days]);
 
-  const items: RegimeScoreItem[] = history?.items ?? [];
+  const allItems: RegimeScoreItem[] = history?.items ?? [];
+  const items = allItems.filter((item) => {
+    const snapshotQuality = (item.snapshot?.quality ?? {}) as Record<string, unknown>;
+    const qualityState = item.qualityState ?? snapshotQuality.state;
+    return qualityState !== 'unavailable';
+  });
+  const excludedCount = allItems.length - items.length;
   const width = 720;
   const pad = { left: 32, right: 40, top: 8, bottom: 20 };
   const plotW = width - pad.left - pad.right;
@@ -86,8 +92,10 @@ export const RegimeHistoryChart: React.FC<RegimeHistoryChartProps> = ({
         <EmptyState
           title={items.length === 0 ? '还没有 regime 历史记录' : '历史只有 1 天，无法绘图'}
           description={
-            '每天 14:00 UTC 的 GitHub Action 会自动算当日 regime，手动触发请点 RegimeGauge 卡上的 Recompute，' +
-            '或在终端跑 `python -m src.regime.cli`。第 2 次 compute 后折线会出来。'
+            excludedCount > 0
+              ? `${excludedCount} 条记录因核心行情缺失已从趋势图排除；至少需要 2 条可用或降级记录。`
+              : '每天 14:00 UTC 的 GitHub Action 会自动算当日 regime，手动触发请点 RegimeGauge 卡上的 Recompute，' +
+                '或在终端跑 `python -m src.regime.cli`。第 2 次 compute 后折线会出来。'
           }
           size="sm"
         />
@@ -99,6 +107,11 @@ export const RegimeHistoryChart: React.FC<RegimeHistoryChartProps> = ({
 
   return (
     <div className={cn('rounded-ds-md border border-subtle bg-bg-1 p-3', className)}>
+      {excludedCount > 0 && (
+        <div className="mb-2 text-caption text-text-3">
+          已排除 {excludedCount} 条核心行情缺失记录，避免把占位 0 画成真实 Regime。
+        </div>
+      )}
       <svg viewBox={`0 0 ${width} ${height + 18}`} className="w-full" aria-label="Regime history">
         {thresholds.map((t) => (
           <g key={t}>

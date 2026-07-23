@@ -1,0 +1,503 @@
+# -*- coding: utf-8 -*-
+"""API contracts for the evidence-first daily opportunity research list."""
+from __future__ import annotations
+
+import re
+from typing import Any, Literal, Optional
+
+from pydantic import BaseModel, Field, field_validator
+
+_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9.^_-]{1,32}$")
+_US_OPTION_UNDERLYING_PATTERN = re.compile(r"^[A-Z]{1,5}(?:[.-][A-Z])?$")
+
+
+class DailyOpportunityRequest(BaseModel):
+    symbols: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        description="候选标的；空数组时回退服务端 STOCK_LIST。",
+    )
+    limit: int = Field(10, ge=1, le=15)
+    refresh: bool = Field(
+        False,
+        description="显式重新扫描时绕过服务端已完成结果的短 TTL；仍复用同 key 的在途请求。",
+    )
+
+    @field_validator("symbols")
+    @classmethod
+    def normalize_symbols(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in value:
+            symbol = str(raw or "").strip().upper()
+            if not symbol:
+                continue
+            if not _SYMBOL_PATTERN.fullmatch(symbol):
+                raise ValueError(f"invalid symbol: {raw!r}")
+            if symbol not in seen:
+                normalized.append(symbol)
+                seen.add(symbol)
+        return normalized
+
+
+class ReadinessItem(BaseModel):
+    domain: str
+    state: Literal[
+        "ready",
+        "partial",
+        "stale",
+        "background_only",
+        "not_configured",
+        "unavailable",
+    ]
+    source: Optional[str] = None
+    as_of: Optional[str] = None
+    actionability: str
+    message: str
+
+
+class EvidenceItem(BaseModel):
+    evidence_id: str
+    domain: str
+    metric: str
+    value: Any = None
+    unit: Optional[str] = None
+    status: Literal["supports", "neutral", "contradicts", "unknown"]
+    source: str
+    observed_at: Optional[str] = None
+    published_at: Optional[str] = None
+    fetched_at: Optional[str] = None
+    observation_window: str
+    quality_state: str
+    actionability: str
+    limitations: list[str] = Field(default_factory=list)
+
+
+class HardGateItem(BaseModel):
+    gate_id: str
+    status: Literal["passed", "failed", "unknown"]
+    reason: str
+    evidence_refs: list[str] = Field(default_factory=list)
+
+
+class StyleMatch(BaseModel):
+    status: Literal["exact", "compatible", "conflict", "unknown"]
+    source: str
+    matched_rules: list[str] = Field(default_factory=list)
+    conflicting_rules: list[str] = Field(default_factory=list)
+    unknown_fields: list[str] = Field(default_factory=list)
+
+
+class DataCompleteness(BaseModel):
+    state: Literal["complete", "partial", "insufficient"]
+    available_count: int = Field(ge=0)
+    expected_count: int = Field(ge=1)
+
+
+class OpportunityCandidate(BaseModel):
+    candidate_id: str
+    ticker: str
+    research_state: Literal["research_ready", "watch_only", "context_only", "blocked"]
+    directional_context: Literal["bullish", "bearish", "mixed", "unknown"]
+    setup_tags: list[str] = Field(default_factory=list)
+    last_completed_bar_at: Optional[str] = None
+    reference_session_date: Optional[str] = None
+    reference_close: Optional[float] = Field(default=None, gt=0)
+    reference_price_basis: Literal["prior_completed_close"]
+    source: Optional[str] = None
+    style_match: StyleMatch
+    hard_gates: list[HardGateItem] = Field(default_factory=list)
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+    readiness: list[ReadinessItem] = Field(default_factory=list)
+    supporting_evidence_count: int = Field(ge=0)
+    data_completeness: DataCompleteness
+    unknowns: list[str] = Field(default_factory=list)
+
+
+class DailyOpportunityResponse(BaseModel):
+    schema_version: str
+    run_id: str
+    run_type: Literal["morning_prior_close"]
+    market_date_et: str
+    as_of: str
+    generated_at: str
+    signal_version: str
+    ranking_method: Literal["rule_based_evidence_count"]
+    strategy_validation_state: Literal["not_validated"]
+    strategy_validation_message: str
+    universe: list[str] = Field(default_factory=list)
+    requested_limit: int
+    candidate_count: int
+    run_readiness: list[ReadinessItem] = Field(default_factory=list)
+    candidates: list[OpportunityCandidate] = Field(default_factory=list)
+
+
+class OpportunityOutcomeProgress(BaseModel):
+    horizon_sessions: Literal[5, 20]
+    eligible_count: int = Field(ge=0)
+    mature_count: int = Field(ge=0)
+    pending_count: int = Field(ge=0)
+    partial_count: int = Field(default=0, ge=0)
+    data_gap_count: int = Field(default=0, ge=0)
+
+
+class OpportunitySnapshotItem(BaseModel):
+    schema_version: str = "opportunity-snapshot/1.0"
+    snapshot_key: str
+    market_date_et: str
+    source_run_id: str
+    frozen_at: str
+    signal_version: str
+    candidate_count: int = Field(ge=0)
+    eligible_candidate_count: int = Field(ge=0)
+    validation_eligible: bool
+    eligibility_reasons: list[str] = Field(default_factory=list)
+    outcome_progress: list[OpportunityOutcomeProgress] = Field(default_factory=list)
+    idempotent_replay: bool = False
+
+
+class OpportunitySnapshotListResponse(BaseModel):
+    schema_version: str = "opportunity-snapshot-list/1.0"
+    items: list[OpportunitySnapshotItem] = Field(default_factory=list)
+
+
+class OpportunitySnapshotEnsureResponse(BaseModel):
+    schema_version: str = "opportunity-snapshot-ensure/1.0"
+    state: Literal["saved", "existing", "outside_window", "unavailable"]
+    market_date_et: str
+    snapshot: Optional[OpportunitySnapshotItem] = None
+    message: str
+
+
+class OpportunitySnapshotEvaluationResponse(BaseModel):
+    schema_version: str = "opportunity-outcome-evaluation/1.0"
+    snapshot_key: str
+    evaluated_at: str
+    candidate_count: int = Field(ge=0)
+    inserted_outcomes: int = Field(ge=0)
+    already_recorded: int = Field(ge=0)
+    pending_horizons: int = Field(ge=0)
+    data_gap_horizons: int = Field(ge=0)
+    outcome_progress: list[OpportunityOutcomeProgress] = Field(default_factory=list)
+    message: str
+
+
+class OpportunityLearningHorizon(BaseModel):
+    horizon_sessions: Literal[5, 20]
+    mature_count: int = Field(ge=0)
+    distinct_signal_sessions: int = Field(ge=0)
+    context_hit_count: int = Field(ge=0)
+    context_miss_count: int = Field(ge=0)
+    neutral_count: int = Field(ge=0)
+    non_directional_count: int = Field(ge=0)
+    context_hit_rate_percent: Optional[float] = Field(default=None, ge=0, le=100)
+    summary_visible: bool
+    investigation_ready: bool
+    cohort_key: Optional[str] = None
+    cohort_label: Optional[str] = None
+    excluded_quality_count: int = Field(default=0, ge=0)
+
+
+class OpportunityLearningSummaryResponse(BaseModel):
+    schema_version: str = "opportunity-learning/1.0"
+    generated_at: str
+    strategy_state: Literal[
+        "collecting",
+        "descriptive_summary_available",
+        "investigation_ready",
+    ]
+    auto_adjustment: Literal[False] = False
+    minimum_summary_samples: int = 10
+    minimum_investigation_samples: int = 20
+    horizons: list[OpportunityLearningHorizon] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+
+
+class OptionContextRequest(BaseModel):
+    symbols: list[str] = Field(
+        min_length=1,
+        max_length=3,
+        description="最多 3 个美股期权 underlying；US. 前缀会被规范化移除。",
+    )
+
+    @field_validator("symbols")
+    @classmethod
+    def normalize_us_option_underlyings(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in value:
+            symbol = str(raw or "").strip().upper()
+            if symbol.startswith("US."):
+                symbol = symbol[3:]
+            if not _US_OPTION_UNDERLYING_PATTERN.fullmatch(symbol):
+                raise ValueError(
+                    f"unsupported US option underlying: {raw!r}"
+                )
+            if symbol not in seen:
+                normalized.append(symbol)
+                seen.add(symbol)
+        if not normalized:
+            raise ValueError("at least one US option underlying is required")
+        return normalized
+
+
+class OptionContextItem(BaseModel):
+    ticker: str
+    state: Literal["ready", "not_configured", "unavailable"]
+    source: str
+    fetched_at: str
+    expiry: Optional[str] = None
+    atm_call_iv_percent: Optional[float] = Field(default=None, gt=0)
+    message: str
+    limitations: list[str] = Field(default_factory=list)
+
+
+class OptionContextResponse(BaseModel):
+    schema_version: str
+    generated_at: str
+    market_date_et: str
+    items: list[OptionContextItem] = Field(default_factory=list)
+
+
+class OptionOverviewRequest(BaseModel):
+    symbols: list[str] = Field(
+        min_length=1,
+        max_length=15,
+        description="最多 15 个美股期权 underlying；批量读取概览，不下单。",
+    )
+
+    @field_validator("symbols")
+    @classmethod
+    def normalize_us_option_underlyings(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in value:
+            symbol = str(raw or "").strip().upper()
+            if symbol.startswith("US."):
+                symbol = symbol[3:]
+            if not _US_OPTION_UNDERLYING_PATTERN.fullmatch(symbol):
+                raise ValueError(f"unsupported US option underlying: {raw!r}")
+            if symbol not in seen:
+                normalized.append(symbol)
+                seen.add(symbol)
+        if not normalized:
+            raise ValueError("at least one US option underlying is required")
+        return normalized
+
+
+class OptionOverviewItem(BaseModel):
+    ticker: str
+    name: Optional[str] = None
+    state: Literal["ready", "not_configured", "unavailable"]
+    source: str
+    fetched_at: str
+    session_volume_date: str
+    open_interest_as_of: Optional[str] = None
+    volume_basis: Literal["current_session_cumulative"]
+    open_interest_basis: Literal["prior_clearing_session"]
+    volatility_basis: Literal["provider_snapshot"]
+    call_volume: Optional[int] = Field(default=None, ge=0)
+    put_volume: Optional[int] = Field(default=None, ge=0)
+    put_call_volume_ratio: Optional[float] = Field(default=None, ge=0)
+    call_open_interest: Optional[int] = Field(default=None, ge=0)
+    put_open_interest: Optional[int] = Field(default=None, ge=0)
+    put_call_open_interest_ratio: Optional[float] = Field(default=None, ge=0)
+    iv_percent: Optional[float] = Field(default=None, ge=0)
+    iv_rank_percent: Optional[float] = Field(default=None, ge=0, le=100)
+    iv_percentile_percent: Optional[float] = Field(default=None, ge=0, le=100)
+    previous_iv_percent: Optional[float] = Field(default=None, ge=0)
+    iv_change_points: Optional[float] = None
+    hv_30d_percent: Optional[float] = Field(default=None, ge=0)
+    hv_30d_percentile: Optional[float] = Field(default=None, ge=0, le=100)
+    hv_60d_percent: Optional[float] = Field(default=None, ge=0)
+    hv_60d_percentile: Optional[float] = Field(default=None, ge=0, le=100)
+    hv_90d_percent: Optional[float] = Field(default=None, ge=0)
+    hv_90d_percentile: Optional[float] = Field(default=None, ge=0, le=100)
+    hv_120d_percent: Optional[float] = Field(default=None, ge=0)
+    hv_120d_percentile: Optional[float] = Field(default=None, ge=0, le=100)
+    hv_365d_percent: Optional[float] = Field(default=None, ge=0)
+    hv_365d_percentile: Optional[float] = Field(default=None, ge=0, le=100)
+    iv_hv30_spread_points: Optional[float] = None
+    message: str
+    limitations: list[str] = Field(default_factory=list)
+
+
+class OptionOverviewResponse(BaseModel):
+    schema_version: str
+    generated_at: str
+    market_date_et: str
+    items: list[OptionOverviewItem] = Field(default_factory=list)
+
+
+class OptionWallRequest(BaseModel):
+    symbols: list[str] = Field(
+        min_length=1,
+        max_length=5,
+        description="最多 5 个美股期权 underlying；US. 前缀会被规范化移除。",
+    )
+    dte_min: int = Field(0, ge=0, le=90)
+    dte_max: int = Field(45, ge=0, le=90)
+
+    @field_validator("symbols")
+    @classmethod
+    def normalize_us_option_underlyings(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in value:
+            symbol = str(raw or "").strip().upper()
+            if symbol.startswith("US."):
+                symbol = symbol[3:]
+            if not _US_OPTION_UNDERLYING_PATTERN.fullmatch(symbol):
+                raise ValueError(f"unsupported US option underlying: {raw!r}")
+            if symbol not in seen:
+                normalized.append(symbol)
+                seen.add(symbol)
+        if not normalized:
+            raise ValueError("at least one US option underlying is required")
+        return normalized
+
+    @field_validator("dte_max")
+    @classmethod
+    def validate_dte_range(cls, value: int, info) -> int:
+        dte_min = info.data.get("dte_min", 0)
+        if value < dte_min:
+            raise ValueError("dte_max must be greater than or equal to dte_min")
+        return value
+
+
+class OptionWallScope(BaseModel):
+    dte_min: int = Field(ge=0)
+    dte_max: int = Field(ge=0)
+    expiries: list[str] = Field(default_factory=list)
+    standard_contracts_only: bool
+
+
+class OptionWallCoverage(BaseModel):
+    requested_contracts: int = Field(ge=0)
+    snapshot_received_contracts: int = Field(ge=0)
+    valid_contracts: int = Field(ge=0)
+    coverage_percent: float = Field(ge=0, le=100)
+    failed_batches: int = Field(ge=0)
+    excluded_nonstandard_contracts: int = Field(ge=0)
+    excluded_unknown_standard_type_contracts: int = Field(ge=0)
+    gamma_contracts: int = Field(ge=0)
+
+
+class OptionWallLevel(BaseModel):
+    rank: int = Field(ge=1)
+    strike: float = Field(gt=0)
+    distance_from_spot_percent: float
+    metric_value: float = Field(gt=0)
+    share_of_bucket_percent: float = Field(ge=0, le=100)
+    unit: Literal["contracts", "usd_delta_change_per_1pct_move"]
+    method: Literal[
+        "sum_open_interest",
+        "sum_session_volume",
+        "gross_gamma_concentration_1pct",
+    ]
+
+
+class OptionWallSet(BaseModel):
+    call_oi: list[OptionWallLevel] = Field(default_factory=list)
+    put_oi: list[OptionWallLevel] = Field(default_factory=list)
+    call_volume: list[OptionWallLevel] = Field(default_factory=list)
+    put_volume: list[OptionWallLevel] = Field(default_factory=list)
+    call_gamma_concentration: list[OptionWallLevel] = Field(default_factory=list)
+    put_gamma_concentration: list[OptionWallLevel] = Field(default_factory=list)
+    gross_gamma_concentration: list[OptionWallLevel] = Field(default_factory=list)
+
+
+class OptionWallItem(BaseModel):
+    ticker: str
+    state: Literal["ready", "partial", "not_configured", "unavailable"]
+    source: str
+    fetched_at: str
+    quote_as_of: Optional[str] = None
+    formula_version: str
+    spot: Optional[float] = Field(default=None, gt=0)
+    scope: OptionWallScope
+    coverage: OptionWallCoverage
+    walls: OptionWallSet
+    message: str
+    assumptions: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+
+
+class OptionWallResponse(BaseModel):
+    schema_version: str
+    generated_at: str
+    market_date_et: str
+    items: list[OptionWallItem] = Field(default_factory=list)
+
+
+class OptionEventRequest(BaseModel):
+    symbols: list[str] = Field(
+        min_length=1,
+        max_length=3,
+        description="最多 3 个美股期权 underlying；US. 前缀会被规范化移除。",
+    )
+    limit_per_symbol: int = Field(5, ge=1, le=10)
+
+    @field_validator("symbols")
+    @classmethod
+    def normalize_us_option_underlyings(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in value:
+            symbol = str(raw or "").strip().upper()
+            if symbol.startswith("US."):
+                symbol = symbol[3:]
+            if not _US_OPTION_UNDERLYING_PATTERN.fullmatch(symbol):
+                raise ValueError(f"unsupported US option underlying: {raw!r}")
+            if symbol not in seen:
+                normalized.append(symbol)
+                seen.add(symbol)
+        if not normalized:
+            raise ValueError("at least one US option underlying is required")
+        return normalized
+
+
+class OptionEventRecord(BaseModel):
+    event_id: str
+    option_code: str
+    owner_code: Optional[str] = None
+    symbol: Optional[str] = None
+    fill_time: Optional[str] = None
+    ticker_type: Optional[str] = None
+    price: Optional[float] = Field(default=None, gt=0)
+    volume: Optional[int] = Field(default=None, ge=0)
+    turnover: Optional[float] = Field(default=None, ge=0)
+    option_type: Optional[str] = None
+    strike_price: Optional[float] = Field(default=None, gt=0)
+    expiry: Optional[str] = None
+    dte: Optional[int] = Field(default=None, ge=0)
+    underlying_price: Optional[float] = Field(default=None, gt=0)
+    bid_price: Optional[float] = Field(default=None, ge=0)
+    ask_price: Optional[float] = Field(default=None, ge=0)
+    iv_percent: Optional[float] = Field(default=None, ge=0)
+    total_volume: Optional[int] = Field(default=None, ge=0)
+    total_open_interest: Optional[int] = Field(default=None, ge=0)
+    vo_ratio_percent: Optional[float] = Field(default=None, ge=0)
+    delta: Optional[float] = Field(default=None, ge=-1, le=1)
+    sentiment: Optional[str] = None
+    order_types: list[str] = Field(default_factory=list)
+    strategy_type: Optional[str] = None
+
+
+class OptionEventItem(BaseModel):
+    ticker: str
+    state: Literal["ready", "empty", "not_configured", "unavailable"]
+    source: str
+    fetched_at: str
+    event_as_of: Optional[str] = None
+    all_count: Optional[int] = Field(default=None, ge=0)
+    events: list[OptionEventRecord] = Field(default_factory=list)
+    message: str
+    limitations: list[str] = Field(default_factory=list)
+
+
+class OptionEventResponse(BaseModel):
+    schema_version: str
+    generated_at: str
+    market_date_et: str
+    items: list[OptionEventItem] = Field(default_factory=list)

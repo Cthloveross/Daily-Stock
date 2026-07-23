@@ -328,8 +328,8 @@ def get_stock_history(
     stock_code: str,
     period: str = Query(
         "daily",
-        description="K 线周期：daily/weekly/monthly 或 1m/5m/15m/30m/60m/90m/1h（分钟级仅美股）",
-        pattern="^(1m|5m|15m|30m|60m|90m|1h|daily|weekly|monthly)$",
+        description="K 线周期：daily/weekly/monthly 或 1m/2m/5m/15m/30m/60m/90m/1h（分钟级仅美股）",
+        pattern="^(1m|2m|5m|15m|30m|60m|90m|1h|daily|weekly|monthly)$",
     ),
     days: int = Query(
         30,
@@ -380,6 +380,12 @@ def get_stock_history(
             stock_code=stock_code,
             stock_name=result.get("stock_name"),
             period=period,
+            source=result.get("source"),
+            coverage_start=result.get("coverage_start"),
+            coverage_end=result.get("coverage_end"),
+            last_bar_at=result.get("last_bar_at"),
+            derived_from_period=result.get("derived_from_period"),
+            aggregation_method=result.get("aggregation_method"),
             data=data
         )
     

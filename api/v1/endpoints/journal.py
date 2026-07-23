@@ -12,27 +12,48 @@ Stage 7 exposes:
 """
 from __future__ import annotations
 
+import json
 import logging
-import tempfile
 from datetime import date, datetime, timedelta
-from pathlib import Path
+from decimal import Decimal
 from typing import Optional
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from sqlalchemy import and_, func, select
 
 from api.v1.schemas.journal import (
+    CanonicalEpisodeBuildConfirmRequest,
+    CanonicalEpisodeBuildPlanResponse,
+    EpisodeBuildMetadata,
+    EpisodeBuildResponse,
+    EpisodeConditionalPnl,
+    EpisodeHeadlinePnl,
+    EpisodeReconciliationSummary,
     HealthCheckItem,
     ImportResponse,
     JournalQaRequest,
     JournalQaResponse,
     JournalStatsByStyleResponse,
     JournalStatsResponse,
+    LedgerDataHealthResponse,
+    LedgerImportResponse,
     MonthlyReviewGenerateRequest,
     MonthlyReviewItem,
     MonthlyReviewListResponse,
+    MoomooOpenApiConfirmResponse,
+    MoomooOpenApiPlanResponse,
+    MoomooStatementPreviewResponse,
+    MoomooOpenApiPreviewResponse,
     MoomooSyncRequest,
     MoomooSyncResponse,
+    PositionEpisodeDetailResponse,
+    PositionEpisodeCaseFocus,
+    PositionEpisodeEvidenceItem,
+    PositionEpisodeInstrument,
+    PositionEpisodeItem,
+    PositionEpisodeListResponse,
+    PositionEpisodeQuality,
+    PositionEpisodeSummaryResponse,
     RealityTestResponse,
     TradeItem,
     TradeListResponse,
@@ -44,21 +65,48 @@ from src.journal.analytics import (
     reality_test,
     stats_by_style,
 )
-from src.journal.brokers.moomoo_us import parse as parse_moomoo
-from src.journal.matcher import match_legs_fifo
+from src.journal.brokers.moomoo_statement import (
+    MoomooStatementError,
+    parse_statement,
+)
+from src.journal.brokers.moomoo_openapi_export import (
+    MoomooOpenApiExportError,
+    parse_openapi_export,
+)
+from src.journal.ledger.repository import (
+    DEFAULT_LEDGER_ACCOUNT_KEY,
+    LedgerImportError,
+    get_latest_data_health,
+    import_statement_batch,
+)
+from src.journal.ledger.openapi_repository import (
+    OpenApiPlanError,
+    confirm_openapi_import_plan,
+    plan_openapi_import,
+)
+from src.journal.ledger.episode_repository import (
+    EpisodeBuildSummary,
+    EpisodeRepositoryError,
+    PositionEpisodeListItem,
+    append_canonical_position_episode_build,
+    append_latest_position_episode_build,
+    get_episode_summary,
+    get_latest_episode_summary,
+    get_latest_position_episode_detail,
+    get_latest_position_episode_page,
+    get_position_episode_detail,
+    get_position_episode_page,
+    preview_canonical_position_episodes,
+    preview_latest_position_episodes,
+)
 from src.journal.models import (
     JournalHealthCheck,
     JournalMonthlyReview,
-    JournalOrder,
     JournalTrade,
 )
 from src.journal.storage import (
     DEFAULT_PORTFOLIO_LABEL,
     init_journal_schema,
-    insert_events_from_orders,
-    query_events_for_matching,
-    record_import,
-    replace_trades,
 )
 from src.storage import get_db
 
@@ -66,10 +114,50 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-_PARSERS = {"moomoo_us": parse_moomoo}
+_LEGACY_BROKERS = {"moomoo_us"}
+_MAX_CSV_UPLOAD_BYTES = 50 * 1024 * 1024
+_MAX_OPENAPI_EXPORT_BYTES = 20 * 1024 * 1024
 
 
 # --- helpers -----------------------------------------------------------------
+
+
+async def _read_upload_limited(file: UploadFile, limit: int) -> bytes:
+    """Read at most ``limit`` bytes and close the temporary upload handle."""
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        while True:
+            chunk = await file.read(min(1024 * 1024, limit + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > limit:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"file too large ({total} bytes read, max {limit})",
+                )
+        return b"".join(chunks)
+    finally:
+        await file.close()
+
+
+def _parse_openapi_content(content: bytes) -> tuple[dict, object]:
+    if not content:
+        raise HTTPException(status_code=400, detail="empty file")
+    try:
+        payload = json.loads(content.decode("utf-8-sig"), parse_float=Decimal)
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="read-only export must be valid UTF-8 JSON",
+        ) from exc
+    try:
+        preview = parse_openapi_export(payload)
+    except MoomooOpenApiExportError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return payload, preview
 
 
 def _trade_row_to_dict(row: JournalTrade) -> dict:
@@ -117,6 +205,245 @@ def _load_trades(portfolio: str, since: Optional[date] = None) -> list[dict]:
                 continue
             out.append(_trade_row_to_dict(r))
         return out
+
+
+def _decimal_text(value: object) -> Optional[str]:
+    """Serialize ledger Decimals without a float round-trip."""
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    return format(Decimal(str(value)), "f")
+
+
+def _stringify_nested_decimals(value: object) -> object:
+    """Keep Decimal-safe JSON semantics inside parsed evidence metadata too."""
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, dict):
+        return {
+            str(key): _stringify_nested_decimals(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_stringify_nested_decimals(item) for item in value]
+    return value
+
+
+def _episode_build_metadata(
+    summary: EpisodeBuildSummary,
+) -> EpisodeBuildMetadata:
+    policy = summary.opening_boundary_policy
+    source_batch_ids = getattr(summary, "source_batch_ids", None)
+    if source_batch_ids is None:
+        source_batch_ids = (summary.source_batch_id,)
+    return EpisodeBuildMetadata(
+        id=summary.build_id,
+        build_key=summary.build_key,
+        builder_name=summary.builder_name,
+        builder_version=summary.builder_version,
+        status=summary.status,
+        source_batch_ids=list(source_batch_ids),
+        source_kind=getattr(summary, "source_kind", "csv_batch"),
+        canonical_set_id=getattr(summary, "canonical_set_id", None),
+        canonical_set_sha256=getattr(
+            summary,
+            "canonical_set_sha256",
+            None,
+        ),
+        source_cutoff_at=summary.source_cutoff_at,
+        position_episode_count=summary.position_episode_count,
+        unresolved_evidence_count=summary.unresolved_evidence_count,
+        completeness_score=_decimal_text(summary.completeness_score) or "0",
+        opening_boundary_policy=policy,
+        assumed_flat_unverified=policy in {
+            "assumed_flat_unverified",
+            "mixed_explicit_and_assumed",
+        },
+        partial_reasons=list(summary.partial_reasons),
+        recorded_at=summary.recorded_at,
+    )
+
+
+def _episode_reconciliation(
+    summary: EpisodeBuildSummary,
+) -> EpisodeReconciliationSummary:
+    """Prefer immutable build coverage, with a fallback for older callers."""
+    frozen_fields = (
+        "reconciliation_window_start",
+        "reconciliation_window_end",
+        "reconciled_order_count",
+        "total_order_count",
+    )
+    has_frozen_fields = all(
+        hasattr(summary, field) for field in frozen_fields
+    )
+    has_frozen_coverage = (
+        has_frozen_fields
+        and summary.total_order_count > 0
+    )
+    if has_frozen_coverage:
+        scope = summary.reconciliation_scope
+        return EpisodeReconciliationSummary(
+            status=summary.reconciliation_status,
+            scope=scope,
+            partial_window=scope == "partial_window",
+            window_start=summary.reconciliation_window_start,
+            window_end=summary.reconciliation_window_end,
+            matched_order_count=summary.reconciled_order_count,
+            total_order_count=summary.total_order_count,
+        )
+
+    health = get_latest_data_health(summary.account_key)
+    same_batch = health is not None and health.batch_id == summary.source_batch_id
+    scope = summary.reconciliation_scope
+    return EpisodeReconciliationSummary(
+        status=summary.reconciliation_status,
+        scope=scope,
+        partial_window=scope == "partial_window",
+        window_start=(
+            health.reconciliation_window_start if same_batch else None
+        ),
+        window_end=health.reconciliation_window_end if same_batch else None,
+        matched_order_count=(
+            health.reconciled_order_observations if same_batch else 0
+        ),
+        total_order_count=health.order_observations if same_batch else 0,
+    )
+
+
+def _episode_summary(
+    summary: EpisodeBuildSummary,
+) -> PositionEpisodeSummaryResponse:
+    exclusion_counts = {
+        str(key): int(value)
+        for key, value in summary.headline_exclusion_counts.items()
+    }
+    total = summary.position_episode_count
+    return PositionEpisodeSummaryResponse(
+        total_episode_count=total,
+        open_episode_count=summary.open_episode_count,
+        closed_episode_count=summary.closed_episode_count,
+        boundary_unverified_episode_count=(
+            summary.boundary_unverified_episode_count
+        ),
+        left_censored_episode_count=summary.left_censored_episode_count,
+        incomplete_episode_count=summary.incomplete_episode_count,
+        aggregate_only_episode_count=summary.aggregate_only_episode_count,
+        headline_pnl=EpisodeHeadlinePnl(
+            eligible_closed_count=summary.headline_episode_count,
+            excluded_episode_count=summary.headline_excluded_episode_count,
+            exclusion_counts=exclusion_counts,
+            realized_pnl_gross=_decimal_text(
+                summary.headline_realized_pnl_gross
+            ),
+            total_fee=_decimal_text(summary.headline_total_fee),
+            realized_pnl_net=_decimal_text(
+                summary.headline_realized_pnl_net
+            ),
+        ),
+        conditional_pnl=EpisodeConditionalPnl(
+            opening_boundary_policy=summary.opening_boundary_policy,
+            count=summary.conditional_closed_episode_count,
+            realized_pnl_gross=_decimal_text(
+                summary.conditional_realized_pnl_gross
+            ),
+            total_fee=_decimal_text(summary.conditional_total_fee),
+            realized_pnl_net=_decimal_text(
+                summary.conditional_realized_pnl_net
+            ),
+            included_in_headline=False,
+        ),
+    )
+
+
+def _episode_exclusion_reasons(
+    item: PositionEpisodeListItem,
+    opening_boundary_policy: str,
+) -> list[str]:
+    reasons: list[str] = []
+    if not item.left_boundary_verified:
+        reasons.append("boundary_unverified")
+        if opening_boundary_policy in {
+            "assumed_flat_unverified",
+            "mixed_explicit_and_assumed",
+        }:
+            reasons.append("assumed_flat_unverified")
+    if item.lifecycle_status != "closed":
+        reasons.append("open")
+    if item.is_left_censored:
+        reasons.append("left_censored")
+    if item.completeness_status not in {"exact", "complete"}:
+        reasons.append("incomplete")
+    if item.realized_pnl_net is None:
+        reasons.append("pnl_unavailable")
+    return reasons
+
+
+def _position_episode_item(
+    item: PositionEpisodeListItem,
+    *,
+    opening_boundary_policy: str,
+) -> PositionEpisodeItem:
+    item_policy = getattr(
+        item,
+        "opening_boundary_policy",
+        opening_boundary_policy,
+    )
+    exclusion_reasons = _episode_exclusion_reasons(item, item_policy)
+    return PositionEpisodeItem(
+        id=item.episode_id,
+        episode_build_id=item.build_id,
+        strategy_episode_id=item.strategy_episode_id,
+        episode_key=item.episode_key,
+        lineage_key=item.lineage_key,
+        strategy_type=item.strategy_type,
+        instrument=PositionEpisodeInstrument(
+            raw_symbol=item.raw_symbol,
+            asset_type=item.asset_type,
+            underlying=item.underlying,
+            expiry=item.expiry,
+            strike=_decimal_text(item.strike),
+            option_right=item.option_right,
+            contract_multiplier=_decimal_text(item.contract_multiplier),
+            currency=item.currency,
+        ),
+        direction=item.direction,
+        lifecycle_status=item.lifecycle_status,
+        opened_at=item.opened_at,
+        closed_at=item.closed_at,
+        hold_seconds=item.hold_seconds,
+        opened_quantity=_decimal_text(item.opened_quantity) or "0",
+        closed_quantity=_decimal_text(item.closed_quantity) or "0",
+        remaining_quantity=_decimal_text(item.remaining_quantity) or "0",
+        average_entry_price=_decimal_text(item.average_entry_price),
+        average_exit_price=_decimal_text(item.average_exit_price),
+        realized_pnl_gross=_decimal_text(item.realized_pnl_gross),
+        total_fee=_decimal_text(item.total_fee),
+        realized_pnl_net=_decimal_text(item.realized_pnl_net),
+        quality=PositionEpisodeQuality(
+            completeness_status=item.completeness_status,
+            completeness_score=(
+                _decimal_text(item.completeness_score) or "0"
+            ),
+            construction_basis=item.construction_basis,
+            contract_multiplier_basis=item.contract_multiplier_basis,
+            opening_boundary_policy=item_policy,
+            assumed_flat_unverified=(
+                item_policy
+                in {
+                    "assumed_flat_unverified",
+                    "mixed_explicit_and_assumed",
+                }
+                and not item.left_boundary_verified
+            ),
+            left_boundary_verified=item.left_boundary_verified,
+            is_left_censored=item.is_left_censored,
+            is_right_censored=item.is_right_censored,
+            pnl_summary_eligible=not exclusion_reasons,
+            pnl_exclusion_reasons=exclusion_reasons,
+        ),
+    )
 
 
 # --- endpoints ---------------------------------------------------------------
@@ -272,59 +599,613 @@ def get_stats(
     )
 
 
+@router.get("/v2/data-health", response_model=LedgerDataHealthResponse)
+def get_ledger_data_health(
+    account_key: str = Query(
+        DEFAULT_LEDGER_ACCOUNT_KEY,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    ),
+) -> LedgerDataHealthResponse:
+    health = get_latest_data_health(account_key)
+    if health is None:
+        return LedgerDataHealthResponse(has_data=False)
+    return LedgerDataHealthResponse(
+        has_data=True,
+        batch_id=health.batch_id,
+        analysis_level=health.analysis_level,
+        reconciliation_status=health.reconciliation_status,
+        reconciliation_scope=health.reconciliation_scope,
+        reconciliation_window_start=health.reconciliation_window_start,
+        reconciliation_window_end=health.reconciliation_window_end,
+        reconciled_order_observations=health.reconciled_order_observations,
+        completeness_score=format(health.completeness_score, "f"),
+        order_observations=health.order_observations,
+        fill_observations=health.fill_observations,
+        aggregate_only_filled_orders=health.aggregate_only_filled_orders,
+        window_start=health.window_start,
+        window_end=health.window_end,
+        recorded_at=health.recorded_at,
+        legacy_journal_written=False,
+    )
+
+
+@router.get(
+    "/v2/position-episodes",
+    response_model=PositionEpisodeListResponse,
+)
+def list_position_episodes_v2(
+    underlying: Optional[str] = Query(None, min_length=1, max_length=32),
+    lifecycle_status: Optional[str] = Query(
+        None,
+        pattern=r"^(open|closed)$",
+    ),
+    completeness_status: Optional[str] = Query(
+        None,
+        pattern=r"^(exact|complete|partial)$",
+    ),
+    case_focus: Optional[PositionEpisodeCaseFocus] = Query(None),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(50, ge=1, le=200),
+    build_id: Optional[int] = Query(None, ge=1),
+    account_key: str = Query(
+        DEFAULT_LEDGER_ACCOUNT_KEY,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    ),
+) -> PositionEpisodeListResponse:
+    """List the default build, or one explicitly selected immutable build."""
+    if build_id is None:
+        summary = get_latest_episode_summary(account_key)
+    else:
+        summary = get_episode_summary(build_id, account_key)
+    if summary is None:
+        if build_id is not None:
+            raise HTTPException(status_code=404, detail="episode build not found")
+        return PositionEpisodeListResponse(
+            data_state="not_built",
+            total=0,
+            page=page,
+            per_page=per_page,
+            items=[],
+        )
+
+    page_kwargs = {
+        "underlying": underlying,
+        "lifecycle_status": lifecycle_status,
+        "completeness_status": completeness_status,
+        "case_focus": case_focus,
+        "page": page,
+        "per_page": per_page,
+    }
+    if build_id is None:
+        result_page = get_latest_position_episode_page(
+            account_key,
+            **page_kwargs,
+        )
+        # A concurrent CSV append can move the default between repository reads.
+        # Retry once so build metadata and rows never cross versions.
+        if result_page.build_id != summary.build_id:
+            summary = get_latest_episode_summary(account_key)
+            result_page = get_latest_position_episode_page(
+                account_key,
+                **page_kwargs,
+            )
+    else:
+        result_page = get_position_episode_page(
+            build_id,
+            account_key,
+            **page_kwargs,
+        )
+    if summary is None or result_page.build_id != summary.build_id:
+        raise HTTPException(
+            status_code=503,
+            detail="episode build changed during read; retry",
+        )
+
+    return PositionEpisodeListResponse(
+        data_state="ready",
+        build=_episode_build_metadata(summary),
+        reconciliation=_episode_reconciliation(summary),
+        summary=_episode_summary(summary),
+        total=result_page.total,
+        page=result_page.page,
+        per_page=result_page.per_page,
+        items=[
+            _position_episode_item(
+                item,
+                opening_boundary_policy=summary.opening_boundary_policy,
+            )
+            for item in result_page.items
+        ],
+    )
+
+
+@router.get(
+    "/v2/position-episodes/{episode_id}",
+    response_model=PositionEpisodeDetailResponse,
+)
+def get_position_episode_v2(
+    episode_id: int,
+    build_id: Optional[int] = Query(None, ge=1),
+    account_key: str = Query(
+        DEFAULT_LEDGER_ACCOUNT_KEY,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    ),
+) -> PositionEpisodeDetailResponse:
+    """Return default or explicitly selected immutable episode evidence."""
+    if build_id is None:
+        summary = get_latest_episode_summary(account_key)
+    else:
+        summary = get_episode_summary(build_id, account_key)
+    if summary is None:
+        raise HTTPException(status_code=404, detail="episode build not found")
+    if build_id is None:
+        detail = get_latest_position_episode_detail(
+            episode_id=episode_id,
+            account_key=account_key,
+        )
+    else:
+        detail = get_position_episode_detail(
+            episode_id=episode_id,
+            build_id=build_id,
+            account_key=account_key,
+        )
+    if detail is None or detail.episode.build_id != summary.build_id:
+        scope = "selected build" if build_id is not None else "latest build"
+        raise HTTPException(
+            status_code=404,
+            detail=f"position episode not found in {scope}",
+        )
+    return PositionEpisodeDetailResponse(
+        data_state="ready",
+        build=_episode_build_metadata(summary),
+        reconciliation=_episode_reconciliation(summary),
+        item=_position_episode_item(
+            detail.episode,
+            opening_boundary_policy=summary.opening_boundary_policy,
+        ),
+        matching=_stringify_nested_decimals(dict(detail.matching_evidence)),
+        evidence_summary=_stringify_nested_decimals(
+            dict(detail.evidence_summary)
+        ),
+        completeness=_stringify_nested_decimals(dict(detail.completeness)),
+        provenance=_stringify_nested_decimals(dict(detail.provenance)),
+        evidence=[
+            PositionEpisodeEvidenceItem(
+                id=item.evidence_id,
+                evidence_key=item.evidence_key,
+                evidence_kind=item.evidence_kind,
+                event_role=item.event_role,
+                allocation_sequence=item.allocation_sequence,
+                evidence_time=item.evidence_time,
+                allocated_quantity=_decimal_text(item.allocated_quantity),
+                allocated_fee=_decimal_text(item.allocated_fee),
+                allocated_cash_flow=_decimal_text(item.allocated_cash_flow),
+                allocation_ratio=_decimal_text(item.allocation_ratio),
+                broker_order_observation_id=(
+                    item.broker_order_observation_id
+                ),
+                broker_fill_observation_id=(
+                    item.broker_fill_observation_id
+                ),
+                allocation=_stringify_nested_decimals(
+                    dict(item.allocation_evidence)
+                ),
+                provenance=_stringify_nested_decimals(dict(item.provenance)),
+            )
+            for item in detail.evidence
+        ],
+    )
+
+
+@router.post(
+    "/v2/episode-builds/canonical",
+    response_model=EpisodeBuildResponse,
+)
+def create_canonical_position_episode_build(
+    request: CanonicalEpisodeBuildConfirmRequest,
+    account_key: str = Query(
+        DEFAULT_LEDGER_ACCOUNT_KEY,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    ),
+) -> EpisodeBuildResponse:
+    """Append an explicitly confirmed canonical build without activating it."""
+    try:
+        result = append_canonical_position_episode_build(
+            canonical_set_id=request.canonical_set_id,
+            expected_canonical_set_sha256=request.canonical_set_sha256,
+            expected_build_key=request.build_key,
+            account_key=account_key,
+            accept_assumed_flat=request.accept_assumed_flat,
+        )
+    except EpisodeRepositoryError as exc:
+        status_code = (
+            404
+            if str(exc) == "canonical evidence set does not exist"
+            else 409
+        )
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+    summary = get_episode_summary(result.build_id, account_key)
+    if summary is None or summary.build_id != result.build_id:
+        raise HTTPException(
+            status_code=500,
+            detail="episode build was appended but cannot be read back",
+        )
+    action = "already present" if result.duplicate else "appended"
+    return EpisodeBuildResponse(
+        data_state="ready",
+        duplicate=result.duplicate,
+        build=_episode_build_metadata(summary),
+        reconciliation=_episode_reconciliation(summary),
+        summary=_episode_summary(summary),
+        message=(
+            f"canonical position episode build {action}: "
+            f"{result.position_episode_count} episodes. "
+            "The default position review remains unchanged; use the explicit "
+            "build ID to inspect this result."
+        ),
+    )
+
+
+@router.get(
+    "/v2/episode-builds/canonical/preview",
+    response_model=CanonicalEpisodeBuildPlanResponse,
+)
+def preview_canonical_position_episode_build(
+    canonical_set_id: Optional[int] = Query(None, ge=1),
+    account_key: str = Query(
+        DEFAULT_LEDGER_ACCOUNT_KEY,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    ),
+) -> CanonicalEpisodeBuildPlanResponse:
+    """Plan one canonical build without appending any episode rows."""
+    try:
+        preview = preview_canonical_position_episodes(
+            canonical_set_id=canonical_set_id,
+            account_key=account_key,
+            assume_flat_if_missing=True,
+        )
+    except EpisodeRepositoryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if preview is None:
+        raise HTTPException(status_code=404, detail="canonical evidence set not found")
+
+    default_summary = get_latest_episode_summary(account_key)
+    default_count = (
+        default_summary.position_episode_count
+        if default_summary is not None
+        else 0
+    )
+    planned_count = len(preview.episodes)
+    assumption_required = preview.opening_boundary_policy in {
+        "assumed_flat_unverified",
+        "mixed_explicit_and_assumed",
+    }
+    warnings = list(preview.partial_reasons)
+    if assumption_required:
+        warnings.append("explicit assumed-flat acceptance is required")
+    warnings.append(
+        "confirming this plan will not replace the default position review"
+    )
+    confirm_allowed = (
+        preview.fee_conserved
+        and preview.unresolved_evidence_count == 0
+        and preview.canonical_set_id is not None
+        and preview.canonical_set_sha256 is not None
+    )
+    return CanonicalEpisodeBuildPlanResponse(
+        data_state="ready",
+        canonical_set_id=preview.canonical_set_id,
+        canonical_set_sha256=preview.canonical_set_sha256,
+        build_key=preview.build_key,
+        source_batch_ids=list(preview.source_batch_ids),
+        source_window_start=preview.source_window_start,
+        source_window_end=preview.source_cutoff_at,
+        source_event_count=preview.source_event_count,
+        aggregate_order_event_count=preview.aggregate_order_event_count,
+        detailed_fill_event_count=preview.detailed_fill_event_count,
+        planned_position_episode_count=planned_count,
+        planned_open_episode_count=preview.open_episode_count,
+        planned_closed_episode_count=preview.closed_episode_count,
+        source_known_fee_total=(
+            _decimal_text(preview.source_known_fee_total) or "0"
+        ),
+        allocated_known_fee_total=(
+            _decimal_text(preview.allocated_known_fee_total) or "0"
+        ),
+        fee_conserved=preview.fee_conserved,
+        opening_boundary_policy=preview.opening_boundary_policy,
+        requires_assumed_flat_acceptance=assumption_required,
+        default_build_id=(
+            default_summary.build_id if default_summary is not None else None
+        ),
+        default_position_episode_count=default_count,
+        episode_count_delta=planned_count - default_count,
+        default_will_change=False,
+        confirm_allowed=confirm_allowed,
+        warnings=warnings,
+    )
+
+
+@router.post(
+    "/v2/episode-builds",
+    response_model=EpisodeBuildResponse,
+)
+def create_position_episode_build_v2(
+    accept_assumed_flat: bool = Query(False),
+    account_key: str = Query(
+        DEFAULT_LEDGER_ACCOUNT_KEY,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    ),
+) -> EpisodeBuildResponse:
+    """Append a build only after explicit acceptance of an assumed boundary."""
+    try:
+        preview = preview_latest_position_episodes(
+            account_key,
+            assume_flat_if_missing=True,
+        )
+        if preview is None:
+            raise HTTPException(
+                status_code=409,
+                detail="no accepted evidence batch exists",
+            )
+        assumption_used = preview.opening_boundary_policy in {
+            "assumed_flat_unverified",
+            "mixed_explicit_and_assumed",
+        }
+        if assumption_used and not accept_assumed_flat:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "accept_assumed_flat=true is required because no verified "
+                    "opening-position snapshot exists"
+                ),
+            )
+        result = append_latest_position_episode_build(
+            account_key,
+            accept_assumed_flat=accept_assumed_flat,
+        )
+    except EpisodeRepositoryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    summary = get_latest_episode_summary(account_key)
+    if summary is None or summary.build_id != result.build_id:
+        raise HTTPException(
+            status_code=500,
+            detail="episode build was appended but cannot be read back",
+        )
+    action = "already present" if result.duplicate else "appended"
+    return EpisodeBuildResponse(
+        data_state="ready",
+        duplicate=result.duplicate,
+        build=_episode_build_metadata(summary),
+        reconciliation=_episode_reconciliation(summary),
+        summary=_episode_summary(summary),
+        message=(
+            f"position episode build {action}: "
+            f"{result.position_episode_count} episodes; "
+            f"opening boundary={result.opening_boundary_policy}."
+        ),
+    )
+
+
+@router.post(
+    "/v2/imports/preview",
+    response_model=MoomooStatementPreviewResponse,
+)
+async def preview_moomoo_statement(
+    file: UploadFile = File(...),
+) -> MoomooStatementPreviewResponse:
+    """Inspect Moomoo CSV coverage without opening or writing the database."""
+    content = await _read_upload_limited(file, _MAX_CSV_UPLOAD_BYTES)
+    if not content:
+        raise HTTPException(status_code=400, detail="empty file")
+    try:
+        statement = parse_statement(content)
+    except MoomooStatementError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    summary = statement.summary()
+    warnings = list(summary["warnings"])
+    if summary["orders_total"] == 0:
+        analysis_level = "blocked"
+        warnings.append("no_order_rows")
+    elif summary["inconsistent_filled_orders"] or summary["orphan_fill_rows"]:
+        analysis_level = "blocked"
+    elif summary["aggregate_only_filled_orders"]:
+        analysis_level = "partial"
+        warnings.append("older_filled_orders_have_aggregate_evidence_only")
+    else:
+        analysis_level = "exact"
+
+    response_data = dict(summary)
+    response_data.update(
+        {
+            "analysis_level": analysis_level,
+            "warnings": warnings,
+            "journal_database_written": False,
+        }
+    )
+    return MoomooStatementPreviewResponse(**response_data)
+
+
+@router.post(
+    "/v2/openapi-imports/preview",
+    response_model=MoomooOpenApiPreviewResponse,
+)
+async def preview_moomoo_openapi_export(
+    file: UploadFile = File(...),
+) -> MoomooOpenApiPreviewResponse:
+    """Validate a de-identified read-only export without opening the DB."""
+    content = await _read_upload_limited(file, _MAX_OPENAPI_EXPORT_BYTES)
+    _, preview = _parse_openapi_content(content)
+
+    metadata = preview.metadata
+    order_currency = {
+        order.source_order_id: order.currency for order in preview.orders
+    }
+    fee_totals: dict[str, Decimal] = {}
+    for fee in preview.fees:
+        currency = order_currency[fee.source_order_id]
+        fee_totals[currency] = (
+            fee_totals.get(currency, Decimal("0")) + fee.total_fee
+        )
+    return MoomooOpenApiPreviewResponse(
+        source_schema=metadata.source_schema,
+        parser_name=metadata.parser_name,
+        parser_version=metadata.parser_version,
+        source_sha256=metadata.source_sha256,
+        evidence_sha256=metadata.evidence_sha256,
+        batch_key=metadata.batch_key,
+        environment=metadata.environment,
+        market=metadata.market,
+        analysis_level=metadata.analysis_level,
+        analysis_ready=metadata.analysis_ready,
+        reconciliation_status=metadata.reconciliation_status,
+        reconciliation=metadata.reconciliation.as_dict(),
+        warnings=list(metadata.warnings),
+        window_start=metadata.window_start,
+        window_end=metadata.window_end,
+        source_timezone=metadata.source_timezone,
+        order_observations=len(preview.orders),
+        fill_observations=len(preview.fills),
+        fee_observations=len(preview.fees),
+        fee_totals_by_currency={
+            currency: format(amount, "f")
+            for currency, amount in sorted(fee_totals.items())
+        },
+        journal_database_written=False,
+    )
+
+
+@router.post(
+    "/v2/openapi-imports/plan",
+    response_model=MoomooOpenApiPlanResponse,
+)
+async def plan_moomoo_openapi_export(
+    file: UploadFile = File(...),
+    account_key: str = Query(
+        DEFAULT_LEDGER_ACCOUNT_KEY,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    ),
+) -> MoomooOpenApiPlanResponse:
+    """Plan cross-source links and canonical impact without writing rows."""
+    content = await _read_upload_limited(file, _MAX_OPENAPI_EXPORT_BYTES)
+    payload, preview = _parse_openapi_content(content)
+    try:
+        plan = plan_openapi_import(preview, payload, account_key=account_key)
+    except OpenApiPlanError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return MoomooOpenApiPlanResponse(**plan.as_dict())
+
+
+@router.post(
+    "/v2/openapi-imports/confirm",
+    response_model=MoomooOpenApiConfirmResponse,
+)
+async def confirm_moomoo_openapi_export(
+    file: UploadFile = File(...),
+    preview_key: str = Query(..., min_length=64, max_length=64),
+    acknowledge_partial_window: bool = Query(False),
+    account_key: str = Query(
+        DEFAULT_LEDGER_ACCOUNT_KEY,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    ),
+) -> MoomooOpenApiConfirmResponse:
+    """Append the exact acknowledged plan in one immutable transaction."""
+    content = await _read_upload_limited(file, _MAX_OPENAPI_EXPORT_BYTES)
+    payload, preview = _parse_openapi_content(content)
+    try:
+        result = confirm_openapi_import_plan(
+            preview,
+            payload,
+            preview_key=preview_key,
+            acknowledge_partial_window=acknowledge_partial_window,
+            account_key=account_key,
+        )
+    except OpenApiPlanError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return MoomooOpenApiConfirmResponse(**result.__dict__)
+
+
+@router.post("/v2/imports", response_model=LedgerImportResponse)
+async def import_moomoo_statement_v2(
+    file: UploadFile = File(...),
+    allow_partial: bool = Query(False),
+    account_key: str = Query(
+        DEFAULT_LEDGER_ACCOUNT_KEY,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    ),
+) -> LedgerImportResponse:
+    """Append one confirmed CSV snapshot to the isolated evidence ledger."""
+    content = await _read_upload_limited(file, _MAX_CSV_UPLOAD_BYTES)
+    if not content:
+        raise HTTPException(status_code=400, detail="empty file")
+    try:
+        statement = parse_statement(content)
+        result = import_statement_batch(
+            statement,
+            account_key=account_key,
+            allow_partial=allow_partial,
+        )
+    except MoomooStatementError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except LedgerImportError as exc:
+        status_code = 409 if "explicitly allow" in str(exc) else 422
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+    action = "already present" if result.duplicate else "appended"
+    return LedgerImportResponse(
+        batch_id=result.batch_id,
+        duplicate=result.duplicate,
+        analysis_level=result.analysis_level,
+        order_observations=result.order_observations,
+        fill_observations=result.fill_observations,
+        legacy_journal_written=False,
+        message=(
+            f"evidence batch {action}: {result.order_observations} orders, "
+            f"{result.fill_observations} fills; legacy Journal unchanged."
+        ),
+    )
+
+
 @router.post("/import", response_model=ImportResponse)
 async def import_csv(
     file: UploadFile = File(...),
     broker: str = Query("moomoo_us"),
     portfolio: str = Query(DEFAULT_PORTFOLIO_LABEL),
 ) -> ImportResponse:
-    if broker not in _PARSERS:
+    if broker not in _LEGACY_BROKERS:
         raise HTTPException(status_code=400, detail=f"unknown broker: {broker}")
 
-    content = await file.read()
+    content = await _read_upload_limited(file, _MAX_CSV_UPLOAD_BYTES)
     if not content:
         raise HTTPException(status_code=400, detail="empty file")
-    # Guard against runaway uploads. Phase 0 CSVs are < 1 MB; 50 MB cap
-    # protects the process from OOM on malicious input.
-    if len(content) > 50 * 1024 * 1024:
-        raise HTTPException(
-            status_code=413,
-            detail=f"file too large ({len(content)} bytes, max 52428800)",
-        )
 
-    init_journal_schema()
-    orders = _PARSERS[broker](content)
-    # Sanitize filename to prevent path-traversal in the audit source_path.
-    safe_name = Path(file.filename or "upload.csv").name
-    src_path = Path(tempfile.gettempdir()) / safe_name
-    import_id = record_import(
-        source_path=str(src_path),
-        content=content,
-        broker=broker,
-        rows_total=len(orders),
-        portfolio_label=portfolio,
-    )
-    if import_id is None:
-        return ImportResponse(
-            inserted=0,
-            skipped=0,
-            trades_rebuilt=0,
-            message="CSV already imported (sha256 match); nothing to do.",
-        )
-
-    inserted, skipped = insert_events_from_orders(
-        import_id, orders, portfolio_label=portfolio
-    )
-    events = query_events_for_matching(portfolio_label=portfolio)
-    trades = match_legs_fifo(events)
-    replaced = replace_trades(trades, portfolio_label=portfolio)
-    return ImportResponse(
-        inserted=inserted,
-        skipped=skipped,
-        trades_rebuilt=replaced,
-        message=(
-            f"{inserted} new orders imported, {skipped} dupes skipped; "
-            f"{replaced} trades rebuilt."
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "legacy Moomoo CSV import is disabled because it can discard "
+            "aggregate-only executions and rebuild FIFO from incomplete "
+            "evidence; use /v2/imports/preview then /v2/imports"
         ),
     )
 
@@ -529,36 +1410,19 @@ def journal_qa(payload: JournalQaRequest) -> JournalQaResponse:
 
 @router.post("/sync-live", response_model=MoomooSyncResponse)
 def sync_live(payload: MoomooSyncRequest) -> MoomooSyncResponse:
-    """Pull Moomoo trade-account history and ingest into the journal pipeline.
+    """Refuse the legacy journal writer until its facts are fully reconciled.
 
-    Idempotent: re-running the same window is a no-op (external_id hash
-    dedup). Requires ``MOOMOO_OPEND_ENABLED=true`` and a logged-in OpenD.
+    The old implementation selected an account by position, omitted fees and
+    wrote directly into the FIFO journal.  It remains intentionally unavailable
+    while the isolated read-only export is promoted into a provenance-aware
+    importer.  This endpoint never opens an SDK context or writes the database.
     """
-    from src.journal.brokers.moomoo_live import MoomooLiveError
-    from src.services.moomoo_sync_service import sync_live_orders
-
-    def _parse_dt(s: Optional[str]) -> Optional[datetime]:
-        if not s:
-            return None
-        try:
-            return datetime.fromisoformat(s.replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=f"invalid datetime: {s!r}") from exc
-
-    try:
-        result = sync_live_orders(
-            start=_parse_dt(payload.start),
-            end=_parse_dt(payload.end),
-            window_days=payload.window_days,
-            trd_env=payload.trd_env,
-            market=payload.market,
-            portfolio=DEFAULT_PORTFOLIO_LABEL,
-        )
-    except MoomooLiveError as exc:
-        # 503 because this is an upstream-not-available kind of failure
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("moomoo sync-live failed")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    return MoomooSyncResponse(**result.to_dict())
+    del payload
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "Legacy Moomoo journal sync is paused. Use the bounded read-only "
+            "probe; import remains disabled until account, fill, price and fee "
+            "reconciliation passes."
+        ),
+    )

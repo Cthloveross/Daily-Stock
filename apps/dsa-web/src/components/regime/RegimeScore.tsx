@@ -2,6 +2,7 @@ import type React from 'react';
 import { RefreshCw } from 'lucide-react';
 import { Sparkline } from '../data/Sparkline';
 import { cn } from '../../utils/cn';
+import { formatEtClock } from '../../utils/marketTime';
 
 export type RegimeState = 'aggressive' | 'standard' | 'cautious' | 'no_trade';
 
@@ -37,10 +38,7 @@ function formatScore(n: number): string {
 }
 
 function formatUpdatedAt(ts?: Date | string | null): string {
-  if (!ts) return '';
-  const d = typeof ts === 'string' ? new Date(ts.endsWith('Z') ? ts : `${ts}Z`) : ts;
-  if (Number.isNaN(d.getTime())) return '';
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  return formatEtClock(ts, true);
 }
 
 export const RegimeScore: React.FC<RegimeScoreProps> = ({
@@ -68,7 +66,7 @@ export const RegimeScore: React.FC<RegimeScoreProps> = ({
           onClick={onRecompute}
           disabled={recomputing}
           className="inline-flex items-center gap-1 text-caption text-text-3 hover:text-text-1 disabled:opacity-60"
-          title="Recompute today (60 s cooldown)"
+          aria-label="Recompute today (60 second cooldown)"
         >
           <RefreshCw
             size={11}

@@ -17,6 +17,7 @@ References: New-docs/06_REGIME_CLASSIFIER.md §3-4.
 """
 from __future__ import annotations
 
+import math
 from typing import Iterable
 
 __all__ = [
@@ -33,15 +34,30 @@ def _clamp(value: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, value))
 
 
+def _has_finite_numbers(payload: dict, keys: Iterable[str]) -> bool:
+    """Return ``True`` only when every required numeric input is observed."""
+    if str(payload.get("_status") or "").lower() in {"degraded", "unavailable"}:
+        return False
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        if not math.isfinite(float(value)):
+            return False
+    return True
+
+
 def score_market_direction(spy: dict) -> int:
     """Trend strength from SPY close-over-MA20 and recent momentum.
 
     Expects keys: ``close``, ``ma20``, ``ma50``, ``pct_change_5d``.
     """
-    close = float(spy.get("close") or 0)
-    ma20 = float(spy.get("ma20") or 0)
-    ma50 = float(spy.get("ma50") or 0)
-    pct_5d = float(spy.get("pct_change_5d") or 0)
+    if not _has_finite_numbers(spy, ("close", "ma20", "ma50", "pct_change_5d")):
+        return 0
+    close = float(spy["close"])
+    ma20 = float(spy["ma20"])
+    ma50 = float(spy["ma50"])
+    pct_5d = float(spy["pct_change_5d"])
 
     score = 0
     if ma20 and close:
@@ -67,8 +83,10 @@ def score_volatility(vix: dict) -> int:
         VIX >= 30     -> -15
     Additional penalty when vol spiked > 25% in 5d.
     """
-    level = float(vix.get("level") or 0)
-    pct_5d = float(vix.get("pct_change_5d") or 0)
+    if not _has_finite_numbers(vix, ("level", "pct_change_5d")):
+        return 0
+    level = float(vix["level"])
+    pct_5d = float(vix["pct_change_5d"])
 
     if level <= 0:
         base = 0
@@ -97,6 +115,11 @@ def score_macro_penalty(events: dict) -> int:
         earnings_count_watchlist (int)
         tariff_headline_today (bool)
     """
+    if not events or str(events.get("_status") or "").lower() in {
+        "degraded",
+        "unavailable",
+    }:
+        return 0
     penalty = 0
     if events.get("fomc_today"):
         penalty -= 30
@@ -119,7 +142,9 @@ def score_sector_rotation(sectors: dict) -> int:
 
     Keys: ``sectors_above_ma20`` (int 0-11), ``defensive_leaders`` (bool).
     """
-    n_above = int(sectors.get("sectors_above_ma20") or 0)
+    if not _has_finite_numbers(sectors, ("sectors_above_ma20",)):
+        return 0
+    n_above = int(sectors["sectors_above_ma20"])
     defensive = bool(sectors.get("defensive_leaders"))
 
     # 0..11 -> -5..+15
@@ -136,8 +161,12 @@ def score_prev_day_structure(prev_day: dict) -> int:
     Keys: ``close_vs_high_pct`` (how close to day's high, 0..1),
           ``prev_day_range_pct`` (day range / prior close).
     """
-    clp = float(prev_day.get("close_vs_high_pct") or 0)
-    range_pct = float(prev_day.get("prev_day_range_pct") or 0)
+    if not _has_finite_numbers(
+        prev_day, ("close_vs_high_pct", "prev_day_range_pct")
+    ):
+        return 0
+    clp = float(prev_day["close_vs_high_pct"])
+    range_pct = float(prev_day["prev_day_range_pct"])
 
     score = 0
     if clp >= 0.9:
@@ -157,9 +186,14 @@ def score_premarket_activity(premarket: dict) -> int:
     Keys: ``spy_pre_pct`` (float), ``watchlist_up_5pct`` (int),
           ``watchlist_down_5pct`` (int).
     """
-    spy_pre = float(premarket.get("spy_pre_pct") or 0)
-    up = int(premarket.get("watchlist_up_5pct") or 0)
-    down = int(premarket.get("watchlist_down_5pct") or 0)
+    if not _has_finite_numbers(
+        premarket,
+        ("spy_pre_pct", "watchlist_up_5pct", "watchlist_down_5pct"),
+    ):
+        return 0
+    spy_pre = float(premarket["spy_pre_pct"])
+    up = int(premarket["watchlist_up_5pct"])
+    down = int(premarket["watchlist_down_5pct"])
 
     score = 0
     if spy_pre >= 0.3:

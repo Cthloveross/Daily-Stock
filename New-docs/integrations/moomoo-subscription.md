@@ -216,7 +216,7 @@ MOOMOO_OPEND_ENABLED=false  # default off; turn on after OpenD logged in
 
 - 订阅 ≠ 下单。这一页只覆盖只读行情，无任何账户/资金风险。
 - 但 OpenD daemon 一旦登录后，**所有挂在 11111 端口上的 Python 进程都能调下单接口** — 不要在不受信的代码里 import `moomoo` 后调 `place_order`。
-- 真要做单走 `TrdEnv.SIMULATE`（paper trading）默认；production 模式必须显式 opt-in。
+- 本仓库在任何环境都不调用交易解锁、下单、改单或撤单，包括 `TrdEnv.SIMULATE`。如未来确有执行需求，必须作为独立项目、独立权限和独立审计边界重新立项，不得通过本仓库配置开启。
 
 ---
 

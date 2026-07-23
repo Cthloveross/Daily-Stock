@@ -37,9 +37,14 @@ for label in "${AGENTS[@]}"; do
 done
 
 echo
-echo "Backend:     curl -sI http://127.0.0.1:8000/health 2>/dev/null | head -1"
-curl -sI http://127.0.0.1:8000/health 2>/dev/null | head -1 || echo "  (backend not reachable)"
+echo "Backend:     GET http://127.0.0.1:8000/api/health"
+if curl -fsS --max-time 2 http://127.0.0.1:8000/api/health >/dev/null 2>&1; then
+    echo "  HTTP 200 · healthy"
+else
+    echo "  (backend not reachable)"
+fi
 echo
-echo "Tail logs:   tail -f logs/launchagent.*.{out,err}.log"
+echo "Tail logs:   tail -F logs/launchagent.*.{out,err}.log"
+echo "Reload Web:  bash scripts/install_launchagents.sh --only uvicorn"
 echo "Reload all:  bash scripts/install_launchagents.sh"
 echo "Stop all:    bash scripts/uninstall_launchagents.sh"

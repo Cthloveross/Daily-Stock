@@ -1267,7 +1267,69 @@ class SystemConfigService:
             or SystemConfigService._collect_llm_channel_models_from_map(effective_map)
         )
         available_model_set = set(available_models)
+        configured_journal_model_raw = (
+            effective_map.get("JOURNAL_AI_MODEL") or ""
+        ).strip()
+        configured_journal_model = normalize_agent_litellm_model(
+            configured_journal_model_raw,
+            configured_models=available_model_set,
+        )
+        journal_fallback_models = [
+            normalize_agent_litellm_model(
+                model.strip(),
+                configured_models=available_model_set,
+            )
+            for model in (
+                effective_map.get("JOURNAL_AI_FALLBACK_MODELS") or ""
+            ).split(",")
+            if model.strip()
+        ]
         if not available_model_set:
+            if (
+                configured_journal_model_raw
+                and configured_journal_model
+                and not SystemConfigService._has_runtime_source_for_model(
+                    configured_journal_model,
+                    effective_map,
+                )
+            ):
+                issues.append(
+                    {
+                        "key": "JOURNAL_AI_MODEL",
+                        "code": "missing_runtime_source",
+                        "message": (
+                            "A Journal AI primary model is selected, but no usable runtime "
+                            "source was found. Enable a matching channel or provide the "
+                            "matching provider API key."
+                        ),
+                        "severity": "error",
+                        "expected": "enabled channel model or matching legacy API key",
+                        "actual": configured_journal_model,
+                    }
+                )
+
+            invalid_journal_fallbacks = [
+                model for model in journal_fallback_models
+                if not SystemConfigService._has_runtime_source_for_model(
+                    model,
+                    effective_map,
+                )
+            ]
+            if invalid_journal_fallbacks:
+                issues.append(
+                    {
+                        "key": "JOURNAL_AI_FALLBACK_MODELS",
+                        "code": "missing_runtime_source",
+                        "message": (
+                            "Some Journal AI fallback models do not have an enabled "
+                            "channel or matching provider API key available"
+                        ),
+                        "severity": "error",
+                        "expected": "enabled channel models or matching legacy API keys",
+                        "actual": ", ".join(invalid_journal_fallbacks[:3]),
+                    }
+                )
+
             raw_channels = (effective_map.get("LLM_CHANNELS") or "").strip()
             if not raw_channels:
                 return issues
@@ -1402,6 +1464,27 @@ class SystemConfigService:
                 }
             )
 
+        if (
+            configured_journal_model_raw
+            and configured_journal_model
+            and configured_journal_model not in available_model_set
+            and not _uses_direct_env_provider(configured_journal_model)
+        ):
+            issues.append(
+                {
+                    "key": "JOURNAL_AI_MODEL",
+                    "code": "unknown_model",
+                    "message": (
+                        "The selected Journal AI primary model is not declared by the current "
+                        "enabled channels or advanced model routing config. "
+                        f"Available models: {', '.join(available_models[:6])}"
+                    ),
+                    "severity": "error",
+                    "expected": "one configured channel model",
+                    "actual": configured_journal_model,
+                }
+            )
+
         fallback_models = [
             model.strip()
             for model in (effective_map.get("LITELLM_FALLBACK_MODELS") or "").split(",")
@@ -1423,6 +1506,25 @@ class SystemConfigService:
                     "severity": "error",
                     "expected": ",".join(available_models[:6]),
                     "actual": ", ".join(invalid_fallbacks[:3]),
+                }
+            )
+
+        invalid_journal_fallbacks = [
+            model for model in journal_fallback_models
+            if model not in available_model_set and not _uses_direct_env_provider(model)
+        ]
+        if invalid_journal_fallbacks:
+            issues.append(
+                {
+                    "key": "JOURNAL_AI_FALLBACK_MODELS",
+                    "code": "unknown_model",
+                    "message": (
+                        "Journal AI fallback models include entries that are not declared by "
+                        "the current enabled channels or advanced model routing config"
+                    ),
+                    "severity": "error",
+                    "expected": ",".join(available_models[:6]),
+                    "actual": ", ".join(invalid_journal_fallbacks[:3]),
                 }
             )
 

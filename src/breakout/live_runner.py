@@ -34,6 +34,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Deque, Dict, List, Optional
 
+from src.services.moomoo_runtime import (
+    MoomooRuntimeError,
+    create_ready_quote_context,
+    probe_opend_tcp,
+    quote_context_is_ready,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -162,6 +169,9 @@ class LiveBreakoutRunner:
     _last_emit: Dict[str, float] = field(default_factory=dict, init=False)
     # Connection health monitoring
     _last_push_ts: float = field(default=0.0, init=False)
+    # A READY SDK context is not sufficient: subscribe() must also have
+    # succeeded before the runner is considered healthy.
+    _subscribed: threading.Event = field(default_factory=threading.Event, init=False)
 
     def _moomoo_codes(self) -> List[str]:
         out = []
@@ -182,10 +192,12 @@ class LiveBreakoutRunner:
     # Lifecycle
     # ------------------------------------------------------------------
     def start(self) -> None:
+        if self._ctx is not None or self._subscribed.is_set():
+            raise RuntimeError("breakout runner is already started")
+
         try:
             from moomoo import (
                 CurKlineHandlerBase,
-                OpenQuoteContext,
                 RET_OK,
                 SubType,
                 Session,
@@ -196,7 +208,6 @@ class LiveBreakoutRunner:
                 "Run: pip install moomoo-api>=10.4.6408"
             ) from exc
 
-        self._ctx = OpenQuoteContext(host=self.host, port=self.port)
         runner = self
 
         class _KlineHandler(CurKlineHandlerBase):
@@ -213,22 +224,38 @@ class LiveBreakoutRunner:
                     runner._handle_bar(row)
                 return RET_OK, data
 
-        self._ctx.set_handler(_KlineHandler())
+        try:
+            ctx = create_ready_quote_context(host=self.host, port=self.port)
+        except MoomooRuntimeError as exc:
+            raise RuntimeError(f"OpenD is not ready: {exc}") from exc
 
-        codes = self._moomoo_codes()
-        ret, msg = self._ctx.subscribe(
-            codes,
-            [SubType.K_1M],
-            subscribe_push=True,
-            session=Session.ALL,
-        )
-        if ret != RET_OK:
-            raise RuntimeError(f"moomoo subscribe failed: {msg}")
+        try:
+            ctx.set_handler(_KlineHandler())
+
+            codes = self._moomoo_codes()
+            ret, msg = ctx.subscribe(
+                codes,
+                [SubType.K_1M],
+                subscribe_push=True,
+                session=Session.ALL,
+            )
+            if ret != RET_OK:
+                raise RuntimeError(f"moomoo subscribe failed: {msg}")
+        except Exception:
+            try:
+                ctx.close()
+            except Exception:  # noqa: BLE001 - preserve setup failure
+                pass
+            raise
+
+        self._ctx = ctx
+        self._subscribed.set()
         self._running.set()
         logger.info("[breakout_live] subscribed %d tickers (incl SPY): %s", len(codes), codes)
 
     def stop(self) -> None:
         self._running.clear()
+        self._subscribed.clear()
         if self._ctx is not None:
             try:
                 # Honour the 1-minute cool-down — we already enforce it because
@@ -245,16 +272,12 @@ class LiveBreakoutRunner:
         logger.info("[breakout_live] stopped")
 
     def _ctx_alive(self) -> bool:
-        """Probe OpenD with a cheap query — `False` = need reconnect."""
-        if self._ctx is None:
-            return False
-        try:
-            from moomoo import RET_OK
-
-            ret, _ = self._ctx.get_global_state()
-            return ret == RET_OK
-        except Exception:  # noqa: BLE001
-            return False
+        """Use bounded socket/state checks; never block on an SDK query."""
+        return (
+            self._subscribed.is_set()
+            and probe_opend_tcp(self.host, self.port)
+            and quote_context_is_ready(self._ctx)
+        )
 
     def run_forever(self) -> None:
         """Block the calling thread until SIGINT / KeyboardInterrupt.
@@ -281,6 +304,7 @@ class LiveBreakoutRunner:
                     "[breakout_live] OpenD connection lost, reconnecting in %ds",
                     RECONNECT_BACKOFF_SECONDS,
                 )
+                self._subscribed.clear()
                 try:
                     self._ctx and self._ctx.close()
                 except Exception:  # noqa: BLE001

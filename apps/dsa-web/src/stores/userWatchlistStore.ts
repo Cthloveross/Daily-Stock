@@ -4,6 +4,7 @@ import { persist } from 'zustand/middleware';
 interface UserWatchlistState {
   tickers: string[];
   add: (t: string) => boolean;
+  addMany: (tickers: string[]) => number;
   remove: (t: string) => void;
   clear: () => void;
 }
@@ -22,6 +23,20 @@ export const useUserWatchlistStore = create<UserWatchlistState>()(
         if (get().tickers.includes(t)) return false;
         set({ tickers: [...get().tickers, t] });
         return true;
+      },
+      addMany: (rawTickers) => {
+        const existing = new Set(get().tickers);
+        const next = [...get().tickers];
+        let added = 0;
+        for (const raw of rawTickers) {
+          const ticker = normalize(raw);
+          if (!ticker || existing.has(ticker)) continue;
+          existing.add(ticker);
+          next.push(ticker);
+          added += 1;
+        }
+        if (added > 0) set({ tickers: next });
+        return added;
       },
       remove: (raw) => {
         const t = normalize(raw);

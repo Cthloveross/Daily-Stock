@@ -9,8 +9,11 @@ import {
   type LineData,
   type CandlestickData,
   type HistogramData,
+  type SeriesMarker,
+  type TickMarkType,
   type Time,
 } from 'lightweight-charts';
+import { formatChartTickInTimeZone, formatChartTimeInTimeZone } from './chartTimeFormatting';
 
 export interface Candle {
   time: number | string;
@@ -24,24 +27,56 @@ export interface Candle {
 export interface MAOverlay {
   period: number;
   color: string;
+  label?: string;
   data: { time: number | string; value: number }[];
+}
+
+export interface CandleMarker {
+  id: string;
+  time: number | string;
+  position: 'aboveBar' | 'belowBar' | 'inBar';
+  shape: 'circle' | 'square' | 'arrowUp' | 'arrowDown';
+  color: string;
+  text?: string;
+  size?: number;
 }
 
 export interface CandlestickChartProps {
   data: Candle[];
   overlays?: MAOverlay[];
+  markers?: CandleMarker[];
+  focusedTime?: number | string | null;
+  onTimeSelect?: (time: number | string, markerId?: string) => void;
   height?: number;
   className?: string;
+  timeZone?: string;
+  timeZoneLabel?: string;
 }
 
 export const CandlestickChart: React.FC<CandlestickChartProps> = ({
   data,
   overlays = [],
+  markers = [],
+  focusedTime,
+  onTimeSelect,
   height = 500,
   className,
+  timeZone,
+  timeZoneLabel,
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
+  const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
+  const markersRef = useRef(markers);
+  const onTimeSelectRef = useRef(onTimeSelect);
+
+  useEffect(() => {
+    markersRef.current = markers;
+  }, [markers]);
+
+  useEffect(() => {
+    onTimeSelectRef.current = onTimeSelect;
+  }, [onTimeSelect]);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -65,7 +100,25 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
         horzLine: { color: '#6f6f78', style: LineStyle.Dashed, width: 1 },
       },
       rightPriceScale: { borderColor: '#1d1e22' },
-      timeScale: { borderColor: '#1d1e22', timeVisible: true, secondsVisible: false },
+      timeScale: {
+        borderColor: '#1d1e22',
+        timeVisible: true,
+        secondsVisible: false,
+        ...(timeZone ? {
+          tickMarkFormatter: (time: Time, type: TickMarkType) => (
+            formatChartTickInTimeZone(time, type, timeZone)
+          ),
+        } : {}),
+      },
+      ...(timeZone ? {
+        localization: {
+          timeFormatter: (time: Time) => formatChartTimeInTimeZone(
+            time,
+            timeZone,
+            timeZoneLabel ?? timeZone,
+          ),
+        },
+      } : {}),
     });
     chartRef.current = chart;
 
@@ -78,6 +131,8 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
       wickDownColor: '#f85149',
     });
     candleSeries.setData(data as CandlestickData<Time>[]);
+    candleSeries.setMarkers(markersRef.current as SeriesMarker<Time>[]);
+    candleSeriesRef.current = candleSeries;
 
     if (data.some((d) => typeof d.volume === 'number')) {
       const volSeries = chart.addHistogramSeries({
@@ -98,8 +153,10 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
 
     for (const ov of overlays) {
       const line = chart.addLineSeries({
+        title: ov.label,
         color: ov.color,
-        lineWidth: 1,
+        lineWidth: 2,
+        priceScaleId: 'right',
         priceLineVisible: false,
         lastValueVisible: false,
       });
@@ -111,16 +168,54 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
     };
     window.addEventListener('resize', resize);
 
+    const handleClick = (param: { time?: Time; hoveredObjectId?: unknown }) => {
+      if (param.time == null || !onTimeSelectRef.current) return;
+      const markerId = typeof param.hoveredObjectId === 'string'
+        ? param.hoveredObjectId
+        : undefined;
+      onTimeSelectRef.current(param.time as number | string, markerId);
+    };
+    chart.subscribeClick(handleClick);
+
     chart.timeScale().fitContent();
 
     return () => {
       window.removeEventListener('resize', resize);
+      chart.unsubscribeClick(handleClick);
       chart.remove();
       chartRef.current = null;
+      candleSeriesRef.current = null;
     };
-  }, [data, overlays, height]);
+  }, [data, overlays, height, timeZone, timeZoneLabel]);
 
-  return <div ref={containerRef} className={className} style={{ height, width: '100%' }} />;
+  useEffect(() => {
+    candleSeriesRef.current?.setMarkers(markers as SeriesMarker<Time>[]);
+  }, [markers]);
+
+  useEffect(() => {
+    const chart = chartRef.current;
+    const series = candleSeriesRef.current;
+    if (!chart || !series || focusedTime == null || data.length === 0) return;
+    const index = data.findIndex((candle) => String(candle.time) === String(focusedTime));
+    if (index < 0) return;
+    const candle = data[index];
+    chart.setCrosshairPosition(candle.close, candle.time as Time, series);
+    if (data.length > 60) {
+      chart.timeScale().setVisibleLogicalRange({
+        from: Math.max(0, index - 30),
+        to: Math.min(data.length - 1, index + 30),
+      });
+    }
+  }, [data, focusedTime]);
+
+  return (
+    <div
+      ref={containerRef}
+      className={className}
+      style={{ height, width: '100%' }}
+      aria-label="K 线图"
+    />
+  );
 };
 
 export default CandlestickChart;

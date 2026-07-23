@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class RegimeScoreItem(BaseModel):
@@ -19,9 +19,15 @@ class RegimeScoreItem(BaseModel):
     d4_sector: int
     d5_prev_day: int
     d6_premarket: int
-    snapshot: dict[str, Any] = {}
+    snapshot: dict[str, Any] = Field(default_factory=dict)
     version: str
     generated_at: Optional[datetime] = None
+    quality_state: Literal["ready", "degraded", "unavailable"] = "unavailable"
+    authoritative: bool = False
+    missing_domains: list[str] = Field(default_factory=list)
+    incomplete_domains: list[str] = Field(default_factory=list)
+    domain_quality: dict[str, str] = Field(default_factory=dict)
+    quality_message: Optional[str] = None
 
 
 class RegimeHistoryResponse(BaseModel):

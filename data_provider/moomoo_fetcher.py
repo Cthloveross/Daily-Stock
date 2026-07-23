@@ -36,8 +36,16 @@ import os
 import threading
 from datetime import datetime, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
+
+from src.services.moomoo_runtime import (
+    MoomooRuntimeError,
+    create_ready_quote_context,
+    probe_opend_tcp,
+    quote_context_is_ready,
+)
 
 from .base import BaseFetcher, DataFetchError, STANDARD_COLUMNS
 from .realtime_types import RealtimeSource, UnifiedRealtimeQuote
@@ -61,6 +69,23 @@ _INTRADAY_KTYPE: dict[str, str] = {
     "30m": "K_30M",
     "60m": "K_60M",
     "1h": "K_60M",
+}
+
+# Bound one logical history request so a malformed/repeating continuation key
+# cannot spin forever or accumulate unbounded data in memory.  At 1,000 bars
+# per page this still permits up to 128,000 intraday bars in one response.
+_INTRADAY_MAX_PAGES = 128
+
+# Moomoo's ``time_key`` is expressed in the exchange's local wall-clock time
+# and does not carry an offset. Preserve that market-time meaning before the
+# value crosses the API boundary so browser clients can compare it to UTC
+# execution timestamps without guessing from the viewer's local timezone.
+_MARKET_TIMEZONES: dict[str, str] = {
+    "US": "America/New_York",
+    "HK": "Asia/Shanghai",
+    "SH": "Asia/Shanghai",
+    "SZ": "Asia/Shanghai",
+    "BJ": "Asia/Shanghai",
 }
 
 
@@ -106,6 +131,13 @@ class MoomooFetcher(BaseFetcher):
                 "`pip install moomoo-api` then restart. Shelving at priority 99."
             )
             return
+        except Exception as exc:  # noqa: BLE001 - optional SDK must fail open
+            logger.warning(
+                "[MoomooFetcher] enabled but SDK initialization failed (%s); "
+                "shelving at priority 99.",
+                type(exc).__name__,
+            )
+            return
 
         self._sdk_ok = True
         self.priority = self._requested_priority
@@ -120,16 +152,8 @@ class MoomooFetcher(BaseFetcher):
     # OpenQuoteContext lifecycle
     # ------------------------------------------------------------------
     def _is_ctx_alive(self) -> bool:
-        """Cheap health probe: ping `get_global_state`. None / exception = dead."""
-        if self._ctx is None:
-            return False
-        try:
-            from moomoo import RET_OK
-
-            ret, _data = self._ctx.get_global_state()
-            return ret == RET_OK
-        except Exception:  # noqa: BLE001
-            return False
+        """Inspect connection state without issuing a blocking SDK query."""
+        return quote_context_is_ready(self._ctx)
 
     def _get_ctx(self):
         """Lazy-create + cache the OpenQuoteContext.
@@ -140,7 +164,10 @@ class MoomooFetcher(BaseFetcher):
         if not self.enabled or not self._sdk_ok:
             raise DataFetchError("MoomooFetcher 未启用或 SDK 未安装")
         with self._ctx_lock:
-            if self._ctx is not None and not self._is_ctx_alive():
+            if self._ctx is not None and (
+                not probe_opend_tcp(self.host, self.port)
+                or not self._is_ctx_alive()
+            ):
                 logger.info("[MoomooFetcher] cached ctx dead, reconnecting")
                 try:
                     self._ctx.close()
@@ -148,11 +175,12 @@ class MoomooFetcher(BaseFetcher):
                     pass
                 self._ctx = None
             if self._ctx is None:
-                from moomoo import OpenQuoteContext
-
                 try:
-                    self._ctx = OpenQuoteContext(host=self.host, port=self.port)
-                except Exception as exc:  # noqa: BLE001
+                    self._ctx = create_ready_quote_context(
+                        host=self.host,
+                        port=self.port,
+                    )
+                except MoomooRuntimeError as exc:
                     raise DataFetchError(
                         f"无法连接 OpenD ({self.host}:{self.port})：{exc}"
                     ) from exc
@@ -300,26 +328,82 @@ class MoomooFetcher(BaseFetcher):
             end.isoformat(),
             is_us,
         )
-        try:
-            ret, data, _page_key = ctx.request_history_kline(
-                code=mcode,
-                start=start.isoformat(),
-                end=end.isoformat(),
-                ktype=ktype,
-                autype=AuType.QFQ,
-                fields=[KL_FIELD.ALL],
-                max_count=1000,
-                extended_time=is_us,
+        common_request = {
+            "code": mcode,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "ktype": ktype,
+            "autype": AuType.QFQ,
+            "fields": [KL_FIELD.ALL],
+            "max_count": 1000,
+            "extended_time": is_us,
+        }
+        frames: list[pd.DataFrame] = []
+        page_req_key = None
+        seen_page_keys: set[tuple[str, str]] = set()
+        page_count = 0
+
+        for page_number in range(1, _INTRADAY_MAX_PAGES + 1):
+            request = dict(common_request)
+            if page_req_key is not None:
+                request["page_req_key"] = page_req_key
+            try:
+                ret, data, next_page_key = ctx.request_history_kline(**request)
+            except Exception as exc:  # noqa: BLE001
+                raise DataFetchError(
+                    f"Moomoo intraday page {page_number} request raised: {exc}"
+                ) from exc
+            if ret != RET_OK:
+                raise DataFetchError(
+                    f"Moomoo intraday page {page_number} failed: {data}"
+                )
+            if data is not None and not data.empty:
+                frames.append(data.copy())
+            elif next_page_key is not None:
+                raise DataFetchError(
+                    "Moomoo intraday returned an empty page with a continuation key"
+                )
+
+            page_count = page_number
+            if next_page_key is None:
+                break
+
+            # SDK documents page keys as bytes.  A type+repr identity remains
+            # safe for equivalent bytes-like keys without requiring hashability.
+            key_identity = (type(next_page_key).__name__, repr(next_page_key))
+            if key_identity in seen_page_keys:
+                raise DataFetchError(
+                    "Moomoo intraday returned a repeated continuation key"
+                )
+            seen_page_keys.add(key_identity)
+            page_req_key = next_page_key
+        else:
+            raise DataFetchError(
+                "Moomoo intraday exceeded the safe pagination limit "
+                f"({_INTRADAY_MAX_PAGES} pages)"
             )
-        except Exception as exc:  # noqa: BLE001
-            raise DataFetchError(f"Moomoo intraday request raised: {exc}") from exc
-        if ret != RET_OK:
-            raise DataFetchError(f"Moomoo intraday failed: {data}")
-        if data is None or data.empty:
+
+        if not frames:
             raise DataFetchError(
                 f"Moomoo returned empty intraday for {mcode} interval={interval}"
             )
-        return self._normalize_intraday(data, stock_code)
+        combined = pd.concat(frames, ignore_index=True)
+        if "time_key" not in combined.columns:
+            raise DataFetchError("Moomoo intraday response is missing time_key")
+        combined = (
+            combined.drop_duplicates(subset=["time_key"], keep="last")
+            .sort_values("time_key", kind="stable")
+            .reset_index(drop=True)
+        )
+        logger.info(
+            "[Moomoo] history_kline intraday complete code=%s interval=%s "
+            "pages=%d rows=%d",
+            mcode,
+            interval,
+            page_count,
+            len(combined),
+        )
+        return self._normalize_intraday(combined, stock_code)
 
     def _normalize_intraday(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
         """For intraday we keep ISO 8601 datetime in `date` column (matches yfinance fetcher)."""
@@ -332,14 +416,26 @@ class MoomooFetcher(BaseFetcher):
             }
         )
         if "date" in df.columns:
-            ts = pd.to_datetime(df["date"], errors="coerce")
-            df["date"] = ts.apply(lambda x: x.isoformat() if pd.notna(x) else None)
+            market = self._to_moomoo_code(stock_code).split(".", 1)[0]
+            market_tz = ZoneInfo(_MARKET_TIMEZONES.get(market, "UTC"))
+
+            def _market_iso(value: object) -> Optional[str]:
+                timestamp = pd.to_datetime(value, errors="coerce")
+                if pd.isna(timestamp):
+                    return None
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.tz_localize(market_tz)
+                else:
+                    timestamp = timestamp.tz_convert(market_tz)
+                return timestamp.isoformat()
+
+            df["date"] = df["date"].apply(_market_iso)
         if "pct_chg" not in df.columns and "close" in df.columns:
             df["pct_chg"] = (df["close"].pct_change() * 100).fillna(0).round(2)
         df["code"] = stock_code
         keep = ["code"] + STANDARD_COLUMNS
         df = df[[c for c in keep if c in df.columns]]
-        return df.dropna(subset=["close"]).reset_index(drop=True)
+        return df.dropna(subset=["date", "close"]).reset_index(drop=True)
 
     # ------------------------------------------------------------------
     # Realtime quote — single ticker via market_snapshot (no subscription)

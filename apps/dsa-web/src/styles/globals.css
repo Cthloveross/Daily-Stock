@@ -1,45 +1,6 @@
 /* apps/dsa-web/src/styles/globals.css */
-/* Global base, font-face, scrollbar, focus, reduced motion.
+/* Global base, scrollbar, focus, reduced motion.
    Loaded AFTER tokens.css so CSS variables are available. */
-
-/* ============================================================ */
-/* FONTS — self-hosted Geist (place woff2 under public/fonts/)  */
-/* ============================================================ */
-@font-face {
-  font-family: "Geist";
-  src: url("/fonts/Geist-Regular.woff2") format("woff2");
-  font-weight: 400;
-  font-style: normal;
-  font-display: swap;
-}
-@font-face {
-  font-family: "Geist";
-  src: url("/fonts/Geist-Medium.woff2") format("woff2");
-  font-weight: 500;
-  font-style: normal;
-  font-display: swap;
-}
-@font-face {
-  font-family: "Geist";
-  src: url("/fonts/Geist-SemiBold.woff2") format("woff2");
-  font-weight: 600;
-  font-style: normal;
-  font-display: swap;
-}
-@font-face {
-  font-family: "Geist Mono";
-  src: url("/fonts/GeistMono-Regular.woff2") format("woff2");
-  font-weight: 400;
-  font-style: normal;
-  font-display: swap;
-}
-@font-face {
-  font-family: "Geist Mono";
-  src: url("/fonts/GeistMono-Medium.woff2") format("woff2");
-  font-weight: 500;
-  font-style: normal;
-  font-display: swap;
-}
 
 /* ============================================================ */
 /* GLOBAL BASE                                                  */

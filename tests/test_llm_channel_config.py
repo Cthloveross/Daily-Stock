@@ -9,6 +9,8 @@ from src.config import (
     Config,
     get_effective_agent_models_to_try,
     get_effective_agent_primary_model,
+    get_effective_journal_ai_models_to_try,
+    get_effective_journal_ai_primary_model,
 )
 
 
@@ -278,6 +280,108 @@ class LLMChannelConfigTestCase(unittest.TestCase):
         self.assertEqual(
             get_effective_agent_models_to_try(config),
             ["openai/gpt-4o-mini"],
+        )
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_journal_chain_fully_inherits_agent_chain_when_unset(
+        self,
+        _mock_parse_yaml,
+        _mock_setup_env,
+    ) -> None:
+        env = {
+            "OPENAI_API_KEY": "sk-test-value",
+            "LITELLM_MODEL": "openai/gpt-4o",
+            "AGENT_LITELLM_MODEL": "openai/gpt-4o-mini",
+            "LITELLM_FALLBACK_MODELS": "anthropic/claude-3-5-sonnet-20241022",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            config = Config._load_from_env()
+
+        self.assertIsNone(config.journal_ai_fallback_models)
+        self.assertEqual(
+            get_effective_journal_ai_primary_model(config),
+            get_effective_agent_primary_model(config),
+        )
+        self.assertEqual(
+            get_effective_journal_ai_models_to_try(config),
+            get_effective_agent_models_to_try(config),
+        )
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_journal_primary_appends_deduped_agent_chain_when_fallback_is_absent(
+        self,
+        _mock_parse_yaml,
+        _mock_setup_env,
+    ) -> None:
+        env = {
+            "OPENAI_API_KEY": "sk-test-value",
+            "LITELLM_MODEL": "openai/gpt-4o",
+            "AGENT_LITELLM_MODEL": "openai/gpt-4o-mini",
+            "LITELLM_FALLBACK_MODELS": "openai/gpt-4o,anthropic/claude-3-5-sonnet-20241022",
+            "JOURNAL_AI_MODEL": "openai/gpt-4o",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            config = Config._load_from_env()
+
+        self.assertIsNone(config.journal_ai_fallback_models)
+        self.assertEqual(
+            get_effective_journal_ai_models_to_try(config),
+            [
+                "openai/gpt-4o",
+                "openai/gpt-4o-mini",
+                "anthropic/claude-3-5-sonnet-20241022",
+            ],
+        )
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_explicit_empty_journal_fallback_disables_fallback(
+        self,
+        _mock_parse_yaml,
+        _mock_setup_env,
+    ) -> None:
+        env = {
+            "OPENAI_API_KEY": "sk-test-value",
+            "LITELLM_MODEL": "openai/gpt-4o-mini",
+            "LITELLM_FALLBACK_MODELS": "anthropic/claude-3-5-sonnet-20241022",
+            "JOURNAL_AI_MODEL": "openai/gpt-4o",
+            "JOURNAL_AI_FALLBACK_MODELS": "",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            config = Config._load_from_env()
+
+        self.assertEqual(config.journal_ai_fallback_models, [])
+        self.assertEqual(
+            get_effective_journal_ai_models_to_try(config),
+            ["openai/gpt-4o"],
+        )
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_explicit_journal_fallbacks_are_normalized_and_deduped(
+        self,
+        _mock_parse_yaml,
+        _mock_setup_env,
+    ) -> None:
+        env = {
+            "OPENAI_API_KEY": "sk-test-value",
+            "LITELLM_MODEL": "openai/gpt-4o",
+            "JOURNAL_AI_MODEL": "journal-primary",
+            "JOURNAL_AI_FALLBACK_MODELS": "gpt-4o-mini,openai/gpt-4o-mini",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            config = Config._load_from_env()
+
+        self.assertEqual(config.journal_ai_model, "openai/journal-primary")
+        self.assertEqual(
+            get_effective_journal_ai_models_to_try(config),
+            ["openai/journal-primary", "openai/gpt-4o-mini"],
         )
 
     @patch("src.config.setup_env")

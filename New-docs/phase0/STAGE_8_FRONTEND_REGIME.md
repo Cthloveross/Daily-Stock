@@ -22,6 +22,16 @@
 - 注册到 `api/v1/router.py`：`/regime` tag + `/breakout` tag
 - 7 个新契约测试（含 empty / seeded / fake-only 过滤）
 
+Regime API 追加兼容字段 `quality_state`、`authoritative`、`domain_quality`、
+`missing_domains`、`incomplete_domains` 与 `quality_message`；`today` / `recompute`
+统一使用纽约市场日期。页面对 `unavailable` 隐藏占位 0 与指针，对 `degraded` 标记
+`CONTEXT ONLY · PROVISIONAL`，顶栏不再把临时分档显示成权威 `NO TRADE`；仪表盘色带
+与后端默认阈值 35/55/75 对齐。`generated_at` 由后端返回 UTC 证据时间，Web 统一按
+`America/New_York` 显示，避免浏览器本地时区被误标为 ET。六项贡献按域质量显示数值
+或 `—`，历史图排除核心行情缺失记录。
+数据源状态栏读取快照 provenance，实际展示 `MoomooFetcher / Cboe` 等来源，不再把全部
+市场日线固定标成 yfinance。
+
 ### 2. 前端 store + 组件
 
 新增 [apps/dsa-web/src/types/regime.ts](../../apps/dsa-web/src/types/regime.ts) + [api/regime.ts](../../apps/dsa-web/src/api/regime.ts) + [stores/regimeStore.ts](../../apps/dsa-web/src/stores/regimeStore.ts)。
@@ -60,7 +70,7 @@ Regime 卡片 + 30 天历史图 + 最近 Breakout 信号列表。
 ## 留了什么坑 / 显式延后
 
 - **TradingView Widget 未接入股票详情页**：组件已就位，只在 `/stock/:symbol` 页的 Tab 里调用还没做。Stage 10 Agent 对话里也会引用它；先做通用组件。
-- **Recompute 按钮在未配置 Alpaca 时会成功但数据稀薄**：scorer 本身 graceful，真实环境就是"d6 premarket 为 0"；UI 不额外提示。
+- **Recompute 按钮在未配置 Alpaca 时会成功但数据降级**：d6 的 0 表示未计分，UI 会列出盘前域，不再把它显示成真实平盘贡献。
 - **Breakout 实时扫描** 依然是 Phase 1（需要长驻进程 + Alpaca）；Stage 8 只展示历史。
 - **Bundle size**：`index-*.js` ~1.3MB。Phase 1 做 `React.lazy` 拆 JournalPage / RegimePage / TVWidget 可以大幅瘦身。
 

@@ -12,7 +12,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 
-- [新功能] Moomoo OpenAPI Phase B 实时交割单同步：新建 `src/journal/brokers/moomoo_live.py`（`history_deal_list_query` / `history_order_list_query` → `MoomooOrder`，复用 CSV 路径的 hash 去重）+ `src/services/moomoo_sync_service.py`（`record_import` → `insert_events_from_orders` → `match_legs_fifo` → `replace_trades` 全链路）+ `scripts/sync_moomoo_live.py` cron CLI + `POST /api/v1/journal/sync-live` 端点。默认 `SIMULATE`（paper），LIVE 需 `MOOMOO_TRADE_ENV=LIVE`。
+- [改进] 今日机会研究收敛为 Watchlist Top 5 主清单：Top 5 自动批量加载并直出 0–45 DTE Call/Put 执行价墙，其余候选、排名外增强与 5D/20D 学习口径默认折叠。
+- [修复] 研究状态改由新鲜完整日线、方向结构和独立量能/成交额确认共同决定；降级或缺失 Regime 不再把所有候选统一标为等待状态，页面同步展示“重点研究 / 等待确认 / 背景观察 / 数据阻断”及确认、失效观察。
+- [新功能] 本地 Watchlist 支持合并导入 TradingView 官方 TXT 导出；机会扫描使用前 20 只自选并显示来源，避免把 TradingView 的 broker/Charting Library API 误称为个人账户 Watchlist 同步接口。
+- [新功能] 新增 Moomoo History CSV 的 loss-aware parser、去标识化只读对账 CLI 和可信证据导入预览：保留重复表头的位置语义、逐笔 fill、订单汇总、九项费用与 ET 时间证据，并将批次分为 `exact` / `partial` / `blocked`。
+- [新功能] 新增 append-only `journal_v2_*` 证据账本、预览/确认导入/data-health API 与 Journal 导入交互；相同源文件幂等，partial 必须显式确认，旧 Journal/FIFO 表不被重建或混用，Data Health 明确区分整批范围与局部 API 对账窗口。
+- [新功能] 新增不可变 reconciliation attestation：API 对账可以晚于 CSV 批次追加并记录 export hash，不修改既有 ImportBatch；SQLite trigger 拒绝全部 `journal_v2_*` 表的 UPDATE/DELETE，强化 append-only 契约。
+- [改进] passed reconciliation attestation 必须携带只读 export SHA-256，并验证窗口订单数、statement identity 与当前 batch observation 一一绑定；SQLite 连接启用 `recursive_triggers`，防止 `INSERT OR REPLACE` 绕过 append-only DELETE trigger。
+- [修复] Moomoo 导入不再静默丢失只有 `Filled@Avg Price` 的早期已成交订单，不再合并字节相同但合法的同秒 fill，并补纳 `Consolidated Audit Trail Fees`；缺少逐笔证据的订单保留为 `aggregate_only`，绝不合成 fill；旧 `/journal/import` 固定返回 410，关闭不完整 FIFO 重建旁路。
+- [修复] CSV/OpenAPI 对账门禁现在同时检查 CSV 内部一致性、孤立记录、API order/deal/fee 引用与两端费用总额；任何异常都会阻止 `analysis_ready`，不再出现局部逐单相等但整体证据异常的假阳性。
+- [修复] parser 升级为 `moomoo-statement-v2`：取消/失败订单的 `0@0.00` 保持 `not_filled`，真实部分成交取消仍保留 fill；对账不再以 API 单边 `dealt_qty=0` 跳过 CSV 成交证据。正式库用新 batch 表达升级，旧 v1 仅保留审计。
+- [测试] 用正确真实 CSV 与只读 OpenAPI 稳定窗口逐单核对 1,089 个订单、2,107 条 fill、VWAP 和九项费用分量均为零差异，并新增 parser、reconciliation、append-only repository、API 与 Web 导入状态测试。
+- [文档] 新增 `New-docs/phase1/01_MOOMOO_EVIDENCE_LEDGER.md`，记录真实数据覆盖、证据等级、正式本地批次、分析限制及 PositionEpisode/StrategyEpisode 后续退出条件。
+- [新功能] 新增 PositionEpisode builder v1.1.0、append-only EpisodeBuild/StrategyEpisode/PositionEpisode 持久化与列表/详情 API：latest accepted `moomoo-statement-v2` batch 的 5,400 条真实 fill 和 574 条 aggregate order event 生成 1,441 个生命周期，aggregate-only 证据不会被伪造成 fill。
+- [新功能] Journal 默认进入“仓位复盘”并展示最新 immutable build；legacy Overview/Trades/Reality/Analysis 页面仅作隔离存档，不再作为当前交易事实源。
+- [改进] Episode builder 由 broker amount 证明股票/期权乘数 1/100（金额残差容差 USD 0.005），验证 USD 151,750.75 source/allocated 费用守恒；当前缺少已验证期初持仓快照，1,441 个 Episode 全部以 `assumed_flat_unverified` 排除 headline，条件性 closed P&L 仅作辅助读数。
+- [改进] SQLite 应用连接同时启用 `foreign_keys` 与 `recursive_triggers`，Episode build 继续受 `journal_v2_*` UPDATE/DELETE 拒绝 trigger 保护；build 1 写入前保留 `data/backups/stock_analysis-pre-episodes-20260721.db` 回滚备份。
+- [文档] 新增 `New-docs/phase1/02_POSITION_EPISODES.md`，记录首个正式 Episode build、条件性 P&L 边界、合约乘数证据、费用守恒、API、legacy 隔离与回滚方式。
+- [文档] 新增 `New-docs/architecture/05_PRODUCT_CHARTER_AND_ROADMAP.md`，将产品目标收敛为以 Moomoo 成交事实、期权策略生命周期、证据化复盘和个人 Playbook 为核心的 Trading OS，并定义运行止血、数据对账、复盘工作台、Edge Explorer、Playbook 与只读行情决策台的阶段验收标准；旧 v4 的 LEAP/频率目标降级为待验证假设。
+- [修复] 系统配置响应 Schema 补齐已注册的 `phase0` 分类，修复 `/api/v1/system/config?include_schema=true` 因 Pydantic 分类校验失败返回 500 的问题。
+- [修复] Moomoo 真实账户只读成交同步将应用层 `LIVE` 正确映射为 SDK 10.x 的 `TrdEnv.REAL`，修复因访问不存在的 `TrdEnv.LIVE` 而无法查询真实交割记录的问题，并明确查询过程不解锁交易。
+- [新功能] 新增 `scripts/probe_moomoo_readonly.py` 安全入口：不写 Journal 数据库，显式通过 `get_acc_list` 选择稳定账户，按最多 7 天窗口分块查询订单/成交并按 `order_id`/`deal_id` 去重，费用查询限制为每批 400 单；stdout 仅输出去标识化汇总，显式 `--output` 才导出移除账户标识后的分析记录。
+- [改进] Moomoo 只读探测将同步 Trade Context 隔离到带总截止时间的可终止子进程，并新增 `analysis_ready`：只有订单/成交代码、方向、数量、成交加权均价和费用覆盖全部对账通过才允许进入分析；程序化时间窗口统一转换到市场时区并限制单次最长 366 天。
+- [修复] Moomoo SDK 进程级配置改为线程安全的一次性初始化，关闭 console 重连洪泛并将 SDK 文件日志 best-effort 限到 WARNING/3 份备份；可选 SDK 初始化异常会安全 shelve 到 fallback；Breakout context 仅在 handler 与订阅全部成功后发布，失败路径会关闭资源且未订阅状态不再误报健康。
+- [改进] 旧 Moomoo live Journal writer 继续暂停：旧 CLI 固定返回 `LegacySyncPaused`，`POST /api/v1/journal/sync-live` 固定返回 409；CSV 已改由隔离的 append-only 可信证据导入器入账，在 API observation、canonical reader、opening snapshot 与策略意图确认达到退出条件前不恢复旧 writer。
+- [改进] Journal 用户界面移除 `v2` 迁移代号，统一使用“仓位复盘”“交易证据”和“可信证据账本”；内部 `/journal/v2/...` API、`journal_v2_*` 表名与 parser 版本保持兼容。
+- [改进] Web 顶栏将 Moomoo 状态明确为“可达 · 只读”，使用可访问 Tooltip 说明 TCP 可达不等于交割单已同步；Journal 移除固定 50% 盈亏平衡与 0DTE 30% 危险阈值，并修复重复字体声明导致的 404/解码错误。
+- [测试] 新增 Moomoo 永久只读 AST 边界、总超时与完整对账、旧 writer 暂停、SDK 并发初始化/资源释放、LaunchAgent 日志轮转、Web 字体装载与 Journal 文案回归测试。
+- [改进] macOS 三个 LaunchAgent 统一通过日志轮转包装器启动，分别限制 stdout/stderr 单文件为 10 MiB 并保留 3 个备份，同时保持原日志路径与子进程退出码、信号转发语义，避免 OpenD 离线重连等异常导致日志无限增长。
+- [改进] `scripts/install_launchagents.sh` 新增 `--only uvicorn` 精确选择，可单独恢复只读 Web/API 而不加载旧 Moomoo writer 或 breakout；状态命令同时展示 Web-only 与全量恢复入口。
+- [修复] LaunchAgent 状态脚本改用真实的 `GET /api/health` 探针，不再因请求不存在的 `/health` 或使用不受支持的 HEAD 方法而把健康 Web 服务误报为不可达。
+- [新功能] 新增严格的去标识化 Moomoo OpenAPI export parser、`/journal/v2/openapi-imports/preview` 与 Web“OpenAPI 只读 JSON”预览；展示真实范围、order/fill/fee、费用与对账状态，但明确不写 Journal 数据库。
+- [新功能] 新增 identity-link-aware 纯 canonical reader scaffold：显式 order/deal link 仅在可证明时使用；逐笔无法安全配对但订单级 count/quantity/VWAP 已 attested 时，由 authoritative API fill set 覆盖 CSV weak-fill set 并保留集合级 provenance，禁止伪造 broker deal link；当前尚未生成/持久化 links/attestations，也未接 ORM 或正式 Episode source。
+- [修复] OpenAPI parser 的数字规范化不再依赖 JSON 调用方选择 `float` 或 `Decimal` loader，同一只读文件在两条路径下生成相同 observations、source/evidence hash 与 batch key；兼容 Moomoo 四位小数秒时间。
+- [测试] 真实重叠窗口 canonical 内存合同通过：2,178 order observations 去重为 1,089，4,214 fill observations 去重为 2,107，并保留 2,107 条 CSV weak-fill shadow provenance；`analysis_ready=true`、0 issues、未写正式数据库。
+- [修复] Data Health 与 PositionEpisode repository 在 canonical persistence 接通前继续显式选择 CSV source，防止较新的局部 OpenAPI window 取代完整 CSV 分母或悄悄成为 Episode 输入。
+- [文档] 新增 `New-docs/phase1/03_OPENAPI_CANONICAL.md`，记录 OpenAPI 预览、canonical identity/冲突规则、真实 1,089 orders / 2,107 fills 验收和正式写库前的剩余边界。
+- [chore] 保留早期 Moomoo OpenAPI Phase B live Journal writer 原型作为迁移背景和测试对象；其 CLI/API 当前均固定暂停，不作为可执行同步入口，`LIVE` 仅表示读取真实账户历史事实，不表示开放交易能力。
 - [新功能] Moomoo OpenAPI Phase C 期权链：新建 `data_provider/moomoo_options.py`，调 `get_option_chain` / `get_option_expiration_date`，IV 直接使用 Moomoo 服务端值（无需 BS 反推）。`src/options/iv_rank.py::compute_atm_iv` 在 `MOOMOO_OPEND_ENABLED=true` 时优先走 Moomoo，失败回落 yfinance。
 - [新功能] Moomoo OpenAPI Phase D 实时突破检测：新建 `src/breakout/live_runner.py`（KLine_1M 订阅 + 60 bar 环形缓冲 + range_high 突破触发 + Q1-Q5 过滤）+ `scripts/run_breakout_live.py` 长进程 CLI（JSON 行输出，可接 Telegram bot 等下游）。
 - [修复] `/regime` watchlist 现在合并 `useUserWatchlistStore` 的本地自选（regime snapshot 里原本没有 watchlist key，导致该区块永远为空）；每行带 source dot（accent=本地自选 / grey=regime snapshot）。
@@ -78,6 +114,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] 集成 Anspire Search 作为可选语义搜索后端; 配置 `ANSPIRE_*` 可使用Anspire Search获取实时行情及新闻资讯，未配置时行为与此前一致。Anspire Search请使用 `tests/test_anspire_search.py`（手动脚本）。
 - [修复] GitHub Actions `daily_analysis.yml` 未注入 `REPORT_LANGUAGE` 环境变量，导致用户在 Secrets/Variables 中配置后不生效（fixes #1013）
 - [修复] `GET /api/v1/analysis/status/{task_id}` 从数据库回填已完成任务时缺少 `current_price` / `change_pct`，导致首页报告股票名旁不显示实时价格（fixes #983）
+- [新功能] 新增 Moomoo OpenAPI DB-aware `plan` / `confirm` 与 Web 确认交互：plan 零证据行写入并展示覆盖率、identity provenance、canonical 影响和 blockers；partial window 必须显式确认，stale preview 固定拒绝（服务首次初始化可能创建缺失 schema）。
+- [改进] OpenAPI canonical persistence 只使用目标账户最新 accepted CSV batch，旧 CSV 仅保留审计且不参与本次输入；order/fill/fee observations、order/deal links、fill-set attestations 和 canonical set 以单事务 append-only 追加，相同 export 重复确认幂等，且不写 legacy Journal、不触发 Episode rebuild、不执行交易动作。
+- [改进] OpenAPI plan 与 confirm 统一累积最新 CSV 基线下的全部 accepted API batches；不同窗口可连续追加，重叠窗口复用既有 order/deal identity proofs，避免重复 link。
+- [测试] 正确数据的零证据行写入 plan 与隔离库幂等验收覆盖 1,089 / 3,542 个订单、窗口外 2,453 单；首次计划新增 1,089 order、2,107 fill、1,058 fee、1,089 order links、1,136 deal links、244 fill-set attestations，canonical 输出 3,542 orders / 5,400 fills，重复确认新增计数为 0；另覆盖连续不相交窗口与重叠窗口。上述结果不代表正式 Journal 数据库已导入。
+- [文档] 将 Phase 1.3 专题和 Moomoo 路线图更新到 1.3B，记录只读 plan/confirm、最新 CSV 基线、原子幂等边界、局部覆盖结果，以及 OpenAPI confirm 与 Episode rebuild 的隔离关系。
+- [新功能] 新增冻结 canonical set 到 PositionEpisode 的显式 preview/confirm：重放已保存 members 而不重跑身份推断，以 append-only、幂等方式生成不自动替换默认 CSV build 的对比构建；`assumed_flat_unverified` 仍需独立确认，aggregate submitted amount 不作为执行现金流。
+- [文档] 新增 `New-docs/phase1/04_CANONICAL_EPISODE_BUILD.md` 并同步 README、产品路线图和 Moomoo 路线图，记录 574 aggregate + 5,400 fill events、1,441 个 signed-position lifecycle 与 USD 151,750.75 费用守恒基线，明确该算法不是 FIFO 且项目永久只读。
+- [新功能] 新增 `/journal/review/:episodeId` 单合约复盘工作台：保留 `build_id` 与仓位列表筛选/页码上下文，将底层 K 线与 execution evidence 联动，明确区分真实 fill、订单时间代理和无法映射的行情缺口；期权 premium 不混入底层价格轴。
+- [改进] 股票历史行情响应追加可选 `source`、`coverage_start`、`coverage_end` 与 `last_bar_at`；单合约复盘仅在最近 60 天且 5 分钟 bars 覆盖全部 evidence 时使用分钟视图，否则明确降级日线并禁止精确入场、MFE/MAE 结论，空行情不伪造 provenance。
+- [修复] Moomoo 分钟线将无 offset 的 `time_key` 按 US 美东时间或 HK/中国内地北京时间补入含夏令时的 ISO 时区，并升级 Web 会话缓存版本，避免浏览器复用旧时间语义而把真实成交证据错误降级为日线。
+- [文档] 新增 `New-docs/phase1/05_SINGLE_POSITION_REVIEW_WORKSPACE.md`，记录单合约复盘路由、构建/返回上下文、K 线/evidence 联动、行情覆盖与降级、`assumed_flat_unverified` 和永久只读边界；本次细节未重复写入根 README。
+- [新功能] PositionEpisode 列表新增只读 `case_focus=top_profit|top_loss|largest_fee|longest_hold`：缺省仍按开仓时间最新优先，盈亏聚焦仅纳入已闭合且净损益已知的 Episode，并与现有 build、标的、状态、完整度和分页条件取交集，不构建或改写交易事实。
+- [新功能] 股票 history 新增显式派生的 `period=2m`：底层读取带时区 1 分钟 K 线，按市场本地日期聚合连续 2 分钟 OHLCV，响应通过 `derived_from_period=1m` 与 `aggregation_method=time_bucket_2m_ohlcv` 声明来源，空数据也不伪装为原生周期。
+- [测试] 新增 PositionEpisode 聚焦排序、筛选交集与 OpenAPI schema 契约，以及 2 分钟行情 OHLCV、缺分钟/时段缺口、DST、空响应和 API 映射回归测试。
+- [修复] Moomoo 分钟历史改为沿 `page_req_key` 安全读取全部分页，合并后按 `time_key` 去重排序；后续页错误、重复 continuation key、异常空页或超过 128 页均拒绝返回部分覆盖，同时每页保持美股盘前盘后参数。
+- [新功能] 单合约复盘新增 1m/2m/5m/1h/日线显式切换与按需 AI 辅助复盘；AI 固定绑定当前 Episode/build，只接收去标识化执行与市场事实，返回事实/推断/未知边界、SPY/Regime 上下文和 provenance，生成文本不持久化且 Moomoo 永久只读。
+- [修复] 复盘 K 线买卖 marker 改为依据 `allocated_cash_flow` 正负，而非用开仓/平仓角色猜测方向，避免空头回合方向反转；手动周期无 bars 或未覆盖全部 evidence 时明确显示不可用，不静默换周期或重新贴标签。
+- [测试] 新增案例精选路由上下文、多周期控件与 1m/2m 显式请求、5m→日线自动降级、2 分钟派生行情、现金流买卖 marker、显式 build AI 端点、去标识化 prompt、行情/Regime 缺口与 LLM 不可用降级回归测试。
+- [文档] 扩充 `New-docs/phase1/05_SINGLE_POSITION_REVIEW_WORKSPACE.md` 并同步文档索引和产品路线图，记录案例精选、多周期 provenance、现金流买卖语义、AI 输入/端点/失败边界、条件 P&L 与单笔 edge 护栏；专题细节不重复写入根 README。
+- [修复] Moomoo 分钟行情按 `page_req_key` 完整读取请求窗口并对重叠 bar 去重排序；后续页失败、重复 continuation key 或超安全页数时拒绝返回部分数据，Web 同步延长只读行情等待时间并失效旧的单页缓存。
+- [修复] 按需 AI 复盘把 LiteLLM 适配器的失败文本或缺少必需章节的截断输出识别为不可用状态，不再把内部连接异常/残缺文本冒充模型分析或回传给页面；同时将 LiteLLM 第三方日志降至 WARNING，避免完整复盘 prompt 写入 DEBUG 日志造成日志洪泛。
+- [新功能] 单合约复盘 K 线新增原生 `15m` / `30m` 显式切换，并在七档周期上叠加由底层 close 计算的 EMA8 / EMA13；EMA 以首个完整周期 SMA 为 seed 后按标准系数递推，bars 不足时不补值，期权 premium 仍不进入底层价格轴。
+- [改进] 按需 AI 复盘并行读取底层与 SPY、跳过无关名称/实时报价补取，并为成功非空行情增加 180 秒、最多 32 项的只读短缓存；每个标的的模型输入收敛到最多 24 根 OHLCV，LLM fallback 共用 30 秒路由预算且单模型最多 15 秒，并用 35 秒服务端墙钟硬截止兜住不遵守 timeout 的供应商 SDK；LiteLLM 默认使用本地 cost map，超时或章节不完整继续返回确定性市场上下文，不缓存或持久化 AI 文本。
+- [文档] 更新 `New-docs/phase1/05_SINGLE_POSITION_REVIEW_WORKSPACE.md`，记录七档原生/派生周期、EMA seed 与递推口径、AI 延迟预算/缓存边界，以及 Moomoo 永久只读、不下单和条件 P&L 护栏；专题细节未重复写入根 README。
+- [修复] 单合约复盘分钟图默认按纽约常规时段 09:30–16:00 ET 过滤，并可显式切换含盘前盘后的 04:00–20:00 ET；EMA8/13 基于当前时段重算，修复扩展时段混算导致与常见行情软件口径明显不一致的问题。
+- [修复] 复盘图表横轴与十字光标不再把 Unix 时间按 UTC 展示，统一使用 `America/New_York` 并自动处理夏令时；历史最终 bar 的 close/EMA 明确不得冒充成交瞬间已知信号。
+- [改进] 复盘助手拆分为无需外部模型的本地证据复盘与可选模型增强；模型失败时返回完整的事实结论、成交结构、相对 SPY、证据缺口和补充问题，模型等待预算收敛到单模型 10 秒、路由 16 秒、服务端墙钟 20 秒。
+- [新功能] 新增 `JOURNAL_AI_MODEL` 与 `JOURNAL_AI_FALLBACK_MODELS` 复盘专用模型链，支持继承 Agent 链、接续去重和显式空 fallback；OpenAI/GPT 仍要求服务端 API Key，不复用 ChatGPT/Codex 登录态。
+- [文档] 同步根 README、产品章程与 Phase 1.5 工作台说明，记录 EMA 时段/ET 口径、真实 Episode 数值核对、证据复盘/模型增强边界和后续 ReviewAnnotation 方向。
+- [新功能] 单回合复盘新增六字段交易逻辑草稿，严格分开进场前计划与事后记录；草稿按 build/episode 仅存浏览器，本次复盘只发送非空字段，后端将其标记为未经独立验证的用户自述且不写 Moomoo 或证据账本。
+- [修复] 分钟级复盘收益代理不再读取成交所在未完成 bar 的最终 close，改用成交前最近已完成且仍新鲜的 bar；模型行情切片增加 finalized/availability 边界，Regime 缺少生成 as-of 时明确保持开仓可见性未知。
+- [改进] 复盘 API 始终返回不可被模型覆盖的 `evidence_markdown`，模型成功时另返独立 `model_analysis_markdown`；用户补录明确标为事后回忆并限制总计 6,000 字，默认行情读取增加每路 8 秒截止与全局有界降级。
+- [新功能] `/regime` 新增“今日机会研究”确定性候选榜与 `POST /api/v1/opportunities/daily`：扫描本地自选或服务端 `STOCK_LIST`，使用上一完整交易日量价、EMA8/13 和已保存 Regime，按研究状态、证据支持与完整度稳定排序；逐项展示来源、时间、反证、未知项和 readiness，不调用 LLM、不输出伪精确总分、不执行交易。
+- [修复] Moomoo 期权链按官方语义改为先取静态合约 code，再以每批最多 400 个 code 合并动态 market snapshot；bid/ask、成交量、OI、IV 和 Delta 不再从静态链行读取或被伪装为全 0 实时行情。
+- [改进] 每日机会扫描改为单请求复用行情 manager、最多四路并发、30 秒服务端 TTL 与 single-flight；前端增加 5 分钟缓存和最新请求保护，减少重复初始化、日志洪泛和旧 watchlist 响应覆盖；未配置的可选 Tushare 数据源降为 debug 能力状态，行情 fallback 只保留一次最终 warning，并抑制 yfinance 已由应用汇总的重复 ERROR。
+- [修复] 每日机会固定只使用美股 T-1 或更早完整日线，非美股候选明确 blocked，过期日线/no_trade 降为仅背景；成交额代理不再重复抬高支持证据，UI 分开显示基础量价覆盖与总体数据域覆盖。
+- [修复] Moomoo 动态期权快照拒绝 NaN/inf、无效 `option_valid` 与缺字段合约，ATM IV 改为精确单合约快照并在不完整时 fail closed；DTE 统一按纽约市场日期，查询与 context 生命周期使用同一锁。
+- [文档] 新增 `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` 并同步产品路线图，记录 Moomoo v10.9 异常期权事件、本机 10.4 能力差距、FINRA 延迟暗池背景、可选 TRF 数据源、TradePlan 与 5d/20d 结果闭环顺序；专题细节不重复写入根 README。
+- [新功能] 每日机会榜新增独立 `POST /api/v1/opportunities/option-context` 渐进增强：基础候选先显示，再为前三个合格美股 underlying 读取 Moomoo 最近到期 ATM Call 单点 IV；未启用、缺数据或请求失败均逐标降级且不影响基础榜，并明确不是 IV Rank、异常期权流或买卖信号。
+- [改进] 期权上下文按标的、Moomoo 启用状态和 ET 日期使用 30 秒服务端 TTL/single-flight，重叠批次复用已读标的；前端增加 5 分钟缓存、30 秒独立超时、手动刷新和旧响应保护，未进入首批的候选明确标记为未扫描。
+- [修复] Moomoo QuoteContext 在异步 READY 后强制设置 5 秒同步查询连接等待上限，SDK 缺少或拒绝该安全设置时关闭 context 并 fail closed，避免 OpenD 刚断线时同步查询无限重连占住服务端线程。
+- [测试] 新增 ATM IV 上下文启用/禁用、百分比换算、逐标降级、重叠批次缓存、混合市场过滤、前端加载/刷新/竞态与 Moomoo 同步连接截止回归；机会/Moomoo 后端相关测试 70 项通过，前端组件定向测试 8 项通过。
+- [文档] 更新每日机会专题与产品路线图，记录 ATM IV 已交付范围、缓存/超时边界、不得从单点 volume/OI 推断大单，以及后续流动性上下文和 Moomoo 10.9 真异常流接入顺序；专题细节未重复写入根 README。
+- [新功能] 每日机会研究新增只读 `POST /api/v1/opportunities/option-walls`：默认按 0–45 DTE 标准合约返回 Top 3 Call/Put OI、当日累计 Volume 与 unsigned gross gamma concentration 墙，并携带覆盖率、市场日期、抓取时间、排除项和逐标降级状态；墙数据不参与基础候选排名。
+- [改进] 期权墙以 `abs(gamma) × OI × contract_multiplier × spot² × 0.01` 计算标的变动 1% 时的近似美元 Delta 对冲名义变化；明确不称 Dealer GEX、不推断做市商方向、不计算 gamma flip，UI 使用表格加详情展示可复现口径、as-of 和“策略有效性未验证”。
+- [文档] 更新每日机会专题，记录 Moomoo 10.4 已可支持基础期权墙、10.9 `get_option_event` 仍是下一步只读验收，以及当前尚未持久化墙历史或完成结果回测；专题细节不重复写入根 README。
+- [改进] Web 全局视觉从近纯黑与高饱和紫色收敛为 charcoal 层级、单一研究蓝与更清晰的文字/边框对比；cyan/purple 仅保留为多序列图表色，并同步设计系统真源。
+- [修复] 期权墙将任一静态链日期窗口失败计入覆盖失败，避免剩余窗口的快照 100% 被误报为整段 DTE 完整；机会表同时将混合指标列更名为“数据完整度”并移除成交额倍率的美元符号误导。
+- [测试] 机会榜/Moomoo 只读相关后端定向测试 89 项、前端机会组件测试 12 项通过，并完成 Web lint、正式构建和真实 OpenD 期权墙浏览器交互验收。
+- [新功能] 每日机会研究新增只读 `POST /api/v1/opportunities/option-events`：在 Moomoo OpenD 10.9.6918 / Python SDK 10.9.6908 上按 underlying 读取最近异常期权成交，逐标返回成交权利金、盘口、IV/Delta 与 Moomoo 方向/情绪/成交类型分类；页面在当前候选详情中渐进展示，失败不阻断基础榜，全链路不解锁或调用交易接口。
+- [改进] 异常期权成交按标的使用 30 秒服务端 TTL/single-flight、请求数量上限与前端旧响应保护，并通过独立只读 QuoteContext lane 避免被大型期权墙扫描阻塞；明确供应商分类不能证明开平仓、真实主动买卖方、参与者目的或 dealer 定位，事件暂不进入候选排名、不持久化且无历史回测。
+- [文档] 更新每日机会专题，记录 Moomoo 10.9 只读升级验收、`option-events` 字段与时效口径、官方限频和 UI 用途，并将异常成交的证据边界与后续样本外验证顺序固化；专题细节未重复写入根 README。
+- [修复] Moomoo 环境变量示例、订阅说明与旧 LaunchAgent 注释不再建议解锁或模拟/真实交易，也不将 `LIVE` 当作执行开关；`LIVE` 仅表示只读真实账户历史，旧 writer 仍固定暂停。
+- [新功能] 每日机会研究新增显式不可变快照与 5/20 XNYS 交易日结果 API：`snapshots/freeze`、`snapshots`、`snapshots/{snapshot_key}/evaluate` 和 `learning-summary` 分别冻结当前基础榜、只读列出进度、追加成熟结果与返回受门槛保护的描述统计；普通 `/daily` 预览继续零写入。
+- [新功能] 新增 `opportunity_snapshot_runs`、`opportunity_snapshot_candidates`、`opportunity_candidate_outcomes` 三张隔离的 append-only 表和 UPDATE/DELETE 拒绝 trigger；run/candidate 原子写入、相同重试幂等、冲突快照拒绝，partial 与 complete 结果只追加不原地修订，本地升级前数据库备份继续由 `data/` ignore 规则排除于仓库。
+- [改进] 结果评估以 `exchange-calendars` XNYS 日历固定 `S close < freeze < E open` 因果窗口，分别保存冻结 close 与 next-open proxy 的 5D/20D 标的收益、MFE/MAE 和相对 SPY；5D 使用 ±0.5%、20D 使用 ±1.0% 的方向上下文阈值，mixed/unknown 不生成 signed 指标，参考复权或来源连续性无法核对的样本排除于学习。
+- [改进] 学习摘要严格隔离 signal/playbook/universe/结构 setup/Regime/direction/horizon cohort：10 个成熟方向样本才显示描述命中率，20 个样本且来自 20 个独立 signal sessions 才允许人工调查；不生成 TP/FP、missed opportunity 或 regime mismatch，不把 underlying proxy 冒充期权收益，且任何样本量都不会自动调整排名权重。
+- [测试] 新增机会快照日槽幂等/冲突与 SQLite 不可变 trigger、S-close/E-open 门禁、XNYS 节假日、5D/20D 成熟度、close/next-open/MFE/MAE/SPY、mixed/unknown 空 signed 字段、来源/复权缺口、API 显式写入边界和学习样本门槛回归测试。
+- [测试] 离线门禁不再受本地 ignored `.env`、固定历史日期或手工联网诊断脚本影响，并补齐 requirements 已声明的 JSON repair 本地测试依赖；真实行情、LLM 与通知诊断只在 `network` 测试中执行。
+- [文档] 扩充每日机会专题，记录三表/API、因果冻结窗口、5/20 结果公式、严格 cohort、样本门槛和永久不自动调权边界；专题细节未重复写入根 README。
+- [新功能] 每日机会研究接入 Moomoo Python SDK 10.9 的只读 `get_option_underlying_overview`：通过 `POST /api/v1/opportunities/option-overview` 为全部合格候选批量展示供应商 IV、IV Rank/Percentile、HV，以及 Call/Put Volume 与 OI 概览；任一标的失败均独立降级，全链路不解锁、不下单。
+- [新功能] 新增 `/regime/opportunity/:ticker` 专业单票研究页，集中展示 1m/2m/5m/15m/30m/1h/1D underlying K 线与 EMA8/13、上一完整交易日结构、IV/HV、0–45 DTE 墙和 Moomoo 异常成交，并保留来源、抓取时间和不可推断边界。
+- [改进] 每日清单改用 `snapshots/ensure` 在合法 XNYS 盘前窗口幂等保存当日第一份研究版本，周末、休市、盘中和盘后只更新页面而不生成事后样本；UI 移除需要用户理解的“冻结今日研究”主操作。
+- [改进] 机会榜和单票详情按数据域明确时钟：Volume 是当前交易时段累计，OI 是上一清算日 T-1，IV 只表达隐含波动幅度而不表达方向，unsigned Gross Gamma 仅是公开 OI 的集中度代理、不是 Dealer GEX 或 gamma flip。
+- [文档] 更新每日机会专题，记录全候选期权概览、专业单票研究页、盘前自动保存、七档 K 线/EMA8/13，以及 OI、Volume、IV、Gross Gamma 和异常成交的时点与解释限制；细节未重复写入根 README。
+- [新功能] 单票机会页新增首屏专业摘要与 1/5/20 交易日 IV 模型终值区间，以简化 lognormal 假设分别展示约 68%/95% 理论覆盖区间；明确它们不是方向预测、真实胜率、目标价或盘中触及概率。
+- [改进] 单票机会页压缩重复内容，将波动率、期权墙和异常成交归并为按需切换的标签页；首屏只保留 setup、关键价位、主要反证、未知项和图表，完整 provenance 与限制留在对应明细域。
+- [文档] 更新每日机会专题，固化专业摘要的信息层级、IV 模型区间公式与缺失值降级，以及 68%/95% 终值区间不得被解释为策略胜率或路径概率的边界；专题细节未重复写入根 README。
+- [修复] 单票机会页的美股分钟 K 线默认仅显示纽约常规时段 09:30–16:00 ET，并可切换含盘前盘后的 04:00–20:00 ET；EMA8/13 始终基于当前可见 bars 重算，数据时点同步取当前可见最后一根，日线隐藏时段切换。
+- [修复] 每日机会扫描在已启用 Moomoo OpenD 时优先读取本地美股日线，再回退 Yfinance/Longbridge；基础请求收敛为 35 秒独立预算，手动刷新同时绕过前后端已完成缓存，不再因远端限流长期停在“扫描中”。
+- [改进] 今日机会研究将基础扫描、市场背景与排名外增强分层：`unknown` 不再当失败门禁，Playbook/异常期权成交/期权墙/暗池背景不再重复冒充核心证据缺口；行情阻断显示具体原因，刷新失败时保留上一份可用列表。
+- [修复] Regime 新增 `regime-quality-v1` 快照质量合同：空 Sector/昨日结构/盘前不再产生 −5/−2/+3 伪分，SPY/VIX 核心缺失时 fail closed 且不展示成真实 no_trade，API/Web 明确 degraded、缺失域与非权威边界；今日日期统一为纽约市场日。
+- [改进] Regime 重算改为 Moomoo-first 有界取数：SPY/11 个板块/昨日结构复用本地只读日线，VIX 缺少 Moomoo 覆盖时使用 3 秒 Cboe 官方 CSV fallback；Finnhub 合并为两个 7 日区间请求并识别 403/timeout，Alpaca SPY 失败停止逐股扩散，避免远端串行请求令页面超时或把权限失败伪装成零事件。
+- [修复] Regime 仪表盘色带与后端 35/55/75 分档阈值重新对齐，degraded 状态改为 `CONTEXT ONLY · PROVISIONAL` 且不再给出执行指令；重算同时刷新 UTC 证据时间，Web 始终按纽约时区显示，修复本地时间误标为 ET。
 
 ## [3.12.0] - 2026-04-01
 

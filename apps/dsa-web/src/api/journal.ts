@@ -4,10 +4,24 @@ import { sessionCache } from '../utils/sessionCache';
 import type {
   HealthCheckItem,
   ImportResponse,
+  MoomooStatementPreview,
+  MoomooOpenApiPreview,
+  MoomooOpenApiImportConfirmResponse,
+  MoomooOpenApiImportPlan,
   JournalQaRequest,
   JournalQaResponse,
   JournalStatsByStyleResponse,
   JournalStatsResponse,
+  LedgerDataHealth,
+  LedgerImportResponse,
+  EpisodeBuildResponse,
+  CanonicalEpisodeBuildConfirmRequest,
+  CanonicalEpisodeBuildPlanResponse,
+  PositionEpisodeDetailResponse,
+  PositionEpisodeAiReviewResponse,
+  PositionEpisodeAiReviewUserContext,
+  PositionEpisodeFilters,
+  PositionEpisodeListResponse,
   RealityTestResponse,
   TradeItem,
   TradeListFilters,
@@ -81,6 +95,176 @@ export async function importJournalCsv(file: File, broker = 'moomoo_us'): Promis
     timeout: 60000,
   });
   return toCamelCase<ImportResponse>(data);
+}
+
+export async function previewJournalCsv(file: File): Promise<MoomooStatementPreview> {
+  const form = new FormData();
+  form.append('file', file);
+  const headers: { [key: string]: string | undefined } = { 'Content-Type': undefined };
+  const { data } = await apiClient.post(`${BASE}/v2/imports/preview`, form, {
+    headers,
+    timeout: 60000,
+  });
+  return toCamelCase<MoomooStatementPreview>(data);
+}
+
+export async function previewJournalOpenApiExport(
+  file: File,
+): Promise<MoomooOpenApiPreview> {
+  const form = new FormData();
+  form.append('file', file);
+  const headers: { [key: string]: string | undefined } = { 'Content-Type': undefined };
+  const { data } = await apiClient.post(`${BASE}/v2/openapi-imports/preview`, form, {
+    headers,
+    timeout: 60000,
+  });
+  return toCamelCase<MoomooOpenApiPreview>(data);
+}
+
+export async function planJournalOpenApiImport(
+  file: File,
+): Promise<MoomooOpenApiImportPlan> {
+  const form = new FormData();
+  form.append('file', file);
+  const headers: { [key: string]: string | undefined } = { 'Content-Type': undefined };
+  const { data } = await apiClient.post(`${BASE}/v2/openapi-imports/plan`, form, {
+    headers,
+    timeout: 60000,
+  });
+  return toCamelCase<MoomooOpenApiImportPlan>(data);
+}
+
+export async function confirmJournalOpenApiImport(
+  file: File,
+  previewKey: string,
+  acknowledgePartialWindow: boolean,
+): Promise<MoomooOpenApiImportConfirmResponse> {
+  const form = new FormData();
+  form.append('file', file);
+  const headers: { [key: string]: string | undefined } = { 'Content-Type': undefined };
+  const { data } = await apiClient.post(`${BASE}/v2/openapi-imports/confirm`, form, {
+    params: {
+      preview_key: previewKey,
+      acknowledge_partial_window: acknowledgePartialWindow,
+    },
+    headers,
+    timeout: 60000,
+  });
+  return toCamelCase<MoomooOpenApiImportConfirmResponse>(data);
+}
+
+export async function importJournalLedgerCsv(
+  file: File,
+  allowPartial: boolean,
+): Promise<LedgerImportResponse> {
+  const form = new FormData();
+  form.append('file', file);
+  const headers: { [key: string]: string | undefined } = { 'Content-Type': undefined };
+  const { data } = await apiClient.post(`${BASE}/v2/imports`, form, {
+    params: { allow_partial: allowPartial },
+    headers,
+    timeout: 60000,
+  });
+  return toCamelCase<LedgerImportResponse>(data);
+}
+
+export async function fetchLedgerDataHealth(): Promise<LedgerDataHealth> {
+  const { data } = await apiClient.get(`${BASE}/v2/data-health`);
+  return toCamelCase<LedgerDataHealth>(data);
+}
+
+export async function fetchPositionEpisodes(
+  filters: PositionEpisodeFilters = {},
+): Promise<PositionEpisodeListResponse> {
+  const { data } = await apiClient.get(`${BASE}/v2/position-episodes`, {
+    params: {
+      underlying: filters.underlying,
+      lifecycle_status: filters.lifecycleStatus || undefined,
+      completeness_status: filters.completenessStatus || undefined,
+      case_focus: filters.caseFocus || undefined,
+      build_id: filters.buildId,
+      page: filters.page ?? 1,
+      per_page: filters.perPage ?? 50,
+    },
+  });
+  return toCamelCase<PositionEpisodeListResponse>(data);
+}
+
+export async function fetchPositionEpisodeDetail(
+  episodeId: number,
+  buildId?: number,
+): Promise<PositionEpisodeDetailResponse> {
+  const { data } = await apiClient.get(`${BASE}/v2/position-episodes/${episodeId}`, {
+    params: { build_id: buildId },
+  });
+  return toCamelCase<PositionEpisodeDetailResponse>(data);
+}
+
+export async function createPositionEpisodeAiReview(
+  episodeId: number,
+  buildId: number,
+  enhanceWithModel = true,
+  userContext?: PositionEpisodeAiReviewUserContext,
+): Promise<PositionEpisodeAiReviewResponse> {
+  const snakeContext: Record<string, string> = {};
+  const addContextField = (key: string, value?: string) => {
+    const trimmed = value?.trim();
+    if (trimmed) snakeContext[key] = trimmed;
+  };
+  addContextField('setup_thesis', userContext?.setupThesis);
+  addContextField('entry_trigger', userContext?.entryTrigger);
+  addContextField('invalidation_plan', userContext?.invalidationPlan);
+  addContextField('position_rationale', userContext?.positionRationale);
+  addContextField('exit_reason', userContext?.exitReason);
+  addContextField('post_trade_reflection', userContext?.postTradeReflection);
+  const requestBody = Object.keys(snakeContext).length > 0
+    ? { user_context: snakeContext }
+    : undefined;
+  const { data } = await apiClient.post(
+    `${BASE}/v2/position-episodes/${episodeId}/ai-review`,
+    requestBody,
+    // Evidence-only reviews return without a provider call. Model enhancement
+    // has a 20-second server wall-clock deadline plus market-context loading.
+    { params: { build_id: buildId, enhance: enhanceWithModel }, timeout: 45000 },
+  );
+  return toCamelCase<PositionEpisodeAiReviewResponse>(data);
+}
+
+export async function createPositionEpisodeBuild(): Promise<EpisodeBuildResponse> {
+  const { data } = await apiClient.post(`${BASE}/v2/episode-builds`, undefined, {
+    params: { accept_assumed_flat: true },
+  });
+  return toCamelCase<EpisodeBuildResponse>(data);
+}
+
+export async function fetchCanonicalEpisodeBuildPreview(
+  canonicalSetId?: number,
+  accountKey?: string,
+): Promise<CanonicalEpisodeBuildPlanResponse> {
+  const { data } = await apiClient.get(`${BASE}/v2/episode-builds/canonical/preview`, {
+    params: {
+      canonical_set_id: canonicalSetId,
+      account_key: accountKey,
+    },
+  });
+  return toCamelCase<CanonicalEpisodeBuildPlanResponse>(data);
+}
+
+export async function createCanonicalPositionEpisodeBuild(
+  request: CanonicalEpisodeBuildConfirmRequest,
+  accountKey?: string,
+): Promise<EpisodeBuildResponse> {
+  const { data } = await apiClient.post(
+    `${BASE}/v2/episode-builds/canonical`,
+    {
+      canonical_set_id: request.canonicalSetId,
+      canonical_set_sha256: request.canonicalSetSha256,
+      build_key: request.buildKey,
+      accept_assumed_flat: request.acceptAssumedFlat,
+    },
+    { params: { account_key: accountKey } },
+  );
+  return toCamelCase<EpisodeBuildResponse>(data);
 }
 
 export async function fetchStatsByStyle(params: {

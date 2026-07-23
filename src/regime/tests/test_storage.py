@@ -2,7 +2,7 @@
 """Regime storage CRUD tests."""
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, timedelta, timezone
 
 from src.regime.classifier import RegimeResult
 from src.regime.storage import (
@@ -41,6 +41,7 @@ def test_save_and_fetch():
     assert row["score"] == 60
     assert row["label"] == "standard"
     assert row["snapshot"]["spy"]["close"] == 510
+    assert row["generated_at"].tzinfo is timezone.utc
 
 
 def test_upsert_updates_existing():

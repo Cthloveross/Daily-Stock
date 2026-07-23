@@ -99,6 +99,20 @@ AGENT_LITELLM_MODEL=deepseek/deepseek-reasoner
 LITELLM_FALLBACK_MODELS=openai/gpt-4o-mini,anthropic/claude-3-5-sonnet
 ```
 
+### Optional Review-only Model Chain
+
+The single-position workspace does not call a model for “Generate evidence review.” Only the optional model-enhancement action uses this chain:
+
+```env
+JOURNAL_AI_MODEL=<provider>/<model-name>
+JOURNAL_AI_FALLBACK_MODELS=<provider>/<fallback-model-name>
+```
+
+- If both settings are absent, reviews inherit the Agent chain.
+- If only the primary is set and the fallback setting is absent, the Agent chain is appended with duplicates removed.
+- An explicit `JOURNAL_AI_FALLBACK_MODELS=` disables further fallback.
+- GPT still requires a server-side OpenAI API key; a ChatGPT/Codex login or subscription is not an API credential.
+
 ### Example: Ollama Channel Mode (Local Models, No API Key)
 ```env
 # 1. Enable channel mode, declare ollama channel

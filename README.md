@@ -22,27 +22,30 @@
 
 </div>
 
-> **🧭 v4 Phase 0 — Mirror 层 · 已完工（2026-04-20）**
+> **🧭 v4 运行审计与 Options Trading OS 收敛中（2026-07-21）**
 >
-> 本 fork 在原仓库之上扩展了 **"美股期权 / LEAP / 趋势流" 陪跑系统**，不侵入 A 股 / 港股原链路：
-> - 🪞 **Phase 0 Mirror 层**（2026-04-20 完工）：Journal (Moomoo CSV → FIFO → **Reality Test**) · Regime 6 维度速度表 + Telegram 晨报 · Breakout Q1-Q5 假突破过滤 · AI 月度复盘 · 3 Agent Skills (`option_trader` / `leap_explorer` / `trend_follower`)
-> - 🟢 **Moomoo OpenAPI 集成 A/B/C/D**（2026-04-29 完工）：A 实时行情（K 线 / 报价）· B 真实账户**交割单自动同步**（每 15 分钟）· C 期权链 IV/Greeks 服务端值 · D KLine_1M push **实时突破检测** · _不规划下单 (Phase E)_
-> - ⚙️ **macOS LaunchAgent always-on 部署**：`bash scripts/install_launchagents.sh` 把 uvicorn + 同步 + 突破 daemon 全部纳入开机自启 + 崩溃自重启 + OpenD 断线自动重连。开机自动跑，**不再每天手动启**。
-> - 🎨 **Linear-Dark 终端化前端**：`/regime` 半圆速度表 (Fear & Greed 风) + 内联 TradingView · `/stocks/:ticker` Moomoo 实时 K 线 + MA 8/13/144/169 + 5 档新闻 sentiment 箭头 + LLM 中文摘要 · `/journal` 8 tab (Overview / Analysis / Trades / Reality / Framework / Ask AI / Reviews / Import) · 自动补全 + did-you-mean (`amaz` → `AMZN`) · sessionStorage TTL 缓存 · TopBar Moomoo Live 状态徽章
+> 当前产品目标已经收敛为：以 **Moomoo 订单、逐笔成交和真实费用** 为事实起点，重建期权策略生命周期，完成证据化复盘、盈亏归因和个人 Playbook。详细目标与阶段退出条件见 [产品章程与路线图](New-docs/architecture/05_PRODUCT_CHARTER_AND_ROADMAP.md)。
 >
-> **🚀 一行启动（Moomoo 用户）**：
+> - 🔒 **Moomoo 永久只读**：只查账户列表、历史订单、逐笔成交与费用；不读取交易密码，不解锁、不下单、不改单、不撤单。
+> - ✅ **真实读取已验证**：新增独立只读探测/导出，显式选择稳定账户、按 7 天分块、按稳定 ID 去重、分批获取费用，并且默认不写 Journal 数据库。只有订单/成交的代码、方向、数量、加权均价和费用全部对账通过才返回 `analysis_ready=true`；盘中费用延迟不会混进稳定分析。
+> - 🧾 **证据生命周期已启用**：Moomoo CSV 先只读预览，再由用户明确确认追加到可信证据账本（内部表名保留为 `journal_v2_*`）；当前 CSV 基线已生成 append-only PositionEpisode build。OpenAPI JSON 的 plan/confirm 只使用最新 accepted CSV baseline，并把 observations、identity provenance 与 canonical set 原子、幂等追加；另一个显式 preview/confirm 可重放冻结 canonical set，生成不自动替换默认 CSV build 的对比构建。当前真实基线为 574 个 aggregate order events + 5,400 个真实 fill、1,441 个生命周期，USD 151,750.75 费用守恒。没有已验证的期初持仓快照时，条件性 P&L 仍标记 `assumed_flat_unverified` 并排除在 headline 之外。旧 live writer 继续暂停。
+> - 🛑 **Always-on 暂停验收**：2026-07-20 审计发现旧 LaunchAgent 在 OpenD 离线时会无限重连并产生数 GB 日志，三项服务已卸载。连接快速失败和日志轮转已修复，但完成离线/在线 smoke 与观察前，不要执行 `scripts/install_launchagents.sh` 恢复常驻。
+> - 🧱 **现有能力保留**：Journal / Reality Test / Regime / Breakout / Options / Web 页面仍是后续演进起点；旧文档中预设的 LEAP、0DTE 与交易频率目标均降级为待真实数据验证的假设。
+>
+> **当前受控启动（Moomoo 用户）**：
 > ```bash
 > pip install -r requirements.txt && pip install moomoo-api
-> echo 'MOOMOO_OPEND_ENABLED=true' >> .env       # 然后开 OpenD GUI 登录
-> bash scripts/install_launchagents.sh           # 后端 + 同步 + 突破 daemon 全自动跑
-> open http://localhost:8000                     # 完事
+> echo 'MOOMOO_OPEND_ENABLED=true' >> .env       # 然后手动打开 OpenD GUI 登录并保持交易锁定
+> python scripts/probe_moomoo_readonly.py --days 30
+> python main.py --serve-only
+> open http://localhost:8000
 > ```
 >
-> **没有 Moomoo 账号也能用**：保持 `MOOMOO_OPEND_ENABLED=false`（默认）→ 系统全程走 yfinance 兜底，所有功能不变只是有 15 分钟延迟。
+> **没有 OpenD 也能运行行情分析**：保持 `MOOMOO_OPEND_ENABLED=false`（默认），行情链路会回退到 yfinance 等数据源；Moomoo 实时只读探测不可用，但已有 Moomoo CSV 的可信证据预览与导入不依赖 OpenD。
 >
-> **入门 / 完整架构 / 路由速查 → [`New-docs/architecture/04_CURRENT_STATE.md`](New-docs/architecture/04_CURRENT_STATE.md)** ←推荐先读这个
+> **当前状态 / 路由速查 → [`New-docs/architecture/04_CURRENT_STATE.md`](New-docs/architecture/04_CURRENT_STATE.md)**
 >
-> 其它专题：[Moomoo 路线图](New-docs/integrations/moomoo-roadmap.md) · [Moomoo 订阅 API](New-docs/integrations/moomoo-subscription.md) · [Phase 0 各 stage](New-docs/phase0/README.md) · [HOW_TO_USE](New-docs/phase0/HOW_TO_USE.md) · [设计系统](New-docs/design/Design_system.md)
+> 其它专题：[Phase 1.1 Moomoo 证据账本](New-docs/phase1/01_MOOMOO_EVIDENCE_LEDGER.md) · [Phase 1.2 PositionEpisode](New-docs/phase1/02_POSITION_EPISODES.md) · [Phase 1.3B OpenAPI/canonical persistence](New-docs/phase1/03_OPENAPI_CANONICAL.md) · [Phase 1.4 canonical 对比构建](New-docs/phase1/04_CANONICAL_EPISODE_BUILD.md) · [Moomoo 路线图](New-docs/integrations/moomoo-roadmap.md) · [Moomoo 订阅 API](New-docs/integrations/moomoo-subscription.md) · [Phase 0 各 stage](New-docs/phase0/README.md) · [HOW_TO_USE](New-docs/phase0/HOW_TO_USE.md) · [设计系统](New-docs/design/Design_system.md)
 
 ## 💖 赞助商 (Sponsors)
 <div align="center">
@@ -63,7 +66,8 @@
 | 基本面 | 结构化聚合 | 新增 `fundamental_context`（valuation/growth/earnings/institution/capital_flow/dragon_tiger/boards，其中 `earnings.data` 新增 `financial_report` 与 `dividend`，`boards` 表示板块涨跌榜），主链路 fail-open 降级 |
 | 策略 | 市场策略系统 | 内置 A股「三段式复盘策略」与美股「Regime Strategy」，输出进攻/均衡/防守或 risk-on/neutral/risk-off 计划，并附“仅供参考，不构成投资建议”提示 |
 | 复盘 | 大盘复盘 | 每日市场概览、板块涨跌；支持 cn(A股)/us(美股)/both(两者) 切换 |
-| 界面 | 双主题工作台 | Web 工作台现支持全新浅色主题与深色主题切换，首页 / 问股 / 回测 / 持仓 / 设置统一升级为同一套视觉与交互体系 |
+| 复盘 | Moomoo 证据与 PositionEpisode | CSV/OpenAPI 证据分别受控入账，冻结 canonical set 可显式 preview/confirm 为 append-only 对比构建；逐笔成交和汇总成交严格分开，新构建不自动替换默认 CSV build，期初边界未核验时不输出 headline P&L |
+| 界面 | 深色交易工作台 | Web 工作台当前采用统一的 Linear-Dark 设计 token，后续围绕 Today / Trades / Review / Analytics / Playbook / Data 重组交易任务流 |
 | 补全 | 智能补全 (MVP) | **[测试阶段]** 首页搜索框支持代码/名称/拼音/别名联想；索引已覆盖 A股、港股、美股三个市场，支持通过 Tushare 或 AkShare 数据源更新 |
 | 智能导入 | 多源导入 | 支持图片、CSV/Excel 文件、剪贴板粘贴；Vision LLM 提取代码+名称；置信度分层确认；名称→代码解析（本地+拼音+AkShare） |
 | 历史记录 | 批量管理 | 支持多选、全选及批量删除历史分析记录，优化管理效率与 UI/UX 体验 |
@@ -77,7 +81,7 @@
 
 > 回测页现支持“次日验证 / 1 日窗口”视图，可按股票代码和分析日期范围查看当时 AI 预测、次日实际涨跌以及区间准确率；该视图基于历史分析记录与 1 日回测结果，不代表真实成交流水。
 
-> Web 工作台已完成一轮 UI 升级：新增完整浅色主题，并支持浅色 / 深色主题一键切换；首页、问股、回测、持仓、设置页改为共享同一套设计 token、输入表面、状态反馈和抽屉/滚动语义，日常使用与移动端浏览更连贯。
+> Web `/journal` 默认进入“仓位复盘”，读取当前 CSV 基线的 immutable build；“交易证据”页支持 CSV 预览后显式保存，以及 OpenAPI JSON 的零证据行写入 plan 和局部范围确认。OpenAPI confirm 只追加证据与 canonical provenance；冻结 canonical set 需再单独 preview/confirm 才会生成对比构建，而且不会自动切换默认视图。新的 PositionEpisode 按有符号持仓 `0 -> 非 0 -> 0` 构建，不是 FIFO。旧 Overview、Trades、Reality、Analysis 等 FIFO 页面仅作隔离存档，不得与可信账本指标混算。完整口径见 [Phase 1.2](New-docs/phase1/02_POSITION_EPISODES.md)、[Phase 1.3B](New-docs/phase1/03_OPENAPI_CANONICAL.md)与 [Phase 1.4](New-docs/phase1/04_CANONICAL_EPISODE_BUILD.md)。
 
 > 问股页进一步补强了消息复制、会话导出、通知发送、历史删除和追问上下文保护；首页与报告抽屉的复制反馈、空态和错误态也已按面板独立收口，减少误触和状态串扰。
 
@@ -142,9 +146,13 @@
 | `OPENAI_BASE_URL` | OpenAI 兼容 API 地址（如 `https://api.deepseek.com/v1`） | 可选 |
 | `OPENAI_MODEL` | 模型名称（如 `gemini-3.1-pro-preview`、`gemini-3-flash-preview`、`gpt-5.2`） | 可选 |
 | `OPENAI_VISION_MODEL` | 图片识别专用模型（部分第三方模型不支持图像；不填则用 `OPENAI_MODEL`） | 可选 |
+| `JOURNAL_AI_MODEL` | 仓位复盘专用模型，格式 `provider/model`；留空时继承 Agent 模型链 | 可选 |
+| `JOURNAL_AI_FALLBACK_MODELS` | 仓位复盘专用备用模型，逗号分隔；显式留空表示不回退 | 可选 |
 | `OLLAMA_API_BASE` | Ollama 本地服务地址（如 `http://localhost:11434`），本地/Docker 部署时使用，**不要**用 `OPENAI_BASE_URL` 配置 Ollama，详见 [LLM 配置指南 - Ollama](New-docs/configuration/LLM_CONFIG_GUIDE.md#示例-4使用-ollama-本地模型) | 可选 |
 
 > 注：AI 优先级 Gemini > Anthropic > OpenAI（含 AIHubmix）> Ollama，至少配置一个。`AIHUBMIX_KEY` 无需配置 `OPENAI_BASE_URL`，系统自动适配。图片识别需 Vision 能力模型。DeepSeek 思考模式（deepseek-reasoner、deepseek-r1、qwq、deepseek-chat）按模型名自动识别，无需额外配置。**Ollama 本地模型**（无需 API Key）必须使用 `OLLAMA_API_BASE`，误用 `OPENAI_BASE_URL` 会导致 404。
+
+> 仓位复盘先生成不依赖外部模型的本地证据复盘，再由用户按需请求模型增强。单回合页面还提供按 `build_id + episode_id` 隔离的浏览器本机交易逻辑草稿；草稿不会写入 Moomoo 或证据账本，只有非空字段会随本次复盘请求发送，并始终标记为未经独立验证的用户自述。证据复盘只把草稿发给本机服务；点击模型增强时，草稿还会发送给已配置的第三方模型供应商。网站内自动使用 GPT 仍需要服务端 OpenAI API Key；ChatGPT/Codex 登录或订阅不会自动成为本地网站的 API 凭据。只增加 OpenAI Key 但保留 Gemini 自动主模型时，复盘仍可能优先走 Gemini；需要 GPT 时请同时显式设置 `JOURNAL_AI_MODEL`。
 
 <details>
 <summary><b>通知渠道配置</b>（点击展开，至少配置一个）</summary>

@@ -47,6 +47,7 @@ from zoneinfo import ZoneInfo
 
 from src.journal.brokers.moomoo_us import MoomooOrder
 from src.options.occ_parser import parse_symbol
+from src.services.moomoo_runtime import MoomooRuntimeError, ensure_opend_ready
 
 __all__ = [
     "MoomooLiveError",
@@ -165,7 +166,12 @@ def _build_order(
 
 
 def _ctx_open(host: str, port: int, market: str):
-    """Open ``OpenSecTradeContext`` lazily so this module imports without the SDK."""
+    """Open a trade context only after a bounded, read-only OpenD preflight."""
+    try:
+        ensure_opend_ready(host=host, port=port)
+    except MoomooRuntimeError as exc:
+        raise MoomooLiveError(f"OpenD preflight failed: {exc}") from exc
+
     from moomoo import OpenSecTradeContext, SecurityFirm, TrdMarket
 
     market_enum = getattr(TrdMarket, market.upper())
@@ -336,15 +342,16 @@ def fetch_orders_as_journal(
         raise ValueError(f"invalid trd_env={trd_env!r}; expected SIMULATE or LIVE")
 
     try:
-        from moomoo import TrdEnv  # noqa: F401  — early SDK probe
+        from moomoo import TrdEnv
     except ImportError as exc:
         raise MoomooLiveError(
             "moomoo-api SDK not installed. `pip install moomoo-api>=10.4.6408`"
         ) from exc
 
-    from moomoo import TrdEnv
-
-    env_enum = getattr(TrdEnv, trd_env)
+    # The application-level contract uses LIVE because it is clearer to users.
+    # Moomoo SDK 10.x calls that same real-account environment ``REAL`` and has
+    # no ``TrdEnv.LIVE`` attribute, so translate at this boundary.
+    env_enum = TrdEnv.REAL if trd_env == "LIVE" else TrdEnv.SIMULATE
     fmt = "%Y-%m-%d %H:%M:%S"
     start_str = start.strftime(fmt)
     end_str = end.strftime(fmt)

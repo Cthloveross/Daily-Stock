@@ -10,7 +10,7 @@ import argparse
 import logging
 from datetime import date, timedelta
 
-from src.regime.classifier import compute_regime_score
+from src.regime.classifier import compute_regime_score, current_market_date
 
 
 def _is_weekday(d: date) -> bool:
@@ -26,7 +26,7 @@ def main() -> None:
 
     ok = 0
     for i in range(args.days, -1, -1):
-        d = date.today() - timedelta(days=i)
+        d = current_market_date() - timedelta(days=i)
         if not _is_weekday(d):
             continue
         try:

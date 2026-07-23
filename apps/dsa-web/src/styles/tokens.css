@@ -6,34 +6,34 @@
   /* ============================================================ */
   /* COLOR — BACKGROUND                                           */
   /* ============================================================ */
-  --bg-0: #08090a;
-  --bg-1: #0e0f11;
-  --bg-2: #16171a;
-  --bg-3: #1e1f23;
+  --bg-0: #0f1216;
+  --bg-1: #151a20;
+  --bg-2: #1b222a;
+  --bg-3: #242d37;
 
   /* ============================================================ */
   /* COLOR — BORDER                                               */
   /* ============================================================ */
-  --border-subtle:  #1d1e22;
-  --border-default: #26272c;
-  --border-strong:  #3a3b41;
+  --border-subtle:  #252d36;
+  --border-default: #303a45;
+  --border-strong:  #465363;
 
   /* ============================================================ */
   /* COLOR — TEXT                                                 */
   /* ============================================================ */
-  --text-1: #f4f4f7;
-  --text-2: #c4c4cc;
-  --text-3: #8a8a94;
-  --text-4: #5a5a62;
+  --text-1: #f1f4f7;
+  --text-2: #c1c8d0;
+  --text-3: #87919c;
+  --text-4: #626d78;
 
   /* ============================================================ */
-  /* COLOR — ACCENT (violet-blue, Linear-inspired)               */
+  /* COLOR — ACCENT (single restrained research blue)            */
   /* ============================================================ */
-  --accent:                #7170ff;
-  --accent-hover:          #8584ff;
-  --accent-active:         #5e5dff;
-  --accent-subtle-bg:      rgba(113, 112, 255, 0.12);
-  --accent-subtle-border:  rgba(113, 112, 255, 0.24);
+  --accent:                #2f6fed;
+  --accent-hover:          #4c82ef;
+  --accent-active:         #245bc7;
+  --accent-subtle-bg:      rgba(47, 111, 237, 0.12);
+  --accent-subtle-border:  rgba(47, 111, 237, 0.24);
 
   /* ============================================================ */
   /* COLOR — SEMANTIC                                             */
@@ -53,7 +53,7 @@
   /* ============================================================ */
   /* COLOR — CHART SERIES (multi-series only)                    */
   /* ============================================================ */
-  --chart-1: #7170ff;
+  --chart-1: #2f6fed;
   --chart-2: #3fb950;
   --chart-3: #f85149;
   --chart-4: #d29922;
@@ -63,7 +63,7 @@
   /* ============================================================ */
   /* TYPOGRAPHY — FONT STACKS                                    */
   /* ============================================================ */
-  --font-sans: "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-sans: "Geist Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: "Geist Mono", ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
 
   /* ============================================================ */

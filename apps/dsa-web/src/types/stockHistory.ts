@@ -1,5 +1,6 @@
 export type Timeframe =
   | '1m'
+  | '2m'
   | '5m'
   | '15m'
   | '30m'
@@ -25,6 +26,10 @@ export interface StockHistory {
   stockCode: string;
   stockName?: string | null;
   period: Timeframe;
+  source?: string | null;
+  coverageStart?: string | null;
+  coverageEnd?: string | null;
+  lastBarAt?: string | null;
   data: StockKLine[];
 }
 

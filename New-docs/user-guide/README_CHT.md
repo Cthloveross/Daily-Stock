@@ -92,8 +92,12 @@
 | `OPENAI_API_KEY` | OpenAI 兼容 API Key（支持 DeepSeek、通義千問等） | 可選 |
 | `OPENAI_BASE_URL` | OpenAI 兼容 API 地址（如 `https://api.deepseek.com/v1`） | 可選 |
 | `OPENAI_MODEL` | 模型名稱（如 `deepseek-chat`） | 可選 |
+| `JOURNAL_AI_MODEL` | 僅供倉位復盤使用的模型，格式為 `provider/model`；留空時繼承 Agent 模型鏈 | 可選 |
+| `JOURNAL_AI_FALLBACK_MODELS` | 倉位復盤專用備選模型，逗號分隔；顯式留空表示不回退 | 可選 |
 
 > *注：`GEMINI_API_KEY` 和 `OPENAI_API_KEY` 至少配置一個
+
+> 倉位復盤會先提供不依賴外部模型的本地證據復盤。單回合頁面另有六欄交易邏輯草稿，依 build 與 episode 隔離並只保存在此瀏覽器；它不會寫入 Moomoo 或證據帳本，只有非空欄位會作為未獨立驗證的使用者自述隨單次復盤送出。證據復盤只送到本機服務；點選模型增強時，內容也會送到已設定的第三方模型供應商。若要在本地網站內使用 GPT 增強，仍需服務端 OpenAI API Key；ChatGPT/Codex 登入或訂閱不等於 API 憑據。已有 Gemini 自動主模型時，還需顯式設定 `JOURNAL_AI_MODEL`。
 
 <details>
 <summary><b>通知渠道配置</b>（點擊展開，至少配置一個）</summary>

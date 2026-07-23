@@ -291,7 +291,9 @@ Current UI uses `shadow-xl` / `shadow-lg` to lift cards. This creates a "floatin
 <div className="bg-bg-1 hover:bg-bg-2 border border-border-subtle rounded-md p-4">...</div>
 ```
 
-Linear, Vercel, Koyfin — none use drop shadows. Elevation is a stack of lighter backgrounds, not blur.
+Professional research workspaces such as Koyfin rely primarily on background
+steps and dividers rather than decorative glow. Elevation is a stack of lighter
+backgrounds, not blur.
 
 ---
 
@@ -303,11 +305,11 @@ All tokens are defined as CSS custom properties in `tokens.css` (full file in Se
 
 | Token | Hex | Usage |
 |---|---|---|
-| `--bg-0` | `#08090a` | Page background (document body) |
-| `--bg-1` | `#0e0f11` | Primary surface (main content regions, table backgrounds) |
-| `--bg-2` | `#16171a` | Elevated surface (hovered row, modal, popover, dropdown) |
-| `--bg-3` | `#1e1f23` | Highest elevation (selected row, active button state) |
-| `--bg-accent-subtle` | `rgba(113,112,255,0.08)` | Accent-tinted background for selected states |
+| `--bg-0` | `#0f1216` | Page background (document body) |
+| `--bg-1` | `#151a20` | Primary surface (main content regions, table backgrounds) |
+| `--bg-2` | `#1b222a` | Elevated surface (hovered row, modal, popover, dropdown) |
+| `--bg-3` | `#242d37` | Highest elevation (selected row, active button state) |
+| `--bg-accent-subtle` | `rgba(47,111,237,0.08)` | Accent-tinted background for selected states |
 
 **Why 5 steps?** Linear uses 4; we add one for selected-row states which need to be clearly distinct from hover. Pages must never use more than 3 levels simultaneously — too many elevations flatten the hierarchy.
 
@@ -315,36 +317,39 @@ All tokens are defined as CSS custom properties in `tokens.css` (full file in Se
 
 | Token | Hex | Usage |
 |---|---|---|
-| `--border-subtle` | `#1d1e22` | Default border (table rules, card outlines, input borders) |
-| `--border-default` | `#26272c` | Stronger border (focused input, active tab underline) |
-| `--border-strong` | `#3a3b41` | Emphatic border (only for disabled states or separators between major regions) |
+| `--border-subtle` | `#252d36` | Default border (table rules, card outlines, input borders) |
+| `--border-default` | `#303a45` | Stronger border (focused input, active tab underline) |
+| `--border-strong` | `#465363` | Emphatic border (only for disabled states or separators between major regions) |
 
 ### 4.3 Text scale (4 steps)
 
 | Token | Hex | Usage |
 |---|---|---|
-| `--text-1` | `#e9e9ec` | Primary text (body copy, prices, headings) |
-| `--text-2` | `#a5a5ad` | Secondary text (metadata, timestamps, supporting labels) |
-| `--text-3` | `#6f6f78` | Tertiary text (section labels, placeholder, disabled inline) |
-| `--text-4` | `#4a4a52` | Quaternary text (disabled, not-yet-loaded) |
+| `--text-1` | `#f1f4f7` | Primary text (body copy, prices, headings) |
+| `--text-2` | `#c1c8d0` | Secondary text (metadata, timestamps, supporting labels) |
+| `--text-3` | `#87919c` | Tertiary text (section labels, placeholder, disabled inline) |
+| `--text-4` | `#626d78` | Quaternary text (disabled, not-yet-loaded) |
 
 **Contrast verification** (against `--bg-0`):
-- `--text-1`: 15.1:1 ✓ AAA
-- `--text-2`: 7.4:1 ✓ AAA large / AA normal
-- `--text-3`: 3.8:1 ✓ AA large only — use for 11px+ labels, never for body copy
-- `--text-4`: 2.0:1 — disabled only
+- `--text-1`: 17.0:1 ✓ AAA
+- `--text-2`: 11.1:1 ✓ AAA
+- `--text-3`: 5.9:1 ✓ AA normal
+- `--text-4`: 3.6:1 — disabled/large text only
 
 ### 4.4 Accent (single color)
 
 | Token | Hex | Usage |
 |---|---|---|
-| `--accent` | `#7170ff` | Primary interactive color (primary button, active link, focus ring, selected row tint) |
-| `--accent-hover` | `#8584ff` | Accent on hover |
-| `--accent-active` | `#5e5dff` | Accent on pressed/active |
-| `--accent-subtle-bg` | `rgba(113,112,255,0.12)` | Accent tinted background |
-| `--accent-subtle-border` | `rgba(113,112,255,0.24)` | Accent tinted border |
+| `--accent` | `#2f6fed` | Primary interactive color (primary button, active link, focus ring, selected row tint) |
+| `--accent-hover` | `#4c82ef` | Accent on hover |
+| `--accent-active` | `#245bc7` | Accent on pressed/active |
+| `--accent-subtle-bg` | `rgba(47,111,237,0.12)` | Accent tinted background |
+| `--accent-subtle-border` | `rgba(47,111,237,0.24)` | Accent tinted border |
 
-**Why violet-blue?** Linear's signature. Cooler than blue (which is overused in finance — everyone uses GitHub `#58a6ff`), warmer than pure indigo (which reads as corporate). One accent color, not two — never introduce a "secondary accent."
+**Why restrained blue?** The product is a research workspace, so interaction
+must read as navigation rather than decoration. A single moderate blue is used
+for links, focus and selection; cyan/purple remain chart-series colors only and
+must not compete as a second interface accent.
 
 ### 4.5 Semantic colors (3 pairs)
 
@@ -378,7 +383,7 @@ FLAT / NEUTRAL — no dedicated color, use --text-3
 Used only in rare multi-series line charts (e.g., comparing 5 stocks). Never in UI chrome.
 
 ```
---chart-1: #7170ff  (accent — primary series)
+--chart-1: #2f6fed  (accent — primary series)
 --chart-2: #3fb950  (up-green — second series)
 --chart-3: #f85149  (down-red — third series)
 --chart-4: #d29922  (amber — fourth series)
@@ -576,34 +581,34 @@ Place at `apps/dsa-web/src/styles/tokens.css`. Import once from `main.tsx` befor
   /* ============================================================ */
   /* COLOR — BACKGROUND                                           */
   /* ============================================================ */
-  --bg-0: #08090a;
-  --bg-1: #0e0f11;
-  --bg-2: #16171a;
-  --bg-3: #1e1f23;
+  --bg-0: #0f1216;
+  --bg-1: #151a20;
+  --bg-2: #1b222a;
+  --bg-3: #242d37;
 
   /* ============================================================ */
   /* COLOR — BORDER                                               */
   /* ============================================================ */
-  --border-subtle:  #1d1e22;
-  --border-default: #26272c;
-  --border-strong:  #3a3b41;
+  --border-subtle:  #252d36;
+  --border-default: #303a45;
+  --border-strong:  #465363;
 
   /* ============================================================ */
   /* COLOR — TEXT                                                 */
   /* ============================================================ */
-  --text-1: #e9e9ec;
-  --text-2: #a5a5ad;
-  --text-3: #6f6f78;
-  --text-4: #4a4a52;
+  --text-1: #f1f4f7;
+  --text-2: #c1c8d0;
+  --text-3: #87919c;
+  --text-4: #626d78;
 
   /* ============================================================ */
-  /* COLOR — ACCENT (violet-blue, Linear-inspired)               */
+  /* COLOR — ACCENT (single restrained research blue)            */
   /* ============================================================ */
-  --accent:                #7170ff;
-  --accent-hover:          #8584ff;
-  --accent-active:         #5e5dff;
-  --accent-subtle-bg:      rgba(113, 112, 255, 0.12);
-  --accent-subtle-border:  rgba(113, 112, 255, 0.24);
+  --accent:                #2f6fed;
+  --accent-hover:          #4c82ef;
+  --accent-active:         #245bc7;
+  --accent-subtle-bg:      rgba(47, 111, 237, 0.12);
+  --accent-subtle-border:  rgba(47, 111, 237, 0.24);
 
   /* ============================================================ */
   /* COLOR — SEMANTIC                                             */
@@ -623,7 +628,7 @@ Place at `apps/dsa-web/src/styles/tokens.css`. Import once from `main.tsx` befor
   /* ============================================================ */
   /* COLOR — CHART SERIES (multi-series only)                    */
   /* ============================================================ */
-  --chart-1: #7170ff;
+  --chart-1: #2f6fed;
   --chart-2: #3fb950;
   --chart-3: #f85149;
   --chart-4: #d29922;

@@ -29,17 +29,25 @@ export const TopBar: React.FC<TopBarProps> = ({ onSearchOpen }) => {
   const navigate = useNavigate();
   const today = useRegimeStore((s) => s.today);
   const state = deriveState(today?.label);
-  const stateColor = STATE_COLOR[state] ?? 'text-text-1';
+  const stateColor = today?.qualityState === 'degraded'
+    ? 'text-warn-strong'
+    : today?.qualityState === 'unavailable'
+      ? 'text-text-2'
+      : (STATE_COLOR[state] ?? 'text-text-1');
 
   const signStr = (() => {
-    if (!today) return '—';
+    if (!today || today.qualityState === 'unavailable') return '—';
     const n = today.score;
     return (n > 0 ? '+' : n < 0 ? '\u2212' : '') + Math.abs(n).toFixed(0);
   })();
 
-  const labelDisplay = today?.label
-    ? today.label.replace(/_/g, ' ').toUpperCase()
-    : '';
+  const labelDisplay = today?.qualityState === 'unavailable'
+    ? 'UNAVAILABLE'
+    : today?.qualityState === 'degraded'
+      ? 'PROVISIONAL'
+      : today?.label
+        ? today.label.replace(/_/g, ' ').toUpperCase()
+        : '';
 
   return (
     <header className="flex h-14 w-full items-center gap-3 border-b border-subtle bg-bg-0 px-4">

@@ -1,9 +1,11 @@
-# Daily-Stock — 当前架构与功能（2026-04 快照）
+# Daily-Stock — 当前架构与功能（2026-07-20 审计快照）
 
 > 这份文档说明 fork 当前的实际形态。**和上游 `ZhuLinsen/daily_stock_analysis` 已经显著分叉**：
 > - Phase 0 v4 Mirror 层（完工于 2026-04-20）—— Journal / Regime / Breakout / Options / LEAP
 > - Moomoo OpenAPI 集成 Phase A/B/C/D（完工于 2026-04-29）
 > - macOS LaunchAgent "always-on" 部署 + sessionStorage 缓存 + 实时突破 daemon
+>
+> 2026-07-20 运行审计发现旧 LaunchAgent 在 OpenD 离线时会被 SDK 同步连接阻塞并无限刷日志，三项服务现已暂停。快速失败、资源回收、日志硬上限和只读探测已有测试与真实 smoke，但仍需 24 小时观察；旧 Journal sync 因账户选择与费用口径不可信而明确禁用，不随服务恢复。产品实施顺序以 [`05_PRODUCT_CHARTER_AND_ROADMAP.md`](./05_PRODUCT_CHARTER_AND_ROADMAP.md) 为准。
 >
 > 旧的"配股票池 → 跑分析 → 推 Telegram"链路保留作为兼容路径，但本 fork 的核心已转向**单人交易终端 + 实时陪跑系统**。
 
@@ -23,7 +25,7 @@
 └──────────────────────┬──────────────────────────────────────────┘
                        │ HTTP (FastAPI on 8000)
 ┌──────────────────────┴──────────────────────────────────────────┐
-│ uvicorn 后端（macOS LaunchAgent 守护，开机自启）                 │
+│ uvicorn 后端（当前手动受控启动；LaunchAgent 暂停验收）          │
 │  ├─ Phase 0 modules: journal / regime / breakout / options/lab │
 │  ├─ Moomoo OpenAPI 集成 Phase A-D                              │
 │  ├─ Search providers: Tavily / Brave / SerpAPI / SearXNG ...   │
@@ -76,7 +78,7 @@
   /reality-test               Reality Test 灵魂指标
   /stats, /stats-by-style     统计 + 按 trade_style 聚合
   /qa                         用户 framework + 最近交易 → LLM 中文回答
-  /sync-live                  从 Moomoo OpenD 同步真实账户交割单
+  /sync-live                  409：旧入库链路暂停，不创建 SDK Context、不写库
   /reviews/{ym}, /reviews/{y}/{m}/generate   月度 AI 复盘
   /import                     上传 CSV
 /system
@@ -174,10 +176,10 @@ src/agent/        Skill bundles (option_trader / leap_explorer / trend_follower)
 | Phase | 范围 | 关键文件 | 状态 |
 |---|---|---|---|
 | **A · 行情** | quote / 日 K / 1m-1h intraday | [`data_provider/moomoo_fetcher.py`](../../data_provider/moomoo_fetcher.py) | ✅ |
-| **B · 交割单同步** | history_deal/order_list_query → JournalOrder pipeline | [`src/journal/brokers/moomoo_live.py`](../../src/journal/brokers/moomoo_live.py) + [`src/services/moomoo_sync_service.py`](../../src/services/moomoo_sync_service.py) | ✅ |
+| **B · 交割单事实读取** | get_acc_list + history order/deal + order fees → 去标识化导出 | [`src/journal/brokers/moomoo_readonly.py`](../../src/journal/brokers/moomoo_readonly.py) + [`scripts/probe_moomoo_readonly.py`](../../scripts/probe_moomoo_readonly.py) | ✅ 只读读取、分块、稳定 ID、费用和完整对账已实测；⚠️ 正式 provenance 入库未实现，旧 writer 已暂停 |
 | **C · 期权 IV** | get_option_chain (服务端 IV/Greeks) | [`data_provider/moomoo_options.py`](../../data_provider/moomoo_options.py) | ✅ |
 | **D · 实时突破** | KLine_1M push + Q1-Q5 过滤 + 5 min cooldown 去重 | [`src/breakout/live_runner.py`](../../src/breakout/live_runner.py) | ✅ |
-| E · 下单 | TrdEnv.SIMULATE / LIVE | — | ❌ 不规划（安全） |
+| E · 下单 | 解锁 / 下单 / 改单 / 撤单 | — | ❌ 永久排除（安全边界） |
 
 详情见 [moomoo-roadmap.md](../integrations/moomoo-roadmap.md) + [moomoo-subscription.md](../integrations/moomoo-subscription.md)。
 
@@ -185,24 +187,30 @@ src/agent/        Skill bundles (option_trader / leap_explorer / trend_follower)
 
 ## 六、macOS Always-On 部署
 
-3 个 `~/Library/LaunchAgents/` 守护：
+仓库保留 3 个 `~/Library/LaunchAgents/` 模板，但 2026-07-20 审计期间均已卸载，不能把下表理解为当前正在运行：
 
 | LaunchAgent | 职责 | 频率 |
 |---|---|---|
 | `com.dailystock.uvicorn` | 后端 + 前端 static (8000) | 开机自启，崩了 30s 重启 |
-| `com.dailystock.moomoo-sync` | Phase B 拉新交割单 | 每 15 分钟 |
+| `com.dailystock.moomoo-sync` | 旧 Phase B writer（当前入口只返回暂停状态） | 每 15 分钟模板，当前未加载 |
 | `com.dailystock.breakout-live` | Phase D 实时突破 daemon | 常驻 + 自动重连 OpenD |
 
-**装/卸/状态**：
+三个 LaunchAgent 均通过 `scripts/run_with_rotating_logs.py` 分流并轮转子进程
+stdout/stderr；沿用原日志路径，每个活动文件上限 10 MiB、保留 3 个备份，
+LaunchAgent 自身输出指向 `/dev/null`，避免固定文件无限增长。
+
+**装/卸/状态**（审计期间只使用状态与卸载；不要执行全量安装）：
 ```bash
-bash scripts/install_launchagents.sh        # 装 + 重载
 bash scripts/launchagent_status.sh          # 看 PID + 最后日志
 bash scripts/uninstall_launchagents.sh      # 全清
+# bash scripts/install_launchagents.sh      # 暂停使用，需完成 24 小时验收后逐项恢复
+# bash scripts/install_launchagents.sh --only uvicorn
+# 上一行仅恢复 Web/API，不会加载旧同步 writer 或 breakout；仍需先完成验收
 ```
 
 OpenD 本身在 macOS 系统设置 → 通用 → 登录项里勾上"Moomoo OpenD"就能开机自启 + Auto Login。
 
-**用户每日唯一手动步骤**：开 Mac → 看到 OpenD 已登录 → 浏览器打开 `localhost:8000`，完事。
+恢复 always-on 前必须先通过离线快速失败、日志轮转、单实例和 24 小时日志增长验收。当前安全启动方式是：先确认 OpenD 已登录且保持交易锁定，再手动启动受控服务；项目不读取或保存交易密码。即使其他服务恢复，旧 Moomoo Journal writer 也保持禁用，直至新 importer 完成稳定账户、完整费用、provenance 与策略生命周期对账。
 
 ---
 
@@ -213,7 +221,7 @@ OpenD 本身在 macOS 系统设置 → 通用 → 登录项里勾上"Moomoo Open
 - **本地 watchlist**：`useUserWatchlistStore` (zustand+persist) → `dsa-user-watchlist` localStorage key，刷新不丢。
 - **Journal framework**：`useJournalFrameworkStore` → `dsa-journal-framework`，用户写一段文本作 AI 分析交割单的"大前提"。
 - **TickerPicker autocomplete**：`useStockIndex` 加载 `public/stock-index.json`，前缀匹配 + Levenshtein fuzzy 兜底（"amaz" → "AMZN" did-you-mean）。
-- **MoomooBadge** in TopBar：每 30s 拉一次 `/api/v1/system/moomoo-status`，3 态：MOOMOO LIVE 绿 / Moomoo offline 黄 / yfinance 灰。
+- **MoomooBadge** in TopBar：每 30s 拉一次 `/api/v1/system/moomoo-status`，3 态：Moomoo 可达且只读（绿）/ Moomoo offline（黄）/ yfinance（灰）。`connected` 当前只表示有界 TCP 探测成功，不表示交割单已经同步；端点不能为轮询创建一个会无限重连的 SDK Context。
 
 ---
 
@@ -225,6 +233,7 @@ OpenD 本身在 macOS 系统设置 → 通用 → 登录项里勾上"Moomoo Open
 - ⚠️ **Moomoo IV 盘后/无 LV2 时为 0**：自动 fallback yfinance。
 - ⚠️ **Phase D 突破 push 无通知渠道**：现在仅写到 `logs/breakout-live.jsonl`；接 Telegram bot 是用户层加 hook 的事。
 - 📋 **A 股 / 港股的 intraday**：Moomoo 支持但 fetcher 路由暂只优先美股。
+- ⚠️ **现有 Journal 不是完整期权策略账本**：当前 FIFO 行模型不能可靠表达逐笔费用、分批、多腿、roll、行权/指派和完整证据链；不要把现有聚合 P&L 当作最终券商对账结论。
 
 ---
 

@@ -1,6 +1,6 @@
 import type React from 'react';
-import { useEffect, useMemo, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import JournalImport from '../components/journal/JournalImport';
 import DTEDistribution from '../components/journal/DTEDistribution';
 import MonthlyReviewPanel from '../components/journal/MonthlyReviewPanel';
@@ -10,25 +10,43 @@ import StyleBreakdown from '../components/journal/StyleBreakdown';
 import PnLByDte from '../components/journal/PnLByDte';
 import FrameworkPanel from '../components/journal/FrameworkPanel';
 import AskJournalChat from '../components/journal/AskJournalChat';
+import PositionEpisodesPanel from '../components/journal/PositionEpisodesPanel';
+import { positionReviewPath } from '../components/journal/review/journalReviewRouting';
 import { useJournalStore } from '../stores/journalStore';
+import { usePositionEpisodes } from '../hooks/usePositionEpisodes';
 import { fetchStatsByStyle } from '../api/journal';
 import { parseApiError, type ParsedApiError } from '../api/error';
-import type { JournalStatsByStyleResponse, TradeItem } from '../types/journal';
+import type {
+  JournalStatsByStyleResponse,
+  PositionEpisodeFilters,
+  PositionEpisodeItem,
+  TradeItem,
+} from '../types/journal';
 
-type Tab = 'overview' | 'analysis' | 'trades' | 'reality' | 'framework' | 'ask' | 'reviews' | 'import';
+type Tab = 'positions' | 'import' | 'overview' | 'analysis' | 'trades' | 'reality' | 'framework' | 'ask' | 'reviews';
 
-const TAB_ORDER: Tab[] = ['overview', 'analysis', 'trades', 'reality', 'framework', 'ask', 'reviews', 'import'];
+const TAB_ORDER: Tab[] = ['positions', 'import', 'overview', 'analysis', 'trades', 'reality', 'framework', 'ask', 'reviews'];
 
 const TAB_LABEL: Record<Tab, string> = {
-  overview: 'Overview',
-  analysis: 'Analysis',
-  trades: 'Trades',
-  reality: 'Reality',
-  framework: 'Framework',
-  ask: 'Ask AI',
-  reviews: 'Reviews',
-  import: 'Import',
+  positions: '仓位复盘',
+  import: '交易证据',
+  overview: 'Overview · Legacy 存档',
+  analysis: 'Analysis · Legacy',
+  trades: 'Trades · Legacy',
+  reality: 'Reality · Legacy',
+  framework: 'Framework · Legacy',
+  ask: 'Ask AI · Legacy',
+  reviews: 'Reviews · Legacy',
 };
+
+const POSITION_STATUSES = new Set(['open', 'closed']);
+const POSITION_COMPLETENESS = new Set(['exact', 'complete', 'partial']);
+const POSITION_CASE_FOCUS = new Set([
+  'top_profit',
+  'top_loss',
+  'largest_fee',
+  'longest_hold',
+]);
 
 const fmtMoney = (n?: number | null) => {
   if (n == null) return '—';
@@ -38,38 +56,86 @@ const fmtMoney = (n?: number | null) => {
 const fmtPct = (n?: number | null) => (n == null ? '—' : `${(n * 100).toFixed(0)}%`);
 
 const JournalPage: React.FC = () => {
+  const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
-  const initialTab = (params.get('tab') as Tab) || 'overview';
+  const requestedTab = (params.get('tab') as Tab) || 'positions';
+  const tab = TAB_ORDER.includes(requestedTab) ? requestedTab : 'positions';
   const initialStyle = params.get('style') ?? '';
 
-  const [tab, setTabRaw] = useState<Tab>(TAB_ORDER.includes(initialTab) ? initialTab : 'overview');
   const [symbol, setSymbol] = useState('');
   const [style, setStyle] = useState(initialStyle);
   const [statusFilter, setStatusFilter] = useState('');
   const [selected, setSelected] = useState<TradeItem | null>(null);
+  const overviewLoadedRef = useRef(false);
+  const previousTabRef = useRef<Tab | null>(null);
 
   // analysis state
   const [statsByStyle, setStatsByStyle] = useState<JournalStatsByStyleResponse | null>(null);
   const [statsLoading, setStatsLoading] = useState(false);
   const [statsError, setStatsError] = useState<ParsedApiError | null>(null);
 
-  const { loadStats, loadTrades, loadRealityTest, stats, trades, tradesLoading } =
+  const { loadStats, loadTrades, stats, trades, tradesLoading } =
     useJournalStore();
 
+  const positionFilters = useMemo<PositionEpisodeFilters>(() => {
+    const lifecycleStatus = params.get('status') ?? '';
+    const completenessStatus = params.get('completeness') ?? '';
+    const caseFocus = params.get('case') ?? '';
+    const requestedPage = Number(params.get('page') ?? '1');
+    const requestedBuildId = Number(params.get('build_id') ?? '');
+    return {
+      underlying: params.get('symbol')?.trim().toUpperCase() || undefined,
+      lifecycleStatus: POSITION_STATUSES.has(lifecycleStatus)
+        ? lifecycleStatus as PositionEpisodeFilters['lifecycleStatus']
+        : '',
+      completenessStatus: POSITION_COMPLETENESS.has(completenessStatus)
+        ? completenessStatus as PositionEpisodeFilters['completenessStatus']
+        : '',
+      caseFocus: POSITION_CASE_FOCUS.has(caseFocus)
+        ? caseFocus as PositionEpisodeFilters['caseFocus']
+        : '',
+      buildId: Number.isInteger(requestedBuildId) && requestedBuildId > 0
+        ? requestedBuildId
+        : undefined,
+      page: Number.isInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1,
+      perPage: 50,
+    };
+  }, [params]);
+
+  const positionController = usePositionEpisodes({
+    active: tab === 'positions',
+    filters: positionFilters,
+  });
+
   const setTab = (next: Tab) => {
-    setTabRaw(next);
     // keep url in sync for deep links (StyleBreakdown clicks `?tab=trades&style=xxx`)
     const nextParams = new URLSearchParams(params);
     nextParams.set('tab', next);
     setParams(nextParams, { replace: true });
   };
 
+  // Legacy endpoints are intentionally dormant until their archived tab is
+  // opened. This keeps the active position review free from old stats/trades logs.
   useEffect(() => {
-    void loadStats();
-    void loadRealityTest();
-    void loadTrades({ perPage: 100, style: initialStyle || undefined });
+    if (tab === 'overview' && !overviewLoadedRef.current) {
+      overviewLoadedRef.current = true;
+      void loadStats();
+      void loadTrades({ perPage: 100, style: initialStyle || undefined });
+    }
+    const enteredLegacyTrades = tab === 'trades' && previousTabRef.current !== 'trades';
+    previousTabRef.current = tab;
+    if (enteredLegacyTrades) {
+      void loadTrades({
+        symbol: symbol || undefined,
+        style: style || undefined,
+        status: statusFilter || undefined,
+        perPage: 100,
+      });
+    }
+    // Entering a Legacy tab is the load boundary; draft filter edits do not
+    // issue requests until Apply is clicked.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [tab]);
 
   // Lazy-load the analysis breakdown when user enters that tab for the first time.
   useEffect(() => {
@@ -103,9 +169,7 @@ const JournalPage: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab, params]);
 
-  const refresh = () => {
-    void loadStats();
-    void loadRealityTest();
+  const refreshLegacyTrades = () => {
     void loadTrades({
       symbol: symbol || undefined,
       style: style || undefined,
@@ -113,22 +177,58 @@ const JournalPage: React.FC = () => {
       perPage: 100,
     });
   };
-
-  const applyStyleFromUrl = () => {
-    void loadTrades({
-      symbol: symbol || undefined,
-      style: style || undefined,
-      status: statusFilter || undefined,
-      perPage: 100,
-    });
-  };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(applyStyleFromUrl, [style]);
 
   const items = useMemo(() => trades?.items ?? [], [trades]);
 
+  const applyPositionFilters = (filters: PositionEpisodeFilters) => {
+    const next = new URLSearchParams(params);
+    next.set('tab', 'positions');
+    next.delete('style');
+    const setOrDelete = (key: string, value?: string) => {
+      if (value) next.set(key, value);
+      else next.delete(key);
+    };
+    setOrDelete('symbol', filters.underlying);
+    setOrDelete('status', filters.lifecycleStatus);
+    setOrDelete('completeness', filters.completenessStatus);
+    setOrDelete('case', filters.caseFocus);
+    if ((filters.page ?? 1) > 1) next.set('page', String(filters.page));
+    else next.delete('page');
+    setParams(next, { replace: true });
+  };
+
+  const changePositionPage = (page: number) => {
+    applyPositionFilters({ ...positionFilters, page });
+  };
+
+  const selectPositionBuild = (buildId?: number) => {
+    const next = new URLSearchParams(params);
+    next.set('tab', 'positions');
+    next.delete('page');
+    if (buildId != null) next.set('build_id', String(buildId));
+    else next.delete('build_id');
+    setParams(next, { replace: true });
+  };
+
+  const refreshPositionEvidence = () => {
+    positionController.reload();
+    positionController.reloadCanonicalPreview();
+  };
+
+  const openPositionReview = (item: PositionEpisodeItem) => {
+    navigate(positionReviewPath(item.id, params));
+  };
+
   return (
     <div className="mx-auto max-w-6xl p-4">
+      <div className="mb-5 flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <div className="text-label uppercase tracking-label text-text-3">Journal · Evidence first</div>
+          <h1 className="mt-1 text-h1 text-text-1">期权交易复盘</h1>
+          <p className="mt-1 text-body-sm text-text-3">当前分析主线是不可变证据账本与 PositionEpisode；旧 FIFO 页面仅作存档查阅。</p>
+        </div>
+        <span className="rounded-full border border-up-strong/25 bg-up-subtle px-3 py-1 text-caption text-up-strong">Moomoo 只读 · 不下单</span>
+      </div>
       <div className="mb-6 flex flex-wrap items-center gap-2 border-b border-subtle">
         {TAB_ORDER.map((t) => (
           <button
@@ -146,11 +246,28 @@ const JournalPage: React.FC = () => {
         ))}
       </div>
 
+      {tab !== 'positions' && tab !== 'import' && (
+        <div className="mb-4 rounded-ds-md border border-warn-strong/25 bg-warn-subtle px-4 py-3 text-body-sm text-warn-strong" role="status">
+          Legacy / 存档视图：这里的数据来自旧 Journal，不参与当前仓位复盘与核心指标。
+        </div>
+      )}
+
+      {tab === 'positions' && (
+        <PositionEpisodesPanel
+          key={`${positionFilters.buildId ?? 'default'}:${positionFilters.underlying ?? ''}:${positionFilters.lifecycleStatus ?? ''}:${positionFilters.completenessStatus ?? ''}:${positionFilters.caseFocus ?? ''}:${positionFilters.page ?? 1}`}
+          filters={positionFilters}
+          controller={positionController}
+          onApplyFilters={applyPositionFilters}
+          onPageChange={changePositionPage}
+          onSelectBuild={selectPositionBuild}
+          onOpenReview={openPositionReview}
+        />
+      )}
+
       {tab === 'overview' && (
         <div className="space-y-4">
-          {/* Two small tiles that DON'T overlap with what RealityTestCard shows
-              (total_trades / total_pnl_net / median). Win rate + 0DTE share
-              are the two most useful "are we violating the framework" signals. */}
+          {/* Descriptive mix metrics. Neither metric is a standalone profitability
+              or risk verdict; users should compare them with payoff, fees, and P&L. */}
           {stats && (
             <div className="grid grid-cols-2 gap-3">
               <div className="rounded-ds-md border border-subtle bg-bg-1 p-3">
@@ -159,9 +276,7 @@ const JournalPage: React.FC = () => {
                   {stats.winRate == null ? '—' : fmtPct(stats.winRate)}
                 </div>
                 <div className="mt-1 text-caption text-text-3">
-                  {stats.winRate != null && stats.winRate >= 0.5
-                    ? 'above break-even'
-                    : 'below break-even'}
+                  Descriptive only · combine with payoff ratio and fees
                 </div>
               </div>
               <div className="rounded-ds-md border border-subtle bg-bg-1 p-3">
@@ -173,7 +288,9 @@ const JournalPage: React.FC = () => {
                     return total ? fmtPct(zero / total) : '—';
                   })()}
                 </div>
-                <div className="mt-1 text-caption text-text-3">dangerous if &gt; 30%</div>
+                <div className="mt-1 text-caption text-text-3">
+                  Trade mix only · compare P&amp;L, fees, and risk by DTE
+                </div>
               </div>
             </div>
           )}
@@ -307,7 +424,7 @@ const JournalPage: React.FC = () => {
               <option value="closed">closed</option>
               <option value="open">open</option>
             </select>
-            <button type="button" className="btn-primary" onClick={refresh}>
+            <button type="button" className="btn-primary" onClick={refreshLegacyTrades}>
               Apply
             </button>
           </div>
@@ -340,9 +457,13 @@ const JournalPage: React.FC = () => {
 
       {tab === 'import' && (
         <div className="space-y-4">
-          <JournalImport onImported={refresh} />
+          <JournalImport onImported={refreshPositionEvidence} />
           <div className="rounded-ds-md border border-subtle bg-bg-1 p-4 text-body-sm text-text-3">
-            <p>Import 之后 FIFO 会自动重配；CSV 已处理过会被跳过。</p>
+            <p>
+              文件会先做只读证据检查。CSV 可在明确确认后幂等追加到可信证据账本；
+              OpenAPI JSON 会先生成零证据行写入计划，明确确认后原子、幂等追加。
+              旧 FIFO、交易备注、历史复盘和 Episode 不会被自动重建。
+            </p>
           </div>
         </div>
       )}

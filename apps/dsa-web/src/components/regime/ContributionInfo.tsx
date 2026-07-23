@@ -115,7 +115,6 @@ export const ContributionInfo: React.FC<{ className?: string }> = ({ className }
       <button
         type="button"
         aria-label="How are contributions computed?"
-        title="如何计算每个维度？"
         onClick={() => setOpen((v) => !v)}
         className="inline-flex h-5 w-5 items-center justify-center rounded-full text-text-3 hover:bg-bg-2 hover:text-text-1"
       >

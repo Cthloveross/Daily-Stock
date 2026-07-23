@@ -8,13 +8,22 @@ interface consumed by the AgentExecutor, via LiteLLM.
 
 import json
 import logging
+import os
+from queue import Empty, Queue
+from threading import BoundedSemaphore, Thread
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
-import litellm
-from litellm import Router
+# LiteLLM otherwise tries to refresh its model-cost map from the network during
+# the first import.  That is unnecessary on the interactive path and can add a
+# multi-second startup stall.  setdefault deliberately preserves an operator's
+# explicit override.
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "true")
+
+import litellm  # noqa: E402 - environment must be set before this import
+from litellm import Router  # noqa: E402 - see local cost-map guard above
 
 from src.config import (
     extra_litellm_params,
@@ -22,10 +31,60 @@ from src.config import (
     get_config,
     get_configured_llm_models,
     get_effective_agent_models_to_try,
-    get_effective_agent_primary_model,
 )
 
 logger = logging.getLogger(__name__)
+
+
+_HARD_TIMEOUT_MAX_WORKERS = 4
+_hard_timeout_slots = BoundedSemaphore(_HARD_TIMEOUT_MAX_WORKERS)
+
+
+def _run_with_hard_timeout(
+    operation: Callable[[], Any],
+    timeout: float,
+    *,
+    worker_name: str,
+) -> Any:
+    """Run one provider call with a real wall-clock deadline.
+
+    Some provider SDK paths do not honour LiteLLM's ``timeout`` argument.  A
+    daemon thread lets the caller continue to the next configured model once
+    the interactive deadline expires.  Timed-out provider calls cannot be
+    force-killed safely, so a bounded semaphore caps how many may remain alive
+    in the background; the worker releases its slot only when it actually
+    exits.
+    """
+    slot_pool = _hard_timeout_slots
+    if not slot_pool.acquire(blocking=False):
+        raise TimeoutError("LLM hard-timeout worker capacity is exhausted")
+
+    result_queue: Queue[tuple[bool, Any]] = Queue(maxsize=1)
+
+    def run() -> None:
+        try:
+            result_queue.put((True, operation()))
+        except BaseException as exc:  # noqa: BLE001 - re-raised on caller thread
+            result_queue.put((False, exc))
+        finally:
+            slot_pool.release()
+
+    worker = Thread(target=run, name=worker_name, daemon=True)
+    try:
+        worker.start()
+    except BaseException:  # pragma: no cover - Thread.start failures are rare
+        slot_pool.release()
+        raise
+
+    try:
+        succeeded, value = result_queue.get(timeout=timeout)
+    except Empty as exc:
+        raise TimeoutError(
+            f"LLM provider call exceeded {timeout:.3f}s hard deadline"
+        ) from exc
+    if succeeded:
+        return value
+    raise value
 
 
 # ============================================================
@@ -138,13 +197,39 @@ class LLMToolAdapter:
     load balancing.
     """
 
-    def __init__(self, config=None):
+    def __init__(
+        self,
+        config=None,
+        *,
+        models_to_try: Optional[Sequence[str]] = None,
+    ):
         config = config or get_config()
         self._config = config
+        # Instance-scoped selection lets a feature use its own model chain
+        # without mutating the process-wide Config singleton used by Agents.
+        self._models_to_try_override = (
+            None
+            if models_to_try is None
+            else tuple(
+                model.strip()
+                for model in models_to_try
+                if isinstance(model, str) and model.strip()
+            )
+        )
         self._router = None          # litellm Router (multi-key primary model)
         self._litellm_available = False
         self._register_custom_model_pricing()
         self._init_litellm()
+
+    def _effective_models_to_try(self) -> List[str]:
+        override = getattr(self, "_models_to_try_override", None)
+        if override is not None:
+            return list(override)
+        return get_effective_agent_models_to_try(self._config)
+
+    def _effective_primary_model(self) -> str:
+        models = self._effective_models_to_try()
+        return models[0] if models else ""
 
     @staticmethod
     def _register_custom_model_pricing() -> None:
@@ -172,9 +257,9 @@ class LLMToolAdapter:
     def _init_litellm(self) -> None:
         """Initialize litellm Router from channels / YAML / legacy keys."""
         config = self._config
-        litellm_model = get_effective_agent_primary_model(config)
+        litellm_model = self._effective_primary_model()
         if not litellm_model:
-            logger.warning("Agent LLM: no effective primary model configured")
+            logger.warning("LLM adapter: no effective primary model configured")
             return
 
         self._litellm_available = True
@@ -238,7 +323,7 @@ class LLMToolAdapter:
     @property
     def primary_provider(self) -> str:
         """Provider name extracted from litellm_model prefix."""
-        model = get_effective_agent_primary_model(self._config)
+        model = self._effective_primary_model()
         if "/" in model:
             return model.split("/")[0]
         return model or "none"
@@ -275,8 +360,17 @@ class LLMToolAdapter:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
+        per_model_timeout: Optional[float] = None,
+        response_validator: Optional[Callable[[LLMResponse], bool]] = None,
     ) -> LLMResponse:
-        """Send a text-only completion through the shared routing stack."""
+        """Send a text-only completion through the shared routing stack.
+
+        ``timeout`` is the total budget across configured fallbacks.  Callers
+        with an interactive latency budget may additionally cap each model via
+        ``per_model_timeout``.  ``response_validator`` lets a caller reject a
+        syntactically successful but unusable response and continue to the next
+        configured model without weakening its own output contract.
+        """
         return self.call_completion(
             messages,
             tools=None,
@@ -284,6 +378,8 @@ class LLMToolAdapter:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            per_model_timeout=per_model_timeout,
+            response_validator=response_validator,
         )
 
     def call_completion(
@@ -295,10 +391,12 @@ class LLMToolAdapter:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
+        per_model_timeout: Optional[float] = None,
+        response_validator: Optional[Callable[[LLMResponse], bool]] = None,
     ) -> LLMResponse:
         """Shared completion path for both tool and text-only calls."""
         config = self._config
-        models_to_try = get_effective_agent_models_to_try(config)
+        models_to_try = self._effective_models_to_try()
         started_at = time.time()
         providers = [self._get_model_provider(model) for model in models_to_try]
 
@@ -313,15 +411,54 @@ class LLMToolAdapter:
                         f"LLM completion timed out before trying fallback model {model}"
                     )
                     break
+            attempt_timeout = remaining_timeout
+            if per_model_timeout is not None and per_model_timeout > 0:
+                attempt_timeout = float(per_model_timeout)
+                if remaining_timeout is not None and remaining_timeout > 0:
+                    attempt_timeout = min(attempt_timeout, remaining_timeout)
             try:
-                return self._call_litellm_model(
-                    messages,
-                    tools or [],
-                    model,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    timeout=remaining_timeout,
-                )
+                # Bind loop values now: the previous provider daemon may still
+                # be alive after the loop advances to a fallback model.
+                def call_model(
+                    model_to_call: str = model,
+                    timeout_to_use: Optional[float] = attempt_timeout,
+                ) -> LLMResponse:
+                    return self._call_litellm_model(
+                        messages,
+                        tools or [],
+                        model_to_call,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        timeout=timeout_to_use,
+                    )
+
+                if per_model_timeout is not None and per_model_timeout > 0:
+                    response = _run_with_hard_timeout(
+                        call_model,
+                        float(attempt_timeout),
+                        worker_name=f"llm-provider-{model}",
+                    )
+                else:
+                    response = call_model()
+                if response_validator is not None:
+                    try:
+                        valid_response = response_validator(response)
+                    except Exception as exc:  # noqa: BLE001 - validator is caller-owned
+                        logger.warning(
+                            "Agent LLM response validator failed for %s: %s",
+                            model,
+                            exc,
+                        )
+                        last_error = ValueError("LLM response validator failed")
+                        continue
+                    if not valid_response:
+                        logger.warning(
+                            "Agent LLM response rejected by validator for %s",
+                            model,
+                        )
+                        last_error = ValueError("LLM response rejected by validator")
+                        continue
+                return response
             except litellm.RateLimitError as e:
                 logger.warning("Agent LLM rate-limited on %s: %s", model, e)
                 last_error = e
@@ -399,11 +536,11 @@ class LLMToolAdapter:
         # Use Router for primary model (multi-key), direct litellm for others
         use_channel_router = self._has_channel_config()
         _router_model_names = set(get_configured_llm_models(self._config.llm_model_list))
-        agent_primary_model = get_effective_agent_primary_model(self._config)
+        adapter_primary_model = self._effective_primary_model()
         if use_channel_router and self._router and model in _router_model_names:
             # Channel / YAML path: Router manages all models in its model_list
             response = self._router.completion(**call_kwargs)
-        elif self._router and model == agent_primary_model and not use_channel_router:
+        elif self._router and model == adapter_primary_model and not use_channel_router:
             # Legacy path: Router for primary model multi-key
             response = self._router.completion(**call_kwargs)
         else:

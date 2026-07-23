@@ -94,7 +94,8 @@ export const stocksApi = {
     }
     const response = await apiClient.get<Record<string, unknown>>(
       `/api/v1/stocks/${encodeURIComponent(code)}/history`,
-      { params: { period, days } },
+      // A complete Moomoo minute range can require several read-only pages.
+      { params: { period, days }, timeout: 120000 },
     );
     const data = toCamelCase<StockHistory>(response.data);
     // Only cache when we actually got bars. Empty arrays get re-fetched next

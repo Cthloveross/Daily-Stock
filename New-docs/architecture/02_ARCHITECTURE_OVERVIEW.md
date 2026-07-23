@@ -1,7 +1,9 @@
 # 02 · Architecture Overview
 
 > **目的**：标注真实 repo 里每个目录的改造点，让你知道"哪个文件改哪几行"  
-> **前置**：`01_PROJECT_VISION_v4.md`
+> **状态**：Phase 0 设计快照；部分路径和页面已随实现变化，实时事实以代码和 `04_CURRENT_STATE.md` 为准。
+>
+> **前置**：产品目标与实施顺序先读 `05_PRODUCT_CHARTER_AND_ROADMAP.md`；Phase 0 背景再读 `01_PROJECT_VISION_v4.md`。
 
 ---
 

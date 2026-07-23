@@ -39,13 +39,17 @@ class RelativePathFormatter(logging.Formatter):
         return super().format(record)
 
 
-
 # 默认需要降低日志级别的第三方库
 DEFAULT_QUIET_LOGGERS = [
     'urllib3',
     'sqlalchemy',
     'google',
     'httpx',
+    # LiteLLM DEBUG records include full prompts and can overwhelm both the
+    # terminal and rotating debug log during an on-demand trade review.
+    'LiteLLM',
+    'LiteLLM Router',
+    'LiteLLM Proxy',
 ]
 
 
@@ -133,6 +137,11 @@ def setup_logging(
 
     for logger_name in quiet_loggers:
         logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+    # yfinance logs each empty/fallback response as its own ERROR before the
+    # application can classify it. DataFetcherManager already emits one
+    # bounded final summary, so suppress the duplicate third-party stack.
+    logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
     # 输出初始化完成信息（使用相对路径）
     try:

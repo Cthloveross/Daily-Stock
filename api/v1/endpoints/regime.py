@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import date
 from threading import Lock
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
 from api.v1.schemas.regime import RegimeHistoryResponse, RegimeScoreItem
-from src.regime.classifier import classify, compute_regime_score
+from src.regime.classifier import classify, compute_regime_score, current_market_date
+from src.regime.quality import assess_regime_snapshot
 from src.regime.storage import get_recent_scores, get_regime_score
 
 logger = logging.getLogger(__name__)
@@ -26,17 +26,38 @@ _last_recompute_at: float = 0.0
 
 
 def _with_action_hint(item: dict) -> dict:
+    quality = assess_regime_snapshot(item.get("snapshot"))
+    item["quality_state"] = quality["state"]
+    item["authoritative"] = quality["authoritative"]
+    item["missing_domains"] = quality["missing_domains"]
+    item["incomplete_domains"] = quality["incomplete_domains"]
+    item["domain_quality"] = quality["domain_states"]
+    item["quality_message"] = quality["reason"]
+
+    if quality["state"] == "unavailable":
+        item["action_hint"] = (
+            "Regime unavailable: core SPY/VIX inputs are incomplete; "
+            "the stored numeric value is not a trading signal."
+        )
+        return item
+
     label = item.get("label") or ""
     if label:
         # Classifier returns (label, hint). Use the same mapping.
         _, hint = classify(int(item.get("score") or 0))
-        item["action_hint"] = hint
+        item["action_hint"] = (
+            "Provisional Regime: supporting inputs are incomplete. "
+            "Treat the numeric bucket as context only; it must not "
+            "authorize or block a trade."
+            if quality["state"] == "degraded"
+            else hint
+        )
     return item
 
 
 @router.get("/today", response_model=Optional[RegimeScoreItem])
 def get_today():
-    row = get_regime_score(date.today())
+    row = get_regime_score(current_market_date())
     if row is None:
         return None
     return RegimeScoreItem(**_with_action_hint(row))

@@ -31,6 +31,7 @@ const TIMEFRAME_ITEMS: { value: Timeframe; label: string }[] = [
 function daysForTimeframe(tf: Timeframe): number {
   switch (tf) {
     case '1m': return 7;
+    case '2m': return 60;
     case '5m': return 30;
     case '15m': return 60;
     case '30m': return 60;

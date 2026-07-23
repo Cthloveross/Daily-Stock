@@ -1,6 +1,8 @@
 import type React from 'react';
 import { RefreshCw } from 'lucide-react';
 import { cn } from '../../utils/cn';
+import { formatEtClock } from '../../utils/marketTime';
+import type { RegimeQualityState } from '../../types/regime';
 import type { RegimeState } from './RegimeScore';
 
 export interface RegimeGaugeProps {
@@ -11,6 +13,8 @@ export interface RegimeGaugeProps {
   version?: string | null;
   onRecompute?: () => void;
   recomputing?: boolean;
+  qualityState?: RegimeQualityState;
+  incompleteDomains?: string[];
   className?: string;
 }
 
@@ -18,10 +22,10 @@ export interface RegimeGaugeProps {
 // Bands are drawn as arcs in the SVG, matching the design-system semantic
 // colors (muted green/red/amber, accent violet for Standard).
 const BANDS: Array<{ from: number; to: number; fill: string; label: string; state: RegimeState }> = [
-  { from: -100, to: -50, fill: 'var(--down-strong)', label: 'NO TRADE', state: 'no_trade' },
-  { from: -50,  to: 20,  fill: 'var(--warn-strong)', label: 'CAUTIOUS', state: 'cautious' },
-  { from: 20,   to: 55,  fill: 'var(--accent)',      label: 'STANDARD', state: 'standard' },
-  { from: 55,   to: 100, fill: 'var(--up-strong)',   label: 'AGGRESSIVE', state: 'aggressive' },
+  { from: -100, to: 35,  fill: 'var(--down-strong)', label: 'NO TRADE', state: 'no_trade' },
+  { from: 35,   to: 55,  fill: 'var(--warn-strong)', label: 'CAUTIOUS', state: 'cautious' },
+  { from: 55,   to: 75,  fill: 'var(--accent)',      label: 'STANDARD', state: 'standard' },
+  { from: 75,   to: 100, fill: 'var(--up-strong)',   label: 'AGGRESSIVE', state: 'aggressive' },
 ];
 
 const STATE_COLOR: Record<RegimeState, string> = {
@@ -79,10 +83,7 @@ function formatScore(n: number): string {
 }
 
 function formatUpdatedAt(ts?: Date | string | null): string {
-  if (!ts) return '';
-  const d = typeof ts === 'string' ? new Date(ts.endsWith('Z') ? ts : `${ts}Z`) : ts;
-  if (Number.isNaN(d.getTime())) return '';
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  return formatEtClock(ts, true);
 }
 
 export const RegimeGauge: React.FC<RegimeGaugeProps> = ({
@@ -93,8 +94,12 @@ export const RegimeGauge: React.FC<RegimeGaugeProps> = ({
   version,
   onRecompute,
   recomputing,
+  qualityState = 'ready',
+  incompleteDomains = [],
   className,
 }) => {
+  const publishable = qualityState !== 'unavailable';
+  const authoritative = qualityState === 'ready';
   const needleAngle = angleForScore(score);
   const needleTip = polar(CX, CY, R_OUTER - 6, needleAngle);
 
@@ -105,7 +110,7 @@ export const RegimeGauge: React.FC<RegimeGaugeProps> = ({
           <div className="text-label uppercase text-text-3">Regime · speedometer</div>
           <span
             className="rounded-full border border-subtle px-1.5 py-0.5 text-[9px] font-medium text-text-3"
-            title="设计参考 CNN Fear & Greed Index（把多组市场信号折叠成单一刻度）"
+            aria-label="设计参考 CNN Fear & Greed Index，把多组市场信号折叠成单一刻度"
           >
             F&amp;G style
           </span>
@@ -116,7 +121,7 @@ export const RegimeGauge: React.FC<RegimeGaugeProps> = ({
             onClick={onRecompute}
             disabled={recomputing}
             className="inline-flex items-center gap-1 text-caption text-text-3 hover:text-text-1 disabled:opacity-60"
-            title="Recompute today (60 s cooldown)"
+            aria-label="Recompute today (60 second cooldown)"
           >
             <RefreshCw size={11} strokeWidth={1.5} className={recomputing ? 'animate-spin' : undefined} />
             {recomputing ? 'Computing…' : 'Recompute'}
@@ -124,12 +129,20 @@ export const RegimeGauge: React.FC<RegimeGaugeProps> = ({
         )}
       </div>
 
-      <svg viewBox={`0 0 ${W} ${H + 8}`} className="w-full" aria-label={`Regime score ${score}`}>
+      <svg
+        viewBox={`0 0 ${W} ${H + 8}`}
+        className="w-full"
+        aria-label={
+          publishable
+            ? `Regime score ${score}, quality ${qualityState}`
+            : 'Regime unavailable because core market inputs are incomplete'
+        }
+      >
         {/* Band arcs */}
         {BANDS.map((b) => {
           const a1 = angleForScore(b.from);
           const a2 = angleForScore(b.to);
-          const active = b.state === state;
+          const active = authoritative && b.state === state;
           return (
             <path
               key={b.label}
@@ -147,7 +160,7 @@ export const RegimeGauge: React.FC<RegimeGaugeProps> = ({
           const midScore = (b.from + b.to) / 2;
           const a = angleForScore(midScore);
           const labelP = polar(CX, CY, (R_OUTER + R_INNER) / 2, a);
-          const active = b.state === state;
+          const active = authoritative && b.state === state;
           return (
             <text
               key={`${b.label}-label`}
@@ -165,7 +178,7 @@ export const RegimeGauge: React.FC<RegimeGaugeProps> = ({
         })}
 
         {/* Tick marks every 25 units */}
-        {[-100, -50, 0, 50, 100].map((t) => {
+        {[-100, 0, 100].map((t) => {
           const a = angleForScore(t);
           const outer = polar(CX, CY, R_OUTER + 3, a);
           const inner = polar(CX, CY, R_OUTER - 3, a);
@@ -195,16 +208,21 @@ export const RegimeGauge: React.FC<RegimeGaugeProps> = ({
         })}
 
         {/* Needle */}
-        <line
-          x1={CX}
-          y1={CY}
-          x2={needleTip.x}
-          y2={needleTip.y}
-          stroke="var(--text-1)"
-          strokeWidth={3}
-          strokeLinecap="round"
-        />
-        <circle cx={CX} cy={CY} r={7} fill="var(--bg-3)" stroke="var(--text-1)" strokeWidth={1.5} />
+        {publishable && (
+          <>
+            <line
+              x1={CX}
+              y1={CY}
+              x2={needleTip.x}
+              y2={needleTip.y}
+              stroke="var(--text-1)"
+              strokeWidth={3}
+              strokeLinecap="round"
+              opacity={authoritative ? 1 : 0.65}
+            />
+            <circle cx={CX} cy={CY} r={7} fill="var(--bg-3)" stroke="var(--text-1)" strokeWidth={1.5} />
+          </>
+        )}
 
         {/* Score number — big, F&G style */}
         <text
@@ -215,7 +233,7 @@ export const RegimeGauge: React.FC<RegimeGaugeProps> = ({
           style={{ fontSize: 38, fontVariantNumeric: 'tabular-nums', fontWeight: 500 }}
           fill="var(--text-1)"
         >
-          {formatScore(score)}
+          {publishable ? formatScore(score) : '—'}
         </text>
 
         {/* Small caption under the number */}
@@ -227,13 +245,26 @@ export const RegimeGauge: React.FC<RegimeGaugeProps> = ({
           fill="var(--text-3)"
           style={{ letterSpacing: '0.08em' }}
         >
-          REGIME SCORE
+          {publishable ? 'REGIME SCORE' : 'INSUFFICIENT CORE DATA'}
         </text>
       </svg>
 
+      <div className="text-center font-mono text-mono-xs text-text-4">
+        默认阈值 · 35 谨慎 · 55 标准 · 75 激进
+      </div>
+
       <div className="flex items-center justify-between">
-        <span className={cn('font-mono text-mono-sm uppercase', STATE_COLOR[state])}>
-          {STATE_LABEL[state]}
+        <span
+          className={cn(
+            'font-mono text-mono-sm uppercase',
+            publishable ? STATE_COLOR[state] : 'text-text-2',
+          )}
+        >
+          {publishable
+            ? qualityState === 'degraded'
+              ? 'CONTEXT ONLY · PROVISIONAL'
+              : STATE_LABEL[state]
+            : 'UNAVAILABLE'}
         </span>
         <div className="text-caption text-text-4">
           {version && <span className="font-mono">{version}</span>}
@@ -243,6 +274,12 @@ export const RegimeGauge: React.FC<RegimeGaugeProps> = ({
       </div>
 
       {note && <div className="text-caption text-text-3">{note}</div>}
+      {qualityState !== 'ready' && incompleteDomains.length > 0 && (
+        <div className="rounded-ds-sm border border-warn-strong/30 bg-warn-strong/5 px-2.5 py-2 text-caption text-text-2">
+          缺失或不完整：{incompleteDomains.join('、')}。当前结果
+          {qualityState === 'unavailable' ? '不作为 Regime 分数或交易门禁' : '仅作临时背景'}。
+        </div>
+      )}
     </div>
   );
 };

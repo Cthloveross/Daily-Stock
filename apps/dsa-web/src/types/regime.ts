@@ -1,3 +1,5 @@
+export type RegimeQualityState = 'ready' | 'degraded' | 'unavailable';
+
 export interface RegimeScoreItem {
   date: string;
   score: number;
@@ -12,6 +14,12 @@ export interface RegimeScoreItem {
   snapshot: Record<string, unknown>;
   version: string;
   generatedAt?: string | null;
+  qualityState?: RegimeQualityState;
+  authoritative?: boolean;
+  missingDomains?: string[];
+  incompleteDomains?: string[];
+  domainQuality?: Record<string, RegimeQualityState>;
+  qualityMessage?: string | null;
 }
 
 export interface RegimeHistoryResponse {

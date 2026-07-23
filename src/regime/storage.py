@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import select
 
 from src.regime.models import RegimeScore
+from src.regime.quality import assess_regime_snapshot
 from src.storage import Base, get_db
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,10 @@ def save_regime_score(result) -> None:
             "d6_premarket": int(result.d6_premarket),
             "snapshot_json": json.dumps(result.snapshot, default=str),
             "version": getattr(result, "version", "v1"),
+            # Refreshing today's row must also refresh the evidence timestamp.
+            # SQLite stores this as a naive wall clock, so persist UTC by
+            # contract and restore the UTC offset on read.
+            "generated_at": datetime.now(timezone.utc).replace(tzinfo=None),
         }
         if existing is None:
             session.add(RegimeScore(date=result.date, **payload))
@@ -67,7 +72,10 @@ def get_regime_score(target_date: date) -> Optional[dict]:
 
 def get_recent_scores(days: int = 30) -> list[dict]:
     init_regime_schema()
-    cutoff = date.today() - timedelta(days=days)
+    # Import lazily to keep the storage/classifier dependency acyclic.
+    from src.regime.classifier import current_market_date
+
+    cutoff = current_market_date() - timedelta(days=days)
     db = get_db()
     with db.session_scope() as session:
         rows = (
@@ -81,6 +89,18 @@ def get_recent_scores(days: int = 30) -> list[dict]:
 
 
 def _row_to_dict(row: RegimeScore) -> dict:
+    snapshot = json.loads(row.snapshot_json) if row.snapshot_json else {}
+    # Old rows remain readable without a schema migration.  The inferred
+    # quality is conservative (especially for ambiguous all-zero premarket
+    # payloads) and is added only to the returned object, not written here.
+    snapshot["quality"] = assess_regime_snapshot(snapshot)
+    generated_at = row.generated_at
+    if generated_at is not None:
+        if generated_at.tzinfo is None:
+            generated_at = generated_at.replace(tzinfo=timezone.utc)
+        else:
+            generated_at = generated_at.astimezone(timezone.utc)
+
     return {
         "date": row.date,
         "score": row.score,
@@ -92,9 +112,9 @@ def _row_to_dict(row: RegimeScore) -> dict:
         "d4_sector": row.d4_sector,
         "d5_prev_day": row.d5_prev_day,
         "d6_premarket": row.d6_premarket,
-        "snapshot": json.loads(row.snapshot_json) if row.snapshot_json else {},
+        "snapshot": snapshot,
         "version": row.version,
-        "generated_at": row.generated_at,
+        "generated_at": generated_at,
         "user_perceived_quality": row.user_perceived_quality,
         "user_did_trade": row.user_did_trade,
     }

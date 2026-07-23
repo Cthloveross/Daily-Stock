@@ -3,9 +3,10 @@
 
 Phase C of the Moomoo integration. Replaces the yfinance option chain (which
 has known gaps: missing strikes, no Greeks, IV occasionally 0) with Moomoo's
-``get_option_chain`` — that endpoint already returns server-computed
-``implied_volatility`` and Greeks (delta/gamma/vega/theta/rho), so we don't
-have to reverse-solve Black-Scholes.
+static ``get_option_chain`` contract list plus ``get_market_snapshot`` for the
+dynamic quote, open-interest, IV and Greek fields.  Moomoo explicitly documents
+``get_option_chain`` as static metadata only; treating that DataFrame as a
+quote snapshot silently turns the dynamic fields into zero.
 
 Surface
 -------
@@ -14,16 +15,20 @@ Surface
 - :func:`compute_atm_iv_moomoo(symbol, ref_date)` →
   ``(atm_iv: float | None, expiry: str)``
 - :func:`get_expirations_moomoo(symbol)` → ``list[str]`` ISO dates
+- :func:`fetch_option_wall_snapshot_moomoo(symbol, dte_min, dte_max, ref_date)`
+  → read-only strike-level OI / volume / gamma inputs with explicit coverage
+- :func:`fetch_option_events_moomoo(symbol, limit)` → recent, provider-labelled
+  unusual option transactions from the quote-only event feed
 
-All three short-circuit to a no-op (returning empty / None) when
+All public quote helpers short-circuit to a no-op (returning empty / None) when
 ``MOOMOO_OPEND_ENABLED!=true`` so callers can do ``moomoo first → yfinance
 fallback`` without conditional branching at every call site.
 
 Caveats
 -------
-- Moomoo IV is in **percent form** in the API (e.g. ``20.0`` = 20%); we
-  convert to decimal (0.20) to match the yfinance convention used by
-  :mod:`src.options.iv_rank`.
+- Moomoo IV is in **percent form** in the API (e.g. ``20.0`` = 20%). Chain and
+  ATM-IV helpers convert it to decimal (0.20) for :mod:`src.options.iv_rank`;
+  option-event records expose the provider value explicitly as ``iv_percent``.
 - Strike date format from ``get_option_expiration_date`` is ``YYYY-MM-DD``.
 - Equity option codes look like ``US.AAPL250620C250000``; we extract the
   numeric strike via the ``strike_price`` column directly, never parse the
@@ -31,12 +36,23 @@ Caveats
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import math
 import os
 import threading
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional
+from zoneinfo import ZoneInfo
+
+from src.services.moomoo_runtime import (
+    MoomooRuntimeError,
+    create_ready_quote_context,
+    probe_opend_tcp,
+    quote_context_is_ready,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,18 +110,162 @@ def _endpoint() -> tuple[str, int]:
 _ctx_lock = threading.RLock()
 _ctx_singleton = None
 
+# Unusual option events use a separate QuoteContext lane.  Full option-wall
+# snapshots intentionally hold ``_ctx_lock`` across several SDK calls so their
+# context cannot be closed mid-scan.  Sharing that lane would make the small,
+# first-page event query wait behind thousands of wall snapshots.  Keep the
+# same readiness/reconnect/fail-closed rules, but isolate the two read-only
+# workloads so event freshness is not coupled to wall-scan latency.
+_event_ctx_lock = threading.RLock()
+_event_ctx_singleton = None
+
+_SNAPSHOT_BATCH_SIZE = 400
+_NEW_YORK = ZoneInfo("America/New_York")
+
+
+@dataclass(frozen=True)
+class _OptionSnapshotResult:
+    """Dynamic option snapshots plus an explicit completeness boundary."""
+
+    snapshots: dict[str, dict]
+    requested_codes: tuple[str, ...]
+    failed_batch_count: int = 0
+
+    @property
+    def missing_codes(self) -> tuple[str, ...]:
+        return tuple(
+            code for code in self.requested_codes if code not in self.snapshots
+        )
+
+    @property
+    def complete(self) -> bool:
+        return (
+            bool(self.requested_codes)
+            and self.failed_batch_count == 0
+            and not self.missing_codes
+        )
+
+
+@dataclass(frozen=True)
+class MoomooOptionWallContract:
+    """One valid strike-level input for an option-wall model.
+
+    ``volume`` and ``open_interest`` are required observed snapshot fields.
+    Gamma and contract size remain nullable because older OpenD builds or quote
+    permissions may omit them.  No dealer-position sign is inferred here.
+    """
+
+    code: str
+    expiry: str
+    dte: int
+    right: str
+    strike: float
+    volume: int
+    open_interest: int
+    gamma: Optional[float]
+    contract_size: Optional[int]
+    update_time: Optional[str]
+
+
+@dataclass(frozen=True)
+class MoomooOptionWallSnapshot:
+    """Standard-contract-only observations with explicit coverage counters."""
+
+    symbol: str
+    spot: float
+    fetched_at: datetime
+    expiries: tuple[str, ...]
+    contracts: tuple[MoomooOptionWallContract, ...]
+    requested_contract_count: int
+    snapshot_received_count: int
+    valid_contract_count: int
+    failed_batch_count: int
+    excluded_nonstandard_count: int
+    excluded_unknown_standard_type_count: int
+
+
+@dataclass(frozen=True)
+class MoomooOptionEvent:
+    """One Moomoo-classified unusual option transaction.
+
+    ``ticker_type`` and ``sentiment`` are provider classifications only.  They
+    do not identify open/close intent, the counterparty, or dealer inventory.
+    Nullable fields stay nullable when the SDK omits or invalidates a value.
+    """
+
+    event_id: str
+    option_code: str
+    owner_code: Optional[str]
+    symbol: Optional[str]
+    fill_time: Optional[str]
+    ticker_type: Optional[str]
+    price: Optional[float]
+    volume: Optional[int]
+    turnover: Optional[float]
+    option_type: Optional[str]
+    strike_price: Optional[float]
+    expiry: Optional[str]
+    dte: Optional[int]
+    underlying_price: Optional[float]
+    bid_price: Optional[float]
+    ask_price: Optional[float]
+    iv_percent: Optional[float]
+    total_volume: Optional[int]
+    total_open_interest: Optional[int]
+    vo_ratio_percent: Optional[float]
+    delta: Optional[float]
+    sentiment: Optional[str]
+    order_types: tuple[str, ...]
+    strategy_type: Optional[str]
+
+
+@dataclass(frozen=True)
+class MoomooOptionEventSnapshot:
+    """A single-underlying, first-page read from ``get_option_event``."""
+
+    symbol: str
+    fetched_at: datetime
+    event_as_of: Optional[str]
+    all_count: Optional[int]
+    events: tuple[MoomooOptionEvent, ...]
+
+
+@dataclass(frozen=True)
+class MoomooOptionUnderlyingOverview:
+    """Provider-reported option summary for one underlying.
+
+    Moomoo documents option volume as the current session's cumulative
+    activity and open interest as T-1 clearing data.  The adapter deliberately
+    keeps those observations separate and preserves IV/HV values in the
+    provider's percent form (``31.2`` means ``31.2%``).
+    """
+
+    symbol: str
+    name: Optional[str]
+    fetched_at: datetime
+    call_volume: Optional[int]
+    put_volume: Optional[int]
+    call_open_interest: Optional[int]
+    put_open_interest: Optional[int]
+    iv_percent: Optional[float]
+    iv_rank_percent: Optional[float]
+    iv_percentile_percent: Optional[float]
+    previous_iv_percent: Optional[float]
+    hv_30d_percent: Optional[float]
+    hv_30d_percentile: Optional[float]
+    hv_60d_percent: Optional[float]
+    hv_60d_percentile: Optional[float]
+    hv_90d_percent: Optional[float]
+    hv_90d_percentile: Optional[float]
+    hv_120d_percent: Optional[float]
+    hv_120d_percentile: Optional[float]
+    hv_365d_percent: Optional[float]
+    hv_365d_percentile: Optional[float]
+
 
 def _is_alive(ctx) -> bool:
-    """Cheap health probe: ping global state. False on any failure."""
-    if ctx is None:
-        return False
-    try:
-        from moomoo import RET_OK
-
-        ret, _ = ctx.get_global_state()
-        return ret == RET_OK
-    except Exception:  # noqa: BLE001
-        return False
+    """Inspect connection state without issuing a blocking SDK query."""
+    return quote_context_is_ready(ctx)
 
 
 def _get_ctx():
@@ -120,7 +280,11 @@ def _get_ctx():
         return None
     with _ctx_lock:
         # Health-check the cached ctx; reconnect if OpenD bounced.
-        if _ctx_singleton is not None and not _is_alive(_ctx_singleton):
+        host, port = _endpoint()
+        if _ctx_singleton is not None and (
+            not probe_opend_tcp(host, port)
+            or not _is_alive(_ctx_singleton)
+        ):
             logger.info("[moomoo_options] cached ctx dead, reconnecting")
             try:
                 _ctx_singleton.close()
@@ -128,15 +292,50 @@ def _get_ctx():
                 pass
             _ctx_singleton = None
         if _ctx_singleton is None:
-            host, port = _endpoint()
             try:
-                from moomoo import OpenQuoteContext
-
-                _ctx_singleton = OpenQuoteContext(host=host, port=port)
-            except Exception as exc:  # noqa: BLE001
+                _ctx_singleton = create_ready_quote_context(host=host, port=port)
+            except MoomooRuntimeError as exc:
                 logger.warning("[moomoo_options] OpenD connect failed: %s", exc)
                 return None
         return _ctx_singleton
+
+
+def _get_event_ctx():
+    """Lazy-create the dedicated quote-only context for option-event reads."""
+
+    global _event_ctx_singleton
+    if not _enabled():
+        return None
+    try:
+        from moomoo import OpenQuoteContext  # noqa: F401  (probe real symbol)
+    except ImportError:
+        logger.warning("[moomoo_options] SDK not installed; returning None")
+        return None
+    with _event_ctx_lock:
+        host, port = _endpoint()
+        if _event_ctx_singleton is not None and (
+            not probe_opend_tcp(host, port)
+            or not _is_alive(_event_ctx_singleton)
+        ):
+            logger.info("[moomoo_options] cached event ctx dead, reconnecting")
+            try:
+                _event_ctx_singleton.close()
+            except Exception:  # noqa: BLE001
+                pass
+            _event_ctx_singleton = None
+        if _event_ctx_singleton is None:
+            try:
+                _event_ctx_singleton = create_ready_quote_context(
+                    host=host,
+                    port=port,
+                )
+            except MoomooRuntimeError as exc:
+                logger.warning(
+                    "[moomoo_options] OpenD event connect failed: %s",
+                    exc,
+                )
+                return None
+        return _event_ctx_singleton
 
 
 def _to_moomoo_underlying(symbol: str) -> str:
@@ -154,13 +353,18 @@ def get_expirations_moomoo(symbol: str) -> List[str]:
 
     Returns ``[]`` when Moomoo is not enabled / OpenD unreachable.
     """
-    ctx = _get_ctx()
-    if ctx is None:
-        return []
     try:
         from moomoo import RET_OK
 
-        ret, data = ctx.get_option_expiration_date(code=_to_moomoo_underlying(symbol))
+        # Readiness, reconnect/close and the query share one lifecycle lock so
+        # another thread cannot close this context while the SDK call is active.
+        with _ctx_lock:
+            ctx = _get_ctx()
+            if ctx is None:
+                return []
+            ret, data = ctx.get_option_expiration_date(
+                code=_to_moomoo_underlying(symbol)
+            )
         if ret != RET_OK or data is None or data.empty:
             return []
         col = "strike_time"
@@ -181,19 +385,111 @@ def get_expirations_moomoo(symbol: str) -> List[str]:
 
 def _spot_for_classification(symbol: str) -> Optional[float]:
     """Best-effort spot price via Moomoo snapshot. Used only for moneyness label."""
-    ctx = _get_ctx()
-    if ctx is None:
-        return None
     try:
         from moomoo import RET_OK
 
-        ret, data = ctx.get_market_snapshot([_to_moomoo_underlying(symbol)])
-        if ret != RET_OK or data is None or data.empty:
-            return None
-        last = data.iloc[0].get("last_price")
-        return float(last) if last not in (None, "") else None
+        with _ctx_lock:
+            ctx = _get_ctx()
+            if ctx is None:
+                return None
+            return _spot_from_ctx(ctx, symbol, RET_OK)
     except Exception:  # noqa: BLE001
         return None
+
+
+def _spot_from_ctx(ctx, symbol: str, ret_ok) -> Optional[float]:
+    """Read a finite positive underlying spot from an already leased context."""
+    with _ctx_lock:
+        ret, data = ctx.get_market_snapshot([_to_moomoo_underlying(symbol)])
+    if ret != ret_ok or data is None or data.empty:
+        return None
+    last = _safe_float(data.iloc[0].get("last_price"))
+    return last if last is not None and last > 0 else None
+
+
+def _get_static_chain_frame(ctx, underlying: str, expiry: str, ret_ok):
+    """Read one expiry's static contract metadata under the context lock."""
+    try:
+        with _ctx_lock:
+            ret, data = ctx.get_option_chain(
+                code=underlying,
+                start=expiry,
+                end=expiry,
+            )
+        if ret != ret_ok or data is None or data.empty:
+            logger.debug(
+                "[moomoo_options] empty static chain for %s %s",
+                underlying,
+                expiry,
+            )
+            return None
+        return data
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[moomoo_options] get_option_chain failed: %s", exc)
+        return None
+
+
+def _get_static_chain_range_frame(
+    ctx,
+    underlying: str,
+    start_date: date,
+    end_date: date,
+    ret_ok,
+):
+    """Read one option-chain date range of at most 30 calendar days."""
+
+    if end_date < start_date or (end_date - start_date).days >= 30:
+        raise ValueError("option-chain range must contain at most 30 days")
+    try:
+        with _ctx_lock:
+            ret, data = ctx.get_option_chain(
+                code=underlying,
+                start=start_date.isoformat(),
+                end=end_date.isoformat(),
+            )
+        if ret != ret_ok or data is None:
+            logger.warning(
+                "[moomoo_options] option-wall chain range unavailable for "
+                "%s %s..%s (ret=%s, detail=%s)",
+                underlying,
+                start_date,
+                end_date,
+                ret,
+                _brief_detail(data),
+            )
+            return None
+        return data
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[moomoo_options] option-wall chain range failed for %s "
+            "%s..%s: %s",
+            underlying,
+            start_date,
+            end_date,
+            exc,
+        )
+        return None
+
+
+def _static_contracts(data) -> list[dict]:
+    """Return only well-formed contracts from static chain metadata."""
+    contracts: list[dict] = []
+    for _, row in data.iterrows():
+        item = row.to_dict()
+        code = str(item.get("code") or "").strip()
+        right_raw = str(item.get("option_type") or "").strip().upper()
+        right = (
+            "C"
+            if right_raw == "CALL"
+            else "P"
+            if right_raw == "PUT"
+            else ""
+        )
+        strike = _safe_float(item.get("strike_price"))
+        if not code or not right or strike is None or strike <= 0:
+            continue
+        contracts.append({"code": code, "right": right, "strike": strike})
+    return contracts
 
 
 def fetch_chain_via_moomoo(symbol: str, expiry: str) -> List[OptionQuote]:
@@ -205,76 +501,998 @@ def fetch_chain_via_moomoo(symbol: str, expiry: str) -> List[OptionQuote]:
 
     Returns ``[]`` on any failure or when not enabled.
     """
-    ctx = _get_ctx()
-    if ctx is None:
-        return []
     try:
         from moomoo import RET_OK
     except ImportError:
         return []
 
     underlying = _to_moomoo_underlying(symbol)
-    try:
-        ret, data = ctx.get_option_chain(code=underlying, start=expiry, end=expiry)
-        if ret != RET_OK or data is None or data.empty:
-            logger.info("[moomoo_options] empty chain for %s %s: %s", underlying, expiry, data)
+    with _ctx_lock:
+        ctx = _get_ctx()
+        if ctx is None:
             return []
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("[moomoo_options] get_option_chain failed: %s", exc)
-        return []
 
-    spot = _spot_for_classification(symbol)
-    today = date.today()
-    try:
-        exp_d = date.fromisoformat(expiry)
-        dte = max(0, (exp_d - today).days)
-    except ValueError:
-        dte = 0
+        data = _get_static_chain_frame(ctx, underlying, expiry, RET_OK)
+        if data is None:
+            return []
+        contracts = _static_contracts(data)
+        if not contracts:
+            return []
 
-    out: List[OptionQuote] = []
-    for _, row in data.iterrows():
-        d = row.to_dict()
-        right_raw = str(d.get("option_type") or "").upper()
-        right = "C" if right_raw == "CALL" else "P" if right_raw == "PUT" else right_raw[:1]
-        strike = float(d.get("strike_price") or 0) or 0.0
-        if strike <= 0:
-            continue
-        # Moomoo IV comes as percent (20 = 20%) — normalise to decimal.
-        iv_pct = d.get("implied_volatility")
-        try:
-            iv = float(iv_pct) / 100.0 if iv_pct not in (None, "") else 0.0
-        except (TypeError, ValueError):
-            iv = 0.0
-
-        moneyness = (
-            _classify_moneyness(right, strike, spot) if spot else ""
+        snapshot_result = _get_option_snapshots(
+            ctx,
+            [contract["code"] for contract in contracts],
+            RET_OK,
         )
-        out.append(
-            OptionQuote(
-                underlying=symbol.upper(),
-                expiry=expiry,
-                right=right,
-                strike=strike,
-                bid=float(d.get("bid_price") or 0) or 0.0,
-                ask=float(d.get("ask_price") or 0) or 0.0,
-                last=float(d.get("last_price") or 0) or 0.0,
-                volume=int(d.get("volume") or 0),
-                open_interest=int(d.get("open_interest") or 0),
-                implied_volatility=iv,
-                delta=_safe_float(d.get("delta")),
-                dte=dte,
-                moneyness=moneyness,
+        if not snapshot_result.snapshots:
+            logger.debug(
+                "[moomoo_options] no dynamic snapshots for %s %s; "
+                "refusing to present static chain rows as live quotes",
+                underlying,
+                expiry,
             )
+            return []
+
+        spot = _spot_from_ctx(ctx, symbol, RET_OK)
+        try:
+            exp_d = date.fromisoformat(expiry)
+            fallback_dte = max(
+                0,
+                (exp_d - _new_york_market_date()).days,
+            )
+        except ValueError:
+            fallback_dte = 0
+
+        out: List[OptionQuote] = []
+        omitted = 0
+        for contract in contracts:
+            snapshot = snapshot_result.snapshots.get(contract["code"])
+            if snapshot is None or not _snapshot_option_valid(snapshot):
+                omitted += 1
+                continue
+
+            bid = _safe_float(snapshot.get("bid_price"))
+            ask = _safe_float(snapshot.get("ask_price"))
+            last = _safe_float(snapshot.get("last_price"))
+            volume = _safe_int(snapshot.get("volume"))
+            open_interest = _safe_int(
+                _first_present(
+                    snapshot,
+                    "option_open_interest",
+                    "open_interest",
+                )
+            )
+            iv_pct = _safe_float(
+                _first_present(
+                    snapshot,
+                    "option_implied_volatility",
+                    "implied_volatility",
+                )
+            )
+
+            # ``OptionQuote`` cannot represent missing numeric values. Omit an
+            # incomplete contract rather than manufacturing a live-looking 0.
+            if (
+                bid is None
+                or ask is None
+                or last is None
+                or volume is None
+                or open_interest is None
+                or iv_pct is None
+                or min(bid, ask, last, iv_pct) < 0
+                or volume < 0
+                or open_interest < 0
+            ):
+                omitted += 1
+                continue
+
+            official_dte = _safe_int(
+                snapshot.get("option_expiry_date_distance")
+            )
+            dte = (
+                max(0, official_dte)
+                if official_dte is not None
+                else fallback_dte
+            )
+            strike = contract["strike"]
+            right = contract["right"]
+            moneyness = (
+                _classify_moneyness(right, strike, spot)
+                if spot is not None and spot > 0
+                else ""
+            )
+            out.append(
+                OptionQuote(
+                    underlying=symbol.upper(),
+                    expiry=expiry,
+                    right=right,
+                    strike=strike,
+                    bid=bid,
+                    ask=ask,
+                    last=last,
+                    volume=volume,
+                    open_interest=open_interest,
+                    implied_volatility=iv_pct / 100.0,
+                    delta=_safe_float(
+                        _first_present(snapshot, "option_delta", "delta")
+                    ),
+                    dte=dte,
+                    moneyness=moneyness,
+                )
+            )
+
+        if omitted:
+            logger.debug(
+                "[moomoo_options] omitted %s/%s incomplete option snapshots "
+                "for %s %s",
+                omitted,
+                len(contracts),
+                underlying,
+                expiry,
+            )
+        return out
+
+
+def _get_option_snapshots(
+    ctx,
+    codes: List[str],
+    ret_ok,
+) -> _OptionSnapshotResult:
+    """Fetch dynamic option fields in documented batches of at most 400.
+
+    Missing and failed batches remain explicit. General chain callers may use
+    the valid subset, while ATM-IV lookup requests one exact code and requires
+    ``complete`` before using it.
+    """
+    clean_codes = tuple(dict.fromkeys(code for code in codes if code))
+    requested = set(clean_codes)
+    snapshots: dict[str, dict] = {}
+    failed_batch_count = 0
+    with _ctx_lock:
+        for start in range(0, len(clean_codes), _SNAPSHOT_BATCH_SIZE):
+            batch = list(clean_codes[start : start + _SNAPSHOT_BATCH_SIZE])
+            try:
+                ret, frame = ctx.get_market_snapshot(batch)
+            except Exception as exc:  # noqa: BLE001
+                failed_batch_count += 1
+                logger.warning(
+                    "[moomoo_options] option snapshot batch failed "
+                    "(requested=%s): %s",
+                    len(batch),
+                    exc,
+                )
+                continue
+            if ret != ret_ok or frame is None or frame.empty:
+                failed_batch_count += 1
+                logger.warning(
+                    "[moomoo_options] option snapshot batch unavailable "
+                    "(requested=%s, ret=%s, detail=%s)",
+                    len(batch),
+                    ret,
+                    _brief_detail(frame),
+                )
+                continue
+            for _, row in frame.iterrows():
+                item = row.to_dict()
+                code = str(item.get("code") or "").strip()
+                if code and code in requested:
+                    snapshots[code] = item
+
+    result = _OptionSnapshotResult(
+        snapshots=snapshots,
+        requested_codes=clean_codes,
+        failed_batch_count=failed_batch_count,
+    )
+    if result.missing_codes:
+        logger.debug(
+            "[moomoo_options] dynamic snapshot coverage incomplete: "
+            "received=%s requested=%s failed_batches=%s",
+            len(result.snapshots),
+            len(result.requested_codes),
+            result.failed_batch_count,
         )
-    return out
+    return result
+
+
+def _brief_detail(value, limit: int = 240) -> str:
+    text = str(value).replace("\n", " ").strip()
+    return text if len(text) <= limit else f"{text[:limit]}..."
+
+
+def _snapshot_option_valid(snapshot: dict) -> bool:
+    value = snapshot.get("option_valid")
+    if isinstance(value, bool):
+        return value
+    number = _safe_float(value)
+    if number is not None:
+        return number == 1.0
+    return str(value or "").strip().lower() in {"true", "yes", "on"}
+
+
+def _new_york_market_date() -> date:
+    return datetime.now(tz=_NEW_YORK).date()
+
+
+def _first_present(mapping: dict, *keys: str):
+    for key in keys:
+        value = mapping.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return None
 
 
 def _safe_float(v) -> Optional[float]:
-    if v is None or v == "":
+    if v is None or (isinstance(v, str) and not v.strip()):
         return None
     try:
-        return float(v)
+        value = float(v)
     except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _safe_int(v) -> Optional[int]:
+    value = _safe_float(v)
+    if value is None or not value.is_integer():
+        return None
+    return int(value)
+
+
+def _safe_text(value) -> Optional[str]:
+    """Return a non-empty provider value without inventing a timestamp."""
+
+    if value is None:
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if hasattr(value, "isoformat") and not isinstance(value, str):
+        try:
+            text = value.isoformat()
+        except Exception:  # noqa: BLE001 - provider scalar compatibility
+            text = str(value)
+    else:
+        text = str(value)
+    text = text.strip()
+    return text or None
+
+
+def _normalise_option_standard_type(value) -> Optional[str]:
+    """Normalise SDK enum/string values while preserving an unknown state."""
+
+    if value is None:
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    enum_name = getattr(value, "name", None)
+    text = str(enum_name if enum_name is not None else value).strip().upper()
+    if not text or text in {"N/A", "NA", "NAN", "NONE", "NULL", "UNKNOWN"}:
+        return None
+    # Enum string representations can be ``OptionStandardType.NON_STANDARD``.
+    text = text.rsplit(".", 1)[-1].replace("-", "_").replace(" ", "_")
+    return text
+
+
+def _wall_static_contracts(
+    data,
+    *,
+    target_date: date,
+    dte_min: int,
+    dte_max: int,
+    allowed_expiries: set[str],
+) -> tuple[list[dict], int, int]:
+    """Extract strictly ranged wall inputs from each row's ``strike_time``."""
+
+    contracts: list[dict] = []
+    excluded_nonstandard = 0
+    unknown_standard_type = 0
+    for _, row in data.iterrows():
+        item = row.to_dict()
+        expiry_date = _safe_iso_date(
+            str(item.get("strike_time") or "").split(" ")[0]
+        )
+        if expiry_date is None or expiry_date < target_date:
+            continue
+        expiry = expiry_date.isoformat()
+        dte = (expiry_date - target_date).days
+        if (
+            expiry not in allowed_expiries
+            or dte < dte_min
+            or dte > dte_max
+        ):
+            continue
+
+        standard_type = _normalise_option_standard_type(
+            item.get("option_standard_type")
+        )
+        if standard_type in {"NON_STANDARD", "NONSTANDARD"}:
+            excluded_nonstandard += 1
+            continue
+        if standard_type != "STANDARD":
+            # A standard-only wall must fail closed.  Older SDK rows without
+            # this field or new unknown enum values are counted separately,
+            # never relabelled STANDARD.
+            unknown_standard_type += 1
+            continue
+
+        code = str(item.get("code") or "").strip()
+        right_raw = str(item.get("option_type") or "").strip().upper()
+        right = (
+            "C"
+            if right_raw == "CALL"
+            else "P"
+            if right_raw == "PUT"
+            else ""
+        )
+        strike = _safe_float(item.get("strike_price"))
+        if not code or not right or strike is None or strike <= 0:
+            continue
+        contracts.append(
+            {
+                "code": code,
+                "expiry": expiry,
+                "dte": dte,
+                "right": right,
+                "strike": strike,
+                "standard_type": standard_type,
+            }
+        )
+    return contracts, excluded_nonstandard, unknown_standard_type
+
+
+def _option_chain_windows(
+    *,
+    target_date: date,
+    dte_min: int,
+    dte_max: int,
+    selected_expiries: set[str],
+) -> list[tuple[date, date]]:
+    """Build only occupied, non-overlapping range calls capped at 30 days."""
+
+    parsed_selected = {
+        parsed
+        for expiry in selected_expiries
+        if (parsed := _safe_iso_date(expiry)) is not None
+    }
+    windows: list[tuple[date, date]] = []
+    cursor = target_date + timedelta(days=dte_min)
+    final_date = target_date + timedelta(days=dte_max)
+    while cursor <= final_date:
+        window_end = min(cursor + timedelta(days=29), final_date)
+        if any(cursor <= expiry <= window_end for expiry in parsed_selected):
+            windows.append((cursor, window_end))
+        cursor = window_end + timedelta(days=1)
+    return windows
+
+
+def _expiration_dates_from_ctx(ctx, underlying: str, ret_ok) -> Optional[list[str]]:
+    """Read expiration metadata from an already leased quote context."""
+
+    try:
+        ret, data = ctx.get_option_expiration_date(code=underlying)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[moomoo_options] option-wall expiration query failed for %s: %s",
+            underlying,
+            exc,
+        )
+        return None
+    if ret != ret_ok or data is None:
+        logger.warning(
+            "[moomoo_options] option-wall expirations unavailable for %s "
+            "(ret=%s, detail=%s)",
+            underlying,
+            ret,
+            _brief_detail(data),
+        )
+        return None
+    if data.empty:
+        return []
+    if "strike_time" not in data.columns:
+        logger.warning(
+            "[moomoo_options] option-wall expiration response for %s lacks "
+            "strike_time",
+            underlying,
+        )
+        return None
+    expiries = {
+        parsed.isoformat()
+        for value in data["strike_time"].tolist()
+        if (parsed := _safe_iso_date(str(value).split(" ")[0])) is not None
+    }
+    return sorted(expiries)
+
+
+def fetch_option_wall_snapshot_moomoo(
+    symbol: str,
+    dte_min: int = 0,
+    dte_max: int = 45,
+    ref_date: Optional[date] = None,
+) -> Optional[MoomooOptionWallSnapshot]:
+    """Fetch read-only strike-level inputs for option-wall analysis.
+
+    The function performs only quote metadata and market-snapshot queries.  It
+    does not subscribe to streams, unlock trading, place/cancel orders, or infer
+    dealer positioning.  Explicit ``NON_STANDARD`` contracts are excluded;
+    rows without ``option_standard_type`` are excluded and counted separately;
+    they are never relabelled as standard.
+    """
+
+    if not isinstance(dte_min, int) or not isinstance(dte_max, int):
+        raise ValueError("dte_min and dte_max must be integers")
+    if dte_min < 0 or dte_max < dte_min:
+        raise ValueError("require 0 <= dte_min <= dte_max")
+    if not _enabled():
+        return None
+
+    try:
+        from moomoo import RET_OK
+    except ImportError:
+        return None
+
+    target_date = ref_date or _new_york_market_date()
+    if not isinstance(target_date, date):
+        raise ValueError("ref_date must be a date")
+    normalized_symbol = str(symbol or "").strip().upper()
+    underlying = _to_moomoo_underlying(normalized_symbol)
+
+    try:
+        with _ctx_lock:
+            ctx = _get_ctx()
+            if ctx is None:
+                return None
+
+            available_expiries = _expiration_dates_from_ctx(
+                ctx,
+                underlying,
+                RET_OK,
+            )
+            if available_expiries is None:
+                return None
+
+            selected: list[tuple[str, int]] = []
+            for expiry in available_expiries:
+                parsed = _safe_iso_date(expiry)
+                if parsed is None or parsed < target_date:
+                    continue
+                dte = (parsed - target_date).days
+                if dte_min <= dte <= dte_max:
+                    selected.append((expiry, dte))
+
+            spot = _spot_from_ctx(ctx, normalized_symbol, RET_OK)
+            if spot is None or spot <= 0:
+                return None
+
+            requested_by_code: dict[str, dict] = {}
+            excluded_nonstandard_count = 0
+            unknown_standard_type_count = 0
+            failed_chain_range_count = 0
+            selected_expiry_set = {expiry for expiry, _ in selected}
+            chain_windows = _option_chain_windows(
+                target_date=target_date,
+                dte_min=dte_min,
+                dte_max=dte_max,
+                selected_expiries=selected_expiry_set,
+            )
+            for window_start, window_end in chain_windows:
+                frame = _get_static_chain_range_frame(
+                    ctx,
+                    underlying,
+                    window_start,
+                    window_end,
+                    RET_OK,
+                )
+                if frame is None:
+                    failed_chain_range_count += 1
+                    continue
+                static_contracts, excluded, unknown = _wall_static_contracts(
+                    frame,
+                    target_date=target_date,
+                    dte_min=dte_min,
+                    dte_max=dte_max,
+                    allowed_expiries=selected_expiry_set,
+                )
+                excluded_nonstandard_count += excluded
+                unknown_standard_type_count += unknown
+                for contract in static_contracts:
+                    requested_by_code.setdefault(contract["code"], contract)
+
+            requested_codes = list(requested_by_code)
+            snapshot_result = _get_option_snapshots(ctx, requested_codes, RET_OK)
+
+            contracts: list[MoomooOptionWallContract] = []
+            for code, static in requested_by_code.items():
+                dynamic = snapshot_result.snapshots.get(code)
+                if dynamic is None or not _snapshot_option_valid(dynamic):
+                    continue
+                volume = _safe_int(dynamic.get("volume"))
+                open_interest = _safe_int(
+                    _first_present(
+                        dynamic,
+                        "option_open_interest",
+                        "open_interest",
+                    )
+                )
+                if (
+                    volume is None
+                    or open_interest is None
+                    or volume < 0
+                    or open_interest < 0
+                ):
+                    continue
+
+                gamma = _safe_float(
+                    _first_present(dynamic, "option_gamma", "gamma")
+                )
+                if gamma is not None and gamma < 0:
+                    gamma = None
+                contract_size = _safe_int(
+                    _first_present(
+                        dynamic,
+                        "option_contract_size",
+                        "contract_size",
+                    )
+                )
+                if contract_size is not None and contract_size <= 0:
+                    contract_size = None
+                update_time = _safe_text(dynamic.get("update_time"))
+
+                contracts.append(
+                    MoomooOptionWallContract(
+                        code=code,
+                        expiry=static["expiry"],
+                        dte=static["dte"],
+                        right=static["right"],
+                        strike=static["strike"],
+                        volume=volume,
+                        open_interest=open_interest,
+                        gamma=gamma,
+                        contract_size=contract_size,
+                        update_time=update_time,
+                    )
+                )
+
+        contracts.sort(
+            key=lambda item: (item.expiry, item.strike, item.right, item.code)
+        )
+        if unknown_standard_type_count:
+            logger.info(
+                "[moomoo_options] option-wall %s excluded %s contracts with "
+                "unknown option_standard_type",
+                normalized_symbol,
+                unknown_standard_type_count,
+            )
+        return MoomooOptionWallSnapshot(
+            symbol=normalized_symbol,
+            spot=spot,
+            fetched_at=datetime.now(timezone.utc),
+            expiries=tuple(expiry for expiry, _ in selected),
+            contracts=tuple(contracts),
+            requested_contract_count=len(requested_codes),
+            snapshot_received_count=len(snapshot_result.snapshots),
+            valid_contract_count=len(contracts),
+            failed_batch_count=(
+                failed_chain_range_count + snapshot_result.failed_batch_count
+            ),
+            excluded_nonstandard_count=excluded_nonstandard_count,
+            excluded_unknown_standard_type_count=unknown_standard_type_count,
+        )
+    except Exception as exc:  # noqa: BLE001 - quote failures degrade to unavailable
+        logger.warning(
+            "[moomoo_options] option-wall snapshot(%s) failed: %s",
+            normalized_symbol,
+            exc,
+        )
+        return None
+
+
+def _normalise_option_event_enum(value) -> Optional[str]:
+    """Return a stable SDK enum label while preserving unknown as missing."""
+
+    if value is None:
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    enum_name = getattr(value, "name", None)
+    text = str(enum_name if enum_name is not None else value).strip().upper()
+    if not text or text in {"N/A", "NA", "NAN", "NONE", "NULL", "UNKNOWN"}:
+        return None
+    return text.rsplit(".", 1)[-1].replace("-", "_").replace(" ", "_")
+
+
+def _normalise_option_event_order_types(value) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    raw_values = value if isinstance(value, (list, tuple, set)) else [value]
+    normalised: list[str] = []
+    for raw in raw_values:
+        item = _normalise_option_event_enum(raw)
+        if item is not None and item not in normalised:
+            normalised.append(item)
+    return tuple(normalised)
+
+
+def _valid_nonnegative_float(value) -> Optional[float]:
+    parsed = _safe_float(value)
+    return parsed if parsed is not None and parsed >= 0 else None
+
+
+def _valid_positive_float(value) -> Optional[float]:
+    parsed = _safe_float(value)
+    return parsed if parsed is not None and parsed > 0 else None
+
+
+def _valid_nonnegative_int(value) -> Optional[int]:
+    parsed = _safe_int(value)
+    return parsed if parsed is not None and parsed >= 0 else None
+
+
+def fetch_option_underlying_overviews_moomoo(
+    symbols: list[str] | tuple[str, ...],
+) -> dict[str, MoomooOptionUnderlyingOverview]:
+    """Batch-read Moomoo's quote-only option overview for US underlyings.
+
+    This uses only ``OpenQuoteContext.get_option_underlying_overview``.  It
+    never constructs a trade context, unlocks trading, or calls an order API.
+    Missing SDK support, permissions, connection state, or malformed provider
+    rows fail closed by returning an empty/partial mapping.
+    """
+
+    if not _enabled():
+        return {}
+
+    requested: list[str] = []
+    seen: set[str] = set()
+    for raw in symbols:
+        try:
+            code = _to_moomoo_underlying(str(raw))
+        except ValueError:
+            continue
+        if not code.startswith("US.") or code in seen:
+            continue
+        requested.append(code)
+        seen.add(code)
+    if not requested:
+        return {}
+
+    try:
+        from moomoo import RET_OK
+    except (ImportError, AttributeError):
+        return {}
+
+    try:
+        with _ctx_lock:
+            ctx = _get_ctx()
+            if ctx is None:
+                return {}
+            getter = getattr(ctx, "get_option_underlying_overview", None)
+            if not callable(getter):
+                logger.info(
+                    "[moomoo_options] installed SDK lacks "
+                    "get_option_underlying_overview"
+                )
+                return {}
+            ret, frame = getter(requested)
+        if ret != RET_OK or frame is None or not hasattr(frame, "iterrows"):
+            logger.warning(
+                "[moomoo_options] option overview unavailable: %s",
+                _brief_detail((ret, frame)),
+            )
+            return {}
+    except Exception as exc:  # noqa: BLE001 - quote-only provider boundary
+        logger.warning("[moomoo_options] option overview failed: %s", exc)
+        return {}
+
+    fetched_at = datetime.now(timezone.utc)
+    result: dict[str, MoomooOptionUnderlyingOverview] = {}
+    requested_set = set(requested)
+    for _, row in frame.iterrows():
+        item = row.to_dict() if hasattr(row, "to_dict") else dict(row)
+        code = (_safe_text(item.get("code")) or "").upper()
+        if code not in requested_set:
+            continue
+        symbol = code[3:]
+        result[symbol] = MoomooOptionUnderlyingOverview(
+            symbol=symbol,
+            name=_safe_text(item.get("name")),
+            fetched_at=fetched_at,
+            call_volume=_valid_nonnegative_int(item.get("call_volume")),
+            put_volume=_valid_nonnegative_int(item.get("put_volume")),
+            call_open_interest=_valid_nonnegative_int(
+                item.get("call_open_interest")
+            ),
+            put_open_interest=_valid_nonnegative_int(
+                item.get("put_open_interest")
+            ),
+            iv_percent=_valid_nonnegative_float(item.get("iv")),
+            iv_rank_percent=_valid_nonnegative_float(item.get("iv_rank")),
+            iv_percentile_percent=_valid_nonnegative_float(
+                item.get("iv_percentile")
+            ),
+            previous_iv_percent=_valid_nonnegative_float(item.get("pre_iv")),
+            hv_30d_percent=_valid_nonnegative_float(item.get("hv_30d")),
+            hv_30d_percentile=_valid_nonnegative_float(
+                item.get("hv_30d_percentile")
+            ),
+            hv_60d_percent=_valid_nonnegative_float(item.get("hv_60d")),
+            hv_60d_percentile=_valid_nonnegative_float(
+                item.get("hv_60d_percentile")
+            ),
+            hv_90d_percent=_valid_nonnegative_float(item.get("hv_90d")),
+            hv_90d_percentile=_valid_nonnegative_float(
+                item.get("hv_90d_percentile")
+            ),
+            hv_120d_percent=_valid_nonnegative_float(item.get("hv_120d")),
+            hv_120d_percentile=_valid_nonnegative_float(
+                item.get("hv_120d_percentile")
+            ),
+            hv_365d_percent=_valid_nonnegative_float(item.get("hv_365d")),
+            hv_365d_percentile=_valid_nonnegative_float(
+                item.get("hv_365d_percentile")
+            ),
+        )
+    return result
+
+
+def _option_event_expiry(value) -> Optional[str]:
+    text = _safe_text(value)
+    if text is None:
+        return None
+    parsed = _safe_iso_date(text.split(" ", 1)[0])
+    return parsed.isoformat() if parsed is not None else None
+
+
+def _option_event_id(item: dict, *, order_types: tuple[str, ...]) -> str:
+    """Build a repeatable identifier from provider-observed transaction data."""
+
+    identity = {
+        "option_code": _safe_text(item.get("option_code")),
+        "fill_timestamp": _safe_float(item.get("fill_timestamp")),
+        "fill_time": _safe_text(item.get("fill_time")),
+        "ticker_type": _normalise_option_event_enum(item.get("ticker_type")),
+        "price": _safe_float(item.get("price")),
+        "volume": _safe_int(item.get("volume")),
+        "turnover": _safe_float(item.get("turnover")),
+        "order_types": order_types,
+        "strategy_type": _normalise_option_event_enum(
+            item.get("strategy_type")
+        ),
+    }
+    encoded = json.dumps(
+        identity,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"moomoo-evt-{hashlib.sha256(encoded).hexdigest()[:24]}"
+
+
+def _option_event_rows(frame) -> Optional[list[dict]]:
+    """Accept the current DataFrame and bounded older/future row containers."""
+
+    if frame is None:
+        return None
+    if hasattr(frame, "iterrows"):
+        return [
+            row.to_dict() if hasattr(row, "to_dict") else dict(row)
+            for _, row in frame.iterrows()
+        ]
+    if isinstance(frame, (list, tuple)):
+        rows: list[dict] = []
+        for row in frame:
+            if isinstance(row, dict):
+                rows.append(dict(row))
+            elif hasattr(row, "to_dict"):
+                rows.append(row.to_dict())
+            else:
+                return None
+        return rows
+    return None
+
+
+def _unpack_option_event_result(
+    result,
+    *,
+    ret_ok,
+) -> Optional[tuple[list[dict], Optional[int]]]:
+    """Unpack the 10.9 dict payload plus known legacy direct-frame shape."""
+
+    if not isinstance(result, (tuple, list)) or len(result) < 2:
+        return None
+    if result[0] != ret_ok:
+        return None
+
+    payload = result[1]
+    all_count_raw = None
+    if isinstance(payload, dict):
+        frame = payload.get("event_list")
+        all_count_raw = payload.get("all_count")
+        if frame is None and _safe_int(all_count_raw) == 0:
+            return [], 0
+    else:
+        # Older SDKs may expose the event frame directly and append pagination
+        # metadata.  Do not mistake the current dict payload for a DataFrame.
+        frame = payload
+        if len(result) >= 4:
+            all_count_raw = result[3]
+
+    rows = _option_event_rows(frame)
+    if rows is None:
+        return None
+    all_count = _valid_nonnegative_int(all_count_raw)
+    return rows, all_count
+
+
+def _build_option_event(
+    item: dict,
+    *,
+    requested_symbol: str,
+    requested_owner_code: str,
+) -> Optional[MoomooOptionEvent]:
+    option_code = _safe_text(item.get("option_code"))
+    if option_code is None:
+        return None
+
+    owner_code = _safe_text(item.get("owner_code"))
+    if owner_code is not None:
+        owner_code = owner_code.upper()
+        if owner_code != requested_owner_code:
+            return None
+    row_symbol = _safe_text(item.get("symbol"))
+    if row_symbol is not None:
+        row_symbol = row_symbol.upper()
+        if row_symbol != requested_symbol:
+            return None
+
+    order_types = _normalise_option_event_order_types(
+        item.get("order_type_list")
+    )
+    delta = _safe_float(item.get("delta"))
+    if delta is not None and not -1 <= delta <= 1:
+        delta = None
+    dte = _valid_nonnegative_int(item.get("dte"))
+    vo_ratio = _valid_nonnegative_float(item.get("vo_ratio"))
+
+    return MoomooOptionEvent(
+        event_id=_option_event_id(item, order_types=order_types),
+        option_code=option_code,
+        owner_code=owner_code,
+        symbol=row_symbol,
+        fill_time=_safe_text(item.get("fill_time")),
+        ticker_type=_normalise_option_event_enum(item.get("ticker_type")),
+        price=_valid_positive_float(item.get("price")),
+        volume=_valid_nonnegative_int(item.get("volume")),
+        turnover=_valid_nonnegative_float(item.get("turnover")),
+        option_type=_normalise_option_event_enum(item.get("option_type")),
+        strike_price=_valid_positive_float(item.get("strike_price")),
+        expiry=_option_event_expiry(item.get("strike_time")),
+        dte=dte,
+        underlying_price=_valid_positive_float(item.get("underlying_price")),
+        bid_price=_valid_nonnegative_float(item.get("bid_price")),
+        ask_price=_valid_nonnegative_float(item.get("ask_price")),
+        # get_option_event.iv is already percent-form (40.791 = 40.791%).
+        iv_percent=_valid_nonnegative_float(item.get("iv")),
+        total_volume=_valid_nonnegative_int(item.get("total_volume")),
+        total_open_interest=_valid_nonnegative_int(
+            item.get("total_open_interest")
+        ),
+        # vo_ratio is a decimal volume/OI ratio (0.05203 = 5.203%).
+        vo_ratio_percent=(vo_ratio * 100.0 if vo_ratio is not None else None),
+        delta=delta,
+        sentiment=_normalise_option_event_enum(item.get("sentiment")),
+        order_types=order_types,
+        strategy_type=_normalise_option_event_enum(item.get("strategy_type")),
+    )
+
+
+def fetch_option_events_moomoo(
+    symbol: str,
+    limit: int = 5,
+) -> Optional[MoomooOptionEventSnapshot]:
+    """Read the first page of Moomoo's unusual option transactions.
+
+    Only ``OpenQuoteContext.get_option_event`` is used.  The provider's BUY /
+    SELL and BULLISH / BEARISH labels are preserved as classifications; this
+    adapter never converts them into open/close, counterparty, or dealer-flow
+    claims.  ``None`` means the query was unavailable, while a snapshot with an
+    empty ``events`` tuple means the query succeeded and observed no rows.
+    """
+
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 10:
+        raise ValueError("limit must be an integer between 1 and 10")
+    if not _enabled():
+        return None
+
+    owner_code = _to_moomoo_underlying(symbol)
+    if not owner_code.startswith("US."):
+        return None
+    normalized_symbol = owner_code[3:]
+    try:
+        from moomoo import (
+            RET_OK,
+            EventIndicatorType,
+            OptionEventFilter,
+            OptionMarket,
+        )
+    except (ImportError, AttributeError):
+        return None
+
+    try:
+        with _event_ctx_lock:
+            ctx = _get_event_ctx()
+            if ctx is None:
+                return None
+            get_option_event = getattr(ctx, "get_option_event", None)
+            if not callable(get_option_event):
+                logger.info(
+                    "[moomoo_options] installed SDK lacks get_option_event"
+                )
+                return None
+            owner_filter = OptionEventFilter(
+                EventIndicatorType.OWNER_LIST,
+                security_list=[owner_code],
+            )
+            raw_result = get_option_event(
+                OptionMarket.US_SECURITY,
+                count=limit,
+                filter_list=[owner_filter],
+            )
+
+        unpacked = _unpack_option_event_result(raw_result, ret_ok=RET_OK)
+        if unpacked is None:
+            logger.warning(
+                "[moomoo_options] unusual option events unavailable for %s: %s",
+                owner_code,
+                _brief_detail(raw_result),
+            )
+            return None
+        rows, all_count = unpacked
+        events = tuple(
+            event
+            for row in rows[:limit]
+            if (
+                event := _build_option_event(
+                    row,
+                    requested_symbol=normalized_symbol,
+                    requested_owner_code=owner_code,
+                )
+            )
+            is not None
+        )
+        if rows and not events:
+            logger.warning(
+                "[moomoo_options] unusual option events for %s contained no "
+                "usable contract rows",
+                owner_code,
+            )
+            return None
+        if not rows and all_count not in {None, 0}:
+            logger.warning(
+                "[moomoo_options] unusual option event count/frame mismatch "
+                "for %s (all_count=%s)",
+                owner_code,
+                all_count,
+            )
+            return None
+        event_as_of = max(
+            (event.fill_time for event in events if event.fill_time is not None),
+            default=None,
+        )
+        return MoomooOptionEventSnapshot(
+            symbol=normalized_symbol,
+            fetched_at=datetime.now(timezone.utc),
+            event_as_of=event_as_of,
+            all_count=all_count,
+            events=events,
+        )
+    except Exception as exc:  # noqa: BLE001 - per-symbol graceful degradation
+        logger.warning(
+            "[moomoo_options] unusual option events(%s) failed: %s",
+            owner_code,
+            exc,
+        )
         return None
 
 
@@ -283,45 +1501,82 @@ def compute_atm_iv_moomoo(
 ) -> tuple[Optional[float], str]:
     """Return ``(atm_iv_decimal, chosen_expiry_iso)`` via Moomoo.
 
-    Drop-in replacement for :func:`src.options.iv_rank.compute_atm_iv` —
-    same return shape so callers can fall back without conversion.
+    The ATM path reads one exact contract snapshot instead of selecting from a
+    best-effort full-chain subset. A failed or missing target snapshot therefore
+    fails closed and lets the caller fall back to another provider.
     """
     if not _enabled():
         return None, ""
     expirations = get_expirations_moomoo(symbol)
-    if not expirations:
+    parsed_expirations = sorted(
+        (parsed, raw)
+        for raw in expirations
+        if (parsed := _safe_iso_date(raw)) is not None
+    )
+    if not parsed_expirations:
         return None, ""
 
-    target = ref_date or date.today()
+    target = ref_date or _new_york_market_date()
     chosen = next(
-        (e for e in expirations if _safe_iso_date(e) and _safe_iso_date(e) >= target),
-        expirations[-1],
+        (raw for parsed, raw in parsed_expirations if parsed >= target),
+        None,
     )
+    if chosen is None:
+        # Never present an expired contract as the current ATM-IV context.
+        return None, ""
 
-    chain = fetch_chain_via_moomoo(symbol, chosen)
-    if not chain:
+    try:
+        from moomoo import RET_OK
+    except ImportError:
         return None, chosen
-    spot = _spot_for_classification(symbol)
-    if spot is None or spot <= 0:
-        return None, chosen
-    # Pick ATM call by minimising |strike - spot|.
-    calls = [q for q in chain if q.right == "C" and q.strike > 0]
-    if not calls:
-        return None, chosen
-    atm = min(calls, key=lambda q: abs(q.strike - spot))
-    iv = atm.implied_volatility
-    if not iv or iv <= 0:
-        # Moomoo only populates IV during market hours for LV1+ permissions.
-        # Outside RTH the chain still returns rows but IV/Greeks are 0. We
-        # signal "no IV here" so iv_rank.py falls back to yfinance instead
-        # of treating 0 as a legit value.
-        logger.info(
-            "[moomoo_options] %s ATM call at %s has IV=%s (likely outside RTH "
-            "or LV1 permissions don't push live greeks); falling back",
-            symbol, chosen, iv,
+
+    underlying = _to_moomoo_underlying(symbol)
+    with _ctx_lock:
+        ctx = _get_ctx()
+        if ctx is None:
+            return None, chosen
+        spot = _spot_from_ctx(ctx, symbol, RET_OK)
+        if spot is None or spot <= 0:
+            return None, chosen
+        data = _get_static_chain_frame(ctx, underlying, chosen, RET_OK)
+        if data is None:
+            return None, chosen
+        calls = [
+            contract
+            for contract in _static_contracts(data)
+            if contract["right"] == "C"
+        ]
+        if not calls:
+            return None, chosen
+        atm = min(calls, key=lambda contract: abs(contract["strike"] - spot))
+        snapshot_result = _get_option_snapshots(ctx, [atm["code"]], RET_OK)
+        if not snapshot_result.complete:
+            logger.info(
+                "[moomoo_options] exact ATM snapshot unavailable for %s %s; "
+                "falling back",
+                symbol,
+                chosen,
+            )
+            return None, chosen
+        snapshot = snapshot_result.snapshots.get(atm["code"])
+        if snapshot is None or not _snapshot_option_valid(snapshot):
+            return None, chosen
+        iv_pct = _safe_float(
+            _first_present(
+                snapshot,
+                "option_implied_volatility",
+                "implied_volatility",
+            )
         )
-        return None, chosen
-    return iv, chosen
+        if iv_pct is None or iv_pct <= 0:
+            logger.info(
+                "[moomoo_options] %s ATM call at %s has no valid IV; "
+                "falling back",
+                symbol,
+                chosen,
+            )
+            return None, chosen
+        return iv_pct / 100.0, chosen
 
 
 def _safe_iso_date(s: str) -> Optional[date]:

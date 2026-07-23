@@ -32,6 +32,7 @@ from src.services.system_config_service import (
     ConfigValidationError,
     SystemConfigService,
 )
+from src.services.moomoo_runtime import probe_opend_tcp
 
 logger = logging.getLogger(__name__)
 
@@ -396,7 +397,8 @@ def get_system_config_schema(
     description=(
         "Lightweight probe used by the frontend TopBar badge. Returns whether "
         "the Moomoo OpenD daemon is reachable and whether the SDK is wired up. "
-        "Cheap (~1-2 ms) — no quota cost. Safe to poll every 30 s."
+        "Bounded TCP-only check — no SDK context or quota cost. Safe to poll "
+        "every 30 s."
     ),
 )
 def get_moomoo_status() -> dict:
@@ -418,6 +420,8 @@ def get_moomoo_status() -> dict:
             "enabled": False,
             "sdk_installed": False,
             "connected": False,
+            "read_only": True,
+            "probe_level": "tcp",
             "host": host,
             "port": port,
             "trd_env": trd_env,
@@ -427,60 +431,55 @@ def get_moomoo_status() -> dict:
     # SDK probe — check for a real symbol, not just `import moomoo` (which can
     # resolve to an empty namespace package — see MoomooFetcher comment).
     try:
-        from moomoo import OpenQuoteContext  # noqa: F401
-        sdk_ok = True
-    except ImportError:
+        import moomoo as moomoo_sdk
+
+        sdk_ok = hasattr(moomoo_sdk, "OpenQuoteContext")
+        if not sdk_ok:
+            raise ImportError("OpenQuoteContext missing")
+        sdk_version = getattr(moomoo_sdk, "__version__", None)
+    except (ImportError, AttributeError):
         return {
             "enabled": True,
             "sdk_installed": False,
             "connected": False,
+            "read_only": True,
+            "probe_level": "tcp",
             "host": host,
             "port": port,
             "trd_env": trd_env,
             "message": "moomoo-api SDK not installed",
         }
-
-    # Reuse the MoomooFetcher singleton so we don't open/close a fresh OpenD
-    # socket on every UI poll.
-    connected = False
-    sdk_version = None
-    try:
-        from data_provider.base import DataFetcherManager
-
-        manager = DataFetcherManager()
-        for f in manager._get_fetchers_snapshot():
-            if f.name == "MoomooFetcher" and getattr(f, "_sdk_ok", False):
-                try:
-                    f._get_ctx()  # creates if missing
-                    connected = f._is_ctx_alive()
-                except Exception:  # noqa: BLE001
-                    connected = False
-                break
-        try:
-            import moomoo as _m
-
-            sdk_version = getattr(_m, "__version__", None)
-        except Exception:  # noqa: BLE001
-            pass
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 - surface an SDK import failure safely
         return {
             "enabled": True,
-            "sdk_installed": sdk_ok,
+            "sdk_installed": False,
             "connected": False,
+            "read_only": True,
+            "probe_level": "tcp",
             "host": host,
             "port": port,
             "trd_env": trd_env,
-            "sdk_version": sdk_version,
-            "message": f"manager probe failed: {exc}",
+            "message": f"moomoo-api SDK import failed: {type(exc).__name__}",
         }
+
+    # Never construct DataFetcherManager or an SDK context from a polling
+    # endpoint.  A 500 ms TCP deadline keeps the API worker available even
+    # while OpenD is offline.
+    connected = probe_opend_tcp(host, port)
 
     return {
         "enabled": True,
         "sdk_installed": sdk_ok,
         "connected": connected,
+        "read_only": True,
+        "probe_level": "tcp",
         "host": host,
         "port": port,
         "trd_env": trd_env,
         "sdk_version": sdk_version,
-        "message": "live" if connected else "OpenD daemon not reachable — open the OpenD app and log in",
+        "message": (
+            "OpenD TCP endpoint reachable"
+            if connected
+            else "OpenD daemon not reachable — open the OpenD app and log in"
+        ),
     }

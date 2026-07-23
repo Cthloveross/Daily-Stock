@@ -741,6 +741,10 @@ class DatabaseManager:
             cursor = dbapi_connection.cursor()
             try:
                 cursor.execute(f"PRAGMA busy_timeout={int(self._sqlite_busy_timeout_ms)}")
+                # Required for append-only ledger DELETE triggers to fire when
+                # SQLite implements INSERT OR REPLACE as an implicit delete.
+                cursor.execute("PRAGMA recursive_triggers=ON")
+                cursor.execute("PRAGMA foreign_keys=ON")
                 if self._sqlite_file_db and self._sqlite_wal_enabled:
                     cursor.execute("PRAGMA journal_mode=WAL")
             except Exception as exc:

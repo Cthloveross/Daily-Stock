@@ -65,16 +65,38 @@ f.get_recommendation_trends('NVDA')
 - SPY 前日 Low/High/Close → `close_vs_high_pct`
 - Alpaca premarket SPY + 每只 watchlist symbol（前 20 只）
 
-每个 getter 都 defensive：缺 API key / 缺包 / 网络错 → 返回空 dict（scorer 会读成 0 贡献，总分不 crash）。
+每个 getter 都 defensive：缺 API key / 缺包 / 网络错不会 crash。`regime-quality-v1`
+通过 `_status=ready|degraded|unavailable` 声明输入质量；空或未就绪输入的 0 只表示
+“未计分”，不再被解释成看空/看多证据。
+
+当前只读取数顺序与预算：
+
+- SPY、11 个板块 ETF 与昨日结构优先复用项目 `DataFetcherManager` 中已启用的
+  `MoomooFetcher`；昨日结构复用同一份 SPY 日线，不重复请求
+- VIX 先尝试 Moomoo；本机 OpenD 若返回 `Unknown stock. VIX`，回退到
+  [Cboe 官方每日 VIX 历史 CSV](https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv)，
+  单次 timeout 3 秒，不用 VIX ETF 代理冒充现货指数
+- Moomoo 不可用时，仅 SPY 允许一次 3 秒 yfinance fallback；板块域直接标为
+  unavailable，不再串行发起 11 次远端 fallback
+- Finnhub 经济日历与财报由逐日十几次请求合并为两个 7 日区间请求，自动实例单次 timeout
+  2 秒；403/timeout 会显式标为 degraded/unavailable，不能被当成“今日无事件”
+- Alpaca 先读 SPY；SPY 失败便停止 watchlist fan-out，成功时也最多检查 5 个标的并按覆盖
+  完整度降级。整次 Regime fetcher 使用 18 秒工作预算，后续可选域不会挤占核心行情。
 
 ### 5. 主入口 + 存储
 
 `compute_regime_score(target_date, watchlist=None, save_to_db=True, thresholds=None) -> RegimeResult`
 
-- 默认 `target_date=date.today()`、watchlist 读 `config.stock_list` fallback 到 `['SPY','QQQ','NVDA','AAPL','TSLA']`
+- 默认 `target_date` 使用 `America/New_York` 市场日期、watchlist 读 `config.stock_list` fallback 到 `['SPY','QQQ','NVDA','AAPL','TSLA']`
 - DB 表 `regime_scores`（date PK，d1-d6 + snapshot_json + version）
-- 幂等 upsert：同 date 再跑一次覆盖旧值
+- 幂等 upsert：同 date 再跑一次覆盖旧值并刷新 UTC `generated_at`
 - `get_regime_score(date)` / `get_recent_scores(days=30)` 读取
+
+`snapshot_json.quality` 保存六域质量。仅 `ready` 是权威分数；核心 SPY/VIX 不完整时
+为 `unavailable`，用 `score=0` + `label=unavailable` fail closed，但不得把该占位值
+解释为真实 `no_trade`；核心完整而支持域缺失时为 `degraded`。下游应先检查
+`state` / `authoritative` / `domain_states` / `incomplete_domains`，再读取分数。
+`degraded` 的数字分档仅作市场背景，不得产生允许或阻止交易的 action hint。
 
 ### 6. CLI
 
@@ -125,7 +147,8 @@ sqlite3 data/daily_stock.db "SELECT date, score, label FROM regime_scores ORDER 
 
 - **晨报推送 + GitHub Actions cron** → Stage 4
 - **交易日历精度**：`backfill` 只跳 weekend，不查美国联邦假日。用 `src.core.trading_calendar` 精化留到 Phase 1。
-- **Premarket 数据源**：Alpaca 之外没备选。未配置 Alpaca 时 d6 恒为 0（scorer 下限）—— 不 crash，但信息量低。
+- **Premarket 数据源**：Alpaca 之外没备选。未配置、SPY 请求失败或 watchlist 覆盖不完整时
+  d6 的 0 表示未计分，整体质量标为 `degraded`，不是“盘前平盘”证据。
 - **Watchlist 来源**：优先读 config.stock_list；如果用户只有 A 股 watchlist（v1 默认），`compute_regime_score` 会跑到美股 symbol 也不奇怪——但 scorer 逻辑本身是市场宽度 + 大盘走势，对具体 watchlist 不敏感。
 - **反身性列** (`user_perceived_quality`、`user_did_trade`) 已在 schema 占位，Phase 1 激活。
 - **thresholds 自定义** 已支持但 CLI 没暴露；够用场景下留 argparse 未加。

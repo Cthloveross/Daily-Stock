@@ -306,6 +306,41 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertFalse(validation["valid"])
         self.assertTrue(any(issue["key"] == "AGENT_LITELLM_MODEL" and issue["code"] == "unknown_model" for issue in validation["issues"]))
 
+    def test_validate_reports_unknown_journal_primary_model_for_channels(self) -> None:
+        validation = self.service.validate(
+            items=[
+                {"key": "LLM_CHANNELS", "value": "primary"},
+                {"key": "LLM_PRIMARY_PROTOCOL", "value": "openai"},
+                {"key": "LLM_PRIMARY_API_KEY", "value": "sk-test-value"},
+                {"key": "LLM_PRIMARY_MODELS", "value": "gpt-4o-mini"},
+                {"key": "JOURNAL_AI_MODEL", "value": "openai/gpt-4o"},
+            ]
+        )
+
+        self.assertFalse(validation["valid"])
+        self.assertTrue(any(
+            issue["key"] == "JOURNAL_AI_MODEL" and issue["code"] == "unknown_model"
+            for issue in validation["issues"]
+        ))
+
+    def test_validate_reports_unknown_journal_fallback_model_for_channels(self) -> None:
+        validation = self.service.validate(
+            items=[
+                {"key": "LLM_CHANNELS", "value": "primary"},
+                {"key": "LLM_PRIMARY_PROTOCOL", "value": "openai"},
+                {"key": "LLM_PRIMARY_API_KEY", "value": "sk-test-value"},
+                {"key": "LLM_PRIMARY_MODELS", "value": "gpt-4o-mini"},
+                {"key": "JOURNAL_AI_FALLBACK_MODELS", "value": "openai/gpt-4o"},
+            ]
+        )
+
+        self.assertFalse(validation["valid"])
+        self.assertTrue(any(
+            issue["key"] == "JOURNAL_AI_FALLBACK_MODELS"
+            and issue["code"] == "unknown_model"
+            for issue in validation["issues"]
+        ))
+
     def test_validate_accepts_unprefixed_agent_model_when_channel_declares_openai_model(self) -> None:
         validation = self.service.validate(
             items=[
@@ -556,6 +591,25 @@ class SystemConfigServiceTestCase(unittest.TestCase):
 
         self.assertFalse(validation["valid"])
         self.assertTrue(any(issue["key"] == "AGENT_LITELLM_MODEL" and issue["code"] == "missing_runtime_source" for issue in validation["issues"]))
+
+    def test_validate_reports_stale_journal_primary_when_all_channels_disabled(self) -> None:
+        validation = self.service.validate(
+            items=[
+                {"key": "LLM_CHANNELS", "value": "primary"},
+                {"key": "LLM_PRIMARY_PROTOCOL", "value": "openai"},
+                {"key": "LLM_PRIMARY_API_KEY", "value": "sk-test-value"},
+                {"key": "LLM_PRIMARY_MODELS", "value": "gpt-4o-mini"},
+                {"key": "LLM_PRIMARY_ENABLED", "value": "false"},
+                {"key": "JOURNAL_AI_MODEL", "value": "openai/gpt-4o-mini"},
+            ]
+        )
+
+        self.assertFalse(validation["valid"])
+        self.assertTrue(any(
+            issue["key"] == "JOURNAL_AI_MODEL"
+            and issue["code"] == "missing_runtime_source"
+            for issue in validation["issues"]
+        ))
 
     def test_validate_allows_primary_model_when_all_channels_disabled_but_legacy_key_exists(self) -> None:
         validation = self.service.validate(

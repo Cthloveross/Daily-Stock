@@ -5,7 +5,7 @@ import { useRegimeStore } from '../stores/regimeStore';
 import { useUserWatchlistStore } from '../stores/userWatchlistStore';
 import { useTickerQuotes } from '../hooks/useTickerQuotes';
 import type { StockQuote } from '../api/stocks';
-import type { RegimeScoreItem } from '../types/regime';
+import type { RegimeQualityState, RegimeScoreItem } from '../types/regime';
 import { type RegimeState } from '../components/regime/RegimeScore';
 import { RegimeGauge } from '../components/regime/RegimeGauge';
 import { ContributionList } from '../components/regime/ContributionList';
@@ -13,6 +13,7 @@ import { ContributionInfo } from '../components/regime/ContributionInfo';
 import { DataSourceStatus, type DataSource } from '../components/system/DataSourceStatus';
 import { RegimeHistoryChart } from '../components/regime/RegimeHistoryChart';
 import BreakoutSignalsList from '../components/breakout/BreakoutSignalsList';
+import { DailyOpportunityList } from '../components/opportunities/DailyOpportunityList';
 import { TradingViewWidget } from '../components/charts/TradingViewWidget';
 import { Search, Trash2, X } from 'lucide-react';
 import { Input, toast } from '../components/ui';
@@ -22,6 +23,7 @@ import { DataTable, EmptyState, type ColumnDef } from '../components/ui';
 import { PriceCell } from '../components/data/PriceCell';
 import { ChangeCell } from '../components/data/ChangeCell';
 import { Tabs } from '../components/ui';
+import { formatEtClock } from '../utils/marketTime';
 
 function toRegimeState(label?: string | null): RegimeState {
   const k = (label ?? '').toLowerCase();
@@ -37,19 +39,75 @@ function num(o: unknown, key: string): number | undefined {
   return typeof v === 'number' ? v : undefined;
 }
 
-function deriveStatBar(item: RegimeScoreItem): React.ComponentProps<typeof StatBar>['items'] {
-  const spy = (item.snapshot?.spy ?? {}) as Record<string, unknown>;
-  const vix = (item.snapshot?.vix ?? {}) as Record<string, unknown>;
-  const sectors = (item.snapshot?.sectors ?? {}) as Record<string, unknown>;
-  const pre = (item.snapshot?.premarket ?? {}) as Record<string, unknown>;
+function numAny(o: unknown, ...keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = num(o, key);
+    if (value !== undefined) return value;
+  }
+  return undefined;
+}
 
-  const spyClose = num(spy, 'close');
-  const spyChgPct = num(spy, 'chg_pct');
-  const spyMa20 = num(spy, 'ma20');
-  const vixLevel = num(vix, 'level');
-  const vixChgPct = num(vix, 'chg_pct');
-  const breadthRaw = num(sectors, 'sectors_above_ma20');
-  const preSpy = num(pre, 'spy_pre_pct');
+function block(
+  snapshot: Record<string, unknown>,
+  snakeKey: string,
+  camelKey: string,
+): Record<string, unknown> {
+  return ((snapshot[snakeKey] ?? snapshot[camelKey] ?? {}) as Record<string, unknown>);
+}
+
+const DOMAIN_LABELS: Record<string, string> = {
+  spy: 'SPY 趋势',
+  vix: 'VIX',
+  events: '宏观事件',
+  sectors: '板块广度',
+  prev_day: '昨日结构',
+  premarket: '盘前行情',
+};
+
+function regimeQuality(item: RegimeScoreItem): {
+  state: RegimeQualityState;
+  incomplete: string[];
+  domains: Record<string, RegimeQualityState>;
+} {
+  const snapshotQuality = (item.snapshot?.quality ?? {}) as Record<string, unknown>;
+  const stateRaw = item.qualityState ?? snapshotQuality.state;
+  const state: RegimeQualityState =
+    stateRaw === 'ready' || stateRaw === 'degraded' || stateRaw === 'unavailable'
+      ? stateRaw
+      : 'unavailable';
+  const domainRaw =
+    item.domainQuality ??
+    ((snapshotQuality.domainStates ?? snapshotQuality.domain_states ?? {}) as Record<string, RegimeQualityState>);
+  const domains: Record<string, RegimeQualityState> = {
+    ...domainRaw,
+    prev_day: domainRaw.prev_day ?? domainRaw.prevDay,
+  };
+  const incompleteRaw =
+    item.incompleteDomains ??
+    (Array.isArray(snapshotQuality.incompleteDomains ?? snapshotQuality.incomplete_domains)
+      ? ((snapshotQuality.incompleteDomains ?? snapshotQuality.incomplete_domains) as string[])
+      : []);
+  return {
+    state,
+    incomplete: incompleteRaw.map((domain) => domain === 'prevDay' ? 'prev_day' : domain),
+    domains,
+  };
+}
+
+function deriveStatBar(item: RegimeScoreItem): React.ComponentProps<typeof StatBar>['items'] {
+  const snapshot = item.snapshot ?? {};
+  const spy = block(snapshot, 'spy', 'spy');
+  const vix = block(snapshot, 'vix', 'vix');
+  const sectors = block(snapshot, 'sectors', 'sectors');
+  const pre = block(snapshot, 'premarket', 'premarket');
+
+  const spyClose = numAny(spy, 'close');
+  const spyChgPct = numAny(spy, 'chg_pct', 'chgPct');
+  const spyMa20 = numAny(spy, 'ma20');
+  const vixLevel = numAny(vix, 'level');
+  const vixChgPct = numAny(vix, 'chg_pct', 'chgPct');
+  const breadthRaw = numAny(sectors, 'sectors_above_ma20', 'sectorsAboveMa20');
+  const preSpy = numAny(pre, 'spy_pre_pct', 'spyPrePct');
 
   const fmt = (n?: number, d = 2) =>
     n === undefined ? '—' : n.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
@@ -84,49 +142,83 @@ function deriveStatBar(item: RegimeScoreItem): React.ComponentProps<typeof StatB
     },
     {
       label: 'Updated',
-      value: item.generatedAt
-        ? new Date(item.generatedAt.endsWith('Z') ? item.generatedAt : `${item.generatedAt}Z`).toLocaleTimeString(
-            [],
-            { hour: '2-digit', minute: '2-digit' },
-          )
-        : '—',
+      value: formatEtClock(item.generatedAt) || '—',
       sub: `${item.version} \u00b7 ET`,
     },
   ];
 }
 
 function deriveDataSources(item: RegimeScoreItem): DataSource[] {
-  const spy = (item.snapshot?.spy ?? {}) as Record<string, unknown>;
-  const vix = (item.snapshot?.vix ?? {}) as Record<string, unknown>;
-  const sectors = (item.snapshot?.sectors ?? {}) as Record<string, unknown>;
-  const prev = (item.snapshot?.prev_day ?? {}) as Record<string, unknown>;
-  const pre = (item.snapshot?.premarket ?? {}) as Record<string, unknown>;
-  const ev = (item.snapshot?.events ?? {}) as Record<string, unknown>;
+  const snapshot = item.snapshot ?? {};
+  const spy = block(snapshot, 'spy', 'spy');
+  const vix = block(snapshot, 'vix', 'vix');
+  const sectors = block(snapshot, 'sectors', 'sectors');
+  const prev = block(snapshot, 'prev_day', 'prevDay');
+  const pre = block(snapshot, 'premarket', 'premarket');
+  const ev = block(snapshot, 'events', 'events');
 
-  const hasNum = (o: Record<string, unknown>, k: string) => typeof o[k] === 'number';
+  const quality = regimeQuality(item);
+  const hasQuality = Object.keys(quality.domains).length > 0;
+  const hasNum = (o: Record<string, unknown>, ...keys: string[]) =>
+    keys.some((key) => typeof o[key] === 'number');
+  const domainOk = (domain: string) => quality.domains[domain] === 'ready';
+  const domainSeen = (domain: string) =>
+    quality.domains[domain] === 'ready' || quality.domains[domain] === 'degraded';
   const yfChecks = [
-    hasNum(spy, 'close'),
-    hasNum(vix, 'level'),
-    hasNum(sectors, 'sectors_above_ma20'),
-    hasNum(prev, 'close_vs_high_pct'),
+    hasQuality ? domainOk('spy') : hasNum(spy, 'close'),
+    hasQuality ? domainOk('vix') : hasNum(vix, 'level'),
+    hasQuality ? domainOk('sectors') : hasNum(sectors, 'sectors_above_ma20', 'sectorsAboveMa20'),
+    hasQuality ? domainOk('prev_day') : hasNum(prev, 'close_vs_high_pct', 'closeVsHighPct'),
   ];
   const yfOk = yfChecks.filter(Boolean).length;
   const yfStatus: DataSource['status'] =
     yfOk === yfChecks.length ? 'ok' : yfOk > 0 ? 'partial' : 'missing';
-  const alpacaStatus: DataSource['status'] = hasNum(pre, 'spy_pre_pct')
-    ? pre.spy_pre_pct !== 0
+  const alpacaStatus: DataSource['status'] = hasQuality
+    ? domainOk('premarket')
       ? 'ok'
-      : 'partial'
-    : 'missing';
+      : domainSeen('premarket')
+        ? 'partial'
+        : 'missing'
+    : hasNum(pre, 'spy_pre_pct', 'spyPrePct')
+      ? 'partial'
+      : 'missing';
   const eventsHasKeys = Object.keys(ev).length > 0;
   const anyEventTrue =
-    Boolean(ev.fomc_today) || Boolean(ev.cpi_today) || Boolean(ev.nfp_today) || Boolean(ev.tariff_headline_today);
-  const hasEarningsCount = typeof ev.earnings_count_watchlist === 'number';
-  const finnhubStatus: DataSource['status'] =
-    anyEventTrue || hasEarningsCount ? 'ok' : eventsHasKeys ? 'partial' : 'missing';
+    Boolean(ev.fomc_today ?? ev.fomcToday) ||
+    Boolean(ev.cpi_today ?? ev.cpiToday) ||
+    Boolean(ev.nfp_today ?? ev.nfpToday) ||
+    Boolean(ev.tariff_headline_today ?? ev.tariffHeadlineToday);
+  const hasEarningsCount =
+    typeof (ev.earnings_count_watchlist ?? ev.earningsCountWatchlist) === 'number';
+  const finnhubStatus: DataSource['status'] = hasQuality
+    ? domainOk('events')
+      ? 'ok'
+      : domainSeen('events')
+        ? 'partial'
+        : 'missing'
+    : anyEventTrue || hasEarningsCount
+      ? 'ok'
+      : eventsHasKeys
+        ? 'partial'
+        : 'missing';
+  const marketSources = new Set<string>();
+  for (const payload of [spy, vix, prev]) {
+    const source = payload._source ?? payload.source;
+    if (typeof source === 'string' && source) marketSources.add(source);
+  }
+  const sectorSources = (sectors._sources ?? sectors.sources) as
+    | Record<string, unknown>
+    | undefined;
+  if (sectorSources) {
+    for (const source of Object.values(sectorSources)) {
+      if (typeof source === 'string' && source) marketSources.add(source);
+    }
+  }
+  const marketSourceLabel =
+    marketSources.size > 0 ? [...marketSources].join(' / ') : '市场日线';
 
   return [
-    { name: 'yfinance', status: yfStatus, detail: `${yfOk}/${yfChecks.length} blocks` },
+    { name: marketSourceLabel, status: yfStatus, detail: `${yfOk}/${yfChecks.length} blocks` },
     { name: 'Alpaca', status: alpacaStatus },
     { name: 'Finnhub', status: finnhubStatus },
   ];
@@ -195,7 +287,6 @@ const watchlistColumns: ColumnDef<WatchlistRow, unknown>[] = [
       <span className="inline-flex items-center gap-2">
         <span
           aria-hidden
-          title={row.original.source === 'user' ? '来自本地自选' : '来自 regime snapshot'}
           className={
             row.original.source === 'user'
               ? 'inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-accent'
@@ -276,20 +367,39 @@ const RegimePage: React.FC = () => {
 
   const contributionItems = useMemo(() => {
     if (!today) return [];
+    const quality = regimeQuality(today);
     const snapshot = (today.snapshot ?? {}) as Record<string, unknown>;
-    const events = snapshot.events;
-    const prevDay = snapshot.prev_day;
-    const sectors = snapshot.sectors;
-    const premarket = snapshot.premarket;
+    const events = block(snapshot, 'events', 'events');
+    const prevDay = block(snapshot, 'prev_day', 'prevDay');
+    const sectors = block(snapshot, 'sectors', 'sectors');
+    const premarket = block(snapshot, 'premarket', 'premarket');
     const isEmptyObj = (v: unknown) =>
       v == null || (typeof v === 'object' && !Array.isArray(v) && Object.keys(v as object).length === 0);
-    const macroHasData = Array.isArray(events) && events.length > 0;
-    const prevDayHasData = !isEmptyObj(prevDay);
-    const sectorHasData = !isEmptyObj(sectors);
-    const premarketHasData = !isEmptyObj(premarket);
+    const domainReady = (domain: string, fallback: boolean) =>
+      Object.keys(quality.domains).length > 0
+        ? quality.domains[domain] === 'ready'
+        : fallback;
+    const spyHasData = domainReady('spy', !isEmptyObj(block(snapshot, 'spy', 'spy')));
+    const vixHasData = domainReady('vix', !isEmptyObj(block(snapshot, 'vix', 'vix')));
+    const macroHasData = domainReady('events', !isEmptyObj(events));
+    const prevDayHasData = domainReady('prev_day', !isEmptyObj(prevDay));
+    const sectorHasData = domainReady('sectors', !isEmptyObj(sectors));
+    const premarketHasData = domainReady('premarket', !isEmptyObj(premarket));
     return [
-      { label: 'Direction', value: today.d1Direction, description: 'MA slope + 50D trend' },
-      { label: 'Volatility', value: today.d2Volatility, description: 'VIX level + term' },
+      {
+        label: 'Direction',
+        value: today.d1Direction,
+        description: 'MA slope + 50D trend',
+        status: spyHasData ? ('computed' as const) : ('no_data' as const),
+        noDataHint: 'SPY 趋势输入不完整',
+      },
+      {
+        label: 'Volatility',
+        value: today.d2Volatility,
+        description: 'VIX level + term',
+        status: vixHasData ? ('computed' as const) : ('no_data' as const),
+        noDataHint: 'VIX 输入不完整',
+      },
       {
         label: 'Macro',
         value: today.d3MacroPenalty,
@@ -361,6 +471,7 @@ const RegimePage: React.FC = () => {
   };
   const statItems = useMemo(() => (today ? deriveStatBar(today) : []), [today]);
   const sources = useMemo(() => (today ? deriveDataSources(today) : []), [today]);
+  const quality = useMemo(() => (today ? regimeQuality(today) : null), [today]);
   const days = historyDays === '30d' ? 30 : historyDays === '60d' ? 60 : 90;
 
   if (todayLoading && !today) {
@@ -377,18 +488,39 @@ const RegimePage: React.FC = () => {
 
   if (!today) {
     return (
-      <div className="mx-auto max-w-3xl p-8">
-        <EmptyState
-          title="Regime not computed yet"
-          description="No score for today. Click below to run analysis (~30s) or run `python -m src.regime.cli` in the terminal."
-          action={{ label: recomputing ? 'Computing…' : 'Compute regime', onClick: () => void handleRecompute() }}
-        />
+      <div className="mx-auto max-w-7xl space-y-4 p-4">
+        <DailyOpportunityList symbols={userTickers} />
+        <div className="mx-auto max-w-3xl py-4">
+          <EmptyState
+            title="Regime not computed yet"
+            description="今日机会仍可用，但当前没有 Regime 证据。点击下方生成市场状态，或在终端运行 `python -m src.regime.cli`。"
+            action={{ label: recomputing ? 'Computing…' : 'Compute regime', onClick: () => void handleRecompute() }}
+          />
+        </div>
       </div>
     );
   }
 
   return (
     <div className="mx-auto max-w-7xl space-y-4 p-4">
+      <DailyOpportunityList symbols={userTickers} />
+
+      {quality && quality.state !== 'ready' && (
+        <div
+          role="status"
+          className="rounded-ds-md border border-warn-strong/30 bg-warn-strong/5 px-4 py-3 text-body-sm text-text-2"
+        >
+          <span className="font-medium text-text-1">
+            {quality.state === 'unavailable' ? 'Regime 暂不可用' : 'Regime 数据降级'}
+          </span>
+          {' · '}
+          {quality.incomplete.length > 0
+            ? quality.incomplete.map((domain) => DOMAIN_LABELS[domain] ?? domain).join('、')
+            : '输入质量无法确认'}
+          。{quality.state === 'unavailable' ? '页面不会把存储的 0 展示成真实 no_trade。' : '当前分档仅作背景，不应单独驱动交易。'}
+        </div>
+      )}
+
       <div className="grid gap-4 lg:grid-cols-[320px_1fr]">
         <RegimeGauge
           score={today.score}
@@ -398,6 +530,8 @@ const RegimePage: React.FC = () => {
           version={today.version}
           onRecompute={() => void handleRecompute()}
           recomputing={recomputing}
+          qualityState={quality?.state}
+          incompleteDomains={quality?.incomplete.map((domain) => DOMAIN_LABELS[domain] ?? domain)}
         />
         <div className="rounded-ds-md border border-subtle bg-bg-1 p-4">
           <div className="mb-2 flex items-center gap-2">
@@ -479,7 +613,6 @@ const RegimePage: React.FC = () => {
                     <button
                       type="button"
                       aria-label={`Remove ${r.ticker}`}
-                      title="从自选移除"
                       onClick={() => {
                         removeUserTicker(r.ticker);
                         toast.info(`已移除: ${r.ticker}`);
@@ -507,9 +640,9 @@ const RegimePage: React.FC = () => {
             <div className="flex items-center gap-1">
               <button
                 type="button"
+                aria-label={`打开 ${inlineTicker} 完整详情页，包含 K 线、均线、新闻和总结`}
                 onClick={() => navigate(`/stocks/${inlineTicker}`)}
                 className="rounded-ds-sm px-2 py-1 text-body-sm text-text-2 hover:bg-bg-2 hover:text-text-1"
-                title="打开完整详情页（K 线 + MA + 新闻 + 总结）"
               >
                 Open detail →
               </button>

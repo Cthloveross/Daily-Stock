@@ -10,7 +10,7 @@
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, Dict, Any, List
 
 from src.repositories.stock_repo import StockRepository
@@ -86,7 +86,16 @@ class StockService:
             return None
     
     # 支持的 K 线周期分类
-    _INTRADAY_INTERVALS = {"1m", "5m", "15m", "30m", "60m", "90m", "1h"}
+    _INTRADAY_INTERVALS = {
+        "1m",
+        "2m",
+        "5m",
+        "15m",
+        "30m",
+        "60m",
+        "90m",
+        "1h",
+    }
     _RESAMPLE_RULES = {
         "weekly": "W-FRI",
         "monthly": "ME",
@@ -97,6 +106,8 @@ class StockService:
         stock_code: str,
         period: str = "daily",
         days: int = 30,
+        *,
+        include_stock_name: bool = True,
     ) -> Dict[str, Any]:
         """
         获取股票历史行情
@@ -106,8 +117,11 @@ class StockService:
             period: K 线周期
                 - daily: 日线
                 - weekly / monthly: 基于日线 resample 聚合
-                - 1m / 5m / 15m / 30m / 60m / 90m / 1h: 分钟级（仅美股 via yfinance）
+                - 1m / 2m / 5m / 15m / 30m / 60m / 90m / 1h: 分钟级
+                  （2m 基于带时区的 1m K 线聚合）
             days: 获取天数（周/月会按聚合因子放大，intraday 受 yfinance 上限约束）
+            include_stock_name: 是否额外查询证券名称。只需要 OHLCV 的内部调用可关闭，
+                避免一次与行情复盘无关的实时报价请求。
 
         Returns:
             历史行情数据字典
@@ -116,10 +130,20 @@ class StockService:
             ValueError: 不支持的 period
         """
         if period in self._INTRADAY_INTERVALS:
-            return self._get_intraday_history(stock_code, period, days)
+            return self._get_intraday_history(
+                stock_code,
+                period,
+                days,
+                include_stock_name=include_stock_name,
+            )
 
         if period in ("daily",) or period in self._RESAMPLE_RULES:
-            return self._get_daily_or_resampled_history(stock_code, period, days)
+            return self._get_daily_or_resampled_history(
+                stock_code,
+                period,
+                days,
+                include_stock_name=include_stock_name,
+            )
 
         raise ValueError(
             f"不支持的 K 线周期 '{period}'。"
@@ -132,6 +156,8 @@ class StockService:
         stock_code: str,
         period: str,
         days: int,
+        *,
+        include_stock_name: bool,
     ) -> Dict[str, Any]:
         """日线 / 周线（W-FRI 聚合）/ 月线（ME 聚合）"""
         try:
@@ -147,12 +173,16 @@ class StockService:
             else:
                 fetch_days = days
 
-            df, _source = manager.get_daily_data(stock_code, days=fetch_days)
+            df, source = manager.get_daily_data(stock_code, days=fetch_days)
             if df is None or df.empty:
                 logger.warning(f"获取 {stock_code} 历史数据失败")
-                return {"stock_code": stock_code, "period": period, "data": []}
+                return self._history_result(stock_code, period, [])
 
-            stock_name = manager.get_stock_name(stock_code)
+            stock_name = (
+                manager.get_stock_name(stock_code)
+                if include_stock_name
+                else None
+            )
 
             if period in self._RESAMPLE_RULES:
                 df = self._resample_ohlcv(df, self._RESAMPLE_RULES[period])
@@ -162,36 +192,54 @@ class StockService:
 
             data = [self._row_to_kline(row, intraday=False) for _, row in df.iterrows()]
 
-            return {
-                "stock_code": stock_code,
-                "stock_name": stock_name,
-                "period": period,
-                "data": data,
-            }
+            return self._history_result(
+                stock_code,
+                period,
+                data,
+                stock_name=stock_name,
+                source=source,
+            )
 
         except ImportError:
             logger.warning("DataFetcherManager 未找到，返回空数据")
-            return {"stock_code": stock_code, "period": period, "data": []}
+            return self._history_result(stock_code, period, [])
         except Exception as e:
             logger.error(f"获取历史数据失败: {e}", exc_info=True)
-            return {"stock_code": stock_code, "period": period, "data": []}
+            return self._history_result(stock_code, period, [])
 
     def _get_intraday_history(
         self,
         stock_code: str,
         interval: str,
         days: int,
+        *,
+        include_stock_name: bool,
     ) -> Dict[str, Any]:
         """分钟级 K 线（仅美股）。"""
+        derived_from_period = "1m" if interval == "2m" else None
+        aggregation_method = (
+            "time_bucket_2m_ohlcv" if interval == "2m" else None
+        )
         try:
             from data_provider.base import DataFetcherManager, DataFetchError
         except ImportError:
             logger.warning("DataFetcherManager 未找到，返回空数据")
-            return {"stock_code": stock_code, "period": interval, "data": []}
+            return self._history_result(
+                stock_code,
+                interval,
+                [],
+                derived_from_period=derived_from_period,
+                aggregation_method=aggregation_method,
+            )
 
         manager = DataFetcherManager()
+        source_interval = "1m" if interval == "2m" else interval
         try:
-            df, _source = manager.get_intraday_data(stock_code, interval=interval, days=days)
+            df, source = manager.get_intraday_data(
+                stock_code,
+                interval=source_interval,
+                days=days,
+            )
         except DataFetchError as e:
             # 非美股 / fetcher 缺失 → 转为 422 由上层处理
             raise ValueError(str(e)) from e
@@ -200,17 +248,154 @@ class StockService:
             raise
 
         if df is None or df.empty:
-            return {"stock_code": stock_code, "period": interval, "data": []}
+            return self._history_result(
+                stock_code,
+                interval,
+                [],
+                derived_from_period=derived_from_period,
+                aggregation_method=aggregation_method,
+            )
 
-        stock_name = manager.get_stock_name(stock_code)
+        if interval == "2m":
+            df = self._resample_intraday_ohlcv(df, "2min")
+            if df.empty:
+                return self._history_result(
+                    stock_code,
+                    interval,
+                    [],
+                    derived_from_period=derived_from_period,
+                    aggregation_method=aggregation_method,
+                )
+
+        stock_name = (
+            manager.get_stock_name(stock_code)
+            if include_stock_name
+            else None
+        )
         data = [self._row_to_kline(row, intraday=True) for _, row in df.iterrows()]
 
-        return {
+        return self._history_result(
+            stock_code,
+            interval,
+            data,
+            stock_name=stock_name,
+            source=source,
+            derived_from_period=derived_from_period,
+            aggregation_method=aggregation_method,
+        )
+
+    @staticmethod
+    def _history_result(
+        stock_code: str,
+        period: str,
+        data: List[Dict[str, Any]],
+        *,
+        stock_name: Optional[str] = None,
+        source: Optional[str] = None,
+        derived_from_period: Optional[str] = None,
+        aggregation_method: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build history output and derive provenance from returned bars only."""
+        result: Dict[str, Any] = {
             "stock_code": stock_code,
             "stock_name": stock_name,
-            "period": interval,
+            "period": period,
             "data": data,
+            "source": None,
+            "coverage_start": None,
+            "coverage_end": None,
+            "last_bar_at": None,
+            "derived_from_period": derived_from_period,
+            "aggregation_method": aggregation_method,
         }
+        timestamps = [
+            str(item.get("date")).strip()
+            for item in data
+            if item.get("date") is not None and str(item.get("date")).strip()
+        ]
+        if not timestamps:
+            return result
+
+        result.update(
+            source=source,
+            coverage_start=min(timestamps),
+            coverage_end=max(timestamps),
+            last_bar_at=max(timestamps),
+            derived_from_period=derived_from_period,
+            aggregation_method=aggregation_method,
+        )
+        return result
+
+    @staticmethod
+    def _resample_intraday_ohlcv(df, rule: str):
+        """Aggregate timezone-aware intraday bars without crossing local dates.
+
+        Each market-local trading date is resampled independently. Empty time
+        buckets are discarded, so overnight and midday session gaps cannot be
+        combined into one derived candle.
+        """
+        import pandas as pd
+
+        work = df.copy()
+
+        def _aware_timestamp(value):
+            timestamp = pd.to_datetime(value, errors="coerce")
+            if pd.isna(timestamp) or timestamp.tzinfo is None:
+                return pd.NaT
+            return timestamp
+
+        work["_ts"] = work["date"].map(_aware_timestamp)
+        work = work.dropna(subset=["_ts", "close"])
+        if work.empty:
+            return work.drop(columns=["_ts"], errors="ignore")
+
+        work["_local_date"] = work["_ts"].map(
+            lambda value: value.strftime("%Y-%m-%d")
+        )
+        aggregation = {
+            "open": "first",
+            "high": "max",
+            "low": "min",
+            "close": "last",
+        }
+
+        def _sum_with_missing(series):
+            return series.sum(min_count=1)
+
+        if "volume" in work.columns:
+            aggregation["volume"] = _sum_with_missing
+        if "amount" in work.columns:
+            aggregation["amount"] = _sum_with_missing
+
+        chunks = []
+        for _, daily in work.groupby("_local_date", sort=True):
+            daily = daily.sort_values("_ts").copy()
+            timestamps = pd.DatetimeIndex(daily.pop("_ts").tolist())
+            daily.index = timestamps
+            daily.index.name = "_ts"
+            resampled = daily.resample(
+                rule,
+                origin="start_day",
+                closed="left",
+                label="left",
+            ).agg(aggregation)
+            resampled = resampled.dropna(subset=["close"])
+            if resampled.empty:
+                continue
+            resampled["date"] = [value.isoformat() for value in resampled.index]
+            chunks.append(resampled.reset_index(drop=True))
+
+        if not chunks:
+            return work.iloc[0:0].drop(
+                columns=["_ts", "_local_date"],
+                errors="ignore",
+            )
+
+        result = pd.concat(chunks, ignore_index=True)
+        result["pct_chg"] = (
+            result["close"].pct_change() * 100
+        ).fillna(0).round(2)
+        return result
 
     @staticmethod
     def _resample_ohlcv(df, rule: str):

@@ -40,6 +40,9 @@ class TestVolatility:
     def test_mid_range(self):
         assert score_volatility({"level": 22.0, "pct_change_5d": 0}) == 0
 
+    def test_empty_dict_is_unknown_not_a_volatility_bucket(self):
+        assert score_volatility({}) == 0
+
 
 class TestMacroPenalty:
     def test_all_events_max_penalty(self):
@@ -75,6 +78,9 @@ class TestSectorRotation:
     def test_bearish_breadth(self):
         assert score_sector_rotation({"sectors_above_ma20": 0}) == -5
 
+    def test_empty_dict_is_unknown_not_bearish_breadth(self):
+        assert score_sector_rotation({}) == 0
+
 
 class TestPrevDay:
     def test_strong_close_near_high(self):
@@ -84,7 +90,12 @@ class TestPrevDay:
         assert s == 13  # 10 + 3
 
     def test_weak_close_near_low(self):
-        assert score_prev_day_structure({"close_vs_high_pct": 0.1}) == -2
+        assert score_prev_day_structure(
+            {"close_vs_high_pct": 0.1, "prev_day_range_pct": 1.0}
+        ) == -2
+
+    def test_empty_dict_is_unknown_not_a_weak_close(self):
+        assert score_prev_day_structure({}) == 0
 
 
 class TestPremarket:
@@ -102,9 +113,18 @@ class TestPremarket:
         assert s == 0  # -5 - 3 clamped at 0
 
     def test_cap_up_moves(self):
-        s = score_premarket_activity({"spy_pre_pct": 1.0, "watchlist_up_5pct": 10})
+        s = score_premarket_activity(
+            {
+                "spy_pre_pct": 1.0,
+                "watchlist_up_5pct": 10,
+                "watchlist_down_5pct": 0,
+            }
+        )
         # 8 + min(10,5)*2 = 8 + 10 = 18; clamp 20
         assert 18 <= s <= 20
+
+    def test_empty_dict_is_unknown_not_a_flat_premarket(self):
+        assert score_premarket_activity({}) == 0
 
 
 class TestSum:
@@ -116,7 +136,13 @@ class TestSum:
                 score_macro_penalty({}),
                 score_sector_rotation({"sectors_above_ma20": 8}),
                 score_prev_day_structure({"close_vs_high_pct": 0.8}),
-                score_premarket_activity({"spy_pre_pct": 0.2, "watchlist_up_5pct": 2}),
+                score_premarket_activity(
+                    {
+                        "spy_pre_pct": 0.2,
+                        "watchlist_up_5pct": 2,
+                        "watchlist_down_5pct": 0,
+                    }
+                ),
             ]
         )
         # Should comfortably land in aggressive territory.

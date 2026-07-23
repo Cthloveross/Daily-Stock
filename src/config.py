@@ -397,6 +397,77 @@ def get_effective_agent_models_to_try(config: "Config") -> List[str]:
     return ordered_models
 
 
+def get_effective_journal_ai_primary_model(config: "Config") -> str:
+    """Return the effective Journal review primary model.
+
+    Journal review inherits the Agent primary model unless it has an explicit
+    override.  Router aliases are preserved in the same way as Agent model
+    selection.
+    """
+    configured_router_models = set(
+        get_configured_llm_models(getattr(config, "llm_model_list", []) or [])
+    )
+    configured_journal_model = normalize_agent_litellm_model(
+        getattr(config, "journal_ai_model", ""),
+        configured_models=configured_router_models,
+    )
+    if configured_journal_model:
+        return configured_journal_model
+    return get_effective_agent_primary_model(config)
+
+
+def get_effective_journal_ai_models_to_try(config: "Config") -> List[str]:
+    """Return the dedicated Journal AI model chain in deterministic order.
+
+    ``journal_ai_fallback_models`` deliberately uses three states:
+
+    * ``None``: the environment variable was absent, so inherit the Agent
+      chain (or append it after an explicit Journal primary model).
+    * ``[]``: the environment variable was explicitly empty, so do not fall
+      back beyond the effective Journal primary model.
+    * a non-empty list: use exactly those Journal-specific fallbacks.
+    """
+    configured_router_models = set(
+        get_configured_llm_models(getattr(config, "llm_model_list", []) or [])
+    )
+    configured_journal_model = (
+        getattr(config, "journal_ai_model", "") or ""
+    ).strip()
+    configured_journal_fallbacks = getattr(
+        config,
+        "journal_ai_fallback_models",
+        None,
+    )
+
+    if not configured_journal_model and configured_journal_fallbacks is None:
+        return get_effective_agent_models_to_try(config)
+
+    inherited_or_explicit_fallbacks = (
+        get_effective_agent_models_to_try(config)
+        if configured_journal_fallbacks is None
+        else configured_journal_fallbacks
+    )
+    raw_models = [get_effective_journal_ai_primary_model(config)] + list(
+        inherited_or_explicit_fallbacks or []
+    )
+
+    seen = set()
+    ordered_models: List[str] = []
+    for model in raw_models:
+        normalized_model = (model or "").strip()
+        if not normalized_model:
+            continue
+        dedupe_key = normalize_agent_litellm_model(
+            normalized_model,
+            configured_models=configured_router_models,
+        )
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        ordered_models.append(normalized_model)
+    return ordered_models
+
+
 def setup_env(override: bool = False):
     """
     Initialize environment variables from .env file.
@@ -519,6 +590,10 @@ class Config:
 
     # === Agent 模式配置 ===
     agent_litellm_model: str = ""  # Optional Agent-only primary model; empty inherits LITELLM_MODEL
+    # Position-episode review model chain. None fallbacks means inherit the
+    # Agent chain; [] means the fallback env variable was explicitly empty.
+    journal_ai_model: str = ""
+    journal_ai_fallback_models: Optional[List[str]] = None
     agent_mode: bool = False
     _agent_mode_explicit: bool = False  # True when AGENT_MODE was explicitly set in env
     agent_max_steps: int = AGENT_MAX_STEPS_DEFAULT
@@ -1015,10 +1090,26 @@ class Config:
                 if m not in _seen and not _seen.add(m)  # type: ignore[func-returns-value]
             ]
 
+        configured_llm_models = set(get_configured_llm_models(llm_model_list))
         agent_litellm_model = normalize_agent_litellm_model(
             os.getenv('AGENT_LITELLM_MODEL', ''),
-            configured_models=set(get_configured_llm_models(llm_model_list)),
+            configured_models=configured_llm_models,
         )
+        journal_ai_model = normalize_agent_litellm_model(
+            os.getenv('JOURNAL_AI_MODEL', ''),
+            configured_models=configured_llm_models,
+        )
+        _journal_fallbacks_raw = os.getenv('JOURNAL_AI_FALLBACK_MODELS')
+        journal_ai_fallback_models: Optional[List[str]] = None
+        if _journal_fallbacks_raw is not None:
+            journal_ai_fallback_models = [
+                normalize_agent_litellm_model(
+                    model.strip(),
+                    configured_models=configured_llm_models,
+                )
+                for model in _journal_fallbacks_raw.split(',')
+                if model.strip()
+            ]
 
         # 解析搜索引擎 API Keys（支持多个 key，逗号分隔）
         # Anspire Search
@@ -1173,6 +1264,8 @@ class Config:
             ),
             bias_threshold=parse_env_float(os.getenv('BIAS_THRESHOLD'), 5.0, field_name='BIAS_THRESHOLD', minimum=1.0),
             agent_litellm_model=agent_litellm_model,
+            journal_ai_model=journal_ai_model,
+            journal_ai_fallback_models=journal_ai_fallback_models,
             agent_mode=os.getenv('AGENT_MODE', 'false').lower() == 'true',
             _agent_mode_explicit=os.getenv('AGENT_MODE') is not None,
             agent_max_steps=parse_env_int(
@@ -2083,6 +2176,8 @@ class Config:
 
         configured_agent_primary_model = bool((self.agent_litellm_model or "").strip())
         effective_agent_primary_model = get_effective_agent_primary_model(self)
+        configured_journal_primary_model = bool((self.journal_ai_model or "").strip())
+        effective_journal_primary_model = get_effective_journal_ai_primary_model(self)
 
         if available_router_model_set:
             if (
@@ -2114,6 +2209,21 @@ class Config:
                     field="AGENT_LITELLM_MODEL",
                 ))
 
+            if (
+                configured_journal_primary_model
+                and effective_journal_primary_model
+                and not _uses_direct_env_provider(effective_journal_primary_model)
+                and effective_journal_primary_model not in available_router_model_set
+            ):
+                issues.append(ConfigIssue(
+                    severity="error",
+                    message=(
+                        "已配置的交易复盘 AI 主模型未出现在当前渠道或高级模型路由配置中。"
+                        f" 当前可用模型：{', '.join(available_router_models[:6])}"
+                    ),
+                    field="JOURNAL_AI_MODEL",
+                ))
+
             invalid_fallbacks = [
                 model for model in (self.litellm_fallback_models or [])
                 if model and model not in available_router_model_set
@@ -2129,6 +2239,28 @@ class Config:
                     field="LITELLM_FALLBACK_MODELS",
                 ))
 
+            invalid_journal_fallbacks = []
+            for model in self.journal_ai_fallback_models or []:
+                normalized_model = normalize_agent_litellm_model(
+                    model,
+                    configured_models=available_router_model_set,
+                )
+                if (
+                    normalized_model
+                    and normalized_model not in available_router_model_set
+                    and not _uses_direct_env_provider(normalized_model)
+                ):
+                    invalid_journal_fallbacks.append(normalized_model)
+            if invalid_journal_fallbacks:
+                issues.append(ConfigIssue(
+                    severity="warning",
+                    message=(
+                        "交易复盘 AI 备选模型中包含未在当前渠道或高级模型路由配置中声明的模型："
+                        f"{', '.join(invalid_journal_fallbacks[:3])}"
+                    ),
+                    field="JOURNAL_AI_FALLBACK_MODELS",
+                ))
+
             if (
                 self.vision_model
                 and not _uses_direct_env_provider(self.vision_model)
@@ -2142,19 +2274,48 @@ class Config:
                     ),
                     field="VISION_MODEL",
                 ))
-        elif (
-            configured_agent_primary_model
-            and effective_agent_primary_model
-            and not _has_runtime_source_for_model(effective_agent_primary_model)
-        ):
-            issues.append(ConfigIssue(
-                severity="error",
-                message=(
-                    "已配置 Agent 主模型，但未找到可用的运行时来源"
-                    "（启用渠道或匹配的 API Key）。"
-                ),
-                field="AGENT_LITELLM_MODEL",
-            ))
+        else:
+            if (
+                configured_agent_primary_model
+                and effective_agent_primary_model
+                and not _has_runtime_source_for_model(effective_agent_primary_model)
+            ):
+                issues.append(ConfigIssue(
+                    severity="error",
+                    message=(
+                        "已配置 Agent 主模型，但未找到可用的运行时来源"
+                        "（启用渠道或匹配的 API Key）。"
+                    ),
+                    field="AGENT_LITELLM_MODEL",
+                ))
+
+            if (
+                configured_journal_primary_model
+                and effective_journal_primary_model
+                and not _has_runtime_source_for_model(effective_journal_primary_model)
+            ):
+                issues.append(ConfigIssue(
+                    severity="error",
+                    message=(
+                        "已配置交易复盘 AI 主模型，但未找到可用的运行时来源"
+                        "（启用渠道或匹配的 API Key）。"
+                    ),
+                    field="JOURNAL_AI_MODEL",
+                ))
+
+            invalid_journal_fallbacks = [
+                model for model in (self.journal_ai_fallback_models or [])
+                if model and not _has_runtime_source_for_model(model)
+            ]
+            if invalid_journal_fallbacks:
+                issues.append(ConfigIssue(
+                    severity="error",
+                    message=(
+                        "交易复盘 AI 备选模型缺少可用的运行时来源："
+                        f"{', '.join(invalid_journal_fallbacks[:3])}"
+                    ),
+                    field="JOURNAL_AI_FALLBACK_MODELS",
+                ))
 
         # --- Search engine (informational only) ---
         if not self.has_search_capability_enabled():

@@ -2,7 +2,7 @@
 
 > **定位**：这是整个仓库的文档入口。所有 `.md`（除 `docs/CHANGELOG.md` 和仓库根的 `README.md` / `AGENTS.md` / `SKILL.md`）都在这里。
 > **维护者**：[@Cthloveross](https://github.com/Cthloveross)
-> **最后更新**：2026-04-21
+> **最后更新**：2026-07-22
 
 ---
 
@@ -21,6 +21,12 @@
 | 给这个项目贡献代码 | [`contributing/`](./contributing/) |
 | 接入机器人（Telegram / 钉钉 / Discord / 飞书）或外部服务 | [`integrations/`](./integrations/) |
 | 看 Phase 0（美股期权 + Journal + Regime + Breakout）落地细节 | [`phase0/`](./phase0/) |
+| 看 Phase 1 Moomoo 事实对账与证据账本 | [`phase1/01_MOOMOO_EVIDENCE_LEDGER.md`](./phase1/01_MOOMOO_EVIDENCE_LEDGER.md) |
+| 看 Phase 1 PositionEpisode 构建、P&L 边界与费用守恒 | [`phase1/02_POSITION_EPISODES.md`](./phase1/02_POSITION_EPISODES.md) |
+| 看 Phase 1 OpenAPI 只读预览与跨批次 canonical 规则 | [`phase1/03_OPENAPI_CANONICAL.md`](./phase1/03_OPENAPI_CANONICAL.md) |
+| 看 Phase 1 canonical 事实如何显式生成可对比仓位构建 | [`phase1/04_CANONICAL_EPISODE_BUILD.md`](./phase1/04_CANONICAL_EPISODE_BUILD.md) |
+| 用案例精选、多周期 K 线、成交证据和按需 AI 复盘一个单合约回合 | [`phase1/05_SINGLE_POSITION_REVIEW_WORKSPACE.md`](./phase1/05_SINGLE_POSITION_REVIEW_WORKSPACE.md) |
+| 看每日机会候选、数据 readiness、异常期权流/场外成交边界与结果闭环计划 | [`phase1/06_DAILY_OPPORTUNITY_BOARD.md`](./phase1/06_DAILY_OPPORTUNITY_BOARD.md) |
 | 查看旧版本文档 | [`archive/`](./archive/) |
 
 > **变更日志** 不在这里 —— 在 [`docs/CHANGELOG.md`](../docs/CHANGELOG.md)（自动化与 AGENTS.md 硬规则依赖该路径）。
@@ -34,13 +40,15 @@ New-docs/
 ├── README.md                       ← 本文件（总索引）
 │
 ├── architecture/                   战略 · 架构 · 路线图
-│   ├── 01_PROJECT_VISION_v4.md     项目愿景 v4（基于真实 repo 的精准定位）
+│   ├── 01_PROJECT_VISION_v4.md     Phase 0 历史愿景（策略假设背景）
 │   ├── 02_ARCHITECTURE_OVERVIEW.md 架构总览 + 目录树 + 改造点标注
-│   └── 03_MIGRATION_PLAN.md        Phase 0-3 改造路线 + 里程碑
+│   ├── 03_MIGRATION_PLAN.md        历史 Phase 0-3 改造路线 + 里程碑
+│   ├── 04_CURRENT_STATE.md         2026-04 功能与运行架构快照
+│   └── 05_PRODUCT_CHARTER_AND_ROADMAP.md 当前产品章程 + UX / 数据模型 / 分阶段验收真源
 │
 ├── modules/                        模块设计（具体怎么实现）
 │   ├── 04_OPTION_SUPPORT_EXTENSION.md   OCC 解析 / Greek / IV rank / chain 抓取
-│   ├── 05_JOURNAL_MODULE.md        Moomoo CSV 导入 + FIFO 配对 + Reality Test + 月度复盘
+│   ├── 05_JOURNAL_MODULE.md        Legacy Moomoo CSV + FIFO + Reality Test + 月度复盘
 │   ├── 06_REGIME_CLASSIFIER.md     六维度 Regime Score + 四档分类 + 晨报推送
 │   ├── 07_BREAKOUT_FILTER.md       Q1-Q5 四层过滤 + 历史 trade_style 回填
 │   └── 08_AGENT_SKILL_REGISTRY.md  option_trader / leap_explorer / trend_follower 三个 skill
@@ -78,6 +86,8 @@ New-docs/
 ├── integrations/                   外部集成
 │   ├── bot-command.md              机器人命令大全（中文）
 │   ├── bot-command_EN.md           同上（英文）
+│   ├── moomoo-roadmap.md           Moomoo OpenAPI 永久只读接入路线图
+│   ├── moomoo-subscription.md      Moomoo 行情权限速查
 │   ├── openclaw-skill-integration.md  通过 Openclaw Skill 调用 DSA API
 │   └── bots/                       每个平台的配置图文指南
 │       ├── dingding-bot-config.md  + 8 张截图
@@ -102,6 +112,14 @@ New-docs/
 │   ├── STAGE_10_AGENT_SKILLS.md    三个 Claude skill bundle + 新增 Agent tools
 │   ├── STAGE_11_AUTOMATION.md      folder watcher + Telegram 命令
 │   └── STAGE_12_INTEGRATION.md     Phase 0 整合 + banner + CI 扩展
+│
+├── phase1/                         Phase 1 可信交易事实与策略生命周期
+│   ├── 01_MOOMOO_EVIDENCE_LEDGER.md CSV/OpenAPI 对账与可信证据账本
+│   ├── 02_POSITION_EPISODES.md     PositionEpisode builder、边界假设、费用守恒与 API
+│   ├── 03_OPENAPI_CANONICAL.md     OpenAPI 只读预览、跨批去重规则与 canonical persistence
+│   ├── 04_CANONICAL_EPISODE_BUILD.md 冻结 canonical replay、显式对比构建与默认视图隔离
+│   ├── 05_SINGLE_POSITION_REVIEW_WORKSPACE.md 案例精选、多周期 K 线、现金流买卖点与只读 AI 复盘边界
+│   └── 06_DAILY_OPPORTUNITY_BOARD.md 确定性候选榜、证据 readiness 与期权流/TRF 路线
 │
 └── archive/                        归档（旧版本 / 一次性盘点）
     ├── PROJECT_VISION_v1-3.md      旧愿景（已被 architecture/01 取代）
@@ -153,6 +171,6 @@ New-docs/design/Design_system.md
 ## 🗃️ 已废弃（不要参考）
 
 - `New-docs/00_INDEX.md` → 被本文件（`New-docs/README.md`）取代
-- `PROJECT_VISION.md`（仓库根）→ 已移到 `archive/PROJECT_VISION_v1-3.md`，最新版是 `architecture/01_PROJECT_VISION_v4.md`
+- `PROJECT_VISION.md`（仓库根）→ 已移到 `archive/PROJECT_VISION_v1-3.md`；Phase 0 背景看 `architecture/01_PROJECT_VISION_v4.md`，当前实施方向看 `architecture/05_PRODUCT_CHARTER_AND_ROADMAP.md`
 - `review.md`（仓库根）→ 已移到 `archive/review_2026-03-19.md`
 - `docs/bot/` / `docs/phase0/` / `docs/architecture/*.md` / `docs/*.md` → 全部迁移到 `New-docs/`（只剩 `docs/CHANGELOG.md` 和 `docs/architecture/api_spec.json`）

@@ -51,6 +51,15 @@ class _DummyTickFlowFetcher:
         self.closed = True
 
 
+class _ClosableDummyFetcher(_DummyFetcher):
+    def __init__(self, name):
+        super().__init__(name)
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
 class TestTickFlowMarketReviewFallback(unittest.TestCase):
     def test_manager_prefers_tickflow_indices_when_available(self):
         manager = DataFetcherManager.__new__(DataFetcherManager)
@@ -148,6 +157,20 @@ class TestTickFlowMarketReviewFallback(unittest.TestCase):
         self.assertTrue(tickflow_fetcher.closed)
         self.assertIsNone(manager._tickflow_fetcher)
         self.assertIsNone(manager._tickflow_api_key)
+
+    def test_manager_close_releases_all_managed_fetchers(self):
+        manager = DataFetcherManager.__new__(DataFetcherManager)
+        first = _ClosableDummyFetcher("FirstFetcher")
+        second = _ClosableDummyFetcher("SecondFetcher")
+        manager._fetchers = [first, second]
+        manager._tickflow_fetcher = None
+        manager._tickflow_api_key = None
+        manager._tickflow_lock = None
+
+        DataFetcherManager.close(manager)
+
+        self.assertTrue(first.closed)
+        self.assertTrue(second.closed)
 
 
 if __name__ == "__main__":

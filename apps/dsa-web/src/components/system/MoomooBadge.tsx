@@ -1,8 +1,9 @@
 import type React from 'react';
 import { useEffect, useState } from 'react';
-import { Activity, Power, AlertTriangle } from 'lucide-react';
+import { LockKeyhole, Power, AlertTriangle } from 'lucide-react';
 import apiClient from '../../api';
 import { toCamelCase } from '../../api/utils';
+import { Tooltip } from '../common/Tooltip';
 import { cn } from '../../utils/cn';
 
 interface MoomooStatus {
@@ -13,6 +14,8 @@ interface MoomooStatus {
   port: number;
   trdEnv: string;
   sdkVersion?: string | null;
+  probeLevel?: string | null;
+  readOnly?: boolean;
   message?: string | null;
 }
 
@@ -48,55 +51,60 @@ export const MoomooBadge: React.FC = () => {
 
   if (loading || !status) return null;
 
-  // Three states with progressively-degraded colour:
-  //   live      → green, "Moomoo Live"
+  // Three states with progressively-degraded colour.  `connected` is a
+  // bounded TCP reachability check, not proof that trade history is synced.
+  //   reachable → green, explicitly read-only
   //   enabled+offline → amber, "Moomoo offline" (open OpenD)
   //   disabled  → grey, "yfinance"
-  const live = status.enabled && status.sdkInstalled && status.connected;
+  const reachable = status.enabled && status.sdkInstalled && status.connected;
   const halfBaked = status.enabled && !status.connected;
 
-  if (live) {
-    const isLive = status.trdEnv === 'LIVE';
+  if (reachable) {
+    const detail =
+      `Moomoo OpenD 端口可达 · 项目只读，不解锁或下单` +
+      ` · 端口可达不代表交割单已经同步` +
+      (status.sdkVersion ? ` · SDK ${status.sdkVersion}` : '');
     return (
-      <span
-        className={cn(
-          'inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-caption',
-          isLive
-            ? 'border-down-strong/40 bg-down-strong/10 text-down-strong'
-            : 'border-up-strong/40 bg-up-strong/10 text-up-strong',
-        )}
-        title={
-          `Moomoo OpenD live · ${status.host}:${status.port}` +
-          ` · trd_env=${status.trdEnv}` +
-          (status.sdkVersion ? ` · SDK ${status.sdkVersion}` : '')
-        }
-      >
-        <Activity size={11} strokeWidth={2} />
-        {isLive ? 'MOOMOO LIVE 🔴' : 'MOOMOO LIVE'}
-      </span>
+      <Tooltip content={detail} side="bottom" focusable>
+        <span
+          aria-label={detail}
+          className={cn(
+            'inline-flex items-center gap-1 rounded-full border border-up-strong/40 bg-up-strong/10 px-2 py-0.5 text-caption text-up-strong',
+          )}
+        >
+          <LockKeyhole size={11} strokeWidth={2} />
+          Moomoo 可达 · 只读
+        </span>
+      </Tooltip>
     );
   }
 
   if (halfBaked) {
+    const detail = status.message ?? 'Moomoo enabled but OpenD not reachable';
     return (
-      <span
-        className="inline-flex items-center gap-1 rounded-full border border-warn-strong/40 bg-warn-strong/10 px-2 py-0.5 text-caption text-warn-strong"
-        title={status.message ?? 'Moomoo enabled but OpenD not reachable'}
-      >
-        <AlertTriangle size={11} strokeWidth={2} />
-        Moomoo offline
-      </span>
+      <Tooltip content={detail} side="bottom" focusable>
+        <span
+          aria-label={detail}
+          className="inline-flex items-center gap-1 rounded-full border border-warn-strong/40 bg-warn-strong/10 px-2 py-0.5 text-caption text-warn-strong"
+        >
+          <AlertTriangle size={11} strokeWidth={2} />
+          Moomoo offline
+        </span>
+      </Tooltip>
     );
   }
 
+  const detail = status.message ?? 'Moomoo disabled — using yfinance';
   return (
-    <span
-      className="inline-flex items-center gap-1 rounded-full border border-subtle bg-bg-2 px-2 py-0.5 text-caption text-text-3"
-      title={status.message ?? 'Moomoo disabled — using yfinance'}
-    >
-      <Power size={11} strokeWidth={2} />
-      yfinance
-    </span>
+    <Tooltip content={detail} side="bottom" focusable>
+      <span
+        aria-label={detail}
+        className="inline-flex items-center gap-1 rounded-full border border-subtle bg-bg-2 px-2 py-0.5 text-caption text-text-3"
+      >
+        <Power size={11} strokeWidth={2} />
+        yfinance
+      </span>
+    </Tooltip>
   );
 };
 

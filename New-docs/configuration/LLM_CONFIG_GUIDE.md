@@ -99,6 +99,20 @@ AGENT_LITELLM_MODEL=deepseek/deepseek-reasoner
 LITELLM_FALLBACK_MODELS=openai/gpt-4o-mini,anthropic/claude-3-5-sonnet
 ```
 
+### 仓位复盘单独选择模型（可选）
+
+单合约工作台的“生成证据复盘”不调用模型；只有“尝试模型增强”才使用下面的专用模型链：
+
+```env
+JOURNAL_AI_MODEL=<provider>/<model-name>
+JOURNAL_AI_FALLBACK_MODELS=<provider>/<fallback-model-name>
+```
+
+- 两项都不存在：完全继承 Agent 模型链；
+- 只设置主模型且未声明 fallback：主模型失败后去重接续 Agent 链；
+- 显式设置 `JOURNAL_AI_FALLBACK_MODELS=`：不继续回退；
+- 使用 GPT 时仍需服务端 OpenAI API Key；ChatGPT/Codex 登录或订阅不能作为 API 凭据。
+
 ### 示例：Ollama 渠道模式（本地模型，无需 API Key）
 ```env
 # 1. 开启渠道模式，声明 ollama 渠道

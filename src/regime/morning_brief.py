@@ -18,7 +18,11 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
-from src.regime.classifier import RegimeResult, compute_regime_score
+from src.regime.classifier import (
+    RegimeResult,
+    compute_regime_score,
+    current_market_date,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +127,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
     )
 
-    target = date.fromisoformat(args.date) if args.date else date.today()
+    target = date.fromisoformat(args.date) if args.date else current_market_date()
     result = compute_regime_score(target_date=target, save_to_db=not args.no_save)
 
     body = format_brief(result)

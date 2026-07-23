@@ -389,7 +389,9 @@ class BaseFetcher(ABC):
         except Exception as e:
             elapsed = time.time() - request_start
             error_type, error_reason = summarize_exception(e)
-            logger.error(
+            # The manager owns fallback/final-failure reporting. A single
+            # provider miss is diagnostic context, not a terminal error.
+            logger.info(
                 f"[{self.name}] {stock_code} 获取失败: 范围={start_date} ~ {end_date}, "
                 f"error_type={error_type}, elapsed={elapsed:.2f}s, reason={error_reason}"
             )
@@ -607,6 +609,22 @@ class DataFetcherManager:
 
     def close(self) -> None:
         """Best-effort release of manager-owned resources."""
+        closed_ids = set()
+        for fetcher in self._get_fetchers_snapshot():
+            close_method = getattr(fetcher, "close", None)
+            if not callable(close_method):
+                continue
+            try:
+                with self._get_fetcher_call_lock(fetcher):
+                    close_method()
+                closed_ids.add(id(fetcher))
+            except Exception as exc:
+                logger.debug(
+                    "[%s] 关闭管理器资源失败: %s",
+                    getattr(fetcher, "name", type(fetcher).__name__),
+                    exc,
+                )
+
         if not hasattr(self, "_tickflow_lock") or self._tickflow_lock is None:
             self._tickflow_lock = RLock()
 
@@ -615,7 +633,11 @@ class DataFetcherManager:
             self._tickflow_fetcher = None
             self._tickflow_api_key = None
 
-        if current_fetcher is not None and hasattr(current_fetcher, "close"):
+        if (
+            current_fetcher is not None
+            and id(current_fetcher) not in closed_ids
+            and hasattr(current_fetcher, "close")
+        ):
             try:
                 current_fetcher.close()
             except Exception as exc:
@@ -942,20 +964,36 @@ class DataFetcherManager:
         request_start = time.time()
 
         # 快速路径：美股/港股使用专用数据源路由
-        #   - 配置长桥凭据后: Longbridge 为首选, YFinance/AkShare 兜底
-        #   - 未配置长桥:     YFinance 为首选（美股）, 通用 fetcher 循环（港股）
-        #   - 美股指数:       始终 YFinance 为首选（Longbridge 不提供指数K线）
+        #   - 已启用 Moomoo OpenD: 美股个股优先 Moomoo，避免可用的本地
+        #     QuoteContext 被远端 Yahoo/Longbridge 故障与限流拖慢。
+        #   - Moomoo 不可用时，配置长桥凭据则 Longbridge 优先，否则
+        #     YFinance 优先；两者继续互为兜底。
+        #   - 美股指数: 始终 YFinance 为首选（Moomoo/Longbridge 的指数
+        #     符号覆盖不稳定，不在这里猜测映射）。
         is_us_index = is_us_index_code(stock_code)
         is_us = is_us_index or is_us_stock_code(stock_code)
         is_hk = (not is_us) and _is_hk_market(stock_code)
 
-        # 美股（含美股指数）使用 Longbridge/YFinance 特殊路由；港股走下方通用数据源循环
+        # 美股（含美股指数）使用专用路由；港股走下方通用数据源循环。
         if is_us:
             prefer_lb = self._longbridge_preferred() and not is_us_index
-            source_order = (
+            remote_order = (
                 ["LongbridgeFetcher", "YfinanceFetcher"]
                 if prefer_lb
                 else ["YfinanceFetcher", "LongbridgeFetcher"]
+            )
+            enabled_moomoo = (
+                not is_us_index
+                and any(
+                    fetcher.name == "MoomooFetcher"
+                    and fetcher.priority < 99
+                    for fetcher in fetchers
+                )
+            )
+            source_order = (
+                ["MoomooFetcher", *remote_order]
+                if enabled_moomoo
+                else remote_order
             )
             market_label = "美股指数" if is_us_index else "美股"
 
@@ -987,7 +1025,7 @@ class DataFetcherManager:
                     except Exception as e:
                         error_type, error_reason = summarize_exception(e)
                         error_msg = f"[{fetcher.name}] ({error_type}) {error_reason}"
-                        logger.warning(
+                        logger.info(
                             f"[数据源失败 {attempt}/{total_fetchers}] [{fetcher.name}] {stock_code}: "
                             f"error_type={error_type}, reason={error_reason}"
                         )
@@ -996,7 +1034,7 @@ class DataFetcherManager:
 
             error_summary = f"{market_label} {stock_code} 获取失败:\n" + "\n".join(errors)
             elapsed = time.time() - request_start
-            logger.error(f"[数据源终止] {stock_code} 获取失败: elapsed={elapsed:.2f}s\n{error_summary}")
+            logger.warning(f"[数据源终止] {stock_code} 获取失败: elapsed={elapsed:.2f}s\n{error_summary}")
             raise DataFetchError(error_summary)
 
         for attempt, fetcher in enumerate(fetchers, start=1):
@@ -1022,7 +1060,7 @@ class DataFetcherManager:
             except Exception as e:
                 error_type, error_reason = summarize_exception(e)
                 error_msg = f"[{fetcher.name}] ({error_type}) {error_reason}"
-                logger.warning(
+                logger.info(
                     f"[数据源失败 {attempt}/{total_fetchers}] [{fetcher.name}] {stock_code}: "
                     f"error_type={error_type}, reason={error_reason}"
                 )
@@ -1036,7 +1074,7 @@ class DataFetcherManager:
         # 所有数据源都失败
         error_summary = f"所有数据源获取 {stock_code} 失败:\n" + "\n".join(errors)
         elapsed = time.time() - request_start
-        logger.error(f"[数据源终止] {stock_code} 获取失败: elapsed={elapsed:.2f}s\n{error_summary}")
+        logger.warning(f"[数据源终止] {stock_code} 获取失败: elapsed={elapsed:.2f}s\n{error_summary}")
         raise DataFetchError(error_summary)
 
     def get_intraday_data(
@@ -1046,7 +1084,7 @@ class DataFetcherManager:
         days: int = 30,
     ) -> Tuple[pd.DataFrame, str]:
         """
-        获取分钟级 K 线（目前仅支持美股，走 YfinanceFetcher）。
+        获取分钟级 K 线（目前仅支持美股，优先 Moomoo，失败后回退 Yfinance）。
 
         Args:
             stock_code: 股票代码
@@ -1057,7 +1095,7 @@ class DataFetcherManager:
             (DataFrame, source_name)
 
         Raises:
-            DataFetchError: 未找到 yfinance fetcher 或获取失败
+            DataFetchError: 未找到可用 intraday fetcher 或所有数据源获取失败
         """
         from .us_index_mapping import is_us_index_code, is_us_stock_code
 

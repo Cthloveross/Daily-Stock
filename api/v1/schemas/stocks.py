@@ -98,6 +98,27 @@ class StockHistoryResponse(BaseModel):
     stock_code: str = Field(..., description="股票代码")
     stock_name: Optional[str] = Field(None, description="股票名称")
     period: str = Field(..., description="K 线周期")
+    source: Optional[str] = Field(None, description="最终返回 K 线的数据源")
+    coverage_start: Optional[str] = Field(
+        None,
+        description="最终返回 K 线覆盖的最早日期或时间",
+    )
+    coverage_end: Optional[str] = Field(
+        None,
+        description="最终返回 K 线覆盖的最晚日期或时间",
+    )
+    last_bar_at: Optional[str] = Field(
+        None,
+        description="最终返回的最新一根 K 线日期或时间",
+    )
+    derived_from_period: Optional[str] = Field(
+        None,
+        description="派生 K 线所使用的原始周期；原生周期为 null",
+    )
+    aggregation_method: Optional[str] = Field(
+        None,
+        description="派生 K 线的聚合方法；原生周期为 null",
+    )
     data: List[KLineData] = Field(default_factory=list, description="K 线数据列表")
 
     class Config:
@@ -106,6 +127,12 @@ class StockHistoryResponse(BaseModel):
                 "stock_code": "600519",
                 "stock_name": "贵州茅台",
                 "period": "daily",
+                "source": "EfinanceFetcher",
+                "coverage_start": "2024-01-01",
+                "coverage_end": "2024-01-31",
+                "last_bar_at": "2024-01-31",
+                "derived_from_period": None,
+                "aggregation_method": None,
                 "data": []
             }
         }

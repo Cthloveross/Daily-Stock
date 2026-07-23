@@ -77,7 +77,7 @@ export const ContributionList: React.FC<ContributionListProps> = ({
                 'w-10 shrink-0 text-right font-mono text-mono-sm tabular-nums',
                 zero || noData ? 'text-text-3' : 'text-text-1',
               )}
-              title={noData ? '数据源未返回数据' : undefined}
+              aria-label={noData ? '数据源未返回数据' : undefined}
             >
               {displayedValue}
             </div>

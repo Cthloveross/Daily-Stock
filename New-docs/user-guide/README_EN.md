@@ -95,9 +95,13 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 | `OPENAI_API_KEY` | OpenAI-compatible API Key (supports DeepSeek, Qwen, etc.) | Optional |
 | `OPENAI_BASE_URL` | OpenAI-compatible API endpoint (e.g., `https://api.deepseek.com/v1`) | Optional |
 | `OPENAI_MODEL` | Model name (e.g., `deepseek-chat`) | Optional |
+| `JOURNAL_AI_MODEL` | Model used only for position-episode reviews, in `provider/model` format; empty inherits the Agent chain | Optional |
+| `JOURNAL_AI_FALLBACK_MODELS` | Comma-separated review-only fallbacks; an explicit empty value disables fallback | Optional |
 | `OLLAMA_API_BASE` | Ollama local service address (e.g. `http://localhost:11434`), for local/Docker deployment; **do not** use `OPENAI_BASE_URL` for Ollama, see [LLM Config Guide - Ollama](../configuration/LLM_CONFIG_GUIDE_EN.md#example-4-using-ollama-local-models) | Optional |
 
 > *Note: Configure at least one of `GEMINI_API_KEY`, `OPENAI_API_KEY`, or `OLLAMA_API_BASE` (local). **Ollama** requires `OLLAMA_API_BASE`; using `OPENAI_BASE_URL` causes 404.
+
+> Position reviews always offer a deterministic evidence review first. The review page also keeps a six-field trade-logic draft in this browser, isolated by build and episode; it is never written to Moomoo or the evidence ledger, and only non-empty fields are attached to one review request as unverified user statements. Evidence-only review sends them only to the local service; model enhancement also sends them to the configured third-party model provider. GPT enhancement inside the local website requires a server-side OpenAI API key; a ChatGPT/Codex login or subscription is not an API credential. Set `JOURNAL_AI_MODEL` explicitly if Gemini is already the automatically selected primary model.
 
 <details>
 <summary><b>Notification channels</b> (expand, choose at least one)</summary>

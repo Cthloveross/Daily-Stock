@@ -310,6 +310,49 @@ class TestValidateStructuredLLM:
         issues = cfg.validate_structured()
         assert not any(i.severity == "error" and i.field == "AGENT_LITELLM_MODEL" for i in issues)
 
+    def test_configured_journal_primary_model_missing_from_channels_is_error(self):
+        cfg = _make_config(
+            llm_model_list=[
+                {"model_name": "openai/gpt-4o-mini", "litellm_params": {"model": "openai/gpt-4o-mini", "api_key": "sk-test"}},
+            ],
+            journal_ai_model="openai/gpt-4o",
+        )
+        issues = cfg.validate_structured()
+        assert any(i.severity == "error" and i.field == "JOURNAL_AI_MODEL" for i in issues)
+
+    def test_configured_journal_primary_model_matching_yaml_alias_is_allowed(self):
+        cfg = _make_config(
+            llm_model_list=[
+                {"model_name": "journal-fast", "litellm_params": {"model": "openai/gpt-4o-mini", "api_key": "sk-test"}},
+            ],
+            journal_ai_model="journal-fast",
+        )
+        issues = cfg.validate_structured()
+        assert not any(i.severity == "error" and i.field == "JOURNAL_AI_MODEL" for i in issues)
+
+    def test_configured_journal_fallback_missing_from_channels_is_warning(self):
+        cfg = _make_config(
+            llm_model_list=[
+                {"model_name": "openai/gpt-4o-mini", "litellm_params": {"model": "openai/gpt-4o-mini", "api_key": "sk-test"}},
+            ],
+            journal_ai_fallback_models=["openai/gpt-4o"],
+        )
+        issues = cfg.validate_structured()
+        assert any(
+            i.severity == "warning" and i.field == "JOURNAL_AI_FALLBACK_MODELS"
+            for i in issues
+        )
+
+    def test_configured_journal_primary_without_runtime_source_is_error(self):
+        cfg = _make_config(
+            llm_model_list=[],
+            litellm_model="cohere/command-r-plus",
+            journal_ai_model="openai/gpt-4o-mini",
+            openai_api_keys=[],
+        )
+        issues = cfg.validate_structured()
+        assert any(i.severity == "error" and i.field == "JOURNAL_AI_MODEL" for i in issues)
+
     def test_configured_vision_model_missing_from_channels_is_warning(self):
         cfg = _make_config(
             llm_model_list=[

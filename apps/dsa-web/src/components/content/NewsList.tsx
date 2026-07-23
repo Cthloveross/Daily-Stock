@@ -1,6 +1,7 @@
 import type React from 'react';
 import { ExternalLink, ChevronsUp, ChevronUp, ChevronDown, ChevronsDown, Minus } from 'lucide-react';
 import { cn } from '../../utils/cn';
+import { Tooltip } from '../common/Tooltip';
 
 export type NewsSentiment = -2 | -1 | 0 | 1 | 2;
 
@@ -35,15 +36,16 @@ function SentimentBadge({ score, reason }: { score: NewsSentiment; reason?: stri
   const { Icon } = meta;
   const title = reason ? `${meta.label}：${reason}` : meta.label;
   return (
-    <span
-      className="inline-flex shrink-0 items-center gap-0.5 rounded-full border px-1.5 py-0.5 text-caption"
-      style={{ borderColor: `${meta.color}55`, color: meta.color }}
-      title={title}
-      aria-label={title}
-    >
-      <Icon size={14} strokeWidth={2.5} />
-      <span className="hidden sm:inline">{meta.label}</span>
-    </span>
+    <Tooltip content={title} focusable>
+      <span
+        className="inline-flex shrink-0 items-center gap-0.5 rounded-full border px-1.5 py-0.5 text-caption"
+        style={{ borderColor: `${meta.color}55`, color: meta.color }}
+        aria-label={title}
+      >
+        <Icon size={14} strokeWidth={2.5} />
+        <span className="hidden sm:inline">{meta.label}</span>
+      </span>
+    </Tooltip>
   );
 }
 

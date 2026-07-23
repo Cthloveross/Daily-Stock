@@ -6,13 +6,18 @@ six scorers' contributions is persisted for later reflexivity analysis.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import Column, Date, DateTime, Integer, String, Text
 
 from src.storage import Base
 
 __all__ = ["RegimeScore"]
+
+
+def _utc_now_naive() -> datetime:
+    """UTC wall clock for SQLite, which does not preserve tz offsets."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class RegimeScore(Base):
@@ -22,7 +27,8 @@ class RegimeScore(Base):
 
     date = Column(Date, primary_key=True)
     score = Column(Integer, nullable=False)  # [-50, 100]
-    label = Column(String(16), nullable=False)  # aggressive / standard / cautious / no_trade
+    # aggressive / standard / cautious / no_trade / unavailable
+    label = Column(String(16), nullable=False)
 
     # Six-dimension breakdown
     d1_direction = Column(Integer, default=0)
@@ -39,4 +45,4 @@ class RegimeScore(Base):
     user_perceived_quality = Column(Integer)  # -2 .. +2
     user_did_trade = Column(Integer)  # 0/1
 
-    generated_at = Column(DateTime, default=datetime.now, nullable=False)
+    generated_at = Column(DateTime, default=_utc_now_naive, nullable=False)

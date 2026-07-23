@@ -1,0 +1,773 @@
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, timezone
+from threading import Event
+from types import SimpleNamespace
+
+import pandas as pd
+import pytest
+
+from data_provider import moomoo_options
+
+
+class _QuoteContext:
+    def __init__(self, chain: pd.DataFrame, snapshots: pd.DataFrame):
+        self.chain = chain
+        self.snapshots = snapshots
+        self.snapshot_calls: list[list[str]] = []
+
+    def get_option_chain(self, **_kwargs):
+        return 0, self.chain
+
+    def get_market_snapshot(self, codes):
+        requested = list(codes)
+        self.snapshot_calls.append(requested)
+        return 0, self.snapshots[self.snapshots["code"].isin(requested)]
+
+
+class _WallQuoteContext(_QuoteContext):
+    def __init__(
+        self,
+        chains_by_expiry: dict[str, pd.DataFrame],
+        snapshots: pd.DataFrame,
+        expirations: list[str],
+    ):
+        super().__init__(pd.DataFrame(), snapshots)
+        frames: list[pd.DataFrame] = []
+        for expiry, frame in chains_by_expiry.items():
+            prepared = frame.copy()
+            if "strike_time" not in prepared.columns:
+                prepared["strike_time"] = expiry
+            frames.append(prepared)
+        self.chain = (
+            pd.concat(frames, ignore_index=True)
+            if frames
+            else pd.DataFrame()
+        )
+        self.expirations = expirations
+        self.chain_calls: list[tuple[str, str]] = []
+
+    def get_option_expiration_date(self, **_kwargs):
+        return 0, pd.DataFrame(
+            [{"strike_time": expiry} for expiry in self.expirations]
+        )
+
+    def get_option_chain(self, **kwargs):
+        start = kwargs["start"]
+        end = kwargs["end"]
+        self.chain_calls.append((start, end))
+        if self.chain.empty:
+            return 0, self.chain
+        strike_dates = self.chain["strike_time"].astype(str).str[:10]
+        return 0, self.chain[(strike_dates >= start) & (strike_dates <= end)]
+
+
+def _install_fake_moomoo(monkeypatch):
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "moomoo",
+        SimpleNamespace(RET_OK=0, OpenQuoteContext=object),
+    )
+
+
+def _chain_row(
+    code: str = "US.NVDA260821C180000",
+    strike: float = 180.0,
+    **overrides,
+):
+    row = {
+        "code": code,
+        "option_type": "CALL",
+        "strike_price": strike,
+    }
+    row.update(overrides)
+    return row
+
+
+def _snapshot_row(code: str = "US.NVDA260821C180000", **overrides):
+    row = {
+        "code": code,
+        "option_valid": True,
+        "bid_price": 5.1,
+        "ask_price": 5.3,
+        "last_price": 5.2,
+        "volume": 321,
+        "option_open_interest": 1234,
+        "option_implied_volatility": 42.5,
+        "option_delta": 0.57,
+        "option_expiry_date_distance": 31,
+    }
+    row.update(overrides)
+    return row
+
+
+def _prepare_wall_context(monkeypatch, ctx, *, spot: float = 181.0):
+    _install_fake_moomoo(monkeypatch)
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+    monkeypatch.setattr(moomoo_options, "_get_ctx", lambda: ctx)
+    monkeypatch.setattr(
+        moomoo_options,
+        "_spot_from_ctx",
+        lambda _ctx, _symbol, _ret_ok: spot,
+    )
+
+
+class _OverviewContext:
+    def __init__(self, frame: pd.DataFrame, ret: int = 0):
+        self.frame = frame
+        self.ret = ret
+        self.calls: list[list[str]] = []
+
+    def get_option_underlying_overview(self, codes):
+        self.calls.append(list(codes))
+        return self.ret, self.frame
+
+
+def test_option_underlying_overview_preserves_provider_time_bases(monkeypatch):
+    _install_fake_moomoo(monkeypatch)
+    frame = pd.DataFrame(
+        [
+            {
+                "code": "US.AAPL",
+                "name": "Apple",
+                "call_volume": 451945,
+                "put_volume": 324225,
+                "call_open_interest": 2687511,
+                "put_open_interest": 1971458,
+                "iv": 31.865,
+                "iv_rank": 77.141,
+                "iv_percentile": 88.888,
+                "pre_iv": 32.121,
+                "hv_30d": 36.996,
+                "hv_30d_percentile": 98.015,
+                "hv_60d": 31.782,
+                "hv_60d_percentile": 99.206,
+                "hv_90d": 28.039,
+                "hv_90d_percentile": 95.634,
+                "hv_120d": 27.197,
+                "hv_120d_percentile": 94.047,
+                "hv_365d": 24.506,
+                "hv_365d_percentile": 28.174,
+            }
+        ]
+    )
+    ctx = _OverviewContext(frame)
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+    monkeypatch.setattr(moomoo_options, "_get_ctx", lambda: ctx)
+
+    result = moomoo_options.fetch_option_underlying_overviews_moomoo(
+        ["aapl", "US.AAPL", "AAPL"]
+    )
+
+    assert ctx.calls == [["US.AAPL"]]
+    assert set(result) == {"AAPL"}
+    item = result["AAPL"]
+    assert item.call_volume == 451945
+    assert item.put_open_interest == 1971458
+    assert item.iv_percent == pytest.approx(31.865)
+    assert item.iv_rank_percent == pytest.approx(77.141)
+    assert item.iv_percentile_percent == pytest.approx(88.888)
+    assert item.hv_30d_percent == pytest.approx(36.996)
+
+
+def test_option_underlying_overview_fails_closed_on_provider_error(monkeypatch):
+    _install_fake_moomoo(monkeypatch)
+    ctx = _OverviewContext(pd.DataFrame(), ret=-1)
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+    monkeypatch.setattr(moomoo_options, "_get_ctx", lambda: ctx)
+
+    assert moomoo_options.fetch_option_underlying_overviews_moomoo(["AAPL"]) == {}
+
+
+def test_chain_joins_static_contracts_with_dynamic_snapshots(monkeypatch):
+    _install_fake_moomoo(monkeypatch)
+    chain = pd.DataFrame([_chain_row()])
+    snapshots = pd.DataFrame([_snapshot_row()])
+    ctx = _QuoteContext(chain, snapshots)
+    monkeypatch.setattr(moomoo_options, "_get_ctx", lambda: ctx)
+    monkeypatch.setattr(
+        moomoo_options,
+        "_spot_from_ctx",
+        lambda _ctx, _symbol, _ret_ok: 181.0,
+    )
+
+    quotes = moomoo_options.fetch_chain_via_moomoo("NVDA", "2026-08-21")
+
+    assert len(quotes) == 1
+    quote = quotes[0]
+    assert quote.bid == 5.1
+    assert quote.ask == 5.3
+    assert quote.volume == 321
+    assert quote.open_interest == 1234
+    assert quote.implied_volatility == 0.425
+    assert quote.delta == 0.57
+    assert quote.dte == 31
+    assert ctx.snapshot_calls == [["US.NVDA260821C180000"]]
+
+
+def test_chain_does_not_turn_static_rows_into_zero_quotes(monkeypatch):
+    _install_fake_moomoo(monkeypatch)
+    chain = pd.DataFrame([_chain_row()])
+    ctx = _QuoteContext(chain, pd.DataFrame(columns=["code"]))
+    monkeypatch.setattr(moomoo_options, "_get_ctx", lambda: ctx)
+
+    assert moomoo_options.fetch_chain_via_moomoo("NVDA", "2026-08-21") == []
+
+
+def test_snapshot_requests_respect_the_400_code_limit():
+    codes = [f"US.TEST{i:03d}" for i in range(401)]
+    snapshots = pd.DataFrame([{"code": code} for code in codes])
+    ctx = _QuoteContext(pd.DataFrame(), snapshots)
+
+    result = moomoo_options._get_option_snapshots(ctx, codes, 0)
+
+    assert len(result.snapshots) == 401
+    assert result.complete is True
+    assert [len(call) for call in ctx.snapshot_calls] == [400, 1]
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("bid_price", None),
+        ("ask_price", float("nan")),
+        ("last_price", float("inf")),
+        ("volume", None),
+        ("option_open_interest", float("nan")),
+        ("option_implied_volatility", float("inf")),
+    ],
+)
+def test_chain_omits_missing_or_non_finite_dynamic_fields(
+    monkeypatch,
+    field,
+    invalid,
+):
+    _install_fake_moomoo(monkeypatch)
+    ctx = _QuoteContext(
+        pd.DataFrame([_chain_row()]),
+        pd.DataFrame([_snapshot_row(**{field: invalid})]),
+    )
+    monkeypatch.setattr(moomoo_options, "_get_ctx", lambda: ctx)
+    monkeypatch.setattr(
+        moomoo_options,
+        "_spot_from_ctx",
+        lambda _ctx, _symbol, _ret_ok: 181.0,
+    )
+
+    assert moomoo_options.fetch_chain_via_moomoo(
+        "NVDA",
+        "2026-08-21",
+    ) == []
+
+
+@pytest.mark.parametrize("option_valid", [None, False, 0, "false"])
+def test_chain_requires_explicit_valid_option_snapshot(
+    monkeypatch,
+    option_valid,
+):
+    _install_fake_moomoo(monkeypatch)
+    ctx = _QuoteContext(
+        pd.DataFrame([_chain_row()]),
+        pd.DataFrame([_snapshot_row(option_valid=option_valid)]),
+    )
+    monkeypatch.setattr(moomoo_options, "_get_ctx", lambda: ctx)
+    monkeypatch.setattr(
+        moomoo_options,
+        "_spot_from_ctx",
+        lambda _ctx, _symbol, _ret_ok: 181.0,
+    )
+
+    assert moomoo_options.fetch_chain_via_moomoo(
+        "NVDA",
+        "2026-08-21",
+    ) == []
+
+
+def test_real_zero_quote_fields_are_not_confused_with_missing(monkeypatch):
+    _install_fake_moomoo(monkeypatch)
+    ctx = _QuoteContext(
+        pd.DataFrame([_chain_row()]),
+        pd.DataFrame(
+            [
+                _snapshot_row(
+                    bid_price=0,
+                    last_price=0,
+                    volume=0,
+                    option_open_interest=0,
+                )
+            ]
+        ),
+    )
+    monkeypatch.setattr(moomoo_options, "_get_ctx", lambda: ctx)
+    monkeypatch.setattr(
+        moomoo_options,
+        "_spot_from_ctx",
+        lambda _ctx, _symbol, _ret_ok: 181.0,
+    )
+
+    quote = moomoo_options.fetch_chain_via_moomoo(
+        "NVDA",
+        "2026-08-21",
+    )[0]
+
+    assert quote.bid == 0
+    assert quote.last == 0
+    assert quote.volume == 0
+    assert quote.open_interest == 0
+
+
+def test_snapshot_result_marks_a_failed_batch_incomplete():
+    codes = [f"US.TEST{i:03d}" for i in range(401)]
+    snapshots = pd.DataFrame([{"code": code} for code in codes])
+
+    class _SecondBatchFails(_QuoteContext):
+        def get_market_snapshot(self, requested_codes):
+            requested = list(requested_codes)
+            self.snapshot_calls.append(requested)
+            if len(self.snapshot_calls) == 2:
+                return 1, "provider unavailable"
+            return 0, self.snapshots[self.snapshots["code"].isin(requested)]
+
+    ctx = _SecondBatchFails(pd.DataFrame(), snapshots)
+
+    result = moomoo_options._get_option_snapshots(ctx, codes, 0)
+
+    assert len(result.snapshots) == 400
+    assert result.failed_batch_count == 1
+    assert result.complete is False
+    assert result.missing_codes == ("US.TEST400",)
+
+
+def test_option_wall_snapshot_filters_dte_and_nonstandard_and_keeps_coverage(
+    monkeypatch,
+):
+    expiry_0dte = "2026-07-22"
+    expiry_14dte = "2026-08-05"
+    standard_code = "US.NVDA260722C180000"
+    nonstandard_code = "US.NVDA260722P180000"
+    unknown_type_code = "US.NVDA260722P175000"
+    invalid_oi_code = "US.NVDA260805C185000"
+    nullable_greeks_code = "US.NVDA260805P170000"
+    ctx = _WallQuoteContext(
+        {
+            expiry_0dte: pd.DataFrame(
+                [
+                    _chain_row(
+                        standard_code,
+                        180.0,
+                        option_standard_type="STANDARD",
+                    ),
+                    _chain_row(
+                        nonstandard_code,
+                        180.0,
+                        option_type="PUT",
+                        option_standard_type="OptionStandardType.NON_STANDARD",
+                    ),
+                    _chain_row(
+                        unknown_type_code,
+                        175.0,
+                        option_type="PUT",
+                        option_standard_type=None,
+                    ),
+                ]
+            ),
+            expiry_14dte: pd.DataFrame(
+                [
+                    _chain_row(
+                        invalid_oi_code,
+                        185.0,
+                        option_standard_type="STANDARD",
+                    ),
+                    _chain_row(
+                        nullable_greeks_code,
+                        170.0,
+                        option_type="PUT",
+                        option_standard_type="STANDARD",
+                    ),
+                ]
+            ),
+        },
+        pd.DataFrame(
+            [
+                _snapshot_row(
+                    standard_code,
+                    option_gamma=0.0123,
+                    option_contract_size=100,
+                    update_time="2026-07-22 10:01:02",
+                ),
+                _snapshot_row(
+                    unknown_type_code,
+                    option_gamma=None,
+                    option_contract_size=None,
+                    update_time="2026-07-22 10:01:03",
+                ),
+                _snapshot_row(invalid_oi_code, option_open_interest=None),
+                _snapshot_row(
+                    nullable_greeks_code,
+                    option_gamma=None,
+                    option_contract_size=None,
+                    update_time=None,
+                ),
+            ]
+        ),
+        ["2026-07-19", expiry_0dte, expiry_14dte, "2026-09-30"],
+    )
+    _prepare_wall_context(monkeypatch, ctx)
+
+    result = moomoo_options.fetch_option_wall_snapshot_moomoo(
+        "NVDA",
+        dte_min=0,
+        dte_max=45,
+        ref_date=date(2026, 7, 22),
+    )
+
+    assert isinstance(result, moomoo_options.MoomooOptionWallSnapshot)
+    assert result.symbol == "NVDA"
+    assert result.spot == 181.0
+    assert result.fetched_at.tzinfo == timezone.utc
+    assert result.expiries == (expiry_0dte, expiry_14dte)
+    assert ctx.chain_calls == [("2026-07-22", "2026-08-20")]
+    assert result.requested_contract_count == 3
+    assert result.snapshot_received_count == 3
+    assert result.valid_contract_count == 2
+    assert result.failed_batch_count == 0
+    assert result.excluded_nonstandard_count == 1
+    assert result.excluded_unknown_standard_type_count == 1
+    assert nonstandard_code not in {item.code for item in result.contracts}
+    assert unknown_type_code not in {item.code for item in result.contracts}
+
+    by_code = {item.code: item for item in result.contracts}
+    standard = by_code[standard_code]
+    assert standard == moomoo_options.MoomooOptionWallContract(
+        code=standard_code,
+        expiry=expiry_0dte,
+        dte=0,
+        right="C",
+        strike=180.0,
+        volume=321,
+        open_interest=1234,
+        gamma=0.0123,
+        contract_size=100,
+        update_time="2026-07-22 10:01:02",
+    )
+    assert by_code[nullable_greeks_code].dte == 14
+    assert by_code[nullable_greeks_code].contract_size is None
+    assert invalid_oi_code not in by_code
+
+
+@pytest.mark.parametrize("value", [None, "N/A", "UNKNOWN", float("nan")])
+def test_option_wall_standard_type_unknown_sentinels_fail_closed(value):
+    assert moomoo_options._normalise_option_standard_type(value) is None
+
+
+def test_option_wall_uses_at_most_two_chain_ranges_for_default_45_dte(
+    monkeypatch,
+):
+    expiries = ["2026-07-22", "2026-08-05", "2026-08-21", "2026-09-05"]
+    chains: dict[str, pd.DataFrame] = {}
+    snapshots: list[dict] = []
+    for index, expiry in enumerate(expiries, start=1):
+        code = f"US.NVDA{expiry.replace('-', '')}C{index:06d}"
+        chains[expiry] = pd.DataFrame(
+            [
+                _chain_row(
+                    code,
+                    175.0 + index,
+                    option_standard_type="STANDARD",
+                )
+            ]
+        )
+        snapshots.append(_snapshot_row(code))
+    ctx = _WallQuoteContext(chains, pd.DataFrame(snapshots), expiries)
+    _prepare_wall_context(monkeypatch, ctx)
+
+    result = moomoo_options.fetch_option_wall_snapshot_moomoo(
+        "NVDA",
+        ref_date=date(2026, 7, 22),
+    )
+
+    assert result is not None
+    assert result.expiries == tuple(expiries)
+    assert ctx.chain_calls == [
+        ("2026-07-22", "2026-08-20"),
+        ("2026-08-21", "2026-09-05"),
+    ]
+    assert result.requested_contract_count == 4
+    assert result.snapshot_received_count == 4
+    assert result.valid_contract_count == 4
+
+
+def test_option_wall_reports_failed_chain_range_as_partial_coverage(monkeypatch):
+    expiries = ["2026-07-22", "2026-08-21"]
+    first_code = "US.NVDA260722C180000"
+    second_code = "US.NVDA260821C185000"
+
+    class _SecondChainRangeFails(_WallQuoteContext):
+        def get_option_chain(self, **kwargs):
+            start = kwargs["start"]
+            end = kwargs["end"]
+            self.chain_calls.append((start, end))
+            if len(self.chain_calls) == 2:
+                return 1, "provider unavailable"
+            strike_dates = self.chain["strike_time"].astype(str).str[:10]
+            return 0, self.chain[(strike_dates >= start) & (strike_dates <= end)]
+
+    ctx = _SecondChainRangeFails(
+        {
+            expiries[0]: pd.DataFrame(
+                [_chain_row(first_code, option_standard_type="STANDARD")]
+            ),
+            expiries[1]: pd.DataFrame(
+                [_chain_row(second_code, option_standard_type="STANDARD")]
+            ),
+        },
+        pd.DataFrame([_snapshot_row(first_code), _snapshot_row(second_code)]),
+        expiries,
+    )
+    _prepare_wall_context(monkeypatch, ctx)
+
+    result = moomoo_options.fetch_option_wall_snapshot_moomoo(
+        "NVDA",
+        ref_date=date(2026, 7, 22),
+    )
+
+    assert result is not None
+    assert result.requested_contract_count == 1
+    assert result.snapshot_received_count == 1
+    assert result.valid_contract_count == 1
+    assert result.failed_batch_count == 1
+    assert [item.code for item in result.contracts] == [first_code]
+
+
+def test_option_wall_snapshot_does_not_fall_back_to_expired_expiry(monkeypatch):
+    expired = "2026-07-18"
+    expired_code = "US.NVDA260718C180000"
+    ctx = _WallQuoteContext(
+        {expired: pd.DataFrame([_chain_row(expired_code)])},
+        pd.DataFrame([_snapshot_row(expired_code)]),
+        [expired],
+    )
+    _prepare_wall_context(monkeypatch, ctx)
+
+    result = moomoo_options.fetch_option_wall_snapshot_moomoo(
+        "NVDA",
+        dte_min=0,
+        dte_max=45,
+        ref_date=date(2026, 7, 22),
+    )
+
+    assert result is not None
+    assert result.expiries == ()
+    assert result.contracts == ()
+    assert result.requested_contract_count == 0
+    assert result.snapshot_received_count == 0
+    assert ctx.chain_calls == []
+    assert ctx.snapshot_calls == []
+
+
+def test_option_wall_snapshot_preserves_partial_batch_coverage(monkeypatch):
+    expiry = "2026-08-21"
+    codes = [f"US.NVDA260821C{i:06d}" for i in range(1, 402)]
+    chain = pd.DataFrame(
+        [
+            _chain_row(
+                code,
+                float(index),
+                option_standard_type="STANDARD",
+            )
+            for index, code in enumerate(codes, start=1)
+        ]
+    )
+    snapshots = pd.DataFrame([_snapshot_row(code) for code in codes])
+
+    class _SecondWallBatchFails(_WallQuoteContext):
+        def get_market_snapshot(self, requested_codes):
+            requested = list(requested_codes)
+            self.snapshot_calls.append(requested)
+            if len(self.snapshot_calls) == 2:
+                return 1, "provider unavailable"
+            return 0, self.snapshots[self.snapshots["code"].isin(requested)]
+
+    ctx = _SecondWallBatchFails({expiry: chain}, snapshots, [expiry])
+    _prepare_wall_context(monkeypatch, ctx)
+
+    result = moomoo_options.fetch_option_wall_snapshot_moomoo(
+        "NVDA",
+        dte_min=0,
+        dte_max=45,
+        ref_date=date(2026, 7, 22),
+    )
+
+    assert result is not None
+    assert result.requested_contract_count == 401
+    assert result.snapshot_received_count == 400
+    assert result.valid_contract_count == 400
+    assert result.failed_batch_count == 1
+    assert [len(call) for call in ctx.snapshot_calls] == [400, 1]
+
+
+def test_option_wall_snapshot_validates_bounds_and_enablement(monkeypatch):
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: False)
+    monkeypatch.setattr(
+        moomoo_options,
+        "_get_ctx",
+        lambda: pytest.fail("disabled option wall must not create a context"),
+    )
+
+    assert moomoo_options.fetch_option_wall_snapshot_moomoo("NVDA") is None
+    with pytest.raises(ValueError, match="0 <= dte_min <= dte_max"):
+        moomoo_options.fetch_option_wall_snapshot_moomoo(
+            "NVDA",
+            dte_min=10,
+            dte_max=5,
+        )
+    with pytest.raises(ValueError, match="must be integers"):
+        moomoo_options.fetch_option_wall_snapshot_moomoo(
+            "NVDA",
+            dte_min=0.5,  # type: ignore[arg-type]
+        )
+
+
+def test_atm_iv_fetches_exact_contract_and_fails_closed_when_missing(
+    monkeypatch,
+):
+    _install_fake_moomoo(monkeypatch)
+    atm_code = "US.NVDA260821C180000"
+    far_code = "US.NVDA260821C220000"
+    ctx = _QuoteContext(
+        pd.DataFrame(
+            [
+                _chain_row(atm_code, 180.0),
+                _chain_row(far_code, 220.0),
+            ]
+        ),
+        pd.DataFrame([_snapshot_row(far_code)]),
+    )
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+    monkeypatch.setattr(
+        moomoo_options,
+        "get_expirations_moomoo",
+        lambda _symbol: ["2026-08-21"],
+    )
+    monkeypatch.setattr(moomoo_options, "_get_ctx", lambda: ctx)
+    monkeypatch.setattr(
+        moomoo_options,
+        "_spot_from_ctx",
+        lambda _ctx, _symbol, _ret_ok: 181.0,
+    )
+
+    iv, expiry = moomoo_options.compute_atm_iv_moomoo(
+        "NVDA",
+        ref_date=date(2026, 7, 22),
+    )
+
+    assert iv is None
+    assert expiry == "2026-08-21"
+    assert ctx.snapshot_calls == [[atm_code]]
+
+
+def test_atm_iv_does_not_fall_back_to_an_expired_contract(monkeypatch):
+    _install_fake_moomoo(monkeypatch)
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+    monkeypatch.setattr(
+        moomoo_options,
+        "get_expirations_moomoo",
+        lambda _symbol: ["2026-07-11", "2026-07-18"],
+    )
+    monkeypatch.setattr(
+        moomoo_options,
+        "_get_ctx",
+        lambda: pytest.fail("expired expirations must not reach quote context"),
+    )
+
+    assert moomoo_options.compute_atm_iv_moomoo(
+        "NVDA",
+        ref_date=date(2026, 7, 22),
+    ) == (None, "")
+
+
+def test_atm_expiry_selection_uses_new_york_market_date(monkeypatch):
+    _install_fake_moomoo(monkeypatch)
+    code = "US.NVDA260722C180000"
+    ctx = _QuoteContext(
+        pd.DataFrame([_chain_row(code, 180.0)]),
+        pd.DataFrame([_snapshot_row(code)]),
+    )
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+    monkeypatch.setattr(
+        moomoo_options,
+        "get_expirations_moomoo",
+        lambda _symbol: ["2026-07-22", "2026-07-29"],
+    )
+    monkeypatch.setattr(
+        moomoo_options,
+        "_new_york_market_date",
+        lambda: date(2026, 7, 22),
+    )
+    monkeypatch.setattr(moomoo_options, "_get_ctx", lambda: ctx)
+    monkeypatch.setattr(
+        moomoo_options,
+        "_spot_from_ctx",
+        lambda _ctx, _symbol, _ret_ok: 181.0,
+    )
+
+    iv, expiry = moomoo_options.compute_atm_iv_moomoo("NVDA")
+
+    assert iv == 0.425
+    assert expiry == "2026-07-22"
+
+
+def test_context_cannot_close_while_expiration_query_is_in_flight(monkeypatch):
+    _install_fake_moomoo(monkeypatch)
+    query_started = Event()
+    release_query = Event()
+    closed = Event()
+    reconnect_started = Event()
+
+    class _BlockingContext:
+        alive = True
+
+        def get_option_expiration_date(self, **_kwargs):
+            query_started.set()
+            assert release_query.wait(timeout=2)
+            return 0, pd.DataFrame([{"strike_time": "2026-08-21"}])
+
+        def close(self):
+            closed.set()
+
+    old_ctx = _BlockingContext()
+    replacement = SimpleNamespace(alive=True)
+    monkeypatch.setattr(moomoo_options, "_ctx_singleton", old_ctx)
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+    monkeypatch.setattr(moomoo_options, "probe_opend_tcp", lambda *_args: True)
+    monkeypatch.setattr(
+        moomoo_options,
+        "_is_alive",
+        lambda ctx: bool(getattr(ctx, "alive", False)),
+    )
+    monkeypatch.setattr(
+        moomoo_options,
+        "create_ready_quote_context",
+        lambda **_kwargs: replacement,
+    )
+
+    def reconnect():
+        reconnect_started.set()
+        return moomoo_options._get_ctx()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        query_future = pool.submit(
+            moomoo_options.get_expirations_moomoo,
+            "NVDA",
+        )
+        assert query_started.wait(timeout=2)
+        old_ctx.alive = False
+        reconnect_future = pool.submit(reconnect)
+        assert reconnect_started.wait(timeout=2)
+        assert closed.wait(timeout=0.1) is False
+        release_query.set()
+
+        assert query_future.result(timeout=2) == ["2026-08-21"]
+        assert reconnect_future.result(timeout=2) is replacement
+        assert closed.is_set()

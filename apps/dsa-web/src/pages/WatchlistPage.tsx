@@ -1,7 +1,7 @@
 import type React from 'react';
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Columns3, Download, Search, SlidersHorizontal, X } from 'lucide-react';
+import { Columns3, Download, Search, SlidersHorizontal, Upload, X } from 'lucide-react';
 import { DataTable, EmptyState, Input, Tabs, toast, type ColumnDef } from '../components/ui';
 import { PriceCell } from '../components/data/PriceCell';
 import { ChangeCell } from '../components/data/ChangeCell';
@@ -13,6 +13,7 @@ import { useUserWatchlistStore } from '../stores/userWatchlistStore';
 import { useTickerQuotes } from '../hooks/useTickerQuotes';
 import { exportCsv } from '../utils/exportCsv';
 import { cn } from '../utils/cn';
+import { parseTradingViewWatchlist } from '../utils/tradingViewWatchlist';
 
 type FilterKey = 'all' | 'gainers' | 'losers' | 'movers';
 
@@ -87,6 +88,7 @@ const WatchlistPage: React.FC = () => {
   const todayLoading = useRegimeStore((s) => s.todayLoading);
   const userTickers = useUserWatchlistStore((s) => s.tickers);
   const addTicker = useUserWatchlistStore((s) => s.add);
+  const addManyTickers = useUserWatchlistStore((s) => s.addMany);
   const removeTicker = useUserWatchlistStore((s) => s.remove);
 
   const [query, setQuery] = useState('');
@@ -142,6 +144,29 @@ const WatchlistPage: React.FC = () => {
   const handleRemoveTicker = (t: string) => {
     removeTicker(t);
     toast.info(`已移除: ${t}`);
+  };
+
+  const handleTradingViewImport = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+
+    try {
+      const parsed = parseTradingViewWatchlist(await file.text());
+      if (parsed.symbols.length === 0) {
+        toast.error('没有识别到可用于美股期权研究的 ticker。');
+        return;
+      }
+      const added = addManyTickers(parsed.symbols);
+      const ignoredMessage = parsed.ignored.length > 0
+        ? `；忽略 ${parsed.ignored.length} 个非标准美股标的`
+        : '';
+      toast.success(
+        `TradingView 自选已合并：新增 ${added}，识别 ${parsed.symbols.length}${ignoredMessage}。今日机会扫描使用前 20 只。`,
+      );
+    } catch {
+      toast.error('TradingView TXT 读取失败，请重新导出后再试。');
+    }
   };
 
   const filtered = useMemo(() => {
@@ -233,7 +258,6 @@ const WatchlistPage: React.FC = () => {
           <button
             type="button"
             aria-label={`Remove ${row.original.ticker}`}
-            title="移出自选"
             onClick={(e) => {
               e.stopPropagation();
               handleRemoveTicker(row.original.ticker);
@@ -278,6 +302,17 @@ const WatchlistPage: React.FC = () => {
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <TickerPicker onAdd={handlePickerAdd} className="w-[360px]" />
+          <label className="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-ds-sm border border-subtle bg-bg-1 px-3 text-body-sm text-text-2 hover:border-default hover:text-text-1">
+            <Upload size={14} strokeWidth={1.5} />
+            导入 TradingView TXT
+            <input
+              type="file"
+              accept=".txt,text/plain"
+              className="sr-only"
+              onChange={(event) => void handleTradingViewImport(event)}
+              aria-label="导入 TradingView 自选 TXT"
+            />
+          </label>
           <div className="mx-1 h-5 w-px bg-[color:var(--border-subtle)]" aria-hidden />
           <Input
             value={query}
@@ -350,6 +385,11 @@ const WatchlistPage: React.FC = () => {
           ]}
         />
       </div>
+
+      <p className="mt-2 text-caption text-text-3">
+        TradingView 暂无面向个人账户的公开自选 REST API；请在 Advanced View 下载 TXT 后在此合并导入。
+        今日机会会从本地自选前 20 只中筛选 Top 5。
+      </p>
 
       <section
         className={cn(

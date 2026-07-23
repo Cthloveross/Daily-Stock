@@ -1,5 +1,7 @@
 # 01 · Project Vision v4
 
+> **历史状态（2026-07-20）**：本文保留为 Phase 0 的战略背景。当前产品目标、实施优先级和验收标准以 [`05_PRODUCT_CHARTER_AND_ROADMAP.md`](./05_PRODUCT_CHARTER_AND_ROADMAP.md) 为准。本文中“转向 LEAP / 趋势流”、目标仓位比例和交易频率属于待数据验证的假设，不再作为系统预设结论。
+
 > **基于真实 repo 的精准定位**  
 > 前置阅读：`00_INDEX.md`、`HEALTH_CHECK_REPORT.md`、`BREAKOUT_FILTER_PLAYBOOK.md`  
 > 取代：v1/v2/v3 的所有 PROJECT_VISION

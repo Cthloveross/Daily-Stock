@@ -71,7 +71,8 @@ export const StyleBreakdown: React.FC<Props> = ({ items, className }) => {
           return (
             <div
               key={it.style}
-              title={`${labelFor(it.style)} · ${fmtMoney(it.sumPnlNet)}`}
+              role="img"
+              aria-label={`${labelFor(it.style)} · ${fmtMoney(it.sumPnlNet)}`}
               style={{ width: `${width}%`, background: color, opacity }}
             />
           );

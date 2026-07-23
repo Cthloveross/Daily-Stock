@@ -63,6 +63,15 @@ class SystemConfigApiTestCase(unittest.TestCase):
         self.assertEqual(item_map["GEMINI_API_KEY"]["value"], "secret-key-value")
         self.assertFalse(item_map["GEMINI_API_KEY"]["is_masked"])
 
+    def test_get_config_accepts_phase0_schema_category(self) -> None:
+        payload = system_config.get_system_config(
+            include_schema=True,
+            service=self.service,
+        ).model_dump(by_alias=True)
+        item_map = {item["key"]: item for item in payload["items"]}
+
+        self.assertEqual(item_map["CURRENT_PHASE"]["schema"]["category"], "phase0")
+
     def test_put_config_updates_secret_and_plain_field(self) -> None:
         current = system_config.get_system_config(include_schema=False, service=self.service).model_dump()
         payload = system_config.update_system_config(

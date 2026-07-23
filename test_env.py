@@ -36,6 +36,16 @@ import sys
 from datetime import datetime, date, timedelta
 from typing import Optional
 
+# This file is an operator-run diagnostic CLI. Several commands intentionally
+# call live market-data, LLM, and notification services, so the offline pytest
+# gate must never execute them. Keep the CLI usable when pytest is not installed.
+try:
+    import pytest
+except ImportError:  # pragma: no cover - production CLI environment
+    pytestmark = ()
+else:
+    pytestmark = pytest.mark.network
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,

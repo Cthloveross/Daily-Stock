@@ -120,9 +120,17 @@ class TestStorage(unittest.TestCase):
             with db.get_session() as session:
                 journal_mode = session.connection().exec_driver_sql("PRAGMA journal_mode").scalar()
                 busy_timeout = session.connection().exec_driver_sql("PRAGMA busy_timeout").scalar()
+                recursive_triggers = session.connection().exec_driver_sql(
+                    "PRAGMA recursive_triggers"
+                ).scalar()
+                foreign_keys = session.connection().exec_driver_sql(
+                    "PRAGMA foreign_keys"
+                ).scalar()
 
             self.assertEqual(str(journal_mode).lower(), "wal")
             self.assertEqual(int(busy_timeout), 1234)
+            self.assertEqual(int(recursive_triggers), 1)
+            self.assertEqual(int(foreign_keys), 1)
         finally:
             DatabaseManager.reset_instance()
             Config.reset_instance()
