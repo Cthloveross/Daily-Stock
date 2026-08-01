@@ -441,7 +441,7 @@ Future preview 的关键边界：
 | `blocked` | 证据连续性存在具体冲突 | 查看 reason，补证据，不能绕过 |
 | `ready` | 可以生成零写 future preview | 使用当前 fence 请求 preview |
 
-当前缺口：切片 1（formal future-build confirm 写路径 + `journal_v2_episode_build_snapshot_fence_sources` link 表 + `POST /api/v1/journal/v2/episode-builds/position-snapshot`）已于 2026-07-31 实现——confirm 在 `BEGIN IMMEDIATE` 写事务内重跑 preview 核心、CAS 对比 fence/build/evidence hash、要求 left-censored 与 group-fee 显式接受后 append-only 追加 build 与 link，build 追加后默认视图不变（CSV fallback 显式排除 fence build）。尚未实现的是切片 2（activation 资格扩展到 future build，需 schema 评审）与切片 3（Web UI）；未激活前不要把任何文案改成“已生效”。真实库演练仍待用户完成一次 snapshot confirm + 后续 refresh publication。写合同见 [`phase1/12_FORMAL_FUTURE_BUILD_CONTRACT.md`](./phase1/12_FORMAL_FUTURE_BUILD_CONTRACT.md)。
+当前缺口：切片 1（formal future-build confirm 写路径 + `journal_v2_episode_build_snapshot_fence_sources` link 表 + `POST /api/v1/journal/v2/episode-builds/position-snapshot`）已于 2026-07-31 实现——confirm 在 `BEGIN IMMEDIATE` 写事务内重跑 preview 核心、CAS 对比 fence/build/evidence hash、要求 left-censored 与 group-fee 显式接受后 append-only 追加 build 与 link，build 追加后默认视图不变（CSV fallback 显式排除 fence build）。切片 3（Web UI 显式确认）已于 2026-08-01 实现；切片 2（activation 资格扩展到 future build）也已于 2026-08-01 实现：无 schema 变更，fence build 激活时以 link 冻结的目标事实集身份写入 activation 的 NOT NULL canonical 列，并新增 `accept_left_censored_openings` 显式门禁（决策记录见写合同 §6）。剩余缺口：真实库演练仍待用户完成一次 snapshot confirm + 后续 refresh publication 后走 confirm → 显式激活全链路。写合同见 [`phase1/12_FORMAL_FUTURE_BUILD_CONTRACT.md`](./phase1/12_FORMAL_FUTURE_BUILD_CONTRACT.md)。
 
 ### 5.4 Append-only 与 legacy 的边界
 
@@ -680,23 +680,24 @@ AI 必须区分：
 
 页面应直接展示已有关键执行价墙，不要求用户先点击才知道是否有数据。但必须区分当前 schema 与目标合同。
 
-当前实现：
+当前实现（`option-wall/1.2`，2026-08-01 起）：
 
-- 一个 wall item 是指定 DTE scope 内跨 expiry 的聚合；
-- item 级保存 expiries、coverage、spot 和同一 snapshot 的最近到期 ATM Call IV；
-- 每个 level 只有 rank、strike、距 spot 距离、metric value/share/unit/method；
-- metric 可表达 OI、volume 或 gross absolute gamma 的集中度；
-- level 当前没有独立 expiration/DTE、bid/ask/mark 或逐层 IV。
+- 一个 wall item 仍是指定 DTE scope 内跨 expiry 的聚合；item 级字段（expiries、coverage、spot、同一 snapshot 的最近到期 ATM Call IV）不变；
+- 每个 level 在原 rank、strike、距 spot 距离、metric value/share/unit/method 之外，additive 补齐了逐层字段（`src/opportunities/option_walls.py`）：
+  - `side`：call / put / call_put_aggregate（gross gamma 桶显式标为双边聚合）；
+  - `metric_basis` 结算口径：OI＝`settled_open_interest_prior_session`（T-1 清算），Volume＝`current_session_cumulative_volume`（当日累计），Gamma＝`model_from_settled_oi_and_snapshot_greeks`（模型值，非观测）；
+  - `expiry_breakdown`：按贡献排序的 top 3 到期日（每条含 expiry、dte、metric_value、share_of_level_percent、contract_count）+ `other` 汇总桶，level 不再是不可拆的跨 expiry 黑盒；
+  - 逐到期 quote 上下文：仅当该 strike×expiry×right 单元恰好由一行快照支撑（`contract_count == 1`）时，附该行的 `iv_percent` 与 `quote_as_of`；多行聚合时不归属报价；
+  - `quote_evidence` 显式标缺（observed / partial / unavailable）：缺失字段保持 null，不做零值或估算回填；
+- 前端 `/regime/opportunity/:ticker` 期权墙 tab 与今日机会候选详情逐层可展开到期分布，缺失报价按「标缺」文案显示（`WallLevelExpiryBreakdown.tsx`）。
 
-因此当前墙位只能称为“集中度区域”。它不是 dealer net GEX、gamma flip 或已经证明的对冲支撑/阻力；OI 通常还是结算后数据，不能伪装成实时。
+因此当前墙位仍只能称为“集中度区域”。它不是 dealer net GEX、gamma flip 或已经证明的对冲支撑/阻力；OI 仍是结算后数据，不能伪装成实时。
 
-目标合同应逐层补齐或显式标缺：
+对照目标合同（逐层 underlying、expiration/DTE、call/put、OI、volume、bid/ask/mark、IV、snapshot/as-of、source、coverage、settlement 语义）仍缺：
 
-- underlying、expiration、DTE、call/put、strike；
-- OI、volume、bid/ask/mark、IV；
-- snapshot/as-of、source、coverage；
-- settlement/current-session 语义；
-- dealer sign 假设、若无持仓方向证据则禁止输出 net GEX/gamma flip。
+- 逐层 bid/ask/mark：Moomoo 墙快照 adapter（`data_provider/moomoo_options.py` 的 `MoomooOptionWallContract`）当前只携带 volume/OI/gamma/contract_size/IV/update_time，不携带盘口字段；schema 与前端已预留字段并显式标缺，补齐需扩展 adapter 采集（另一轮次）；
+- 逐层独立 OI 与 volume 双值：breakdown 每条只带该 metric 自己的贡献值，同一到期的 OI 与 volume 需分别看两组墙；
+- dealer sign 假设：无持仓方向证据，继续禁止输出 net GEX / gamma flip（红线不变，builder 测试断言 payload 无任何 dealer-sign 字段）。
 
 ### 9.3 单票详情必须绑定同一研究版本
 
@@ -1203,15 +1204,15 @@ ReportMarkdown 于当前 UI 有稳定入口前不得作为验收证据。
 
 验收：
 
-- snapshot → refresh B → ready fence → preview；
-- 新增独立、显式的 formal future-build confirm/write contract；不得把现有 GET preview 或 canonical POST 偷改成写；
-- confirm 冻结 snapshot id/key、fence policy/key、anchor + publication chain、target canonical id/hash/source cutoff、boundary/guard、source batches、builder config 与 evidence hash；
-- append-only build；
-- 有意扩展 activation eligibility 以支持 future build，同时保留 CAS 与所有 acceptance；当前 activation 只接受 canonical-linked build；
-- stale fence/账户变化/边界成交全部阻断；
-- left-censored/opening cost 限制完整显示；
-- 正式库零交易动作；
-- 有真实小样本演练和 rollback。
+- snapshot → refresh B → ready fence → preview；（已实现）
+- 新增独立、显式的 formal future-build confirm/write contract；不得把现有 GET preview 或 canonical POST 偷改成写；（切片 1 已实现，2026-07-31）
+- confirm 冻结 snapshot id/key、fence policy/key、anchor + publication chain、target canonical id/hash/source cutoff、boundary/guard、source batches、builder config 与 evidence hash；（切片 1 已实现）
+- append-only build；（切片 1 已实现）
+- 有意扩展 activation eligibility 以支持 future build，同时保留 CAS 与所有 acceptance；（切片 2 已实现，2026-08-01：无 schema 变更，激活 fence build 时以 fence link 冻结的目标事实集身份写入 NOT NULL canonical 列；新增 additive `accept_left_censored_openings` 门禁，activation key 仅在置真时参与派生；CAS、assumed-flat、组费 acceptance 全部保留；CSV build 仍不可激活；决策记录见 `New-docs/phase1/12_FORMAL_FUTURE_BUILD_CONTRACT.md` §6）
+- stale fence/账户变化/边界成交全部阻断；（切片 1 已实现）
+- left-censored/opening cost 限制完整显示；（切片 2/3 已实现：confirm 与 activation 双门禁 + Web 勾选文案）
+- 正式库零交易动作；（全链路保持）
+- 有真实小样本演练和 rollback。（未完成：正式库当前 0 confirmed snapshot，真实 fence build confirm + activation 演练要等用户完成一次 snapshot confirm + 后续 refresh publication；rollback＝再激活其他 source-linked build，无法回到「零激活」CSV 默认态，UI 已明示）
 
 ### 阶段 C：把复盘变成个人 Playbook 输入器
 

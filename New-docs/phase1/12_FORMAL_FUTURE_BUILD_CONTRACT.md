@@ -1,9 +1,10 @@
-# 正式 Future Episode Build 写合同（阶段 B · 切片 1 / 切片 3 已实现）
+# 正式 Future Episode Build 写合同（阶段 B · 切片 1 / 2 / 3 已实现）
 
 > 状态：切片 1（confirm 写路径 + snapshot-fence link 表）已于 2026-07-31 实现并通过
 > T1-T9 回归与后端全量 gate；切片 3（Web UI：preview → 正式 build 显式确认）已于
-> 2026-08-01 实现并通过前端 lint / vitest / build；切片 2（activation 扩展）未开始，
-> 因此已写入的 future build 仍不会成为默认复盘视图（UI 明示「已构建 ≠ 已生效」）。
+> 2026-08-01 实现并通过前端 lint / vitest / build；切片 2（activation 扩展）已于
+> 2026-08-01 实现（无 schema 变更，见 §6 决策记录）：fence build 可显式激活为
+> 默认复盘视图，激活前默认视图不变（UI 明示「已构建 ≠ 已生效：激活前默认视图不变」）。
 > 实现落点：`src/journal/ledger/position_snapshot_episode_build.py`（confirm 写路径）、
 > `journal_v2_episode_build_snapshot_fence_sources`（link 表，`models.py`）、
 > `POST /api/v1/journal/v2/episode-builds/position-snapshot`（`journal_positions.py`）；
@@ -24,10 +25,10 @@
 | 切片 | 内容 | 是否改 schema | 状态 |
 |---|---|---|---|
 | 1 | 正式 future-build confirm 写路径 + snapshot-fence link 表 | 新增 1 张 link 表（append-only + deny triggers） | 已实现（2026-07-31） |
-| 2 | activation 资格扩展到 future build | 改 `EpisodeBuildActivation`（canonical 列改 nullable + kind 判别或并行 link 表）——高风险，单独评审 | 未开始 |
+| 2 | activation 资格扩展到 future build | 否（决策：不改 `EpisodeBuildActivation`，见 §6 决策记录） | 已实现（2026-08-01） |
 | 3 | Web UI（preview → 正式 build 按钮 + 显示） | 否 | 已实现（2026-08-01） |
 
-本合同只冻结切片 1；切片 2 的约束记录在 §6。
+本合同冻结切片 1；切片 2 的约束与最终决策记录在 §6。
 
 ## 1. 现状事实（探索结论，file:line 以当前工作树为准）
 
@@ -153,16 +154,53 @@ preview 的 planned_build_key——当前无已持久化消费方，允许）。
   政策不变）；
 - 不在 UI 宣称「已构建=已生效」。
 
-## 6. 切片 2（activation 扩展）已知约束（供后续评审）
+## 6. 切片 2（activation 扩展）约束与决策记录（2026-08-01 已实现）
 
-- `EpisodeBuildActivation.canonical_set_id/sha256` NOT NULL → 需 nullable +
-  kind 判别，或并行 provenance link；append-only 保护表的 schema 变更须走
-  HANDOFF §18.2 备份流程；
+原评审前已知约束：
+
+- `EpisodeBuildActivation.canonical_set_id/sha256` NOT NULL → 曾列出 nullable +
+  kind 判别，或并行 provenance link 两个方案；append-only 保护表的 schema
+  变更须走 HANDOFF §18.2 备份流程；
 - `_eligible_canonical_target` 三元组返回值被 activate 与默认读 resolver 双消费；
 - `_latest_csv_build` 以「无 canonical link」定义 fallback，新 link 种类会改变
-  该语义，须显式排除；
+  该语义，须显式排除（切片 1 已提前落实）；
 - data-health（refresh_repository）与 dsa-web journalCanonical 客户端均对
   activation 形状有断言。
+
+**决策记录：不改 schema，以目标事实集身份复用 NOT NULL 列。**
+
+- `EpisodeBuildActivation.canonical_set_id/sha256` 保持 NOT NULL 不变：激活
+  fence build 时写入其 `EpisodeBuildSnapshotFenceSource` link 冻结的
+  `target_canonical_set_id / target_canonical_set_sha256`。语义上诚实——
+  fence build 的回合正是该冻结目标事实集在快照边界后窗口的严格重放；
+  不引入 nullable 列、不建并行 activation 表、不重建受保护表。
+- `_eligible_canonical_target` 重构为 `_eligible_activation_target`：canonical
+  link 或 snapshot-fence link 之一即可激活；fence 分支 join
+  `CanonicalEvidenceSetRecord` 校验目标集行存在、指纹与 link 一致、账户/
+  broker 匹配且 `analysis_ready`，任一不符 fail closed。两种 link 均无的
+  build 保留原错误文案（`only canonical-linked Episode builds can be
+  activated`），CSV fallback 语义不变。返回值带 `source_kind` 判别，
+  activate 与默认读 resolver 双消费；默认读交叉核对 activation 身份与
+  link（canonical 或 fence target）一致。
+- 新增 additive 激活确认 `accept_left_censored_openings`（默认 false）：目标
+  build 报告 `left_censored_episode_count > 0` 时必须置真（报告缺该字段时
+  从 build 的 episode 行派生计数兜底）；activation key 仅在 flag 置真时
+  参与哈希派生，历史激活 key 与幂等重放不受影响。canonical build 的
+  `accept_assumed_flat` / `accept_group_fee_scope` 语义不变（fence build
+  为 `complete_snapshot`，assumed-flat 门禁天然通过）。
+- data-health：激活的 fence build 目标集即最新 canonical set 时，
+  `get_journal_refresh_status` 视为 `current/none`，不再要求重复 activate
+  最新 canonical build；无 canonical build 时 pending 仍诚实为 `build`。
+- Web：显式查看 canonical / fence build 时提供独立激活卡片（按目标 build
+  实际口径强制勾选 assumed-flat / 组费 / left-censored），确认区明示
+  「激活后默认视图切换，可再激活其他构建切回，但无法回到零激活的 CSV
+  默认状态」；CSV build 无激活入口。
+- 实现落点：`activation_repository.py`（eligibility/acceptance/key 派生）、
+  `refresh_repository.py`（data-health 对齐）、`api/v1` activation 请求
+  schema 与 409 映射、`apps/dsa-web` activation 客户端 + `PositionEpisodesPanel`
+  + `FutureEpisodePreviewSummary` 文案；回归见
+  `src/journal/tests/test_position_snapshot_episode_build.py`（fence 激活
+  五连测）与 `api/v1/tests/test_journal_endpoints.py`。
 
 ## 7. 验收（切片 1）
 

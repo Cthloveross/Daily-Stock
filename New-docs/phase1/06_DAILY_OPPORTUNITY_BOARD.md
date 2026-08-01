@@ -54,7 +54,9 @@ Top 5 不再逐标串行等待完整链。服务端为每个同时扫描的 unde
 
 默认 `0–45 DTE` 每标最多拆成两个 30 日 `get_option_chain` 日期窗口，Top 5 冷加载最多占用 10 次链查询，正好等于 Moomoo 当前环境观测到的 `10 次 / 30 秒` 上限。`option-wall/1.1` 因此在每个 item 内新增 `atm_call_iv`：先固定墙快照的最近到期日，再选最接近 spot 的 Call，并只读取该合约在同批动态快照中的 IV；精确 ATM 合约缺 IV 时 fail closed，不改选其他执行价或到期日。主机会榜不得再并发调用 `/option-context`，否则第 11 次链查询可能令最后一个标的部分覆盖。多个标签页同时对不同集合强制冷刷新仍可能竞争供应商额度，当前缓解不等于全局跨进程限流器。
 
-期权墙 UI 使用主表格承载可比较字段，详情区解释公式、来源、coverage/as-of 与不能推断的内容，并显式显示“计算可复现、策略有效性未验证”。墙位目前只是独立研究上下文，不进入确定性基础榜排序，也未持久化为历史序列或完成交易结果回测。
+`option-wall/1.2`（2026-08-01）在每个墙位 level 上 additive 补齐逐层字段：`side`（call / put / call_put_aggregate）、`metric_basis` 结算口径（OI＝T-1 清算存量、Volume＝当日累计、Gamma＝模型值）、按贡献排序的 top 3 到期日 `expiry_breakdown`（expiry / dte / metric_value / share_of_level_percent / contract_count + `other` 汇总桶），以及逐到期 quote 上下文——仅当该 strike×expiry×right 单元由恰好一行快照支撑时附该行的 `iv_percent` 与 `quote_as_of`，多行聚合不归属报价。Moomoo 墙快照行当前不携带 bid/ask/mark，这些字段保持显式 null 并通过 `quote_evidence`（observed / partial / unavailable）标缺，不做零值回填；旧字段与端点签名不变。
+
+期权墙 UI 使用主表格承载可比较字段，逐层可展开到期分布与报价证据（缺失按「标缺」显示），详情区解释公式、来源、coverage/as-of 与不能推断的内容，并显式显示“计算可复现、策略有效性未验证”。墙位目前只是独立研究上下文，不进入确定性基础榜排序，也未持久化为历史序列或完成交易结果回测。
 
 ### 2.2 异常期权成交合同
 

@@ -303,8 +303,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] `get_macro_events` 不再调用 Finnhub 付费 `/calendar/economic`（免费档每日 403 导致 events 域恒为 degraded）：经济序列以官方日程为主源，Finnhub 只保留 earnings 日历；官方日程覆盖窗口内经济序列 readiness=ready，events 域在 earnings 同时可用时恢复 ready，消除每日 `regime_supporting_events_degraded`。`_readiness`/`_status` 合同与 scorer 字段名保持不变，仅追加 `_economic_calendar` 可观测元数据。
 - [测试] 新增官方日程 provider 单测（决议日/发布日标志、两日会议第一天不标记、非事件日、7 天 agenda 窗口、coverage 边界 fail-closed、缺 series/坏文件 fail-closed、多年度文件合并）与 `get_macro_events` 集成回归（无 Finnhub 时经济序列仍 ready、earnings 正常时 events 整域 ready、超出 coverage 降级、不再调用经济日历端点）。
 - [文档] HANDOFF「官方发布每天 degraded」排障条目更新：events 侧已由官方年度日程解决，premarket 侧仍需 Alpaca key；补充年度运维步骤——来年官方日程发布后需刷新 `src/regime/data/official_economic_schedule_*.json`，否则 coverage 到期前一周起 events 会诚实地重新降级。
-
-## [3.12.0] - 2026-04-01
+- [新功能] 期权墙逐层合同增量（`option-wall/1.2`）：每个墙位 level additive 新增 `side`、`metric_basis`（OI＝T-1 清算 / Volume＝当日累计 / Gamma＝模型值）、按贡献排序的 top 3 到期日 `expiry_breakdown`（expiry/dte/metric_value/share_of_level_percent/contract_count + other 汇总桶）与逐到期 quote 上下文（单行快照支撑时附 IV 与 quote_as_of），缺失字段保持 null 并以 `quote_evidence`（observed/partial/unavailable）显式标缺；旧字段与端点签名不变，旧 payload 仍可通过 schema 校验。
+- [改进] Web 期权墙逐层可展开到期分布：`/regime/opportunity/:ticker` 期权墙 tab 与今日机会候选详情共用 `WallLevelExpiryBreakdown`，逐到期显示占比、DTE、IV 与「Bid/Ask/Mark 标缺（快照未含盘口报价）」等显式标缺文案，保留「集中度区域，非 dealer GEX / gamma flip」诚实框架；期权墙前后端缓存 key 升为 v1.2。
+- [测试] 期权墙逐层合同回归：builder 多到期 fixture 的 top 3 + other 分桶、share 总和 ≤ 100、多合约单元不归属报价、缺 IV 行显式 unavailable、全报价行 observed、三种 metric_basis 语义与 payload 无任何 dealer-sign 字段；API 端点断言逐层 breakdown 与 legacy level 兼容校验；前端补墙位 tab 到期分布与标缺文案渲染断言。
+- [文档] HANDOFF §9.2 更新为 `option-wall/1.2` 已落地逐层字段清单与对照目标合同仍缺项（逐层 bid/ask/mark 需扩展 Moomoo 墙快照 adapter；dealer sign 红线不变）。
+- [新功能] Episode build activation 资格扩展到 snapshot-fence 正式 future build（阶段 B 切片 2）：不改 activation 表 schema，fence build 激活时把 fence link 冻结的目标事实集身份写入 `canonical_set_id/sha256`（其回合正是该冻结集在快照边界后的窗口重放）；目标集行缺失或指纹不一致时激活与后续默认读取均 fail closed，无任一 source link 的 CSV build 仍不可激活，零激活时 CSV fallback 语义不变。
+- [新功能] 激活新增 additive `accept_left_censored_openings` 确认（默认 false）：目标 build 报告含 left-censored 回合（snapshot 继承仓位、无券商成本）时必须显式勾选，否则 409 拒绝且零写；activation key 仅在该 flag 置真时参与派生，历史激活记录的幂等重放不受影响。
+- [改进] data-health（journal refresh status）对激活的 fence build 按其冻结目标事实集对齐：目标集即最新 canonical set 时不再要求重复 activate 最新 canonical build，其余水位与阶段判定不变；激活响应消息按 build 来源标注 canonical / snapshot-fence future。
+- [改进] Web「仓位复盘」显式查看 canonical / snapshot-fence build 时新增独立「设为默认复盘构建」卡片：按目标 build 实际口径强制 assumed-flat / 组费 / left-censored 勾选，确认区明示「激活后默认视图切换，可再激活其他构建切回，但无法回到零激活的 CSV 默认状态」；future build 写入成功提示同步改为「激活前默认复盘视图不变，需显式打开该构建后单独激活」。
+- [测试] 新增 fence build 激活回归：happy path 默认读取切换与幂等重放、缺 left-censored 确认零写拒绝、陈旧 CAS 拒绝、fence link 指纹篡改在激活与默认读取双向 fail closed、激活前 CSV fallback 不变、data-health 三阶段对齐；API 补新 flag 透传与 409 映射；前端补两处激活卡片的勾选门禁、请求载荷与文案回归。
 
 ### 发布亮点
 
