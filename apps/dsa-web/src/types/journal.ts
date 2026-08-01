@@ -126,8 +126,15 @@ export interface MoomooOpenApiPreview {
   windowEnd: string;
   sourceTimezone: string;
   orderObservations: number;
+  ordinaryOrderObservations: number;
+  unclassifiedParentObservations: number;
   fillObservations: number;
   feeObservations: number;
+  contractSpecObservations: number;
+  executionGroupObservations: number;
+  executionGroupLegObservations: number;
+  executionGroupFillLinks: number;
+  executionGroupFeeObservations: number;
   feeTotalsByCurrency: Record<string, string>;
   journalDatabaseWritten: boolean;
 }
@@ -150,12 +157,20 @@ export interface MoomooOpenApiImportPlan {
     environment: string;
     market: string;
     accountSelection: string;
+    accountBound: boolean;
     windowStart: string;
     windowEnd: string;
     sourceTimezone: string;
     orderObservations: number;
+    ordinaryOrderObservations: number;
+    unclassifiedParentObservations: number;
     fillObservations: number;
     feeObservations: number;
+    contractSpecObservations: number;
+    executionGroupObservations: number;
+    executionGroupLegObservations: number;
+    executionGroupFillLinks: number;
+    executionGroupFeeObservations: number;
     feeTotalsByCurrency: Record<string, string>;
   };
   baseScope?: {
@@ -172,6 +187,10 @@ export interface MoomooOpenApiImportPlan {
     matchedOrders: number;
     csvOnlyInWindow: number;
     apiOnlyOrders: number;
+    /** API-only orders inside the historical overlap; these require reconciliation. */
+    overlapApiOnlyOrders: number;
+    /** API-only orders after the prior evidence cutoff; these are expected new tail facts. */
+    incrementalApiOnlyOrders: number;
     ambiguousIdentityKeys: number;
     coveredBaseOrders: number;
     baseOrders: number;
@@ -181,8 +200,14 @@ export interface MoomooOpenApiImportPlan {
   writePlan: {
     alreadyImported: boolean;
     orderObservations: number;
+    ordinaryOrderObservations: number;
+    unclassifiedParentObservations: number;
     fillObservations: number;
     feeObservations: number;
+    executionGroupObservations: number;
+    executionGroupLegObservations: number;
+    executionGroupFillLinks: number;
+    executionGroupFeeObservations: number;
     orderIdentityLinks: number;
     dealIdentityLinks: number;
     fillSetAttestations: number;
@@ -200,8 +225,13 @@ export interface MoomooOpenApiImportPlan {
     blockingIssues: number;
     analysisReady: boolean;
     canonicalSetSha256: string;
+    inputExecutionGroupObservations: number;
+    canonicalExecutionGroups: number;
+    canonicalExecutionGroupLegs: number;
+    duplicateExecutionGroupObservations: number;
   };
   issues: OpenApiImportIssue[];
+  scopeIsFullBatch: boolean;
 }
 
 export interface MoomooOpenApiImportConfirmResponse {
@@ -213,8 +243,13 @@ export interface MoomooOpenApiImportConfirmResponse {
   scope: string;
   appended: {
     orders: number;
+    ordinaryOrders: number;
     fills: number;
     fees: number;
+    executionGroups: number;
+    executionGroupLegs: number;
+    executionGroupFillLinks: number;
+    executionGroupFees: number;
     orderLinks: number;
     dealLinks: number;
     fillSetAttestations: number;
@@ -223,6 +258,8 @@ export interface MoomooOpenApiImportConfirmResponse {
   canonical: {
     orders: number;
     fills: number;
+    executionGroups: number;
+    executionGroupLegs: number;
     shadowedCsvFills: number;
     shadowedAggregateOrders: number;
     blockingIssues: number;
@@ -232,6 +269,92 @@ export interface MoomooOpenApiImportConfirmResponse {
   episodeBuildTriggered: false;
   tradingActionPerformed: false;
   message: string;
+}
+
+export type JournalRefreshFreshnessState =
+  | 'never_synced'
+  | 'stale'
+  | 'evidence_blocked'
+  | 'evidence_current'
+  | 'build_ready'
+  | 'current';
+
+export type JournalRefreshPendingStage =
+  | 'refresh'
+  | 'confirm'
+  | 'build'
+  | 'activate'
+  | 'none';
+
+export interface JournalRefreshStatus {
+  refreshEnabled: boolean;
+  refreshConfigured: boolean;
+  freshnessState: JournalRefreshFreshnessState;
+  pendingStage: JournalRefreshPendingStage;
+  expectedCompleteThrough: string;
+  brokerQueriedThrough?: string | null;
+  latestFillAt?: string | null;
+  evidencePublishedThrough?: string | null;
+  publicationRecordedAt?: string | null;
+  latestArtifactId?: number | null;
+  latestArtifactConfirmAllowed?: boolean | null;
+  latestArtifactExpiresAt?: string | null;
+  latestCanonicalSetId?: number | null;
+  latestCanonicalSetSha256?: string | null;
+  latestCanonicalSourceThrough?: string | null;
+  latestCanonicalBuildId?: number | null;
+  latestCanonicalBuildKey?: string | null;
+  latestCanonicalBuildSourceThrough?: string | null;
+  activeSelectionSource: 'activation' | 'csv_fallback' | 'none';
+  activeActivationId?: number | null;
+  activeBuildId?: number | null;
+  activeBuildKey?: string | null;
+  activeCanonicalSetId?: number | null;
+  activeSourceThrough?: string | null;
+  accountBound: boolean;
+}
+
+export interface MoomooJournalRefreshSource {
+  retrievalComplete: boolean;
+  coverageComplete: boolean;
+  hasActivity: boolean;
+  brokerQueriedThrough: string;
+  latestFillAt?: string | null;
+  orderObservations: number;
+  ordinaryOrderObservations: number;
+  unclassifiedParentObservations: number;
+  fillObservations: number;
+  feeObservations: number;
+  contractSpecObservations: number;
+  executionGroupObservations: number;
+  executionGroupLegObservations: number;
+  executionGroupFillLinks: number;
+  executionGroupFeeObservations: number;
+}
+
+export interface MoomooJournalRefreshPreview {
+  artifactId: number;
+  artifactKey: string;
+  expiresAt: string;
+  source: MoomooJournalRefreshSource;
+  plan: MoomooOpenApiImportPlan;
+  evidenceWritten: false;
+  tradingActionPerformed: false;
+}
+
+export interface MoomooJournalRefreshPublication {
+  publicationId: number;
+  brokerQueriedThrough: string;
+  latestFillAt?: string | null;
+  evidencePublishedThrough: string;
+  recordedAt: string;
+}
+
+export interface MoomooJournalRefreshConfirmResponse {
+  artifactId: number;
+  publication: MoomooJournalRefreshPublication;
+  imported: MoomooOpenApiImportConfirmResponse;
+  tradingActionPerformed: false;
 }
 
 export interface LedgerImportResponse {
@@ -275,12 +398,18 @@ export interface EpisodeBuildMetadata {
   sourceKind: string;
   canonicalSetId?: number | null;
   canonicalSetSha256?: string | null;
+  sourceWindowStart: string;
   sourceCutoffAt: string;
   positionEpisodeCount: number;
   unresolvedEvidenceCount: number;
   completenessScore: string;
   openingBoundaryPolicy: string;
   assumedFlatUnverified: boolean;
+  executionGroupCount: number;
+  groupFeeAffectedEpisodeCount: number;
+  retainedExecutionGroupFeeTotal: string;
+  feeConservationByCurrency: Record<string, Record<string, string>>;
+  legFeeAttributionComplete: boolean;
   partialReasons: string[];
   recordedAt: string;
 }
@@ -323,6 +452,7 @@ export interface PositionEpisodeSummary {
   leftCensoredEpisodeCount: number;
   incompleteEpisodeCount: number;
   aggregateOnlyEpisodeCount: number;
+  groupFeeAffectedEpisodeCount: number;
   headlinePnl: EpisodeHeadlinePnl;
   conditionalPnl?: EpisodeConditionalPnl;
 }
@@ -349,6 +479,7 @@ export interface PositionEpisodeQuality {
   isLeftCensored: boolean;
   isRightCensored: boolean;
   pnlSummaryEligible: boolean;
+  groupFeeUnallocated: boolean;
   pnlExclusionReasons: string[];
 }
 
@@ -373,6 +504,10 @@ export interface PositionEpisodeItem {
   realizedPnlGross?: string | null;
   totalFee?: string | null;
   realizedPnlNet?: string | null;
+  /** Latest user-authored review state for this immutable episode/build pair. */
+  reviewStatus?: PositionEpisodeReviewStatus;
+  reviewRevision?: number | null;
+  reviewUpdatedAt?: string | null;
   quality: PositionEpisodeQuality;
 }
 
@@ -402,6 +537,7 @@ export interface PositionEpisodeListResponse {
   page: number;
   perPage: number;
   items: PositionEpisodeItem[];
+  reviewQueue?: PositionEpisodeReviewQueue;
 }
 
 export interface PositionEpisodeDetailResponse {
@@ -452,6 +588,220 @@ export interface PositionEpisodeTradeLogicDraft {
   postTradeReflection: string;
 }
 
+export type PositionEpisodeReviewStatus = 'not_started' | 'in_progress' | 'completed';
+
+export interface PositionEpisodeReviewQueue {
+  pending: number;
+  inProgress: number;
+  completed: number;
+  total: number;
+}
+
+export interface PositionEpisodeReviewWorkspaceDraft extends PositionEpisodeTradeLogicDraft {
+  tags: string[];
+  errorTypes: string[];
+}
+
+export interface PositionEpisodeReviewAnnotation {
+  id: number;
+  episodeBuildId: number;
+  positionEpisodeId: number;
+  revision: number;
+  reviewStatus: PositionEpisodeReviewStatus;
+  setupThesis: string;
+  entryTrigger: string;
+  invalidationPlan: string;
+  positionRationale: string;
+  exitReason: string;
+  postTradeReflection: string;
+  tags: string[];
+  errorTypes: string[];
+  contentSha256: string;
+  previousAnnotationId?: number | null;
+  createdAt: string;
+}
+
+export interface PositionEpisodeReviewAnnotationLatestResponse {
+  dataState: 'not_started' | 'ready' | string;
+  annotation?: PositionEpisodeReviewAnnotation | null;
+}
+
+export interface PositionEpisodeReviewAnnotationHistoryResponse {
+  dataState: 'not_started' | 'ready' | string;
+  total?: number;
+  items: PositionEpisodeReviewAnnotation[];
+}
+
+export interface SavePositionEpisodeReviewAnnotationRequest
+  extends PositionEpisodeReviewWorkspaceDraft {
+  buildId: number;
+  reviewStatus: Exclude<PositionEpisodeReviewStatus, 'not_started'>;
+}
+
+export interface SavePositionEpisodeReviewAnnotationResponse {
+  dataState: 'ready' | string;
+  created: boolean;
+  idempotentReplay: boolean;
+  annotation: PositionEpisodeReviewAnnotation;
+}
+
+/** Slice C-1: zero-write pattern observation over the default build. */
+export interface ReviewInsightStats {
+  winRate: string;
+  avgPnl: string;
+  sumPnl: string;
+  winCount: number;
+  lossCount: number;
+  breakevenCount: number;
+}
+
+export interface ReviewInsightStatsGate {
+  eligible: boolean;
+  reason?: 'below_sample_threshold' | 'no_verified_pnl_episodes' | null;
+}
+
+export interface ReviewInsightBucket {
+  groupKind: 'tag' | 'error_type';
+  groupValue: string;
+  direction: string;
+  boundaryPolicy: 'verified' | 'assumed_or_censored';
+  episodeCount: number;
+  distinctTradingDayCount: number;
+  reviewCompletedCount: number;
+  verifiedEpisodeCount: number;
+  verifiedDistinctTradingDayCount: number;
+  conditionalEpisodeCount: number;
+  stats?: ReviewInsightStats | null;
+  statsGate: ReviewInsightStatsGate;
+}
+
+export interface ReviewInsightsResponse {
+  schemaVersion: 'journal-review-insights/1.0' | string;
+  dataState: 'not_built' | 'ready' | string;
+  buildId?: number | null;
+  buildKey?: string | null;
+  sourceKind?: string | null;
+  accountKey: string;
+  generatedAt?: string | null;
+  thresholds: {
+    minEpisodeCount: number;
+    minDistinctTradingDayCount: number;
+  };
+  totalEpisodeCount: number;
+  annotatedEpisodeCount: number;
+  unreviewed?: {
+    episodeCount: number;
+    distinctTradingDayCount: number;
+  } | null;
+  buckets: ReviewInsightBucket[];
+}
+
+/** Slice C-2: append-only playbook candidates (L2) and rule versions (L3). */
+export interface PlaybookSourceBucket {
+  groupKind: 'tag' | 'error_type';
+  groupValue: string;
+  direction: string;
+  boundaryPolicy: 'verified' | 'assumed_or_censored';
+}
+
+export interface PlaybookCandidate {
+  schemaVersion: 'playbook-candidate/1.0' | string;
+  id: number;
+  candidateKey: string;
+  accountKey: string;
+  title: string;
+  ruleText: string;
+  sourceBucket?: PlaybookSourceBucket | null;
+  evidenceSnapshot: Record<string, unknown>;
+  evidenceSnapshotSha256: string;
+  promoted: boolean;
+  createdAt: string;
+}
+
+export interface PlaybookRule {
+  schemaVersion: 'playbook-rule/1.0' | string;
+  id: number;
+  ruleKey: string;
+  lineageKey: string;
+  accountKey: string;
+  version: number;
+  status: 'active' | 'retired';
+  promotedFromCandidateId: number;
+  promotedFromCandidateKey: string;
+  previousRuleId?: number | null;
+  title: string;
+  ruleText: string;
+  evidenceSnapshot: Record<string, unknown>;
+  evidenceSnapshotSha256: string;
+  isLatestVersion: boolean;
+  createdAt: string;
+}
+
+export interface PlaybookListResponse {
+  schemaVersion: 'journal-playbook/1.0' | string;
+  accountKey: string;
+  candidates: PlaybookCandidate[];
+  rules: PlaybookRule[];
+}
+
+export interface CreatePlaybookCandidateRequest {
+  title: string;
+  ruleText: string;
+  sourceBucket?: PlaybookSourceBucket | null;
+}
+
+export interface CreatePlaybookCandidateResponse {
+  dataState: 'ready' | string;
+  created: boolean;
+  idempotentReplay: boolean;
+  candidate: PlaybookCandidate;
+}
+
+export interface PromotePlaybookCandidateRequest {
+  allowNewVersion?: boolean;
+  expectedCurrentVersion?: number | null;
+}
+
+export interface PromotePlaybookCandidateResponse {
+  dataState: 'ready' | string;
+  created: boolean;
+  idempotentReplay: boolean;
+  rule: PlaybookRule;
+}
+
+export interface RetirePlaybookRuleResponse {
+  dataState: 'ready' | string;
+  retired: boolean;
+  idempotentReplay: boolean;
+  rule: PlaybookRule;
+}
+
+/** Slice C-3: zero-write reverse links from one episode to frozen snapshots. */
+export interface EpisodePlaybookLink {
+  schemaVersion: 'playbook-episode-link/1.0' | string;
+  kind: 'rule' | 'candidate';
+  linkState: 'confirmed' | 'possible_truncated';
+  title: string;
+  ruleText: string;
+  bucket?: PlaybookSourceBucket | null;
+  snapshotBuildId: number;
+  snapshotGeneratedAt?: string | null;
+  lineageKey?: string | null;
+  version?: number | null;
+  status?: 'active' | 'retired' | null;
+  candidateKey?: string | null;
+  promoted?: boolean | null;
+  createdAt: string;
+}
+
+export interface EpisodePlaybookLinksResponse {
+  schemaVersion: 'journal-playbook-episode-links/1.0' | string;
+  accountKey: string;
+  buildId: number;
+  episodeId: number;
+  links: EpisodePlaybookLink[];
+}
+
 export interface PositionEpisodeAiReviewResponse {
   dataState: 'ready' | string;
   analysisMode: 'model_enhanced' | 'deterministic';
@@ -494,9 +844,15 @@ export interface CanonicalEpisodeBuildPlanResponse {
   plannedClosedEpisodeCount: number;
   sourceKnownFeeTotal?: string | null;
   allocatedKnownFeeTotal?: string | null;
+  retainedExecutionGroupFeeTotal?: string | null;
+  feeConservationByCurrency: Record<string, Record<string, string>>;
   feeConserved: boolean;
+  executionGroupCount: number;
+  groupFeeAffectedEpisodeCount: number;
+  legFeeAttributionComplete: boolean;
   openingBoundaryPolicy?: string | null;
   requiresAssumedFlatAcceptance: boolean;
+  requiresGroupFeeScopeAcceptance: boolean;
   defaultBuildId?: number | null;
   defaultPositionEpisodeCount: number;
   episodeCountDelta: number;
@@ -510,13 +866,51 @@ export interface CanonicalEpisodeBuildConfirmRequest {
   canonicalSetSha256: string;
   buildKey: string;
   acceptAssumedFlat: boolean;
+  acceptGroupFeeScope: boolean;
+}
+
+export type EpisodeBuildSelectionSource = 'activation' | 'csv_fallback' | 'none';
+
+/** Append-only pointer used by default position-review reads. */
+export interface EpisodeBuildActivationState {
+  accountKey: string;
+  selectionSource: EpisodeBuildSelectionSource;
+  currentActivationId?: number | null;
+  currentActivationSequence?: number | null;
+  currentBuildId?: number | null;
+  currentBuildKey?: string | null;
+  canonicalSetId?: number | null;
+  canonicalSetSha256?: string | null;
+  previousActivationId?: number | null;
+  previousBuildId?: number | null;
+  activatedAt?: string | null;
+}
+
+export interface EpisodeBuildActivationRequest {
+  expectedBuildKey: string;
+  expectedCurrentActivationId?: number | null;
+  expectedCurrentBuildId?: number | null;
+  acceptAssumedFlat: boolean;
+  acceptGroupFeeScope: boolean;
+  /** Required whenever the target build has left-censored openings (snapshot-fence future builds). */
+  acceptLeftCensoredOpenings: boolean;
+}
+
+export interface EpisodeBuildActivationResponse {
+  activationId: number;
+  activationKey: string;
+  duplicate: boolean;
+  state: EpisodeBuildActivationState;
+  message: string;
+  tradingActionPerformed: false;
 }
 
 export interface PositionEpisodeFilters {
   underlying?: string;
   lifecycleStatus?: 'open' | 'closed' | '';
   completenessStatus?: 'exact' | 'complete' | 'partial' | '';
-  caseFocus?: 'top_profit' | 'top_loss' | 'largest_fee' | 'longest_hold' | '';
+  caseFocus?: 'top_profit' | 'top_loss' | 'largest_fee' | 'longest_hold' | 'weakest_evidence' | '';
+  reviewStatus?: PositionEpisodeReviewStatus | '';
   buildId?: number;
   page?: number;
   perPage?: number;

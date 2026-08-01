@@ -32,12 +32,21 @@ from sqlalchemy import (
 
 from src.storage import Base
 
+# Register the position-snapshot tables on the shared metadata so that
+# ``EpisodeBuildSnapshotFenceSource``'s foreign key to
+# ``journal_v2_position_snapshots`` always resolves during ``create_all``.
+import src.journal.ledger.position_snapshot_models as _position_snapshot_models  # noqa: F401
+
 __all__ = [
     "ImportBatch",
     "ReconciliationAttestation",
     "BrokerOrderObservation",
     "BrokerFillObservation",
     "BrokerFeeObservation",
+    "BrokerExecutionGroupObservation",
+    "BrokerExecutionGroupLegObservation",
+    "BrokerExecutionGroupFillLink",
+    "BrokerExecutionGroupFeeObservation",
     "OrderIdentityLink",
     "DealIdentityLink",
     "OrderFillSetAttestation",
@@ -45,10 +54,17 @@ __all__ = [
     "CanonicalEvidenceMemberRecord",
     "CanonicalEvidenceIssueRecord",
     "CanonicalEvidenceProvenanceRecord",
+    "CanonicalExecutionGroupMemberRecord",
+    "CanonicalExecutionGroupLegRecord",
+    "CanonicalExecutionGroupFillLinkRecord",
+    "CanonicalExecutionGroupProvenanceRecord",
     "EpisodeBuild",
+    "EpisodeBuildActivation",
+    "EpisodeBuildSnapshotFenceSource",
     "StrategyEpisode",
     "PositionEpisode",
     "PositionEpisodeEvidence",
+    "ReviewAnnotation",
 ]
 
 
@@ -430,6 +446,326 @@ class BrokerFeeObservation(Base):
     )
 
 
+class BrokerExecutionGroupObservation(Base):
+    """One broker combo parent observed in an immutable import batch.
+
+    A combo parent is an execution container, not a tradable instrument.  Its
+    package quantity and broker-reported prices are retained for audit, while
+    economic reconstruction uses only the linked, instrument-specific fills.
+    Group fees deliberately live in ``BrokerExecutionGroupFeeObservation``.
+    """
+
+    __tablename__ = "journal_v2_broker_execution_group_observations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    import_batch_id = Column(
+        Integer,
+        ForeignKey("journal_v2_import_batches.id"),
+        nullable=False,
+    )
+    observation_key = Column(String(128), nullable=False)
+    broker = Column(String(32), nullable=False)
+    account_key = Column(String(64), nullable=False)
+    source_execution_group_id = Column(String(128), nullable=False)
+    identity_strength = Column(String(24), nullable=False)
+    source_row_number = Column(Integer)
+    source_updated_at = Column(DateTime(timezone=True))
+
+    raw_strategy_type = Column(String(64), nullable=False)
+    strategy_type = Column(String(64), nullable=False)
+    raw_parent_symbol = Column(String(128), nullable=False)
+    parent_side = Column(String(24), nullable=False)
+    status = Column(String(32), nullable=False)
+    order_type = Column(String(32))
+    time_in_force = Column(String(24))
+    session = Column(String(24))
+    fill_outside_rth = Column(Boolean)
+    currency = Column(String(8), nullable=False)
+    ordered_at = Column(DateTime(timezone=True), nullable=False)
+
+    # Parent qty is a number of combo packages.  ``dealt_quantity`` and both
+    # price fields preserve the broker response only; they are not leg-level
+    # quantities/prices and must not be used for PositionEpisode economics.
+    group_order_quantity = Column(Numeric(28, 10), nullable=False)
+    broker_reported_dealt_quantity = Column(Numeric(28, 10), nullable=False)
+    broker_reported_order_price = Column(Numeric(28, 10))
+    broker_reported_net_average_price = Column(Numeric(28, 10))
+    parent_quantity_semantics = Column(String(48), nullable=False)
+    parent_price_semantics = Column(String(48), nullable=False)
+
+    evidence_level = Column(String(32), nullable=False)
+    fee_evidence_status = Column(String(24), nullable=False)
+    evidence_json = Column(Text, nullable=False)
+    completeness_score = Column(Numeric(5, 4), nullable=False)
+    completeness_json = Column(Text, nullable=False)
+    provenance_json = Column(Text, nullable=False)
+    source_record_sha256 = Column(String(64), nullable=False)
+    raw_payload_json = Column(Text)
+    recorded_at = Column(
+        DateTime(timezone=True), nullable=False, default=_utc_now
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "import_batch_id",
+            "observation_key",
+            name="uq_jv2_group_batch_observation",
+        ),
+        UniqueConstraint(
+            "import_batch_id",
+            "source_execution_group_id",
+            name="uq_jv2_group_batch_source_id",
+        ),
+        CheckConstraint(
+            "group_order_quantity > 0",
+            name="ck_jv2_group_order_quantity",
+        ),
+        CheckConstraint(
+            "broker_reported_dealt_quantity >= 0",
+            name="ck_jv2_group_dealt_quantity",
+        ),
+        CheckConstraint(
+            "completeness_score >= 0 AND completeness_score <= 1",
+            name="ck_jv2_group_completeness",
+        ),
+        Index(
+            "ix_jv2_group_source_id",
+            "broker",
+            "account_key",
+            "source_execution_group_id",
+            "recorded_at",
+        ),
+        Index(
+            "ix_jv2_group_account_time",
+            "account_key",
+            "ordered_at",
+        ),
+    )
+
+
+class BrokerExecutionGroupLegObservation(Base):
+    """One declared instrument leg belonging to a combo parent observation."""
+
+    __tablename__ = "journal_v2_broker_execution_group_leg_observations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    import_batch_id = Column(
+        Integer,
+        ForeignKey("journal_v2_import_batches.id"),
+        nullable=False,
+    )
+    execution_group_observation_id = Column(
+        Integer,
+        ForeignKey("journal_v2_broker_execution_group_observations.id"),
+        nullable=False,
+    )
+    observation_key = Column(String(128), nullable=False)
+    leg_key = Column(String(128), nullable=False)
+    broker = Column(String(32), nullable=False)
+    account_key = Column(String(64), nullable=False)
+    source_execution_group_id = Column(String(128), nullable=False)
+    leg_index = Column(Integer, nullable=False)
+
+    raw_symbol = Column(String(64), nullable=False)
+    asset_type = Column(String(24), nullable=False)
+    underlying = Column(String(32), nullable=False)
+    expiry = Column(Date)
+    strike = Column(Numeric(28, 10))
+    option_right = Column(String(8))
+    contract_multiplier = Column(Numeric(20, 8))
+    contract_multiplier_basis = Column(String(32), nullable=False)
+    side = Column(String(24), nullable=False)
+    quantity_ratio = Column(Numeric(28, 10), nullable=False)
+    currency = Column(String(8), nullable=False)
+
+    evidence_json = Column(Text, nullable=False)
+    completeness_score = Column(Numeric(5, 4), nullable=False)
+    completeness_json = Column(Text, nullable=False)
+    provenance_json = Column(Text, nullable=False)
+    source_record_sha256 = Column(String(64), nullable=False)
+    recorded_at = Column(
+        DateTime(timezone=True), nullable=False, default=_utc_now
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "import_batch_id",
+            "observation_key",
+            name="uq_jv2_group_leg_batch_observation",
+        ),
+        UniqueConstraint(
+            "execution_group_observation_id",
+            "leg_key",
+            name="uq_jv2_group_leg_key",
+        ),
+        UniqueConstraint(
+            "execution_group_observation_id",
+            "leg_index",
+            name="uq_jv2_group_leg_index",
+        ),
+        UniqueConstraint(
+            "execution_group_observation_id",
+            "raw_symbol",
+            "side",
+            name="uq_jv2_group_leg_instrument_side",
+        ),
+        CheckConstraint("leg_index >= 0", name="ck_jv2_group_leg_index"),
+        CheckConstraint(
+            "quantity_ratio > 0",
+            name="ck_jv2_group_leg_quantity_ratio",
+        ),
+        CheckConstraint(
+            "(contract_multiplier IS NULL "
+            "AND contract_multiplier_basis = 'unknown') "
+            "OR (contract_multiplier > 0 "
+            "AND contract_multiplier_basis IN "
+            "('asset_definition', 'broker_stated', "
+            "'evidence_derived_from_amount'))",
+            name="ck_jv2_group_leg_multiplier",
+        ),
+        CheckConstraint(
+            "completeness_score >= 0 AND completeness_score <= 1",
+            name="ck_jv2_group_leg_completeness",
+        ),
+        Index(
+            "ix_jv2_group_leg_group",
+            "execution_group_observation_id",
+            "leg_index",
+        ),
+        Index(
+            "ix_jv2_group_leg_instrument",
+            "account_key",
+            "underlying",
+            "expiry",
+        ),
+    )
+
+
+class BrokerExecutionGroupFillLink(Base):
+    """Audited parent/leg assignment for one broker fill observation."""
+
+    __tablename__ = "journal_v2_broker_execution_group_fill_links"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    import_batch_id = Column(
+        Integer,
+        ForeignKey("journal_v2_import_batches.id"),
+        nullable=False,
+    )
+    execution_group_observation_id = Column(
+        Integer,
+        ForeignKey("journal_v2_broker_execution_group_observations.id"),
+        nullable=False,
+    )
+    execution_group_leg_observation_id = Column(
+        Integer,
+        ForeignKey("journal_v2_broker_execution_group_leg_observations.id"),
+        nullable=False,
+    )
+    broker_fill_observation_id = Column(
+        Integer,
+        ForeignKey("journal_v2_broker_fill_observations.id"),
+        nullable=False,
+    )
+    link_key = Column(String(128), nullable=False)
+    broker = Column(String(32), nullable=False)
+    account_key = Column(String(64), nullable=False)
+    source_execution_group_id = Column(String(128), nullable=False)
+    source_deal_id = Column(String(128), nullable=False)
+    link_method = Column(String(64), nullable=False)
+    identity_strength = Column(String(24), nullable=False)
+    evidence_json = Column(Text, nullable=False)
+    provenance_json = Column(Text, nullable=False)
+    recorded_at = Column(
+        DateTime(timezone=True), nullable=False, default=_utc_now
+    )
+
+    __table_args__ = (
+        UniqueConstraint("link_key", name="uq_jv2_group_fill_link_key"),
+        UniqueConstraint(
+            "broker_fill_observation_id",
+            name="uq_jv2_group_fill_observation",
+        ),
+        UniqueConstraint(
+            "execution_group_observation_id",
+            "source_deal_id",
+            name="uq_jv2_group_fill_source_deal",
+        ),
+        Index(
+            "ix_jv2_group_fill_group",
+            "execution_group_observation_id",
+            "execution_group_leg_observation_id",
+        ),
+        Index(
+            "ix_jv2_group_fill_fill",
+            "broker_fill_observation_id",
+        ),
+    )
+
+
+class BrokerExecutionGroupFeeObservation(Base):
+    """One immutable fee fact retained only at execution-group scope."""
+
+    __tablename__ = "journal_v2_broker_execution_group_fee_observations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    import_batch_id = Column(
+        Integer,
+        ForeignKey("journal_v2_import_batches.id"),
+        nullable=False,
+    )
+    execution_group_observation_id = Column(
+        Integer,
+        ForeignKey("journal_v2_broker_execution_group_observations.id"),
+        nullable=False,
+    )
+    observation_key = Column(String(128), nullable=False)
+    broker = Column(String(32), nullable=False)
+    account_key = Column(String(64), nullable=False)
+    source_execution_group_id = Column(String(128), nullable=False)
+    currency = Column(String(8), nullable=False)
+    total_fee = Column(Numeric(28, 10), nullable=False)
+    fee_components_json = Column(Text, nullable=False)
+    evidence_json = Column(Text, nullable=False)
+    provenance_json = Column(Text, nullable=False)
+    source_record_sha256 = Column(String(64), nullable=False)
+    recorded_at = Column(
+        DateTime(timezone=True), nullable=False, default=_utc_now
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "import_batch_id",
+            "observation_key",
+            name="uq_jv2_group_fee_batch_observation",
+        ),
+        UniqueConstraint(
+            "import_batch_id",
+            "source_execution_group_id",
+            name="uq_jv2_group_fee_batch_source",
+        ),
+        UniqueConstraint(
+            "execution_group_observation_id",
+            name="uq_jv2_group_fee_group",
+        ),
+        CheckConstraint(
+            "total_fee >= 0",
+            name="ck_jv2_group_fee_total_nonnegative",
+        ),
+        Index(
+            "ix_jv2_group_fee_source",
+            "broker",
+            "account_key",
+            "source_execution_group_id",
+            "recorded_at",
+        ),
+        Index(
+            "ix_jv2_group_fee_group",
+            "execution_group_observation_id",
+        ),
+    )
+
+
 class OrderIdentityLink(Base):
     """Audited alias from one observation ID to a stable broker order ID."""
 
@@ -801,6 +1137,372 @@ class CanonicalEvidenceProvenanceRecord(Base):
     )
 
 
+class CanonicalExecutionGroupMemberRecord(Base):
+    """One frozen canonical combo execution group.
+
+    The parent package fields remain audit-only.  ``proved_executed_group_quantity``
+    is derived from balanced leg fills, never from the broker parent ``dealt_qty``.
+    The fee projection remains group-scoped and is not a leg allocation.
+    """
+
+    __tablename__ = "journal_v2_canonical_execution_group_members"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    canonical_set_id = Column(
+        Integer,
+        ForeignKey("journal_v2_canonical_evidence_sets.id"),
+        nullable=False,
+    )
+    member_key = Column(String(128), nullable=False)
+    identity_key = Column(String(384), nullable=False)
+    canonical_execution_group_id = Column(String(128), nullable=False)
+    selected_execution_group_observation_id = Column(
+        Integer,
+        ForeignKey("journal_v2_broker_execution_group_observations.id"),
+        nullable=False,
+    )
+
+    strategy_type = Column(String(64), nullable=False)
+    status = Column(String(32), nullable=False)
+    currency = Column(String(8), nullable=False)
+    group_order_quantity = Column(Numeric(28, 10), nullable=False)
+    broker_reported_dealt_quantity = Column(Numeric(28, 10), nullable=False)
+    broker_reported_order_price = Column(Numeric(28, 10))
+    broker_reported_net_average_price = Column(Numeric(28, 10))
+    proved_executed_group_quantity = Column(Numeric(28, 10))
+    parent_quantity_semantics = Column(String(48), nullable=False)
+    parent_price_semantics = Column(String(48), nullable=False)
+
+    group_total_fee = Column(Numeric(28, 10))
+    group_fee_components_json = Column(Text)
+    fee_evidence_status = Column(String(24), nullable=False)
+    fee_scope_policy = Column(String(48), nullable=False)
+
+    canonical_payload_json = Column(Text, nullable=False)
+    provenance_json = Column(Text, nullable=False)
+    recorded_at = Column(
+        DateTime(timezone=True), nullable=False, default=_utc_now
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "canonical_set_id",
+            "member_key",
+            name="uq_jv2_canonical_group_member_key",
+        ),
+        UniqueConstraint(
+            "canonical_set_id",
+            "identity_key",
+            name="uq_jv2_canonical_group_identity",
+        ),
+        UniqueConstraint(
+            "canonical_set_id",
+            "selected_execution_group_observation_id",
+            name="uq_jv2_canonical_group_selected_source",
+        ),
+        CheckConstraint(
+            "group_order_quantity > 0",
+            name="ck_jv2_canonical_group_order_quantity",
+        ),
+        CheckConstraint(
+            "broker_reported_dealt_quantity >= 0",
+            name="ck_jv2_canonical_group_dealt_quantity",
+        ),
+        CheckConstraint(
+            "proved_executed_group_quantity IS NULL "
+            "OR proved_executed_group_quantity >= 0",
+            name="ck_jv2_canonical_group_executed_quantity",
+        ),
+        CheckConstraint(
+            "group_total_fee IS NULL OR group_total_fee >= 0",
+            name="ck_jv2_canonical_group_fee",
+        ),
+        CheckConstraint(
+            "(group_total_fee IS NULL AND group_fee_components_json IS NULL) "
+            "OR (group_total_fee IS NOT NULL "
+            "AND group_fee_components_json IS NOT NULL)",
+            name="ck_jv2_canonical_group_fee_pair",
+        ),
+        Index(
+            "ix_jv2_canonical_group_set",
+            "canonical_set_id",
+            "canonical_execution_group_id",
+        ),
+        Index(
+            "ix_jv2_canonical_group_selected",
+            "selected_execution_group_observation_id",
+        ),
+    )
+
+
+class CanonicalExecutionGroupLegRecord(Base):
+    """One frozen, fee-free leg inside a canonical execution group."""
+
+    __tablename__ = "journal_v2_canonical_execution_group_legs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    canonical_set_id = Column(
+        Integer,
+        ForeignKey("journal_v2_canonical_evidence_sets.id"),
+        nullable=False,
+    )
+    canonical_execution_group_member_id = Column(
+        Integer,
+        ForeignKey("journal_v2_canonical_execution_group_members.id"),
+        nullable=False,
+    )
+    selected_execution_group_leg_observation_id = Column(
+        Integer,
+        ForeignKey("journal_v2_broker_execution_group_leg_observations.id"),
+        nullable=False,
+    )
+    leg_key = Column(String(128), nullable=False)
+    identity_key = Column(String(384), nullable=False)
+    leg_index = Column(Integer, nullable=False)
+
+    raw_symbol = Column(String(64), nullable=False)
+    asset_type = Column(String(24), nullable=False)
+    underlying = Column(String(32), nullable=False)
+    expiry = Column(Date)
+    strike = Column(Numeric(28, 10))
+    option_right = Column(String(8))
+    contract_multiplier = Column(Numeric(20, 8))
+    contract_multiplier_basis = Column(String(32), nullable=False)
+    side = Column(String(24), nullable=False)
+    quantity_ratio = Column(Numeric(28, 10), nullable=False)
+    executed_quantity = Column(Numeric(28, 10), nullable=False)
+    proved_executed_group_quantity = Column(Numeric(28, 10))
+    fill_count = Column(Integer, nullable=False)
+    currency = Column(String(8), nullable=False)
+
+    canonical_payload_json = Column(Text, nullable=False)
+    provenance_json = Column(Text, nullable=False)
+    recorded_at = Column(
+        DateTime(timezone=True), nullable=False, default=_utc_now
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "canonical_execution_group_member_id",
+            "leg_key",
+            name="uq_jv2_canonical_group_leg_key",
+        ),
+        UniqueConstraint(
+            "canonical_execution_group_member_id",
+            "leg_index",
+            name="uq_jv2_canonical_group_leg_index",
+        ),
+        UniqueConstraint(
+            "canonical_execution_group_member_id",
+            "identity_key",
+            name="uq_jv2_canonical_group_leg_identity",
+        ),
+        UniqueConstraint(
+            "canonical_set_id",
+            "selected_execution_group_leg_observation_id",
+            name="uq_jv2_canonical_group_leg_selected",
+        ),
+        CheckConstraint(
+            "leg_index >= 0",
+            name="ck_jv2_canonical_group_leg_index",
+        ),
+        CheckConstraint(
+            "quantity_ratio > 0",
+            name="ck_jv2_canonical_group_leg_ratio",
+        ),
+        CheckConstraint(
+            "(executed_quantity = 0 AND fill_count = 0) "
+            "OR (executed_quantity > 0 AND fill_count > 0)",
+            name="ck_jv2_canonical_group_leg_execution",
+        ),
+        CheckConstraint(
+            "proved_executed_group_quantity IS NULL "
+            "OR proved_executed_group_quantity >= 0",
+            name="ck_jv2_canonical_group_leg_group_quantity",
+        ),
+        CheckConstraint(
+            "(contract_multiplier IS NULL "
+            "AND contract_multiplier_basis = 'unknown') "
+            "OR (contract_multiplier > 0 "
+            "AND contract_multiplier_basis IN "
+            "('asset_definition', 'broker_stated', "
+            "'evidence_derived_from_amount'))",
+            name="ck_jv2_canonical_group_leg_multiplier",
+        ),
+        Index(
+            "ix_jv2_canonical_group_leg_group",
+            "canonical_execution_group_member_id",
+            "leg_index",
+        ),
+        Index(
+            "ix_jv2_canonical_group_leg_instrument",
+            "canonical_set_id",
+            "underlying",
+            "expiry",
+        ),
+    )
+
+
+class CanonicalExecutionGroupFillLinkRecord(Base):
+    """Frozen binding from a canonical fill member to one canonical group leg."""
+
+    __tablename__ = "journal_v2_canonical_execution_group_fill_links"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    canonical_set_id = Column(
+        Integer,
+        ForeignKey("journal_v2_canonical_evidence_sets.id"),
+        nullable=False,
+    )
+    canonical_execution_group_member_id = Column(
+        Integer,
+        ForeignKey("journal_v2_canonical_execution_group_members.id"),
+        nullable=False,
+    )
+    canonical_execution_group_leg_id = Column(
+        Integer,
+        ForeignKey("journal_v2_canonical_execution_group_legs.id"),
+        nullable=False,
+    )
+    canonical_fill_member_id = Column(
+        Integer,
+        ForeignKey("journal_v2_canonical_evidence_members.id"),
+        nullable=False,
+    )
+    selected_execution_group_fill_link_id = Column(
+        Integer,
+        ForeignKey("journal_v2_broker_execution_group_fill_links.id"),
+        nullable=False,
+    )
+    link_key = Column(String(128), nullable=False)
+    canonical_deal_id = Column(String(128), nullable=False)
+    link_method = Column(String(64), nullable=False)
+    fee_scope = Column(String(32), nullable=False)
+    canonical_payload_json = Column(Text, nullable=False)
+    provenance_json = Column(Text, nullable=False)
+    recorded_at = Column(
+        DateTime(timezone=True), nullable=False, default=_utc_now
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "canonical_set_id",
+            "link_key",
+            name="uq_jv2_canonical_group_fill_link_key",
+        ),
+        UniqueConstraint(
+            "canonical_set_id",
+            "canonical_fill_member_id",
+            name="uq_jv2_canonical_group_fill_member",
+        ),
+        UniqueConstraint(
+            "canonical_set_id",
+            "selected_execution_group_fill_link_id",
+            name="uq_jv2_canonical_group_fill_selected",
+        ),
+        UniqueConstraint(
+            "canonical_execution_group_member_id",
+            "canonical_deal_id",
+            name="uq_jv2_canonical_group_fill_deal",
+        ),
+        CheckConstraint(
+            "fee_scope = 'execution_group'",
+            name="ck_jv2_canonical_group_fill_fee_scope",
+        ),
+        Index(
+            "ix_jv2_canonical_group_fill_group",
+            "canonical_execution_group_member_id",
+            "canonical_execution_group_leg_id",
+        ),
+        Index(
+            "ix_jv2_canonical_group_fill_member",
+            "canonical_fill_member_id",
+        ),
+    )
+
+
+class CanonicalExecutionGroupProvenanceRecord(Base):
+    """One raw group/leg/link/fee source retained by a canonical group."""
+
+    __tablename__ = "journal_v2_canonical_execution_group_provenance"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    canonical_set_id = Column(
+        Integer,
+        ForeignKey("journal_v2_canonical_evidence_sets.id"),
+        nullable=False,
+    )
+    canonical_execution_group_member_id = Column(
+        Integer,
+        ForeignKey("journal_v2_canonical_execution_group_members.id"),
+        nullable=False,
+    )
+    provenance_key = Column(String(128), nullable=False)
+    import_batch_id = Column(
+        Integer,
+        ForeignKey("journal_v2_import_batches.id"),
+        nullable=False,
+    )
+    execution_group_observation_id = Column(
+        Integer,
+        ForeignKey("journal_v2_broker_execution_group_observations.id"),
+    )
+    execution_group_leg_observation_id = Column(
+        Integer,
+        ForeignKey("journal_v2_broker_execution_group_leg_observations.id"),
+    )
+    execution_group_fill_link_id = Column(
+        Integer,
+        ForeignKey("journal_v2_broker_execution_group_fill_links.id"),
+    )
+    execution_group_fee_observation_id = Column(
+        Integer,
+        ForeignKey("journal_v2_broker_execution_group_fee_observations.id"),
+    )
+    evidence_kind = Column(String(32), nullable=False)
+    evidence_role = Column(String(32), nullable=False)
+    evidence_ref_json = Column(Text, nullable=False)
+    recorded_at = Column(
+        DateTime(timezone=True), nullable=False, default=_utc_now
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "canonical_set_id",
+            "provenance_key",
+            name="uq_jv2_canonical_group_provenance_key",
+        ),
+        CheckConstraint(
+            "(CASE WHEN execution_group_observation_id IS NULL THEN 0 ELSE 1 END "
+            "+ CASE WHEN execution_group_leg_observation_id IS NULL THEN 0 ELSE 1 END "
+            "+ CASE WHEN execution_group_fill_link_id IS NULL THEN 0 ELSE 1 END "
+            "+ CASE WHEN execution_group_fee_observation_id IS NULL THEN 0 ELSE 1 END) = 1",
+            name="ck_jv2_canonical_group_provenance_one_source",
+        ),
+        CheckConstraint(
+            "(evidence_kind = 'execution_group' "
+            "AND execution_group_observation_id IS NOT NULL) "
+            "OR (evidence_kind = 'execution_group_leg' "
+            "AND execution_group_leg_observation_id IS NOT NULL) "
+            "OR (evidence_kind = 'execution_group_fill_link' "
+            "AND execution_group_fill_link_id IS NOT NULL) "
+            "OR (evidence_kind = 'execution_group_fee' "
+            "AND execution_group_fee_observation_id IS NOT NULL)",
+            name="ck_jv2_canonical_group_provenance_kind",
+        ),
+        Index(
+            "ix_jv2_canonical_group_provenance_set",
+            "canonical_set_id",
+            "evidence_kind",
+        ),
+        Index(
+            "ix_jv2_canonical_group_provenance_member",
+            "canonical_execution_group_member_id",
+            "evidence_role",
+        ),
+    )
+
+
 class EpisodeBuild(Base):
     """One immutable, reproducible episode reconstruction result."""
 
@@ -891,6 +1593,157 @@ class EpisodeBuildCanonicalSource(Base):
         Index(
             "ix_jv2_episode_canonical_set",
             "canonical_set_id",
+        ),
+    )
+
+
+class EpisodeBuildSnapshotFenceSource(Base):
+    """Immutable binding from one EpisodeBuild to its verified snapshot fence.
+
+    A row proves which confirmed current-position snapshot, continuity fence,
+    and frozen target canonical set produced one formal future Episode build.
+    ``projection_name``/``projection_version`` mirror the fenced preview
+    projection constants; the append path passes them in rather than
+    re-declaring literals here.
+    """
+
+    __tablename__ = "journal_v2_episode_build_snapshot_fence_sources"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    link_key = Column(String(128), nullable=False)
+    episode_build_id = Column(
+        Integer,
+        ForeignKey("journal_v2_episode_builds.id"),
+        nullable=False,
+    )
+    snapshot_id = Column(
+        Integer,
+        ForeignKey("journal_v2_position_snapshots.id"),
+        nullable=False,
+    )
+    snapshot_key = Column(String(64), nullable=False)
+    fence_key = Column(String(64), nullable=False)
+    continuity_policy_version = Column(String(64), nullable=False)
+    target_publication_id = Column(Integer, nullable=False)
+    target_publication_key = Column(String(128), nullable=False)
+    target_canonical_set_id = Column(
+        Integer,
+        ForeignKey("journal_v2_canonical_evidence_sets.id"),
+        nullable=False,
+    )
+    target_canonical_set_sha256 = Column(String(64), nullable=False)
+    source_cutoff_at = Column(DateTime(timezone=True), nullable=False)
+    boundary_at = Column(DateTime(timezone=True), nullable=False)
+    projection_name = Column(String(64), nullable=False)
+    projection_version = Column(String(64), nullable=False)
+    recorded_at = Column(
+        DateTime(timezone=True), nullable=False, default=_utc_now
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "link_key",
+            name="uq_jv2_episode_snapshot_fence_link_key",
+        ),
+        UniqueConstraint(
+            "episode_build_id",
+            name="uq_jv2_episode_snapshot_fence_build",
+        ),
+        CheckConstraint(
+            "length(target_canonical_set_sha256) = 64",
+            name="ck_jv2_episode_snapshot_fence_hash",
+        ),
+        CheckConstraint(
+            "length(fence_key) = 64",
+            name="ck_jv2_episode_snapshot_fence_key",
+        ),
+        Index(
+            "ix_jv2_episode_snapshot_fence_snapshot",
+            "snapshot_id",
+        ),
+        Index(
+            "ix_jv2_episode_snapshot_fence_target_set",
+            "target_canonical_set_id",
+        ),
+    )
+
+
+class EpisodeBuildActivation(Base):
+    """One immutable event selecting the effective canonical Episode build.
+
+    Selection changes are represented by appending another event.  The chain
+    may therefore move from build A to B and later back to A without mutating
+    either an Episode build or a prior activation record.
+    """
+
+    __tablename__ = "journal_v2_episode_build_activations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    activation_key = Column(String(64), nullable=False)
+    account_key = Column(String(64), nullable=False)
+    activation_sequence = Column(Integer, nullable=False)
+    episode_build_id = Column(
+        Integer,
+        ForeignKey("journal_v2_episode_builds.id"),
+        nullable=False,
+    )
+    episode_build_key = Column(String(64), nullable=False)
+    canonical_set_id = Column(
+        Integer,
+        ForeignKey("journal_v2_canonical_evidence_sets.id"),
+        nullable=False,
+    )
+    canonical_set_sha256 = Column(String(64), nullable=False)
+    previous_activation_id = Column(
+        Integer,
+        ForeignKey("journal_v2_episode_build_activations.id"),
+    )
+    previous_episode_build_id = Column(
+        Integer,
+        ForeignKey("journal_v2_episode_builds.id"),
+    )
+    activated_at = Column(
+        DateTime(timezone=True), nullable=False, default=_utc_now
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "activation_key",
+            name="uq_jv2_episode_build_activation_key",
+        ),
+        UniqueConstraint(
+            "account_key",
+            "activation_sequence",
+            name="uq_jv2_episode_build_activation_sequence",
+        ),
+        UniqueConstraint(
+            "previous_activation_id",
+            name="uq_jv2_episode_build_activation_previous",
+        ),
+        CheckConstraint(
+            "activation_sequence >= 1",
+            name="ck_jv2_episode_build_activation_sequence",
+        ),
+        CheckConstraint(
+            "length(activation_key) = 64 "
+            "AND length(episode_build_key) = 64 "
+            "AND length(canonical_set_sha256) = 64",
+            name="ck_jv2_episode_build_activation_hashes",
+        ),
+        CheckConstraint(
+            "(activation_sequence = 1 AND previous_activation_id IS NULL) "
+            "OR (activation_sequence > 1 "
+            "AND previous_activation_id IS NOT NULL)",
+            name="ck_jv2_episode_build_activation_chain",
+        ),
+        Index(
+            "ix_jv2_episode_build_activation_account",
+            "account_key",
+            "activation_sequence",
+        ),
+        Index(
+            "ix_jv2_episode_build_activation_target",
+            "episode_build_id",
         ),
     )
 
@@ -1165,5 +2018,89 @@ class PositionEpisodeEvidence(Base):
         Index(
             "ix_jv2_evidence_fill_observation",
             "broker_fill_observation_id",
+        ),
+    )
+
+
+class ReviewAnnotation(Base):
+    """One immutable user-authored revision for a PositionEpisode review.
+
+    Review annotations are intentionally stored beside, but remain
+    semantically separate from, broker evidence and deterministic Episode
+    facts.  An edit appends the next revision and links it to the previous
+    annotation; no AI response is written through this model.
+    """
+
+    __tablename__ = "journal_v2_review_annotations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_key = Column(String(64), nullable=False)
+    episode_build_id = Column(
+        Integer,
+        ForeignKey("journal_v2_episode_builds.id"),
+        nullable=False,
+    )
+    position_episode_id = Column(
+        Integer,
+        ForeignKey("journal_v2_position_episodes.id"),
+        nullable=False,
+    )
+    revision = Column(Integer, nullable=False)
+    review_status = Column(String(24), nullable=False)
+
+    setup_thesis = Column(Text, nullable=False)
+    entry_trigger = Column(Text, nullable=False)
+    invalidation_plan = Column(Text, nullable=False)
+    position_rationale = Column(Text, nullable=False)
+    exit_reason = Column(Text, nullable=False)
+    post_trade_reflection = Column(Text, nullable=False)
+    tags_json = Column(Text, nullable=False)
+    error_types_json = Column(Text, nullable=False)
+
+    content_sha256 = Column(String(64), nullable=False)
+    previous_annotation_id = Column(
+        Integer,
+        ForeignKey("journal_v2_review_annotations.id"),
+    )
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, default=_utc_now
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "account_key",
+            "episode_build_id",
+            "position_episode_id",
+            "revision",
+            name="uq_jv2_review_annotation_revision",
+        ),
+        UniqueConstraint(
+            "previous_annotation_id",
+            name="uq_jv2_review_annotation_previous",
+        ),
+        CheckConstraint(
+            "revision >= 1",
+            name="ck_jv2_review_annotation_revision",
+        ),
+        CheckConstraint(
+            "review_status IN ('in_progress', 'completed')",
+            name="ck_jv2_review_annotation_status",
+        ),
+        CheckConstraint(
+            "length(content_sha256) = 64",
+            name="ck_jv2_review_annotation_hash",
+        ),
+        Index(
+            "ix_jv2_review_annotation_scope",
+            "account_key",
+            "episode_build_id",
+            "position_episode_id",
+            "revision",
+        ),
+        Index(
+            "ix_jv2_review_annotation_queue",
+            "account_key",
+            "episode_build_id",
+            "review_status",
         ),
     )

@@ -14,15 +14,33 @@ import type {
   JournalStatsResponse,
   LedgerDataHealth,
   LedgerImportResponse,
+  JournalRefreshStatus,
+  MoomooJournalRefreshConfirmResponse,
+  MoomooJournalRefreshPreview,
   EpisodeBuildResponse,
   CanonicalEpisodeBuildConfirmRequest,
   CanonicalEpisodeBuildPlanResponse,
+  EpisodeBuildActivationRequest,
+  EpisodeBuildActivationResponse,
+  EpisodeBuildActivationState,
   PositionEpisodeDetailResponse,
   PositionEpisodeAiReviewResponse,
   PositionEpisodeAiReviewUserContext,
   PositionEpisodeFilters,
   PositionEpisodeListResponse,
+  PositionEpisodeReviewAnnotationHistoryResponse,
+  PositionEpisodeReviewAnnotationLatestResponse,
+  EpisodePlaybookLinksResponse,
+  PlaybookListResponse,
+  CreatePlaybookCandidateRequest,
+  CreatePlaybookCandidateResponse,
+  PromotePlaybookCandidateRequest,
+  PromotePlaybookCandidateResponse,
+  RetirePlaybookRuleResponse,
   RealityTestResponse,
+  ReviewInsightsResponse,
+  SavePositionEpisodeReviewAnnotationRequest,
+  SavePositionEpisodeReviewAnnotationResponse,
   TradeItem,
   TradeListFilters,
   TradeListResponse,
@@ -173,6 +191,38 @@ export async function fetchLedgerDataHealth(): Promise<LedgerDataHealth> {
   return toCamelCase<LedgerDataHealth>(data);
 }
 
+export async function fetchJournalRefreshStatus(): Promise<JournalRefreshStatus> {
+  const { data } = await apiClient.get(`${BASE}/v2/refresh-status`);
+  return toCamelCase<JournalRefreshStatus>(data);
+}
+
+export async function previewJournalRefresh(
+  overlapDays = 7,
+): Promise<MoomooJournalRefreshPreview> {
+  const { data } = await apiClient.post(
+    `${BASE}/v2/refreshes/preview`,
+    { overlap_days: overlapDays },
+    { timeout: 210000 },
+  );
+  return toCamelCase<MoomooJournalRefreshPreview>(data);
+}
+
+export async function confirmJournalRefresh(
+  artifactId: number,
+  previewKey: string,
+  acknowledgePartialWindow: boolean,
+): Promise<MoomooJournalRefreshConfirmResponse> {
+  const { data } = await apiClient.post(
+    `${BASE}/v2/refreshes/${artifactId}/confirm`,
+    {
+      preview_key: previewKey,
+      acknowledge_partial_window: acknowledgePartialWindow,
+    },
+    { timeout: 60000 },
+  );
+  return toCamelCase<MoomooJournalRefreshConfirmResponse>(data);
+}
+
 export async function fetchPositionEpisodes(
   filters: PositionEpisodeFilters = {},
 ): Promise<PositionEpisodeListResponse> {
@@ -182,6 +232,7 @@ export async function fetchPositionEpisodes(
       lifecycle_status: filters.lifecycleStatus || undefined,
       completeness_status: filters.completenessStatus || undefined,
       case_focus: filters.caseFocus || undefined,
+      review_status: filters.reviewStatus || undefined,
       build_id: filters.buildId,
       page: filters.page ?? 1,
       per_page: filters.perPage ?? 50,
@@ -198,6 +249,125 @@ export async function fetchPositionEpisodeDetail(
     params: { build_id: buildId },
   });
   return toCamelCase<PositionEpisodeDetailResponse>(data);
+}
+
+export async function fetchLatestPositionEpisodeReviewAnnotation(
+  episodeId: number,
+  buildId: number,
+): Promise<PositionEpisodeReviewAnnotationLatestResponse> {
+  const { data } = await apiClient.get(
+    `${BASE}/v2/position-episodes/${episodeId}/review-annotations/latest`,
+    { params: { build_id: buildId } },
+  );
+  return toCamelCase<PositionEpisodeReviewAnnotationLatestResponse>(data);
+}
+
+export async function fetchPositionEpisodeReviewAnnotationHistory(
+  episodeId: number,
+  buildId: number,
+): Promise<PositionEpisodeReviewAnnotationHistoryResponse> {
+  const { data } = await apiClient.get(
+    `${BASE}/v2/position-episodes/${episodeId}/review-annotations`,
+    { params: { build_id: buildId } },
+  );
+  const response = toCamelCase<
+    PositionEpisodeReviewAnnotationHistoryResponse & {
+      annotations?: PositionEpisodeReviewAnnotationHistoryResponse['items'];
+    }
+  >(data);
+  return {
+    ...response,
+    items: response.items ?? response.annotations ?? [],
+  };
+}
+
+export async function fetchReviewInsights(): Promise<ReviewInsightsResponse> {
+  const { data } = await apiClient.get(`${BASE}/v2/review-insights`);
+  return toCamelCase<ReviewInsightsResponse>(data);
+}
+
+export async function fetchPlaybook(): Promise<PlaybookListResponse> {
+  const { data } = await apiClient.get(`${BASE}/v2/playbook`);
+  return toCamelCase<PlaybookListResponse>(data);
+}
+
+export async function createPlaybookCandidate(
+  request: CreatePlaybookCandidateRequest,
+): Promise<CreatePlaybookCandidateResponse> {
+  const { data } = await apiClient.post(`${BASE}/v2/playbook/candidates`, {
+    title: request.title.trim(),
+    rule_text: request.ruleText.trim(),
+    source_bucket: request.sourceBucket
+      ? {
+          group_kind: request.sourceBucket.groupKind,
+          group_value: request.sourceBucket.groupValue,
+          direction: request.sourceBucket.direction,
+          boundary_policy: request.sourceBucket.boundaryPolicy,
+        }
+      : null,
+  });
+  return toCamelCase<CreatePlaybookCandidateResponse>(data);
+}
+
+export async function promotePlaybookCandidate(
+  candidateKey: string,
+  request: PromotePlaybookCandidateRequest = {},
+): Promise<PromotePlaybookCandidateResponse> {
+  const { data } = await apiClient.post(
+    `${BASE}/v2/playbook/candidates/${candidateKey}/promote`,
+    {
+      allow_new_version: request.allowNewVersion ?? false,
+      expected_current_version: request.expectedCurrentVersion ?? null,
+    },
+  );
+  return toCamelCase<PromotePlaybookCandidateResponse>(data);
+}
+
+export async function fetchEpisodePlaybookLinks(
+  episodeId: number,
+  buildId: number,
+): Promise<EpisodePlaybookLinksResponse> {
+  const { data } = await apiClient.get(
+    `${BASE}/v2/position-episodes/${episodeId}/playbook-links`,
+    { params: { build_id: buildId } },
+  );
+  return toCamelCase<EpisodePlaybookLinksResponse>(data);
+}
+
+export async function retirePlaybookRule(
+  lineageKey: string,
+  expectedCurrentVersion: number,
+): Promise<RetirePlaybookRuleResponse> {
+  const { data } = await apiClient.post(
+    `${BASE}/v2/playbook/rules/${lineageKey}/retire`,
+    { expected_current_version: expectedCurrentVersion },
+  );
+  return toCamelCase<RetirePlaybookRuleResponse>(data);
+}
+
+export async function savePositionEpisodeReviewAnnotation(
+  episodeId: number,
+  request: SavePositionEpisodeReviewAnnotationRequest,
+): Promise<SavePositionEpisodeReviewAnnotationResponse> {
+  const cleanLabels = (values: string[]) => (
+    [...new Set(values.map((value) => value.trim()).filter(Boolean))]
+  );
+  const { data } = await apiClient.post(
+    `${BASE}/v2/position-episodes/${episodeId}/review-annotations`,
+    {
+      build_id: request.buildId,
+      review_status: request.reviewStatus,
+      setup_thesis: request.setupThesis.trim(),
+      entry_trigger: request.entryTrigger.trim(),
+      invalidation_plan: request.invalidationPlan.trim(),
+      position_rationale: request.positionRationale.trim(),
+      exit_reason: request.exitReason.trim(),
+      post_trade_reflection: request.postTradeReflection.trim(),
+      tags: cleanLabels(request.tags),
+      error_types: cleanLabels(request.errorTypes),
+    },
+  );
+  return toCamelCase<SavePositionEpisodeReviewAnnotationResponse>(data);
 }
 
 export async function createPositionEpisodeAiReview(
@@ -261,10 +431,34 @@ export async function createCanonicalPositionEpisodeBuild(
       canonical_set_sha256: request.canonicalSetSha256,
       build_key: request.buildKey,
       accept_assumed_flat: request.acceptAssumedFlat,
+      accept_group_fee_scope: request.acceptGroupFeeScope,
     },
     { params: { account_key: accountKey } },
   );
   return toCamelCase<EpisodeBuildResponse>(data);
+}
+
+export async function fetchEpisodeBuildActivation(): Promise<EpisodeBuildActivationState> {
+  const { data } = await apiClient.get(`${BASE}/v2/episode-builds/activation`);
+  return toCamelCase<EpisodeBuildActivationState>(data);
+}
+
+export async function activateEpisodeBuild(
+  buildId: number,
+  request: EpisodeBuildActivationRequest,
+): Promise<EpisodeBuildActivationResponse> {
+  const { data } = await apiClient.post(
+    `${BASE}/v2/episode-builds/${buildId}/activate`,
+    {
+      expected_build_key: request.expectedBuildKey,
+      expected_current_activation_id: request.expectedCurrentActivationId ?? null,
+      expected_current_build_id: request.expectedCurrentBuildId ?? null,
+      accept_assumed_flat: request.acceptAssumedFlat,
+      accept_group_fee_scope: request.acceptGroupFeeScope,
+      accept_left_censored_openings: request.acceptLeftCensoredOpenings,
+    },
+  );
+  return toCamelCase<EpisodeBuildActivationResponse>(data);
 }
 
 export async function fetchStatsByStyle(params: {

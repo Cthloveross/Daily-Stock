@@ -1,55 +1,30 @@
 import type React from 'react';
-import { useEffect, useState } from 'react';
 import { LockKeyhole, Power, AlertTriangle } from 'lucide-react';
-import apiClient from '../../api';
-import { toCamelCase } from '../../api/utils';
 import { Tooltip } from '../common/Tooltip';
 import { cn } from '../../utils/cn';
-
-interface MoomooStatus {
-  enabled: boolean;
-  sdkInstalled: boolean;
-  connected: boolean;
-  host: string;
-  port: number;
-  trdEnv: string;
-  sdkVersion?: string | null;
-  probeLevel?: string | null;
-  readOnly?: boolean;
-  message?: string | null;
-}
-
-const POLL_INTERVAL_MS = 30_000;
+import { useMoomooStatusMonitor } from './moomooStatusMonitor';
 
 export const MoomooBadge: React.FC = () => {
-  const [status, setStatus] = useState<MoomooStatus | null>(null);
-  const [loading, setLoading] = useState(true);
+  const { status, loading, unavailable } = useMoomooStatusMonitor();
 
-  useEffect(() => {
-    let cancelled = false;
-    const probe = async () => {
-      try {
-        const { data } = await apiClient.get('/api/v1/system/moomoo-status', {
-          timeout: 8000,
-        });
-        if (cancelled) return;
-        setStatus(toCamelCase<MoomooStatus>(data));
-      } catch {
-        if (cancelled) return;
-        setStatus(null);
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    };
-    void probe();
-    const id = window.setInterval(() => void probe(), POLL_INTERVAL_MS);
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-    };
-  }, []);
+  if (loading) return null;
 
-  if (loading || !status) return null;
+  if (unavailable || !status) {
+    const detail = (
+      '无法确认 Moomoo OpenD 状态；页面重新可见或网络恢复时会自动重试'
+    );
+    return (
+      <Tooltip content={detail} side="bottom" focusable>
+        <span
+          aria-label={detail}
+          className="inline-flex items-center gap-1 rounded-full border border-warn-strong/40 bg-warn-strong/10 px-2 py-0.5 text-caption text-warn-strong"
+        >
+          <AlertTriangle size={11} strokeWidth={2} />
+          Moomoo 状态未知
+        </span>
+      </Tooltip>
+    );
+  }
 
   // Three states with progressively-degraded colour.  `connected` is a
   // bounded TCP reachability check, not proof that trade history is synced.

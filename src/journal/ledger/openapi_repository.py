@@ -31,6 +31,8 @@ from src.journal.ledger.canonical import (
     CANONICAL_READER_NAME,
     CANONICAL_READER_VERSION,
     CanonicalEvidenceSet,
+    ExecutionGroupLegObservationInput,
+    ExecutionGroupObservationInput,
     FillObservationInput,
     OrderObservationInput,
     canonicalize_observations,
@@ -73,6 +75,9 @@ __all__ = [
 
 _MULTIPLIER_TOLERANCE = Decimal("0.005")
 _CANDIDATE_MULTIPLIERS = (Decimal("1"), Decimal("100"))
+_QUANTITY_TOLERANCE = Decimal("0.000001")
+_EXECUTION_GROUP_PROJECTION_NAME = "moomoo_openapi_execution_group_projection"
+_EXECUTION_GROUP_PROJECTION_VERSION = "1"
 
 
 class OpenApiPlanError(ValueError):
@@ -112,6 +117,10 @@ class OpenApiCanonicalImpact:
     blocking_issues: int
     analysis_ready: bool
     canonical_set_sha256: str
+    input_execution_group_observations: int = 0
+    canonical_execution_groups: int = 0
+    canonical_execution_group_legs: int = 0
+    duplicate_execution_group_observations: int = 0
 
     @classmethod
     def from_evidence_set(cls, value: CanonicalEvidenceSet) -> "OpenApiCanonicalImpact":
@@ -128,6 +137,30 @@ class OpenApiCanonicalImpact:
             blocking_issues=provenance.blocking_issue_count,
             analysis_ready=value.analysis_ready,
             canonical_set_sha256=value.canonical_set_sha256,
+            input_execution_group_observations=(
+                getattr(
+                    provenance,
+                    "input_execution_group_observation_count",
+                    0,
+                )
+            ),
+            canonical_execution_groups=(
+                getattr(provenance, "canonical_execution_group_count", 0)
+            ),
+            canonical_execution_group_legs=(
+                getattr(
+                    provenance,
+                    "canonical_execution_group_leg_count",
+                    0,
+                )
+            ),
+            duplicate_execution_group_observations=(
+                getattr(
+                    provenance,
+                    "duplicate_execution_group_observation_count",
+                    0,
+                )
+            ),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -143,6 +176,16 @@ class OpenApiCanonicalImpact:
             "blocking_issues": self.blocking_issues,
             "analysis_ready": self.analysis_ready,
             "canonical_set_sha256": self.canonical_set_sha256,
+            "input_execution_group_observations": (
+                self.input_execution_group_observations
+            ),
+            "canonical_execution_groups": self.canonical_execution_groups,
+            "canonical_execution_group_legs": (
+                self.canonical_execution_group_legs
+            ),
+            "duplicate_execution_group_observations": (
+                self.duplicate_execution_group_observations
+            ),
         }
 
 
@@ -511,28 +554,189 @@ def _observation_key(kind: str, stable_id: str) -> str:
     )[:32]
 
 
+def _is_execution_group_order(value: Any) -> bool:
+    """Return whether a broker parent declares a multi-leg execution group."""
+    return bool(getattr(value, "combo_legs", ()))
+
+
+def _execution_group_leg_stable_id(
+    source_group_id: str,
+    raw_symbol: str,
+    side: str,
+    quantity_ratio: Decimal,
+) -> str:
+    return "|".join(
+        (
+            source_group_id,
+            raw_symbol.strip().upper(),
+            side.strip().upper(),
+            format(quantity_ratio, "f"),
+        )
+    )
+
+
+def _execution_group_leg_key(
+    source_group_id: str,
+    raw_symbol: str,
+    side: str,
+    quantity_ratio: Decimal,
+) -> str:
+    return _observation_key(
+        "execution_group_leg",
+        _execution_group_leg_stable_id(
+            source_group_id,
+            raw_symbol,
+            side,
+            quantity_ratio,
+        ),
+    )
+
+
+def _execution_group_fill_link_key(
+    source_group_id: str,
+    source_deal_id: str,
+    execution_group_leg_key: str,
+) -> str:
+    return _observation_key(
+        "execution_group_fill_link",
+        "|".join(
+            (source_group_id, source_deal_id, execution_group_leg_key)
+        ),
+    )
+
+
+def _execution_group_fill_link_sha256(
+    source_group_id: str,
+    source_deal_id: str,
+    execution_group_leg_key: str,
+) -> str:
+    return _sha256_json(
+        {
+            "source_execution_group_id": source_group_id,
+            "source_deal_id": source_deal_id,
+            "execution_group_leg_key": execution_group_leg_key,
+            "link_method": "broker_parent_id_and_declared_leg_identity",
+        }
+    )
+
+
+def _execution_group_leg_sha256(
+    *,
+    source_group_id: str,
+    parent_source_record_sha256: str,
+    leg_key: str,
+    raw_symbol: str,
+    side: str,
+    quantity_ratio: Decimal,
+    contract_multiplier: Optional[Decimal],
+    contract_multiplier_basis: str,
+    contract_spec_source_record_sha256: Optional[str],
+) -> str:
+    return _sha256_json(
+        {
+            "source_execution_group_id": source_group_id,
+            "parent_source_record_sha256": parent_source_record_sha256,
+            "leg_key": leg_key,
+            "raw_symbol": raw_symbol.strip().upper(),
+            "side": side.strip().upper(),
+            "quantity_ratio": quantity_ratio,
+            "contract_multiplier": contract_multiplier,
+            "contract_multiplier_basis": contract_multiplier_basis,
+            "contract_spec_source_record_sha256": (
+                contract_spec_source_record_sha256
+            ),
+        }
+    )
+
+
+def _contract_specs_by_symbol(
+    preview: OpenApiExportPreview,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for spec in preview.contract_specs:
+        key = _normalized_symbol(spec.raw_symbol)
+        existing = result.get(key)
+        if (
+            existing is not None
+            and Decimal(existing.resolved_multiplier)
+            != Decimal(spec.resolved_multiplier)
+        ):
+            raise OpenApiPlanError(
+                f"contract multiplier evidence disagrees for {key}"
+            )
+        result[key] = spec
+    return result
+
+
 def _api_inputs(
     preview: OpenApiExportPreview,
     *,
     account_key: str,
     virtual_batch_id: int,
     multiplier_by_instrument: Mapping[tuple[Any, ...], Decimal],
-) -> tuple[tuple[OrderObservationInput, ...], tuple[FillObservationInput, ...]]:
+) -> tuple[
+    tuple[OrderObservationInput, ...],
+    tuple[FillObservationInput, ...],
+    tuple[ExecutionGroupObservationInput, ...],
+]:
     metadata = preview.metadata
     batch_key = _storage_batch_key(preview, account_key)
     fee_by_order = {item.source_order_id: item for item in preview.fees}
-    order_inputs: list[OrderObservationInput] = []
-    for index, row in enumerate(preview.orders, start=1):
-        instrument = _instrument_fields(row.raw_symbol)
+    contract_specs = _contract_specs_by_symbol(preview)
+    group_orders = {
+        item.source_order_id: item
+        for item in preview.orders
+        if _is_execution_group_order(item)
+    }
+
+    def multiplier_fields(
+        *,
+        raw_symbol: str,
+        instrument: Mapping[str, Any],
+        currency: str,
+        allow_derived: bool = True,
+    ) -> tuple[Optional[Decimal], str, Optional[str]]:
+        spec = contract_specs.get(_normalized_symbol(raw_symbol))
+        if spec is not None:
+            return (
+                Decimal(spec.resolved_multiplier),
+                "broker_stated",
+                str(spec.source_record_sha256),
+            )
+        if not allow_derived:
+            return None, "unknown", None
         lookup = (
             instrument["asset_type"],
             str(instrument["underlying"]).upper(),
             instrument["expiry"],
             instrument["strike"],
             instrument["option_right"],
-            row.currency.upper(),
+            currency.upper(),
         )
         multiplier = multiplier_by_instrument.get(lookup)
+        return (
+            multiplier,
+            (
+                "evidence_derived_from_amount"
+                if multiplier is not None
+                else "unknown"
+            ),
+            None,
+        )
+
+    order_inputs: list[OrderObservationInput] = []
+    for index, row in enumerate(preview.orders, start=1):
+        if (
+            row.source_order_id in group_orders
+            or not row.combo_definition_available
+        ):
+            continue
+        instrument = _instrument_fields(row.raw_symbol)
+        multiplier, multiplier_basis, _ = multiplier_fields(
+            raw_symbol=row.raw_symbol,
+            instrument=instrument,
+            currency=row.currency,
+        )
         fee = fee_by_order.get(row.source_order_id)
         order_inputs.append(
             OrderObservationInput(
@@ -558,9 +762,7 @@ def _api_inputs(
                 fee_evidence_status=("complete" if fee is not None else "not_applicable"),
                 recorded_at=_utc(metadata.generated_at, field_name="generated_at"),
                 contract_multiplier=multiplier,
-                contract_multiplier_basis=(
-                    "evidence_derived_from_amount" if multiplier is not None else "unknown"
-                ),
+                contract_multiplier_basis=multiplier_basis,
                 source_updated_at=_utc(row.source_updated_at, field_name="updated_at"),
                 order_price=row.order_price,
                 order_amount=None,
@@ -569,18 +771,160 @@ def _api_inputs(
                 total_fee=None if fee is None else fee.total_fee,
             )
         )
+
+    group_inputs: list[ExecutionGroupObservationInput] = []
+    group_leg_by_identity: dict[tuple[str, str, str], tuple[str, Any]] = {}
+    next_leg_id = 5_000_000_000
+    for group_index, row in enumerate(
+        sorted(group_orders.values(), key=lambda item: item.source_order_id),
+        start=1,
+    ):
+        group_observation_id = 4_000_000_000 + group_index
+        legs: list[ExecutionGroupLegObservationInput] = []
+        for leg in row.combo_legs:
+            next_leg_id += 1
+            instrument = _instrument_fields(leg.raw_symbol)
+            multiplier, multiplier_basis, spec_sha256 = multiplier_fields(
+                raw_symbol=leg.raw_symbol,
+                instrument=instrument,
+                currency=row.currency,
+                allow_derived=False,
+            )
+            leg_key = _execution_group_leg_key(
+                row.source_order_id,
+                leg.raw_symbol,
+                leg.side,
+                leg.quantity_ratio,
+            )
+            leg_input = ExecutionGroupLegObservationInput(
+                observation_id=next_leg_id,
+                import_batch_id=virtual_batch_id,
+                batch_key=batch_key,
+                source_kind="openapi",
+                observation_key=leg_key,
+                source_record_sha256=_execution_group_leg_sha256(
+                    source_group_id=row.source_order_id,
+                    parent_source_record_sha256=row.source_record_sha256,
+                    leg_key=leg_key,
+                    raw_symbol=leg.raw_symbol,
+                    side=leg.side,
+                    quantity_ratio=leg.quantity_ratio,
+                    contract_multiplier=multiplier,
+                    contract_multiplier_basis=multiplier_basis,
+                    contract_spec_source_record_sha256=spec_sha256,
+                ),
+                broker="moomoo",
+                account_key=account_key,
+                group_observation_id=group_observation_id,
+                leg_key=leg_key,
+                **instrument,
+                side=leg.side,
+                currency=row.currency,
+                quantity_ratio=leg.quantity_ratio,
+                recorded_at=_utc(
+                    metadata.generated_at,
+                    field_name="generated_at",
+                ),
+                contract_multiplier=multiplier,
+                contract_multiplier_basis=multiplier_basis,
+                source_updated_at=_utc(
+                    row.source_updated_at,
+                    field_name="updated_at",
+                ),
+            )
+            legs.append(leg_input)
+            group_leg_by_identity[
+                (
+                    row.source_order_id,
+                    _normalized_symbol(leg.raw_symbol),
+                    leg.side.strip().upper(),
+                )
+            ] = (leg_key, leg_input)
+        fee = fee_by_order.get(row.source_order_id)
+        group_inputs.append(
+            ExecutionGroupObservationInput(
+                observation_id=group_observation_id,
+                import_batch_id=virtual_batch_id,
+                batch_key=batch_key,
+                source_kind="openapi",
+                observation_key=_observation_key(
+                    "execution_group",
+                    row.source_order_id,
+                ),
+                source_record_sha256=row.source_record_sha256,
+                broker="moomoo",
+                account_key=account_key,
+                source_group_id=row.source_order_id,
+                identity_strength="broker_stable",
+                environment=metadata.environment,
+                raw_group_symbol=row.raw_symbol,
+                group_side=row.side,
+                strategy_type=row.strategy_type or "UNKNOWN",
+                status=row.status,
+                currency=row.currency,
+                ordered_at=_utc(row.ordered_at, field_name="ordered_at"),
+                source_updated_at=_utc(
+                    row.source_updated_at,
+                    field_name="updated_at",
+                ),
+                package_quantity=row.order_quantity,
+                filled_package_quantity=row.summary_filled_quantity,
+                order_net_price=row.order_price,
+                average_net_price=row.summary_average_fill_price,
+                total_fee=None if fee is None else fee.total_fee,
+                fee_evidence_status=(
+                    "complete" if fee is not None else "missing"
+                ),
+                recorded_at=_utc(
+                    metadata.generated_at,
+                    field_name="generated_at",
+                ),
+                legs=tuple(legs),
+                fee_components=(
+                    () if fee is None else tuple(fee.fee_components)
+                ),
+                fee_observation_id=(
+                    None if fee is None else 7_000_000_000 + group_index
+                ),
+                fee_observation_key=(
+                    None
+                    if fee is None
+                    else _observation_key(
+                        "execution_group_fee",
+                        row.source_order_id,
+                    )
+                ),
+                fee_source_record_sha256=(
+                    None if fee is None else fee.source_record_sha256
+                ),
+            )
+        )
+
     fill_inputs: list[FillObservationInput] = []
     for index, row in enumerate(preview.fills, start=1):
         instrument = _instrument_fields(row.raw_symbol)
-        lookup = (
-            instrument["asset_type"],
-            str(instrument["underlying"]).upper(),
-            instrument["expiry"],
-            instrument["strike"],
-            instrument["option_right"],
-            row.currency.upper(),
+        multiplier, multiplier_basis, _ = multiplier_fields(
+            raw_symbol=row.raw_symbol,
+            instrument=instrument,
+            currency=row.currency,
+            allow_derived=row.source_order_id not in group_orders,
         )
-        multiplier = multiplier_by_instrument.get(lookup)
+        group_leg = group_leg_by_identity.get(
+            (
+                row.source_order_id,
+                _normalized_symbol(row.raw_symbol),
+                row.side.strip().upper(),
+            )
+        )
+        fill_link_key = (
+            None
+            if group_leg is None
+            else _execution_group_fill_link_key(
+                row.source_order_id,
+                row.source_deal_id,
+                group_leg[0],
+            )
+        )
         fill_inputs.append(
             FillObservationInput(
                 observation_id=3_000_000_000 + index,
@@ -602,19 +946,48 @@ def _api_inputs(
                 price=row.price,
                 recorded_at=_utc(metadata.generated_at, field_name="generated_at"),
                 contract_multiplier=multiplier,
-                contract_multiplier_basis=(
-                    "evidence_derived_from_amount" if multiplier is not None else "unknown"
-                ),
+                contract_multiplier_basis=multiplier_basis,
                 amount=None,
                 total_fee=None,
+                execution_group_id=(
+                    row.source_order_id
+                    if row.source_order_id in group_orders
+                    and group_leg is not None
+                    else None
+                ),
+                execution_group_leg_key=(
+                    None if group_leg is None else group_leg[0]
+                ),
+                execution_group_fill_link_id=(
+                    None if group_leg is None else 6_000_000_000 + index
+                ),
+                execution_group_fill_link_key=fill_link_key,
+                execution_group_fill_link_sha256=(
+                    None
+                    if fill_link_key is None
+                    else _execution_group_fill_link_sha256(
+                        row.source_order_id,
+                        row.source_deal_id,
+                        group_leg[0],
+                    )
+                ),
             )
         )
-    return tuple(order_inputs), tuple(fill_inputs)
+    return tuple(order_inputs), tuple(fill_inputs), tuple(group_inputs)
 
 
 def _empty_impact(preview: OpenApiExportPreview) -> OpenApiCanonicalImpact:
+    group_orders = tuple(
+        item for item in preview.orders if _is_execution_group_order(item)
+    )
+    ordinary_orders = tuple(
+        item
+        for item in preview.orders
+        if item.combo_definition_available
+        and not _is_execution_group_order(item)
+    )
     return OpenApiCanonicalImpact(
-        input_order_observations=len(preview.orders),
+        input_order_observations=len(ordinary_orders),
         input_fill_observations=len(preview.fills),
         canonical_orders=0,
         canonical_fills=0,
@@ -625,7 +998,256 @@ def _empty_impact(preview: OpenApiExportPreview) -> OpenApiCanonicalImpact:
         blocking_issues=1,
         analysis_ready=False,
         canonical_set_sha256="",
+        input_execution_group_observations=len(group_orders),
     )
+
+
+def _execution_group_source_counts(
+    preview: OpenApiExportPreview,
+) -> dict[str, int]:
+    group_orders = tuple(
+        item for item in preview.orders if _is_execution_group_order(item)
+    )
+    ordinary_order_count = sum(
+        item.combo_definition_available
+        and not _is_execution_group_order(item)
+        for item in preview.orders
+    )
+    group_ids = {item.source_order_id for item in group_orders}
+    return {
+        "ordinary_order_observations": ordinary_order_count,
+        "unclassified_parent_observations": (
+            len(preview.orders) - ordinary_order_count - len(group_orders)
+        ),
+        "execution_group_observations": len(group_orders),
+        "execution_group_leg_observations": sum(
+            len(item.combo_legs) for item in group_orders
+        ),
+        "execution_group_fill_links": sum(
+            item.source_order_id in group_ids for item in preview.fills
+        ),
+        "execution_group_fee_observations": sum(
+            item.source_order_id in group_ids for item in preview.fees
+        ),
+    }
+
+
+def _empty_write_plan() -> dict[str, Any]:
+    return {
+        "already_imported": False,
+        "order_observations": 0,
+        "ordinary_order_observations": 0,
+        "unclassified_parent_observations": 0,
+        "fill_observations": 0,
+        "fee_observations": 0,
+        "execution_group_observations": 0,
+        "execution_group_leg_observations": 0,
+        "execution_group_fill_links": 0,
+        "execution_group_fee_observations": 0,
+        "order_identity_links": 0,
+        "deal_identity_links": 0,
+        "fill_set_attestations": 0,
+        "canonical_sets": 0,
+    }
+
+
+def _execution_group_plan_issues(
+    preview: OpenApiExportPreview,
+    *,
+    base_start: datetime,
+    base_end: datetime,
+) -> tuple[OpenApiPlanIssue, ...]:
+    """Prove the narrow execution-group shape allowed by the first release."""
+    issues: list[OpenApiPlanIssue] = []
+    fee_by_order = {item.source_order_id: item for item in preview.fees}
+    fills_by_order: dict[str, list[Any]] = {}
+    for fill in preview.fills:
+        fills_by_order.setdefault(fill.source_order_id, []).append(fill)
+    contract_specs = _contract_specs_by_symbol(preview)
+
+    for row in preview.orders:
+        if not row.combo_definition_available:
+            issues.append(
+                OpenApiPlanIssue(
+                    code="combo_definition_capability_unproved",
+                    severity="blocking",
+                    entity_kind="source_capability",
+                    entity_key=_observation_key(
+                        "combo_capability",
+                        row.source_order_id,
+                    ),
+                    message=(
+                        "The source row does not prove that strategy_type and "
+                        "combo_legs were exposed by OpenD."
+                    ),
+                    field_name="combo_legs",
+                )
+            )
+        if not _is_execution_group_order(row):
+            continue
+
+        group_key = _observation_key(
+            "execution_group",
+            row.source_order_id,
+        )
+        ordered_at = _utc(row.ordered_at, field_name="combo.ordered_at")
+        if ordered_at < base_start:
+            issues.append(
+                OpenApiPlanIssue(
+                    code="combo_outside_csv_baseline_unprovable",
+                    severity="blocking",
+                    entity_kind="execution_group",
+                    entity_key=group_key,
+                    message=(
+                        "The execution group predates the accepted CSV baseline; "
+                        "cross-source group identity is not proved."
+                    ),
+                    field_name="ordered_at",
+                )
+            )
+        elif ordered_at <= base_end:
+            issues.append(
+                OpenApiPlanIssue(
+                    code="combo_csv_overlap_unprovable",
+                    severity="blocking",
+                    entity_kind="execution_group",
+                    entity_key=group_key,
+                    message=(
+                        "The execution group overlaps the CSV baseline; the CSV "
+                        "cannot prove that several legs share one broker parent."
+                    ),
+                    field_name="ordered_at",
+                )
+            )
+
+        if row.status.strip().upper() != "FILLED_ALL":
+            issues.append(
+                OpenApiPlanIssue(
+                    code="execution_group_partial_semantics_unproved",
+                    severity="blocking",
+                    entity_kind="execution_group",
+                    entity_key=group_key,
+                    message=(
+                        "Initial execution-group support accepts only terminal "
+                        "FILLED_ALL broker evidence."
+                    ),
+                    field_name="status",
+                )
+            )
+        if (
+            abs(row.summary_filled_quantity - row.order_quantity)
+            > _QUANTITY_TOLERANCE
+        ):
+            issues.append(
+                OpenApiPlanIssue(
+                    code="execution_group_package_quantity_incomplete",
+                    severity="blocking",
+                    entity_kind="execution_group",
+                    entity_key=group_key,
+                    message=(
+                        "Filled package quantity does not equal the requested "
+                        "package quantity."
+                    ),
+                    field_name="summary_filled_quantity",
+                )
+            )
+        if row.source_order_id not in fee_by_order:
+            issues.append(
+                OpenApiPlanIssue(
+                    code="execution_group_fee_missing",
+                    severity="blocking",
+                    entity_kind="execution_group",
+                    entity_key=group_key,
+                    message=(
+                        "A completed execution group requires one exact "
+                        "group-level broker fee observation."
+                    ),
+                    field_name="total_fee",
+                )
+            )
+
+        declared_legs = {
+            (
+                _normalized_symbol(leg.raw_symbol),
+                leg.side.strip().upper(),
+            ): leg
+            for leg in row.combo_legs
+        }
+        fill_quantities: dict[tuple[str, str], Decimal] = {}
+        unassigned_fill = False
+        for fill in fills_by_order.get(row.source_order_id, []):
+            identity = (
+                _normalized_symbol(fill.raw_symbol),
+                fill.side.strip().upper(),
+            )
+            if identity not in declared_legs:
+                unassigned_fill = True
+                continue
+            fill_quantities[identity] = (
+                fill_quantities.get(identity, Decimal("0")) + fill.quantity
+            )
+        if unassigned_fill:
+            issues.append(
+                OpenApiPlanIssue(
+                    code="execution_group_fill_unassigned",
+                    severity="blocking",
+                    entity_kind="execution_group",
+                    entity_key=group_key,
+                    message=(
+                        "One or more broker fills do not map to exactly one "
+                        "declared execution-group leg."
+                    ),
+                    field_name="combo_legs",
+                )
+            )
+        for identity, leg in declared_legs.items():
+            expected = row.order_quantity * leg.quantity_ratio
+            if (
+                abs(fill_quantities.get(identity, Decimal("0")) - expected)
+                > _QUANTITY_TOLERANCE
+            ):
+                issues.append(
+                    OpenApiPlanIssue(
+                        code="execution_group_leg_quantity_mismatch",
+                        severity="blocking",
+                        entity_kind="execution_group",
+                        entity_key=_execution_group_leg_key(
+                            row.source_order_id,
+                            leg.raw_symbol,
+                            leg.side,
+                            leg.quantity_ratio,
+                        ),
+                        message=(
+                            "Leg fill quantity does not equal package quantity "
+                            "multiplied by its declared ratio."
+                        ),
+                        field_name="quantity",
+                    )
+                )
+            instrument = _instrument_fields(leg.raw_symbol)
+            if (
+                instrument["asset_type"] == "option"
+                and _normalized_symbol(leg.raw_symbol) not in contract_specs
+            ):
+                issues.append(
+                    OpenApiPlanIssue(
+                        code="execution_group_contract_multiplier_unproved",
+                        severity="blocking",
+                        entity_kind="execution_group_leg",
+                        entity_key=_execution_group_leg_key(
+                            row.source_order_id,
+                            leg.raw_symbol,
+                            leg.side,
+                            leg.quantity_ratio,
+                        ),
+                        message=(
+                            "Executed option leg has no frozen broker contract "
+                            "multiplier evidence."
+                        ),
+                        field_name="contract_multiplier",
+                    )
+                )
+    return tuple(issues)
 
 
 def _plan_without_csv_baseline(
@@ -659,22 +1281,15 @@ def _plan_without_csv_baseline(
             "matched_orders": 0,
             "csv_only_in_window": 0,
             "api_only_orders": len(preview.orders),
+            "overlap_api_only_orders": 0,
+            "incremental_api_only_orders": 0,
             "ambiguous_identity_keys": 0,
             "covered_base_orders": 0,
             "base_orders": 0,
             "coverage_ratio": "0",
             "outside_unverified_orders": 0,
         },
-        write_plan={
-            "already_imported": False,
-            "order_observations": 0,
-            "fill_observations": 0,
-            "fee_observations": 0,
-            "order_identity_links": 0,
-            "deal_identity_links": 0,
-            "fill_set_attestations": 0,
-            "canonical_sets": 0,
-        },
+        write_plan=_empty_write_plan(),
         canonical_impact=_empty_impact(preview),
         issues=(issue,),
         warnings=tuple(preview.metadata.warnings),
@@ -703,12 +1318,15 @@ def plan_openapi_import(
         "environment": metadata.environment,
         "market": metadata.market,
         "account_selection": metadata.account_selection,
+        "account_bound": metadata.account_binding is not None,
         "window_start": metadata.window_start,
         "window_end": metadata.window_end,
         "source_timezone": metadata.source_timezone,
         "order_observations": len(preview.orders),
         "fill_observations": len(preview.fills),
         "fee_observations": len(preview.fees),
+        "contract_spec_observations": len(preview.contract_specs),
+        **_execution_group_source_counts(preview),
         "fee_totals_by_currency": {},
     }
     order_currency = {item.source_order_id: item.currency for item in preview.orders}
@@ -746,6 +1364,15 @@ def plan_openapi_import(
                 account_key=account_key,
                 source_scope=source_scope,
             )
+        base_start = _utc(base.window_start, field_name="base.window_start")
+        base_end = _utc(base.window_end, field_name="base.window_end")
+        issues.extend(
+            _execution_group_plan_issues(
+                preview,
+                base_start=base_start,
+                base_end=base_end,
+            )
+        )
 
         orders = tuple(
             session.execute(
@@ -771,7 +1398,58 @@ def plan_openapi_import(
         ).scalar_one_or_none()
 
         statement = _statement_from_rows(base, orders, fills)
-        reconciliation = reconcile_statement_with_readonly_export(statement, payload)
+        reconciliation = reconcile_statement_with_readonly_export(
+            statement,
+            payload,
+            baseline_window_end=base_end,
+        )
+        accepted_api_batches = session.execute(
+            select(ImportBatch).where(
+                ImportBatch.broker == "moomoo",
+                ImportBatch.account_key == account_key,
+                ImportBatch.source_kind == "openapi",
+                ImportBatch.status == "accepted",
+            )
+        ).scalars().all()
+        prior_account_bindings: set[str] = set()
+        for batch in accepted_api_batches:
+            try:
+                provenance = json.loads(str(batch.provenance_json))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            binding = str(provenance.get("account_binding") or "").strip().lower()
+            if binding:
+                prior_account_bindings.add(binding)
+        current_binding = (metadata.account_binding or "").strip().lower()
+        if reconciliation.incremental_api_only_orders and not current_binding:
+            issues.append(
+                OpenApiPlanIssue(
+                    code="incremental_tail_account_unbound",
+                    severity="blocking",
+                    entity_kind="account",
+                    entity_key=account_key,
+                    message=(
+                        "Incremental broker-only orders require a stable "
+                        "account binding from the server-owned OpenD refresh."
+                    ),
+                )
+            )
+        if prior_account_bindings and (
+            current_binding not in prior_account_bindings
+            or len(prior_account_bindings) != 1
+        ):
+            issues.append(
+                OpenApiPlanIssue(
+                    code="openapi_account_binding_conflict",
+                    severity="blocking",
+                    entity_kind="account",
+                    entity_key=account_key,
+                    message=(
+                        "This OpenD account binding differs from previously "
+                        "accepted broker evidence."
+                    ),
+                )
+            )
         persisted_inputs = load_canonical_observation_inputs(
             account_key,
             _session=session,
@@ -782,7 +1460,7 @@ def plan_openapi_import(
             )
         multiplier_by_instrument = _multiplier_map(orders, fills)
         if existing_api is None:
-            api_orders, api_fills = _api_inputs(
+            api_orders, api_fills, api_groups = _api_inputs(
                 preview,
                 account_key=account_key,
                 virtual_batch_id=max(max_batch_id + 1, 1),
@@ -792,7 +1470,7 @@ def plan_openapi_import(
             # Re-planning an already accepted export must use its persisted
             # observations exactly once.  Adding a second virtual copy would
             # change provenance counts and break idempotent confirmation.
-            api_orders, api_fills = (), ()
+            api_orders, api_fills, api_groups = (), (), ()
 
         projection: Optional[IdentityProjection] = None
         evidence_set: Optional[CanonicalEvidenceSet] = None
@@ -809,7 +1487,14 @@ def plan_openapi_import(
                     batch_key=str(base.batch_key),
                 ),
             )
-            evidence_set = canonicalize_observations(projection.orders, projection.fills)
+            evidence_set = canonicalize_observations(
+                projection.orders,
+                projection.fills,
+                execution_group_observations=(
+                    *getattr(persisted_inputs, "execution_groups", ()),
+                    *api_groups,
+                ),
+            )
         except IdentityProjectionError as exc:
             issues.append(
                 OpenApiPlanIssue(
@@ -863,6 +1548,18 @@ def plan_openapi_import(
                 )
         else:
             impact = _empty_impact(preview)
+
+        if any(item.severity == "blocking" for item in issues):
+            impact = OpenApiCanonicalImpact(
+                **{
+                    **impact.__dict__,
+                    "blocking_issues": max(
+                        impact.blocking_issues,
+                        sum(item.severity == "blocking" for item in issues),
+                    ),
+                    "analysis_ready": False,
+                }
+            )
 
         planned_order_links = 0
         planned_deal_links = 0
@@ -994,11 +1691,12 @@ def plan_openapi_import(
                 }
             )
 
-        base_start = _utc(base.window_start, field_name="base.window_start")
-        base_end = _utc(base.window_end, field_name="base.window_end")
         cutoff = max(base_end, _utc(metadata.window_end, field_name="window_end"))
         scope_is_full = reconciliation.matched_orders == len(orders)
-        scope = "full_batch" if scope_is_full else "partial_window"
+        if reconciliation.incremental_api_only_orders > 0:
+            scope = "incremental_tail"
+        else:
+            scope = "full_batch" if scope_is_full else "partial_window"
         ratio = (
             Decimal(reconciliation.matched_orders) / Decimal(len(orders))
             if orders
@@ -1018,6 +1716,12 @@ def plan_openapi_import(
             "matched_orders": reconciliation.matched_orders,
             "csv_only_in_window": reconciliation.statement_only_orders,
             "api_only_orders": reconciliation.api_only_orders,
+            "overlap_api_only_orders": (
+                reconciliation.overlap_api_only_orders
+            ),
+            "incremental_api_only_orders": (
+                reconciliation.incremental_api_only_orders
+            ),
             "ambiguous_identity_keys": reconciliation.ambiguous_identity_keys,
             "covered_base_orders": reconciliation.matched_orders,
             "base_orders": len(orders),
@@ -1034,11 +1738,42 @@ def plan_openapi_import(
                 )
             ).scalar_one_or_none()
         already_imported = existing_api is not None and existing_set is not None
+        source_counts = _execution_group_source_counts(preview)
         write_plan = {
             "already_imported": already_imported,
             "order_observations": 0 if existing_api is not None else len(preview.orders),
+            "ordinary_order_observations": (
+                0
+                if existing_api is not None
+                else source_counts["ordinary_order_observations"]
+            ),
+            "unclassified_parent_observations": (
+                0
+                if existing_api is not None
+                else source_counts["unclassified_parent_observations"]
+            ),
             "fill_observations": 0 if existing_api is not None else len(preview.fills),
             "fee_observations": 0 if existing_api is not None else len(preview.fees),
+            "execution_group_observations": (
+                0
+                if existing_api is not None
+                else source_counts["execution_group_observations"]
+            ),
+            "execution_group_leg_observations": (
+                0
+                if existing_api is not None
+                else source_counts["execution_group_leg_observations"]
+            ),
+            "execution_group_fill_links": (
+                0
+                if existing_api is not None
+                else source_counts["execution_group_fill_links"]
+            ),
+            "execution_group_fee_observations": (
+                0
+                if existing_api is not None
+                else source_counts["execution_group_fee_observations"]
+            ),
             "order_identity_links": (
                 0 if already_imported else planned_order_links
             ),
@@ -1067,6 +1802,33 @@ def plan_openapi_import(
                     if projection is None
                     else [item.attestation_key for item in projection.fill_set_attestations]
                 ),
+            },
+            "execution_group_projection": {
+                "name": _EXECUTION_GROUP_PROJECTION_NAME,
+                "version": _EXECUTION_GROUP_PROJECTION_VERSION,
+                "group_observation_keys": [
+                    item.observation_key
+                    for item in sorted(
+                        api_groups,
+                        key=lambda value: value.observation_key,
+                    )
+                ],
+                "leg_observation_keys": sorted(
+                    leg.observation_key
+                    for item in api_groups
+                    for leg in item.legs
+                ),
+                "fill_link_keys": sorted(
+                    item.execution_group_fill_link_key
+                    for item in api_fills
+                    if item.execution_group_fill_link_key is not None
+                ),
+                "fee_observation_keys": sorted(
+                    item.fee_observation_key
+                    for item in api_groups
+                    if item.fee_observation_key is not None
+                ),
+                "fee_scope": "execution_group_only",
             },
             "canonical_reader": {
                 "name": CANONICAL_READER_NAME,
@@ -1164,10 +1926,48 @@ def confirm_openapi_import_plan(
 
     import_result = result.import_result
     canonical_result = result.canonical_set
+    execution_group_observations = int(
+        getattr(import_result, "execution_group_observations", 0)
+    )
+    execution_group_leg_observations = int(
+        getattr(import_result, "execution_group_leg_observations", 0)
+    )
+    execution_group_fill_links = int(
+        getattr(import_result, "execution_group_fill_links", 0)
+    )
+    execution_group_fee_observations = int(
+        getattr(import_result, "execution_group_fee_observations", 0)
+    )
     appended = {
         "orders": 0 if import_result.duplicate else import_result.order_observations,
+        "ordinary_orders": (
+            0
+            if import_result.duplicate
+            else import_result.order_observations
+            - execution_group_observations
+        ),
         "fills": 0 if import_result.duplicate else import_result.fill_observations,
         "fees": 0 if import_result.duplicate else import_result.fee_observations,
+        "execution_groups": (
+            0
+            if import_result.duplicate
+            else execution_group_observations
+        ),
+        "execution_group_legs": (
+            0
+            if import_result.duplicate
+            else execution_group_leg_observations
+        ),
+        "execution_group_fill_links": (
+            0
+            if import_result.duplicate
+            else execution_group_fill_links
+        ),
+        "execution_group_fees": (
+            0
+            if import_result.duplicate
+            else execution_group_fee_observations
+        ),
         "order_links": sum(not item.duplicate for item in result.order_identity_links),
         "deal_links": sum(not item.duplicate for item in result.deal_identity_links),
         "fill_set_attestations": sum(
@@ -1188,6 +1988,8 @@ def confirm_openapi_import_plan(
         canonical={
             "orders": impact.canonical_orders,
             "fills": impact.canonical_fills,
+            "execution_groups": impact.canonical_execution_groups,
+            "execution_group_legs": impact.canonical_execution_group_legs,
             "shadowed_csv_fills": impact.shadowed_csv_fills,
             "shadowed_aggregate_orders": impact.shadowed_aggregate_orders,
             "blocking_issues": impact.blocking_issues,

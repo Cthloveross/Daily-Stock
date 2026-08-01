@@ -75,16 +75,16 @@ Moomoo 原始数据
 
 用户想完成的是“今天是否可交易”“这笔为什么赚/亏”“哪种做法可重复”“下一笔要遵守什么”，而不是分别参观 Journal、Regime、Backtest 等代码模块。
 
-## 4. 当前基线与缺口（更新至 2026-07-21）
+## 4. 当前基线与缺口（更新至 2026-07-23）
 
 | 能力 | 当前事实 | 结论 |
 |---|---|---|
-| Moomoo SDK / OpenD | 只读探测已采用唯一/显式稳定账户、7 日分块、稳定 ID、费用分批、完整对账和进程级总超时；正确 CSV 与 API 稳定窗口已全量对账；去标识化 JSON 已完成严格 parser、plan/confirm、append-only persistence 与 canonical set | live writer 继续暂停；canonical set 已可显式生成对比 EpisodeBuild，下一步是 opening snapshot |
+| Moomoo SDK / OpenD | 只读探测已采用唯一/显式稳定账户、7 日分块、稳定 ID、费用分批、完整对账和进程级总超时；正确 CSV 与 API 稳定窗口已全量对账；去标识化 JSON 已完成严格 parser、plan/confirm、append-only persistence 与 canonical set；当前期权持仓已具备独立双采样、预览/确认、30 分钟 currentness 和 append-only 快照 | live writer 继续暂停；过期、账户变化或 publication 被取代的确认记录只作为历史证据，当前持仓仍只证明本次采集区间，可作未来锚点，但尚未通过成交连续性 fence 成为 Episode opening boundary |
 | 常驻进程 | 三个旧 LaunchAgent 已卸载；SDK 连接快速失败、资源释放和日志轮转已有确定性测试 | 仍需 24 小时在线/离线观察后再决定只恢复哪些服务；旧 Journal sync 不恢复 |
 | 日志 | 项目与 Moomoo SDK 历史轮转日志已归档压缩，约释放 5.3 GB；SDK 控制台关闭、文件日志降到 WARNING 并保留 3 份 | 仍需 24 小时测量实际增长量与重复 incident 抑制 |
-| Journal 数据 | 当前 CSV 基线的 build 1 与 canonical set 1 的冻结 replay 都得到 5,974 个执行事件（574 aggregate + 5,400 fill）、1,441 个 PositionEpisode，USD 151,750.75 费用守恒；OpenAPI batch 3 与 canonical set 1 已正式追加 | canonical 对比构建需显式 confirm 且不自动替换 build 1；期初边界仍为 `assumed_flat_unverified`，headline 严格为空 |
-| Web | `/regime`、`/watchlist`、`/stocks/:ticker`、`/journal` 与 `/journal/review/:episodeId` 等路由可见；仓位列表可按大赚/大亏/高费用/长持有精选案例 | 单合约事实核对、案例定位与底层行情已形成第一条连续路径；完整导航、标注和策略级工作流仍未完成 |
-| Journal UI | 默认进入“仓位复盘”，读取 CSV immutable build；canonical Episode 另走显式 preview/confirm 与 `build_id` 对比；单合约工作台提供 1m/2m/5m/15m/30m/1h/日线、常规/扩展时段、ET 横轴、EMA8/13、现金流 marker、fill/order-time-proxy 区分、行情 provenance、本地证据复盘、六字段本机交易逻辑草稿和按需模型增强 | 证据事实层不依赖 LLM 且不能被模型替换；模型推断层和交易逻辑草稿仍只作非持久化增强。尚无经用户确认的多腿 StrategyEpisode、服务端持久化 ReviewAnnotation、期权行情/Greeks 和完整 Review Workspace |
+| Journal 数据 | 当前 CSV 基线的 build 1 与 canonical set 1 的冻结 replay 都得到 5,974 个执行事件（574 aggregate + 5,400 fill）、1,441 个 PositionEpisode，USD 151,750.75 费用守恒；OpenAPI batch 3 与 canonical set 1 已正式追加；当前持仓快照存放在独立账本 | canonical 对比构建需显式 confirm 且不自动替换 build 1；历史期初边界仍为 `assumed_flat_unverified`，当前快照不会倒推旧窗口，headline 严格为空 |
+| Web | `/regime`、`/watchlist`、`/stocks/:ticker`、`/journal` 与 `/journal/review/:episodeId` 等路由可见；仓位列表可按大赚/大亏/高费用/长持有精选案例，并按待复盘/进行中/已完成进入 Review Queue | 单合约事实核对、案例定位、底层行情与可继续的复盘队列已形成第一条连续路径；完整导航和策略级工作流仍未完成 |
+| Journal UI | 默认进入“仓位复盘”，读取 CSV immutable build；canonical Episode 另走显式 preview/confirm 与 `build_id` 对比；单合约工作台提供 1m/2m/5m/15m/30m/1h/日线、常规/扩展时段、ET 横轴、EMA8/13、现金流 marker、fill/order-time-proxy 区分、行情 provenance、本地证据复盘、六字段草稿、用户标签/错误类型、append-only ReviewAnnotation v1 与按需模型增强 | 证据事实层不依赖 LLM 且不能被模型替换；未提交草稿仍只在浏览器，显式保存才追加绑定 immutable build + PositionEpisode 的用户自述版本，AI 不自动写入。尚无经用户确认的多腿 StrategyEpisode、期权历史行情/Greeks、MFE/MAE 和完整 Strategy Review |
 | Moomoo UI | badge、证据覆盖率、局部对账状态、OpenAPI 写入计划/确认、canonical 构建计划和 PositionEpisode 下钻可见；旧 `/journal/sync-live` 固定拒绝 | 仍缺失败恢复和完整 Strategy Review |
 | 设置 API | `phase0` Schema 错误已修复，真实浏览器可加载全部配置 | Phase0 仍缺用户友好名称与交易任务分层 |
 | 自动交易 | 生产目录未发现解锁/下单/改单/撤单引用，并有 AST 边界测试持续扫描 | 永久保持这一安全边界 |
@@ -118,9 +118,9 @@ Moomoo 原始数据
 - 旧 Journal 的 `Reality Test`、DTE 图和时间显示没有 provenance，且与新的只读事实集不是同一数据口径；时区与 DTE 映射必须在继续美化前修正；
 - 胜率与 0DTE 占比原先使用固定“盈亏平衡/危险”阈值，这些误导文案已改为描述性提示；后续必须结合赔率、费用、P&L 分布和风险判断。
 
-Data Health、“仓位复盘”、canonical 对比构建、案例精选、七档 K 线/evidence 联动、本地证据复盘和按需模型增强已经落地。
+Data Health、“仓位复盘”、canonical 对比构建、案例精选、七档 K 线/evidence 联动、本地证据复盘、按需模型增强、ReviewAnnotation v1 和 Review Queue 已经落地。
 前端下一步不是继续给 legacy 页面加卡片，而是利用案例精选和该工作台抽查复杂生命周期，
-再补用户确认的 StrategyEpisode 分组、复盘注释和期权/市场快照。
+再补用户确认的 StrategyEpisode 分组、TradePlan/RuleEvaluation 和期权/市场快照。
 
 ## 5. 目标用户与核心任务
 
@@ -153,7 +153,7 @@ Data Health、“仓位复盘”、canonical 对比构建、案例精选、七�
 | `OptionSnapshot` | bid/ask、成交量、OI、IV、Greeks、DTE、曲面位置 | 期权链能力存在，但未和每笔交易冻结关联 |
 | `TradePlan` | 入场前假设、触发条件、失效条件、目标、最大风险 | 缺失 |
 | `RuleEvaluation` | 某笔交易对每条 Playbook 规则的遵守结果 | 缺失 |
-| `ReviewAnnotation` | 用户/AI 的观察、截图、图表标注、证据引用 | legacy notes 仍在；单合约本地/模型复盘文本只按需返回、不持久化，尚未形成可审计 annotation |
+| `ReviewAnnotation` | 用户显式保存的事后自述、标签与错误类型 | v1 已实现：绑定 immutable build + PositionEpisode，按 revision append-only 追加并保留 content hash/前序链接；没有 annotation 派生为待复盘，最新版本决定进行中/已完成。AI、本地证据复盘与模型增强不会自动写入，且 annotation 不修改 broker evidence、canonical、Episode 经济字段或 P&L |
 | `PlaybookRule` | 可版本化的个人策略与纪律规则 | 当前 Framework 是一段 localStorage 文本，不可审计 |
 | `Experiment` | 一条候选规律的样本、假设、开始/停止条件和样本外结果 | 缺失 |
 
@@ -223,7 +223,7 @@ Data Health、“仓位复盘”、canonical 对比构建、案例精选、七�
 
 这是整个产品最重要的页面。
 
-第一条可用纵向切片已落地：仓位列表可按大赚、大亏、高费用和长持有定位案例；`/journal/review/:episodeId` 保留 `build_id` 与列表筛选上下文，支持 1m/2m/5m/15m/30m/1h/日线并联动不可变 execution evidence。分钟线默认常规时段，可显式切换含盘前盘后，EMA8/13 根据当前口径重算，横轴与十字光标固定显示 ET。2 分钟线明确声明由带时区 1 分钟线派生；marker 以分配现金流区分买卖，真实 fill 和订单时间代理采用不同视觉语义；首次 5 分钟行情覆盖不足时明确降级日线。用户可在六字段本机草稿中分开记录进场前计划和事后反思，再生成去标识化、非持久化的本地证据复盘或请求专用模型链增强；模型失败不影响完整证据审阅。当前仍是 PositionEpisode 单合约视图，本机草稿不是持久化 ReviewAnnotation，也不含策略分组、期权行情、MFE/MAE 或 Playbook。
+第一条可用纵向切片已落地：仓位列表可按大赚、大亏、高费用和长持有定位案例，并用 Review Queue 区分待复盘、进行中和已完成；`/journal/review/:episodeId` 保留 `build_id` 与列表筛选上下文，支持 1m/2m/5m/15m/30m/1h/日线并联动不可变 execution evidence。分钟线默认常规时段，可显式切换含盘前盘后，EMA8/13 根据当前口径重算，横轴与十字光标固定显示 ET。2 分钟线明确声明由带时区 1 分钟线派生；marker 以分配现金流区分买卖，真实 fill 和订单时间代理采用不同视觉语义；首次 5 分钟行情覆盖不足时明确降级日线。用户可在六字段本机草稿中分开记录进场前计划和事后反思，并添加用户标签/错误类型；显式保存会为当前 immutable build + PositionEpisode 追加一版 ReviewAnnotation，非重复编辑不会覆盖旧版，相同最新内容幂等。去标识化本地证据复盘和专用模型链增强继续独立运行，模型失败不影响证据审阅，也不会自动写入 annotation。当前仍是 PositionEpisode 单合约视图，不含策略分组、期权历史行情、MFE/MAE、TradePlan/RuleEvaluation 或 Playbook。
 
 ```text
 ┌────────────────────────────────────────────────────────────┐
@@ -245,7 +245,7 @@ Data Health、“仓位复盘”、canonical 对比构建、案例精选、七�
 - AI 只使用去标识化事实，条件 P&L 不升级，单笔案例不证明 edge；
 - 一键对比相同 setup 的盈利和亏损交易；
 - AI 回答必须附引用：交易字段、图表区间、规则版本或行情快照；
-- 复盘保存后立即更新 Review Queue 和规则统计。
+- 显式保存用户自述后更新 Review Queue；规则统计要等 RuleEvaluation 落地，不能由 annotation 或 AI 文本自动生成。
 
 ### 8.4 Analytics / Edge Explorer
 
@@ -279,6 +279,7 @@ Data Health、“仓位复盘”、canonical 对比构建、案例精选、七�
 - stdout/stderr 与业务事件分离，结构化记录 component、event、severity、attempt；
 - 文件日志可轮转、可配置保留期和总量上限；
 - 默认不记录账户号、token、完整原始成交或用户 Framework；
+- Finnhub 等第三方 HTTP 失败摘要必须移除完整 query string 与 `token/api_key/key` 值，只保留异常类型、状态和不含查询参数的路径等诊断信息；本次修复只保护后续新日志，现存旧日志可能仍含历史值且不会被程序自动改写；
 - UI 只展示“发生了什么、影响什么、如何恢复、最后一次时间”；
 - 验收时测量空闲、OpenD 离线和数据源故障三种情况下的日志增长。
 
@@ -308,7 +309,7 @@ Data Health、“仓位复盘”、canonical 对比构建、案例精选、七�
 
 ### Phase 1：Moomoo 数据可信与策略生命周期（1–2 周）
 
-**Phase 1.1–1.5 当前进度**：CSV loss-aware parser、双来源稳定窗口对账、append-only ImportBatch/Order/Fill、CSV preview/import/data-health API 已完成。signed-position lifecycle builder 已把当前 CSV 基线的 5,974 个执行事件构建为 1,441 个 PositionEpisode，并用 1:1 unclassified StrategyEpisode 保留后续分组空间；费用 USD 151,750.75 全量守恒。Phase 1.3B 已落地严格 OpenAPI parser、DB-aware plan/confirm、显式 identity links、fill-set attestations 与版本化 canonical persistence；当前正式本地账本已保存 1,089 order、2,107 fill、1,058 fee observations，canonical 输出 3,542 orders / 5,400 fills、0 blockers。Phase 1.4 新增冻结 canonical set replay、显式 preview/confirm、append-only source binding 与 `build_id` 对比读取。Phase 1.5 的单合约复盘切片现已支持大赚/大亏/高费用/长持有案例精选，保留构建/筛选返回上下文，以分配现金流确定买卖 marker，并提供 1m/2m/5m/15m/30m/1h/日线切换；分钟线默认使用 09:30–16:00 ET，可显式切换 04:00–20:00 ET，EMA8/13 基于当前时段重算，图表横轴与十字光标固定显示纽约时间。2 分钟线声明由带时区 1 分钟线派生，首次 5 分钟覆盖不完整时才明确降级日线。复盘助手先返回不依赖 LLM 的证据复盘，再按需调用复盘专用模型链；模型失败时仍返回完整本地复盘且不写入账本。六字段浏览器草稿会严格分开进场前计划和事后记录，只把非空字段作为未经验证的用户自述附在本次请求。分钟级收益代理只使用成交前最近已完成且仍新鲜的 bar，Regime 缺少生成 as-of 时保持开仓可见性未知。它不重新计算账户收益，不把 aggregate proxy、未完成 bar 的最终 close、日线位置或单笔案例描述成当时已知信号、精确入场或已验证 edge。由于缺少已验证的期初持仓快照，构建仍为 `assumed_flat_unverified`，所有 Episode 排除在 headline 之外。opening snapshot、真实多腿意图确认和 20 个复杂生命周期人工抽查仍未完成，因此 Phase 1 尚未退出。
+**Phase 1.1–1.5 当前进度**：CSV loss-aware parser、双来源稳定窗口对账、append-only ImportBatch/Order/Fill、CSV preview/import/data-health API 已完成。signed-position lifecycle builder 已把当前 CSV 基线的 5,974 个执行事件构建为 1,441 个 PositionEpisode，并用 1:1 unclassified StrategyEpisode 保留后续分组空间；费用 USD 151,750.75 全量守恒。Phase 1.3B 已落地严格 OpenAPI parser、DB-aware plan/confirm、显式 identity links、fill-set attestations 与版本化 canonical persistence；当前正式本地账本已保存 1,089 order、2,107 fill、1,058 fee observations，canonical 输出 3,542 orders / 5,400 fills、0 blockers。Phase 1.4 新增冻结 canonical set replay、显式 preview/confirm、append-only source binding 与 `build_id` 对比读取。Phase 1.5 的单合约复盘切片现已支持大赚/大亏/高费用/长持有案例精选，保留构建/筛选返回上下文，以分配现金流确定买卖 marker，并提供 1m/2m/5m/15m/30m/1h/日线切换；分钟线默认使用 09:30–16:00 ET，可显式切换 04:00–20:00 ET，EMA8/13 基于当前时段重算，图表横轴与十字光标固定显示纽约时间。2 分钟线声明由带时区 1 分钟线派生，首次 5 分钟覆盖不完整时才明确降级日线。复盘助手先返回不依赖 LLM 的证据复盘，再按需调用复盘专用模型链；模型失败时仍返回完整本地复盘且不写入账本。六字段浏览器草稿会严格分开进场前计划和事后记录，只把非空字段作为未经验证的用户自述附在本次请求。ReviewAnnotation v1 现允许用户显式把六字段、标签和错误类型保存为绑定 immutable build + PositionEpisode 的 append-only revision；相同最新内容幂等，AI 不自动写入，最新状态驱动待复盘/进行中/已完成队列。分钟级收益代理只使用成交前最近已完成且仍新鲜的 bar，Regime 缺少生成 as-of 时保持开仓可见性未知。annotation 与复盘助手都不重新计算账户收益，不把 aggregate proxy、未完成 bar 的最终 close、日线位置或单笔案例描述成当时已知信号、精确入场或已验证 edge。当前期权持仓已能以独立双采样快照保存，但它只证明采集区间内的当前状态，尚未通过成交连续性 fence 成为任何历史构建的 opening boundary；因此构建仍为 `assumed_flat_unverified`，所有 Episode 排除在 headline 之外。未来边界接线、真实多腿意图确认和 20 个复杂生命周期人工抽查仍未完成，因此 Phase 1 尚未退出。
 
 交付：
 
@@ -327,7 +328,7 @@ Data Health、“仓位复盘”、canonical 对比构建、案例精选、七�
 
 ### Phase 2：单笔复盘工作台与新导航（2–3 周）
 
-**当前进度**：单合约 PositionEpisode 的案例精选、七档 K 线/evidence、常规/扩展时段、ET 时间轴、现金流买卖点、六字段本机交易逻辑草稿、本地证据复盘和按需模型增强已作为第一条纵向切片落地；复盘文本与草稿均不写入服务端，也不把条件 P&L、用户自述或单笔相关性升级为账户事实/edge。完整 StrategyEpisode header、服务端 ReviewAnnotation、规则遵守、期权状态、MFE/MAE、同类 cohort 对照和新导航仍待完成。
+**当前进度**：单合约 PositionEpisode 的案例精选、七档 K 线/evidence、常规/扩展时段、ET 时间轴、现金流买卖点、六字段本机未提交草稿、本地证据复盘、按需模型增强、ReviewAnnotation v1 和 Review Queue 已作为第一条纵向切片落地。用户可显式保存绑定 immutable build + PositionEpisode 的事后自述 revision；AI/确定性复盘文本不自动持久化，annotation 也不把条件 P&L、用户自述或单笔相关性升级为账户事实/edge。完整 StrategyEpisode header、TradePlan/RuleEvaluation、期权状态、MFE/MAE、同类 cohort 对照和新导航仍待完成。
 
 交付：
 
@@ -379,7 +380,15 @@ Data Health、“仓位复盘”、canonical 对比构建、案例精选、七�
 
 ### Phase 5：行情与盘前/盘中决策台（约 3 周）
 
-**当前进度**：已提前交付四层只读纵向切片：`/regime` 顶部按本地自选或服务端 `STOCK_LIST` 请求确定性每日候选，使用上一完整交易日、EMA8/13、量价结构和当日已保存 Regime，逐项展示来源、时间、支持/反证、未知项和 readiness；基础榜先完成，再按需渐进读取 Moomoo 最近到期 ATM Call 单点 IV、0–45 DTE 可观测 OI/Volume/无符号 Gamma 集中墙，以及最近交易时段异常期权成交。四层都不调用 LLM、不写机会或交易事实、不输出伪精确总分；IV 快照不冒充 IV Rank，期权墙不冒充 Dealer GEX，Moomoo 的方向/情绪/事件标签也不证明开平仓、真实主动方或 dealer 仓位。实现以请求级行情 manager 复用、受控并发、服务端 single-flight/TTL、单标重叠缓存、前端独立超时和最新请求保护降低日志、等待与官方限频风险；QuoteContext 另设 5 秒同步连接等待上限，断线查询 fail closed。真实 IV Rank、场外/TRF print、用户确认 Playbook、TradePlan、事件快照持久化和 5d/20d 样本外结果闭环尚未完成，缺失时保持 `not_configured/unknown`。详细边界与接入顺序见 [`phase1/06_DAILY_OPPORTUNITY_BOARD.md`](../phase1/06_DAILY_OPPORTUNITY_BOARD.md)。
+**当前进度**：已提前交付四层只读纵向切片：`/regime` 顶部按本地自选或服务端研究池请求确定性每日候选，使用上一完整交易日、EMA8/13、量价结构和当日已保存 Regime，逐项展示来源、时间、支持/反证、未知项和 readiness；基础榜先完成，再按需渐进读取 Moomoo underlying IV/IV Rank/HV 概览、最近到期 ATM Call 单点 IV、0–45 DTE 可观测 OI/Volume/无符号 Gamma 集中墙，以及最近交易时段异常期权成交。四层都不调用 LLM、不写交易事实、不输出伪精确总分；期权墙不冒充 Dealer GEX，Moomoo 的方向/情绪/事件标签也不证明开平仓、真实主动方或 dealer 仓位。Canonical 盘前研究已具备服务端研究池、持久化 attempt/stage/lease 与 09:12/09:17 ET scheduler；冻结候选的 5D/20D underlying 路径由独立收盘后任务按 XNYS 日历自动成熟，只有同一 cohort 满 20 个方向样本和 20 个独立交易日才显示描述命中率，且永不自动调权。场外/TRF print、用户确认 Playbook、TradePlan、期权增强冻结、真实期权 P&L 和 TriggerSpec 尚未完成。详细边界见 [`phase1/06_DAILY_OPPORTUNITY_BOARD.md`](../phase1/06_DAILY_OPPORTUNITY_BOARD.md) 与 [`phase1/09_AUTOMATIC_OUTCOME_MAINTENANCE.md`](../phase1/09_AUTOMATIC_OUTCOME_MAINTENANCE.md)。
+
+**下一段实施顺序（foundation 已开始接线；未完成项和待验收项不得描述成当前页面能力）**：
+
+1. **Canonical Premarket Research Cycle**：v1 已接入服务端有序研究池版本、append-only attempt/stage、SQLite lease、重启状态重建和 snapshot/publication/lease 同事务；本地 scheduler 在 XNYS `open-18m`（常规日 09:12 ET）首次生成，失败时在 `open-13m`（09:17）恢复，`open-12m` 禁止新 leader、`open-10m` 硬截止。Web 加载只读 status，不再自动 run；只有用户显式操作才发送 `manual=true`，且不能绕过同一时点和两次 attempt 上限。它仍不是完整 canonical session：当前成功 run 会立即冻结，尚无 append-only draft/finalizer、pool 生效交易日、服务端 last-good、外部进程监管或期权增强冻结，且尚未经过真实 `09:12–09:20 ET` 盘前验收。详细合同见 [`phase1/07_CANONICAL_PREMARKET_RESEARCH_CYCLE.md`](../phase1/07_CANONICAL_PREMARKET_RESEARCH_CYCLE.md) 与 [`phase1/08_SERVER_OWNED_PREMARKET_ORCHESTRATION.md`](../phase1/08_SERVER_OWNED_PREMARKET_ORCHESTRATION.md)。
+2. **全宽 Top 5 / near-spot wall**：canonical session 就绪后，再把主页面收敛为全宽 Top 5，优先展示现价附近可执行价位的 Call/Put OI、Volume 与无符号 Gamma 集中墙；完整链与排名外增强按需展开，墙继续不推断 dealer 方向或 gamma flip。
+3. **ATM contract shortlist**：最后才从已通过数据门禁的候选中列出具体近 ATM 合约，至少同时显示到期日/DTE、执行价、Call/Put、bid/ask、spread、delta、OI、volume 与各字段 as-of。缺少盘口或时间证据时不生成“可交易”短名单，短名单也只是研究候选，不是方向预测、胜率或订单指令。
+
+这个顺序先固定“哪一份盘前事实”作为同日真源，再确定重点标的和 near-spot 结构，最后才选择具体合约，避免在候选与墙仍漂移时制造看似精确的合约建议。全链路继续永久只读。
 
 交付：
 
@@ -470,4 +479,4 @@ Data Health、“仓位复盘”、canonical 对比构建、案例精选、七�
 
 ---
 
-当前 Phase 0 的代码止血项已完成，24 小时在线/离线运行观察仍未签字；Phase 1.1–1.2 已建立从 broker evidence 到 PositionEpisode 的第一条可信链路，Phase 1.3B 已完成 OpenAPI 严格预览、DB-aware plan/confirm、identity-link-aware canonical persistence，Phase 1.4 已补齐冻结 canonical set 到显式、可对比 EpisodeBuild 的接线，Phase 1.5 已把案例精选、单个 Episode、七档底层 K 线、常规/扩展时段、ET 时间轴、execution evidence、本地证据复盘和按需模型增强接入同一只读工作台。当前 accepted CSV 与只读 OpenAPI 稳定窗口逐单核对 1,089 / 3,542 个订单，scope 为 `partial_window`；正式本地账本已追加 OpenAPI batch 3（1,089 orders / 2,107 fills / 1,058 fees）、1,089 order links、1,136 deal links、244 fill-set attestations，并生成 3,542 orders / 5,400 fills、0 blockers 的 canonical set。CSV build 1 与 canonical preview 均得到 5,400 条 fill + 574 条 aggregate order events、1,441 个 PositionEpisode（1,437 closed、4 open / 44 contracts）和 USD 151,750.75 费用守恒；后者必须显式 confirm，且不自动替换默认 build 1。工作台保留 `build_id` 与案例上下文，以现金流方向显示买卖点，区分真实 fill/订单时间代理，显示行情 provenance，并在手动周期或模型不可用时显式降级；它不会改变 `assumed_flat_unverified`、headline 资格或 Moomoo 永久只读边界。下一步是用四类案例完成复杂生命周期抽查，核验 opening snapshot，并补多腿/roll 人工确认、复盘注释和期权/市场快照；旧 live writer 在这些退出条件完成前保持禁用。未经用户明确确认，不执行 git commit/push；本项目不引入自动下单能力。
+当前 Phase 0 的代码止血项已完成，24 小时在线/离线运行观察仍未签字；Phase 1.1–1.2 已建立从 broker evidence 到 PositionEpisode 的第一条可信链路，Phase 1.3B 已完成 OpenAPI 严格预览、DB-aware plan/confirm、identity-link-aware canonical persistence，Phase 1.4 已补齐冻结 canonical set 到显式、可对比 EpisodeBuild 的接线，Phase 1.5 已把案例精选、单个 Episode、七档底层 K 线、常规/扩展时段、ET 时间轴、execution evidence、本地证据复盘、按需模型增强、ReviewAnnotation v1 与 Review Queue 接入同一工作台。当前 accepted CSV 与只读 OpenAPI 稳定窗口逐单核对 1,089 / 3,542 个订单，scope 为 `partial_window`；正式本地账本已追加 OpenAPI batch 3（1,089 orders / 2,107 fills / 1,058 fees）、1,089 order links、1,136 deal links、244 fill-set attestations，并生成 3,542 orders / 5,400 fills、0 blockers 的 canonical set。CSV build 1 与 canonical preview 均得到 5,400 条 fill + 574 条 aggregate order events、1,441 个 PositionEpisode（1,437 closed、4 open / 44 contracts）和 USD 151,750.75 费用守恒；后者必须显式 confirm，且不自动替换默认 build 1。工作台保留 `build_id` 与案例上下文，以现金流方向显示买卖点，区分真实 fill/订单时间代理，显示行情 provenance，并在手动周期、annotation 服务或模型不可用时显式降级；用户自述 revision 与 broker evidence/canonical/P&L 隔离，不会改变 `assumed_flat_unverified`、headline 资格或 Moomoo 永久只读边界。下一步是用 Review Queue 和四类案例完成复杂生命周期抽查，核验 opening snapshot，并补多腿/roll 人工确认、TradePlan/RuleEvaluation 和期权/市场快照；盘前研究已具备服务端版本化 pool、持久化恢复、publication/lease 同事务和 09:12/09:17 本地 scheduler，且于 2026-07-24 完成首轮真实自动触发、原子回滚、恢复发布与幂等验收；5D/20D underlying 结果也具备收盘后自动成熟与严格 20 日统计门槛。下一步仍需重复窗口/睡眠唤醒观察、draft/finalizer、server last-good、pool 生效日、分层 eligibility、TriggerSpec 与期权增强冻结，之后才进入可验证的 near-spot wall 与 ATM contract shortlist。旧 live writer 在这些退出条件完成前保持禁用。未经用户明确确认，不执行 git commit/push；本项目不引入自动下单能力。

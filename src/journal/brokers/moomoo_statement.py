@@ -245,6 +245,8 @@ class StatementReconciliation:
     api_fee_total: Decimal
     matches: tuple[StatementApiMatch, ...] = field(default_factory=tuple, repr=False)
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    overlap_api_only_orders: int = 0
+    incremental_api_only_orders: int = 0
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -259,6 +261,8 @@ class StatementReconciliation:
                 "matched": self.matched_orders,
                 "statement_only": self.statement_only_orders,
                 "api_only": self.api_only_orders,
+                "overlap_api_only": self.overlap_api_only_orders,
+                "incremental_api_only": self.incremental_api_only_orders,
                 "ambiguous_identity_keys": self.ambiguous_identity_keys,
             },
             "matched_filled_orders": self.matched_filled_orders,
@@ -700,12 +704,17 @@ def _fee_components_from_api(row: Mapping[str, Any]) -> dict[str, Decimal]:
 def reconcile_statement_with_readonly_export(
     statement: StatementParseResult,
     payload: Mapping[str, Any],
+    *,
+    baseline_window_end: Optional[datetime] = None,
 ) -> StatementReconciliation:
     """Reconcile overlapping CSV and read-only OpenAPI order evidence.
 
     CSV has no broker order/deal IDs, so order identity uses a four-part key:
     normalized symbol, side, requested quantity and second-level order time.
-    Ambiguous keys are reported and never auto-linked.
+    Ambiguous overlap keys are reported and never auto-linked.  When an aware
+    ``baseline_window_end`` is supplied, unmatched broker-ID-backed orders
+    strictly after it are classified as an internally validated incremental
+    tail instead of an overlap mismatch.
     """
     if payload.get("schema") != READONLY_EXPORT_SCHEMA:
         raise MoomooStatementError("unsupported read-only export schema")
@@ -729,6 +738,16 @@ def reconcile_statement_with_readonly_export(
         )
     except (KeyError, ValueError) as exc:
         raise MoomooStatementError("export window is invalid") from exc
+    baseline_end: Optional[datetime] = None
+    if baseline_window_end is not None:
+        if (
+            baseline_window_end.tzinfo is None
+            or baseline_window_end.utcoffset() is None
+        ):
+            raise MoomooStatementError(
+                "baseline_window_end must be timezone-aware"
+            )
+        baseline_end = baseline_window_end.astimezone(timezone)
 
     api_orders = list(records.get("orders") or [])
     api_deals = list(records.get("deals") or [])
@@ -758,18 +777,52 @@ def reconcile_statement_with_readonly_export(
         api_by_key[_api_order_key(row, timezone)].append(row)
 
     all_keys = set(statement_by_key) | set(api_by_key)
-    ambiguous_keys = sum(
-        1
-        for key in all_keys
-        if len(statement_by_key.get(key, [])) > 1
-        or len(api_by_key.get(key, [])) > 1
-    )
     matched_pairs: list[tuple[StatementOrder, Mapping[str, Any]]] = []
+    matched_keys: set[tuple[Any, ...]] = set()
     for key in all_keys:
         statement_rows = statement_by_key.get(key, [])
         api_rows = api_by_key.get(key, [])
         if len(statement_rows) == len(api_rows) == 1:
             matched_pairs.append((statement_rows[0], api_rows[0]))
+            matched_keys.add(key)
+
+    unmatched_api_rows = [
+        row
+        for key, rows in api_by_key.items()
+        if key not in matched_keys
+        for row in rows
+    ]
+    if baseline_end is None:
+        incremental_api_rows: list[Mapping[str, Any]] = []
+    else:
+        incremental_api_rows = [
+            row
+            for row in unmatched_api_rows
+            if _api_time(row.get("create_time"), timezone) > baseline_end
+        ]
+    incremental_api_row_ids = {id(row) for row in incremental_api_rows}
+    # The CSV-derived four-part key is needed only inside the overlap.  Tail
+    # rows already carry broker-stable order IDs, so two legitimate tail
+    # orders with the same symbol/side/quantity/second are not ambiguous.
+    ambiguous_keys = sum(
+        1
+        for key in all_keys
+        if len(statement_by_key.get(key, [])) > 1
+        or (
+            len(api_by_key.get(key, [])) > 1
+            and any(
+                id(row) not in incremental_api_row_ids
+                for row in api_by_key.get(key, [])
+            )
+        )
+    )
+    incremental_api_only = len(incremental_api_rows)
+    overlap_api_only = len(unmatched_api_rows) - incremental_api_only
+    incremental_api_order_ids = {
+        str(row.get("order_id") or "")
+        for row in incremental_api_rows
+        if str(row.get("order_id") or "")
+    }
 
     api_deals_by_order: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     for row in api_deals:
@@ -801,8 +854,18 @@ def reconcile_statement_with_readonly_export(
     matched_filled_orders = 0
     matches: list[StatementApiMatch] = []
     statement_fee_total = Decimal("0")
+    # Fees for a broker-only tail are internally validated by the strict
+    # OpenAPI parser.  Cross-source fee equality applies only to the overlap;
+    # retaining every other fee here also keeps orphan/overlap-only evidence
+    # visible to the existing blocking checks.
     api_fee_total = sum(
-        (_api_decimal(row.get("fee_amount")) for row in api_fees), Decimal("0")
+        (
+            _api_decimal(row.get("fee_amount"))
+            for row in api_fees
+            if str(row.get("order_id") or "")
+            not in incremental_api_order_ids
+        ),
+        Decimal("0"),
     )
 
     for statement_order, api_order in matched_pairs:
@@ -887,7 +950,7 @@ def reconcile_statement_with_readonly_export(
     mismatch_total = sum(
         (
             statement_only,
-            api_only,
+            overlap_api_only,
             status_mismatches,
             fill_count_mismatches,
             quantity_mismatches,
@@ -923,7 +986,13 @@ def reconcile_statement_with_readonly_export(
             and api_record_links_ok
             and aggregate_fee_totals_match
             and mismatch_total == 0
-            and matched_orders > 0
+            and (
+                matched_orders > 0
+                or (
+                    len(statement_window_orders) == 0
+                    and overlap_api_only == 0
+                )
+            )
         ),
         window_start=window_start,
         window_end=window_end,
@@ -944,6 +1013,8 @@ def reconcile_statement_with_readonly_export(
         api_fee_total=api_fee_total,
         matches=tuple(matches),
         warnings=tuple(warnings),
+        overlap_api_only_orders=overlap_api_only,
+        incremental_api_only_orders=incremental_api_only,
     )
 
 

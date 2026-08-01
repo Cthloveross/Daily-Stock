@@ -1,6 +1,6 @@
 # Phase 1.6 · 每日机会研究看板
 
-> 状态：Watchlist Top 5 确定性基础榜、Top 5 直出 Moomoo 0–45 DTE 期权墙、全候选期权概览、单票专业研究页、Moomoo 最近交易时段异常期权成交，以及盘前自动保存的不可变机会快照与 5/20 XNYS 交易日结果学习已接线；场外/TRF 大额成交仍未配置，策略 edge 仍未验证。
+> 状态：Watchlist Top 5 确定性基础榜、Top 5 直出 Moomoo 0–45 DTE 期权墙、全候选期权概览、单票专业研究页、Moomoo 最近交易时段异常期权成交，以及旧 v1 盘前机会快照与 5/20 XNYS 交易日结果学习已接线；Canonical Premarket Research Cycle 已具备服务端研究池、持久化 attempt/stage/lease、XNYS 09:12/09:17 低噪声 scheduler，以及 append-only 三轨 qualification，并于 2026-07-24 真实窗口完成自动触发、原子回滚、自动恢复、冻结发布和幂等验收。5D/20D 标的结果由 `xnys-close-qualified-raw-path-v2` 在目标交易日收盘后自动回填，完整研究命中率另受更严格 track 门禁。draft/finalizer、服务端 last-good 与期权增强冻结仍未完成；当天 Finnhub/Alpaca 权限导致辅助 Regime 数据降级，场外/TRF 大额成交仍未配置，策略 edge 仍未验证。
 >
 > 安全边界：只读行情研究，不解锁、不下单、不改单、不撤单。
 
@@ -20,17 +20,20 @@
 
 - `POST /api/v1/opportunities/daily`：接收最多 20 个自选标的；空列表使用服务端 `STOCK_LIST`。页面把排序后的前 5 个作为主研究清单，其余候选默认折叠，不把十几只股票同时铺在首屏。
 - `POST /api/v1/opportunities/option-overview`：最多批量读取 15 个美股 underlying 的 Moomoo 只读 Quote 概览；机会榜中的全部合格候选都可显示供应商 IV、IV Rank、IV Percentile、前值 IV、30/60/90/120/365 日 HV，以及 Call/Put 的当日累计 Volume 与上一清算日 OI。每个标的独立返回 `ready / not_configured / unavailable`，不再把榜单第四名以后永久留在“首批未扫描”。
-- `POST /api/v1/opportunities/option-context`：保留最近到期、最接近现价的 Call 单合约 IV，用于当前选中标的的合约上下文；它与 underlying overview 的供应商统计口径分开，失败或前端超时不影响基础候选。
-- `POST /api/v1/opportunities/option-walls`：单次最多批量读取 5 个标的的 Moomoo 期权链和动态快照；默认只纳入 0–45 DTE 标准合约，分别返回 Top 3 Call/Put OI 墙、当日累计 Volume 墙和 unsigned gross gamma concentration 墙。页面在基础清单完成后自动为 Top 5 渐进加载墙位并直接显示 Call/Put 摘要，不再要求逐票点击；墙失败或覆盖不足不会阻断基础候选，也不参与基础排名。
+- `POST /api/v1/opportunities/option-context`：兼容保留的独立最近到期、最接近现价 Call 单合约 IV 接口，供单票详情或其他消费者按需使用；它与 underlying overview 的供应商统计口径分开，失败或前端超时不影响基础候选。`/regime` 主机会榜不再调用它。
+- `POST /api/v1/opportunities/option-walls`：单次最多批量读取 5 个标的的 Moomoo 期权链和动态快照；默认只纳入 0–45 DTE 标准合约，分别返回 Top 3 Call/Put OI 墙、当日累计 Volume 墙、unsigned gross gamma concentration 墙，以及由同一动态快照派生的最近到期 ATM Call IV。页面在基础清单完成后自动为 Top 5 渐进加载墙位并直接显示 Call/Put 摘要；选中票的 ATM IV 复用该响应，不再发起第 11 次期权链调用。墙失败或覆盖不足不会阻断基础候选，也不参与基础排名。
 - `POST /api/v1/opportunities/option-events`：最多接收三个合格美股 underlying，使用 Moomoo `get_option_event` 的 `OWNER_LIST` 服务端过滤逐标读取最近异常期权成交；每标默认返回 5 条、最多 10 条，并独立返回 `ready / empty / not_configured / unavailable`，任一标的失败不会阻断基础榜或其他标的。
-- `POST /api/v1/opportunities/snapshots/ensure`：页面加载每日清单后安全、幂等地检查是否应保存“今日研究版本”；只在上一完整 XNYS 日线收盘后、对应下一 XNYS 交易日开盘前写入，周末、休市日、盘中和盘后都跳过，刷新不会重复写入。`snapshots/freeze` 仍作为显式 API 保留，快照列表、成熟结果评估和学习摘要接口保持不变。
+- `POST /api/v1/opportunities/snapshots/ensure`：这是保留的旧 `premarket_prior_close_xnys_v1 / web_daily_opportunity` 结果跟踪路径。它只验证上一完整 XNYS 日线收盘后、对应下一 XNYS 交易日开盘前的因果窗口，不是新的 `08:45–09:20 ET` canonical session，也不再是当前机会页默认写入路径。旧快照、快照列表、到期结果评估和学习摘要继续保留审计，不会被新 scope 覆盖或删除。
+- `OPPORTUNITY_OUTCOME_SCHEDULER_ENABLED=true`：启用服务端 5D/20D 结果到期回填任务。任务在精确 XNYS 收盘后 30 分钟首次检查，数据缺口在收盘后 4.5 小时最多再试一次；启动/周末恢复会接续最近已到期交易日。`xnys-close-qualified-raw-path-v2` 只扫描标的路径 track 已 `qualified` 且因果窗口为 `prospective` 的候选，未到期时不触碰行情源；Web 只读展示最近状态，手动按钮仅用于重试已到期缺口。完整运行合同见 [`09_AUTOMATIC_OUTCOME_MAINTENANCE.md`](09_AUTOMATIC_OUTCOME_MAINTENANCE.md)。
+- `GET/PUT /api/v1/opportunities/premarket/universe` 与 `POST /premarket/status|run`：Canonical Premarket Research Cycle v1 已升级为服务端版本化研究池、持久化 attempt/stage/lease 与本地低噪声 scheduler。页面只读 status，不再自动 run；scheduler 在 `09:12 ET` 首次生成、必要时 `09:17 ET` 恢复，`09:18 ET` 后拒绝新 leader，`09:20 ET` 硬截止。手动运行必须显式 `manual=true` 且不能绕过同一门禁。当前成功 run 仍立即冻结，尚无 draft/finalizer、服务端 last-good、pool 生效交易日或期权增强冻结，详细合同见 [`07_CANONICAL_PREMARKET_RESEARCH_CYCLE.md`](07_CANONICAL_PREMARKET_RESEARCH_CYCLE.md) 与 [`08_SERVER_OWNED_PREMARKET_ORCHESTRATION.md`](08_SERVER_OWNED_PREMARKET_ORCHESTRATION.md)。
+- Opportunity Snapshot 以可选 `qualification` 返回一个 snapshot-level assessment 和三条逐候选分析轨道；官方发布时 qualification 与 snapshot/候选/终态在同一事务追加，旧快照可通过显式 dry-run/apply 回填新 policy assessment，任何路径都不改写已有事实。前端只显示“标的路径 / 日线选股 / 完整研究”的 qualified 计数，不暴露内部 track key。
 - `/regime` 顶部“今日机会研究”：主表只展示 Top 5，并直接列出结构、量能、IV/Rank、Call/Put 墙、研究状态以及可复现的确认/失效观察；其余候选、排名外增强和 5D/20D 学习口径默认折叠。页面明确显示本次来自本地 Watchlist 还是服务端默认池，并提供“管理 / 导入自选”入口。
 - `/regime/opportunity/:ticker` 单票详情：首屏先给出压缩后的专业摘要、1/5/20 交易日 IV 模型终值区间、关键价位和 underlying K 线；供应商 IV/HV、0–45 DTE 墙与异常成交收进分域标签页，避免同一指标在多个卡片反复出现。详情用于形成 setup、trigger、invalidation、流动性与风险检查，不把任何单项指标包装成自动买卖信号。
-- 研究状态由基础证据直接分层：新鲜完整日线同时具备一致方向结构与至少一项独立量能/成交额确认时为 `research_ready`（重点研究）；只有其中一侧成立或方向证据冲突时为 `watch_only`（等待确认）；结构混合且无量能支持、日线过期或权威 Regime 为 `no_trade` 时为 `context_only`（背景观察）；核心日线不足或标的不支持才是 `blocked`。缺失或降级 Regime 不再把所有标的统一压成等待状态；`research_ready` 也只是研究资格，不是入场信号。
-- 基础排名只使用上一完整交易日的 OHLCV/成交额、EMA8/13、相对量能、近期结构和已保存的当日 Regime；不调用 LLM。期权概览、墙和异常成交目前是并列研究上下文，不会悄悄改变基础排序。自动保存只写隔离的 `opportunity_*` 研究快照，不写 Journal 或交易事实表。
+- 研究用途由基础证据直接分层：新鲜完整日线同时具备一致方向结构与至少一项独立量能/成交额确认时为 `research_ready`（基础门禁通过）；只有其中一侧成立或方向证据冲突时为 `watch_only`（基础候选·非信号）；结构混合且无量能支持、日线过期或权威 Regime 为 `no_trade` 时为 `context_only`（仅作背景）；核心日线不足或标的不支持才是 `blocked`（精确数据阻断）。缺失或降级 Regime 不再把所有标的统一压成同一种用途；`research_ready` 也只是研究资格，不是入场信号。
+- 基础排名只使用上一完整交易日的 OHLCV/成交额、EMA8/13、相对量能、近期结构和已保存的当日 Regime；不调用 LLM。期权概览、墙和异常成交目前是并列研究上下文，不会悄悄改变基础排序，也不会被事后混入官方盘前版本。窗口内发布只写隔离的 `opportunity_*` 研究快照，不写 Journal 或交易事实表。
 - 第一阶段 universe 只支持美股期权 underlying；A 股、港股或其他不支持的符号按候选 `blocked`，不会套用纽约收盘时间或 SPY Regime。
 - 同一请求复用一套行情 manager，最多四路日线并发；服务端使用 30 秒 TTL + single-flight，前端使用 5 分钟缓存和最新请求保护，减少重复初始化、日志和旧响应覆盖。
-- Moomoo 期权概览使用单次只读 Quote batch 覆盖全部合格候选，并按“标的集合 + Moomoo 启用状态 + ET 市场日期”缓存和 single-flight；单合约 IV、墙和异常事件仍各自独立限流、缓存与降级，某一重型扫描不会阻断基础清单。
+- Moomoo 期权概览使用单次只读 Quote batch 覆盖全部合格候选，并按“标的集合 + Moomoo 启用状态 + ET 市场日期”缓存和 single-flight；Top 5 期权墙使用最多五条彼此隔离、可复用且逐次独占的 QuoteContext lane 并行读取，每个标的内部仍按官方 400 合约上限分批，响应按请求顺序重组。主机会榜的 ATM Call IV 与墙共用动态快照；兼容保留的独立 IV 接口、墙和异常事件仍各自缓存与降级，某一重型扫描不会阻断基础清单。
 - UI 将 `available / expected` 明确称为“数据完整度”，并另列数据域覆盖；这个计数包含基础日线/技术/Regime 指标，不再误称为纯“量价证据”，期权流、暗池和 Playbook 缺失时也不会显示成“证据完整”。
 - 候选排名合同中的 `unusual_options_flow` 与 `off_exchange_prints` 仍不以 0 参与排序；前者虽已有独立实时研究面板，但在完成历史保存、延迟测量和结果验证前不会悄悄改写基础榜权重。
 - 个人风格在结构化 Playbook 尚未经用户确认前保持 `unknown`，不从单笔盈利或旧 heuristic 标签伪造“高度匹配”。
@@ -47,7 +50,13 @@
 
 响应必须保留 `market_date_et`、`generated_at`、OI/Volume/quote 的 as-of 说明、请求/有效/排除合约数和 coverage ratio。OI 是交易所清算后按日更新的数据，Volume 是当日累计，Gamma/spot 是当前快照；这些时间口径不得被合并描述成同一时点的实时仓位。覆盖不足、任一链日期窗口/快照批次失败、权限缺失、OpenD 不可达或必要字段非法时逐标降级，不能用 0 填补缺失合约或把部分窗口误报为完整覆盖。
 
-期权墙 UI 使用主表格承载可比较字段，详情区解释公式、来源、coverage/as-of 与不能推断的内容，并显式显示“计算可复现、策略有效性未验证”。墙位目前只是独立研究上下文，不进入确定性基础榜排序，也未持久化为历史序列或完成交易结果回测。
+Top 5 不再逐标串行等待完整链。服务端为每个同时扫描的 underlying 独占一条可复用 QuoteContext lane，避免同一个 SDK context 被多线程交叉使用；每条动态快照请求仍最多 400 个代码，单标失败只降级该标，30 秒 TTL 与逐标 single-flight 继续阻止相同请求重复放大。2026-07-24 本机同一组 TSLA/NVDA/AAPL/META/COIN、0–45 DTE、服务重启后冷缓存验收从 `30.47s` 降至 `9.64s`，10,374/10,374 张请求合约均返回且 0 个失败批次；该数值是当次环境证据，不是跨机器 SLA。实现仍受 Moomoo `get_market_snapshot` 每 30 秒 60 次的官方额度约束，多个页面或不同标的集合并发刷新可能触发逐标部分覆盖，不能以重试风暴掩盖。
+
+默认 `0–45 DTE` 每标最多拆成两个 30 日 `get_option_chain` 日期窗口，Top 5 冷加载最多占用 10 次链查询，正好等于 Moomoo 当前环境观测到的 `10 次 / 30 秒` 上限。`option-wall/1.1` 因此在每个 item 内新增 `atm_call_iv`：先固定墙快照的最近到期日，再选最接近 spot 的 Call，并只读取该合约在同批动态快照中的 IV；精确 ATM 合约缺 IV 时 fail closed，不改选其他执行价或到期日。主机会榜不得再并发调用 `/option-context`，否则第 11 次链查询可能令最后一个标的部分覆盖。多个标签页同时对不同集合强制冷刷新仍可能竞争供应商额度，当前缓解不等于全局跨进程限流器。
+
+`option-wall/1.2`（2026-08-01）在每个墙位 level 上 additive 补齐逐层字段：`side`（call / put / call_put_aggregate）、`metric_basis` 结算口径（OI＝T-1 清算存量、Volume＝当日累计、Gamma＝模型值）、按贡献排序的 top 3 到期日 `expiry_breakdown`（expiry / dte / metric_value / share_of_level_percent / contract_count + `other` 汇总桶），以及逐到期 quote 上下文——仅当该 strike×expiry×right 单元由恰好一行快照支撑时附该行的 `iv_percent` 与 `quote_as_of`，多行聚合不归属报价。Moomoo 墙快照行当前不携带 bid/ask/mark，这些字段保持显式 null 并通过 `quote_evidence`（observed / partial / unavailable）标缺，不做零值回填；旧字段与端点签名不变。
+
+期权墙 UI 使用主表格承载可比较字段，逐层可展开到期分布与报价证据（缺失按「标缺」显示），详情区解释公式、来源、coverage/as-of 与不能推断的内容，并显式显示“计算可复现、策略有效性未验证”。墙位目前只是独立研究上下文，不进入确定性基础榜排序，也未持久化为历史序列或完成交易结果回测。
 
 ### 2.2 异常期权成交合同
 
@@ -75,9 +84,9 @@
 
 ### 2.3 单票详情与数据时钟
 
-机会榜只承担横向筛选，单票详情承担纵向研究。详情页按“先结论、再图表、最后证据明细”组织，默认首屏只保留决策最相关的信息：一句话专业摘要、方向背景与 setup、上一完整交易日高低点、IV 所处状态、1/5/20 交易日模型区间、最近的关键墙位、反面证据和仍未知的数据。摘要只能压缩下方已经存在的结构化证据，不允许由单一异常成交、OI 墙或高 IV 生成伪确定性的涨跌结论、胜率或交易指令。
+机会榜只承担横向筛选，单票详情承担纵向研究。2026-07-31 起榜单与详情实现第一层同版本绑定：官方 canonical 榜单跳转详情时 URL 携带 `?snapshotKey=ops_…`，详情页经 `GET /api/v1/opportunities/snapshots/{snapshot_key}` 优先读取同一份冻结 run 的候选证据（数据时点栏显示「官方快照 … · 冻结于 …」），不再对该标的重跑即时扫描；preview 榜单或直接输入 URL 时显示「即时扫描 · 未绑定官方快照」，快照缺失/不含该标的时显式提示并回退即时扫描。期权 overview/context/walls/events 与 K 线仍是实时增强，各自携带 as-of，不进入冻结榜单证据。官方绑定页另显示「冻结与当前差异」条（冻结基准 close vs 当前 Moomoo spot 的百分比变化，注明不改变冻结榜单结论；任一数值缺失时整条隐藏）。详情页按“先结论、再图表、最后证据明细”组织，默认首屏只保留决策最相关的信息：一句话专业摘要、方向背景与 setup、上一完整交易日高低点、IV 所处状态、1/5/20 交易日模型区间、最近的关键墙位、反面证据和仍未知的数据。摘要只能压缩下方已经存在的结构化证据，不允许由单一异常成交、OI 墙或高 IV 生成伪确定性的涨跌结论、胜率或交易指令。
 
-详情页提供 `1m / 2m / 5m / 15m / 30m / 1h / 1D` 七档 underlying K 线，并在当前可见时段的 close 上计算 EMA8 / EMA13。美股分钟图默认只显示纽约常规时段 `09:30–16:00 ET`，可显式切换到含盘前盘后的 `04:00–20:00 ET`；筛选按 `America/New_York` 自动处理夏令时，切换后 EMA8 / EMA13 立即基于新的可见 bars 重算，顶部 K 线时点也同步显示当前可见最后一根，避免常规时段图误报 `20:00 ET`。日线不显示交易时段切换。分钟图用于观察执行环境，日线用于结构背景；最终 bar、EMA 或墙位都不是已验证的入场触发器，页面不能事后把它们描述成成交时已经可见的信号。首屏之外的信息按用途收进四个标签页：
+详情页提供 `1m / 2m / 5m / 15m / 30m / 1h / 1D` 七档 underlying K 线，并在当前可见时段的 close 上计算 EMA8 / EMA13。EMA 使用共享的 SMA-seeded 实现（`apps/dsa-web/src/utils/ema.ts`，2026-07-31 起与 Journal 复盘 overlay 及后端 `_ema_last` 同一语义）：前 period 根 close 的均值作为 seed 落在第 period 根 bar，样本不足一个完整 seed 时该线为空，不用首 close 递推或补零。美股分钟图默认只显示纽约常规时段 `09:30–16:00 ET`，可显式切换到含盘前盘后的 `04:00–20:00 ET`；筛选按 `America/New_York` 自动处理夏令时，切换后 EMA8 / EMA13 立即基于新的可见 bars 重算，顶部 K 线时点也同步显示当前可见最后一根，避免常规时段图误报 `20:00 ET`。日线不显示交易时段切换。分钟图用于观察执行环境，日线用于结构背景；最终 bar、EMA 或墙位都不是已验证的入场触发器，页面不能事后把它们描述成成交时已经可见的信号。首屏之外的信息按用途收进四个标签页：
 
 - “波动与情景”集中展示 IV、IV Rank/Percentile、前值 IV、HV 与模型终值区间的假设和限制；
 - “期权墙”集中展示 Call/Put OI、当日 Volume 与 unsigned gross gamma concentration、覆盖率和 as-of；
@@ -116,17 +125,31 @@
 
 基础候选请求的 Web 墙钟预算为 35 秒；期权概览、ATM IV、墙和异常事件分别独立加载，不能延长“扫描中”状态。手动“重新扫描”同时绕过浏览器缓存与服务端 30 秒已完成结果 TTL，但仍复用相同 key 的在途请求，避免连续点击放大数据源流量。刷新期间保留上一份可用列表；如果本次只得到临时行情阻断，不用十个 `blocked` 候选覆盖 last-known-good，而是明确提示并允许稍后重试。
 
-页面状态分为三层：
+Alpaca 盘前涨跌只接受纽约时间 04:00–09:30 内已经完成且不超过 5 分钟的 1 分钟 bar，并以 `exchange-calendars` 解析出的精确上一 XNYS session 收盘价为分母。未来日期、盘前未开始、缺少或日期错误的前收、未完成分钟和过期数据全部 fail closed，不再用最近几根分钟线的开盘价近似，也不把未知编码成 0%。
+
+Finnhub 的经济日历与自选股财报日历分别记录 readiness。一个子域 403、超时或权限不足时，只屏蔽该子域对应的宏观分数，不再把另一个成功子域一起清零；旧 degraded 载荷没有子域 readiness 时继续保守不计分。失败诊断会移除 HTTP query string，并脱敏 `token/api_key/key` 及当前配置的 key；仍保留异常类型、HTTP 状态和不含查询参数的路径。
+
+Web 将一次研究周期明确展示为“基础榜 → 期权概览 → Top 5 墙”三个阶段，并分别标注等待、读取、可用、增强降级或失败。状态栏同时展示本次扫描请求日、候选基础证据日期（混合日期时显示范围）和 ET 生成时间；阶段进行中禁用重复刷新，但继续展示上一成功结果及其生成时间。期权概览等可选请求失败只标记增强降级，不把基础榜误报为整体失败；执行价墙只覆盖部分 Top 5 时显示实际覆盖数量/比例，不把部分结果冒充完整。Regime 首次请求的 loading skeleton 与机会榜独立挂载，不再阻塞基础扫描开始。
+
+这三个 Web 加载阶段不等同于 canonical backend 的 `resolve_window / compute_regime / scan_completed_bars / quality_gate / persist_snapshot`。页面必须以服务端 `published + snapshot` 为冻结证据；展示阶段本身不能证明 canonical session 已运行或已冻结。页面加载只读 status，不设置自动 run timer；`running` 时最多短期轮询只读 status，且不并发启动 `/daily`。只有用户明确点击时才发送 `manual=true`，服务端仍执行全部时点、pool、attempt、lease 与质量门禁。
+
+官方盘前状态卡把三个彼此独立的轴明确分开，不能再压缩成一个“可用/不可用”标签：
+
+- **发布状态**：回答今天的官方版本是待发布、生成中、已发布还是未发布；只有 `published + snapshot` 证明不可变版本存在。
+- **数据质量**：回答本批输入是完整、支持证据降级还是阻断。`published + degraded` 是合法状态，表示官方版本已经冻结、可以用于今日研究，但辅助证据不完整。
+- **统计入样**：新快照有 `qualification` 时分别显示“标的路径 X/Y、日线选股 X/Y、完整研究 X/Y”；`X` 是该 track 的 `qualified_count`，`Y` 是 `qualified + excluded + unverified`，不是命中数。旧 API 缺少 qualification 时继续显示“已纳入 N/M / 未纳入 N/M / 尚未产生”，不能把缺字段默认成三轨通过。`published + degraded` 可以出现“标的路径 5/5、完整研究 0/5”：它表示基础价格路径仍可前瞻回填，但不能进入完整研究命中率，不是发布失败。
+
+候选研究内容另按以下三层组织：
 
 - **基础扫描**：美股支持范围、至少 21 根新鲜完整日线、来源与 as-of；缺失时显示具体的“行情源暂不可用 / 日线不足 / 日线已过期 / 标的不支持”，不再统一称为“证据不足”。
 - **市场背景**：Regime 可用于风险环境解释；缺失或降级时仍可浏览股票量价结构，但不得把它冒充已通过的市场门禁。
 - **排名外增强**：异常期权成交、期权墙、完整逐笔期权流/NBBO、FINRA ATS/TRF 背景与未确认 Playbook。它们影响后续研究深度或个人风格匹配，当前缺失不阻断基础扫描，也不在每只股票上重复显示成待补核心证据。
 
-`hard_gates.status=unknown` 不等于失败；只有 `failed` 才进入基础门禁失败摘要。`no_trade` 在输入质量合格时表示“市场风险关闭”，不是权限或证据错误。页面保留完整 readiness/provenance 明细，但将可选增强收进折叠说明，首屏优先回答候选是否可扫描、数据来自哪里、为什么值得观察。
+`hard_gates.status=unknown` 不等于失败；只有 `failed` 才进入基础门禁失败摘要。`no_trade` 在输入质量合格时表示“市场风险关闭”，不是权限或证据错误。候选列称为“研究用途”而不是交易触发：`research_ready / watch_only / context_only / blocked` 分别显示“基础门禁通过 / 基础候选·非信号 / 仅作背景 / 精确阻断原因”。页面保留完整 readiness/provenance 明细，但将可选增强收进折叠说明，首屏优先回答候选是否可扫描、数据来自哪里、为什么值得观察。
 
 ### 2.6 Watchlist 来源与 TradingView 边界
 
-机会清单优先使用 Web 本地 Watchlist，按用户顺序最多扫描前 20 只，再从确定性基础排名中展示 Top 5；没有本地自选时才使用服务端 `STOCK_LIST`。`/watchlist` 支持合并导入 TradingView Advanced View 官方导出的 TXT：解析逗号或换行分隔的 `EXCHANGE:TICKER`，忽略分组标题，并把受支持的美股 ticker 去重加入现有自选。
+普通 `/daily` 预览优先使用 Web 本地 Watchlist，按用户顺序最多扫描前 20 只，再从确定性基础排名中展示 Top 5；没有本地自选时才使用服务端 `STOCK_LIST`。官方盘前版本只使用 `/watchlist` 上显式保存的服务端研究池；页面显示本地列表与正式版本是否一致、版本时间与来源，不会静默同步。TradingView TXT 导入继续只合并到本地列表，用户确认后才保存为正式池。
 
 TradingView 面向个人网站账户没有公开的自选列表 REST API；其公开 REST API 是给 broker 集成使用，Charting Library 的 Watchlist API 只管理嵌入式 Trading Platform widget 的 Watchlist，不能当作用户在 tradingview.com 上的个人列表同步接口。因此当前不保存 TradingView 登录信息、不抓取私有网页，也不声称实时双向同步。用户在 TradingView 导出 TXT 后导入，是官方支持、可审计且不依赖浏览器会话的边界：
 
@@ -134,7 +157,7 @@ TradingView 面向个人网站账户没有公开的自选列表 REST API；其�
 - [TradingView：个人数据 API 说明](https://www.tradingview.com/support/solutions/43000474413-i-need-access-to-your-api-in-order-to-get-data-or-indicator-values/)
 - [TradingView Charting Library `IWatchListApi`](https://www.tradingview.com/charting-library-docs/latest/api/interfaces/Charting_Library.IWatchListApi/)
 
-5D/20D 区块是前瞻结果跟踪，不是今日候选筛选门禁。新系统刚开始积累不可变盘前快照时，成熟样本为 0 属于正常状态；主页面只显示一行进度，完整样本门槛与 cohort 口径放在折叠区，避免把尚未成熟的研究统计误当作当天不可用。
+5D/20D 区块是前瞻结果跟踪，不是今日候选筛选门禁。UI 用“已回填 / 等待目标日 / 已到目标日但缺行情”描述结果生命周期；`mature_count` 只表示目标窗口已经到达并保存了结果，不表示策略“成熟”，`pending_count` 也不表示交易机会“待观察”。没有任何统计入样时只显示“尚无可统计样本”，完整样本门槛与 cohort 口径放在折叠区。
 
 ## 3. 数据语义修正
 
@@ -158,7 +181,7 @@ Python SDK `10.9.6908` 的只读 Quote Context 已接入 [`get_option_underlying
 
 ### 5.1 写入边界与 API
 
-一次普通扫描生成内存中的 `OpportunityRun`，每个候选带稳定 `candidate_id`。`POST /api/v1/opportunities/daily` 本身仍是零写入预览；Web 在取得清单后另行调用 `POST /api/v1/opportunities/snapshots/ensure`。`ensure` 只有在 run 的 `market_date_et` 恰好等于候选下一 XNYS entry session，且请求严格早于该 session 常规开盘时，才保存该日第一个正式研究版本。周末、节假日、盘中与盘后返回 `outside_window` 而不写库；相同日槽再次加载返回 `existing`，不覆盖既有不可变版本。
+一次普通扫描生成内存中的 `OpportunityRun`，每个候选带稳定 `candidate_id`。`POST /api/v1/opportunities/daily` 本身仍是零写入预览；当前 Web 先读 canonical status，在允许窗口触发受控 run，成功时使用新 scope 冻结结果，其他状态才显示普通 `/daily` 预览。旧 v1 `snapshots/ensure` API 与历史快照继续保留兼容和结果审计，但当前机会页不再主动调用。
 
 当前持久化使用与 Journal 隔离的三张表：
 
@@ -168,19 +191,47 @@ Python SDK `10.9.6908` 的只读 Quote Context 已接入 [`get_option_underlying
 
 三张表都安装 SQLite `UPDATE / DELETE` 拒绝 trigger；run 与其 candidates 在同一事务写入。结果以“candidate + horizon + evaluator version + complete/partial state”为不可变槽位：完全相同重试幂等，冲突内容拒绝；缺部分路径或 SPY 附件但已有目标收盘时可以先追加 `partial`，后续完整来源只能追加新的 `complete` 行，不能原地修订。
 
+Qualification 另使用两张同样与 Journal 隔离的 append-only 表：
+
+- `opportunity_snapshot_qualification_assessments`：按 `snapshot + qualification policy` 冻结发布证明、analysis quality、原因、事实哈希与 assessment 哈希；
+- `opportunity_candidate_track_assessments`：为快照中的每个候选恰好追加“标的路径 / 日线选股 / 完整研究”三条决策，分别保存 causal window、observation、`qualified / excluded / unverified`、原因与事实哈希。
+
+两表同样拒绝 `UPDATE / DELETE`。同一 policy、同一内容重试幂等，同一槽位出现不同内容时拒绝冲突；新 policy 只能追加新 assessment，不能把旧判断原地改名。Canonical 发布通过 terminal cycle event、attempt、snapshot key 与冻结时间形成 publication proof，qualification 写入失败会令 snapshot 与发布终态一起回滚。历史快照的 qualification 回填必须先生成不写库的确定性计划，再显式 apply；它不会重新抓行情，也不会重写旧 snapshot、candidate 或 outcome。
+
 保存、只读与评估接口如下：
 
-- `POST /api/v1/opportunities/snapshots/ensure`：Web 默认入口；合法盘前窗口自动保存一次，其他时间只返回状态，永远不解锁或调用交易接口；
+- `POST /api/v1/opportunities/snapshots/ensure`：保留的旧 v1 兼容入口；在旧因果窗口幂等保存一次，其他时间只返回状态，永远不解锁或调用交易接口；
 - `POST /api/v1/opportunities/snapshots/freeze`：保留给显式受控流程的低层入口；它创建的是审计快照，是否具备结果学习资格仍由 XNYS 因果窗口判定，不能用来盘后补造正式样本；
-- `GET /api/v1/opportunities/snapshots?limit=...`：只读列出冻结时间、合格样本数和 5/20 日成熟/待定/缺口进度；
-- `POST /api/v1/opportunities/snapshots/{snapshot_key}/evaluate`：只为已成熟目标交易日追加结果；未成熟、日历异常或关键数据缺失不写伪结果；
-- `GET /api/v1/opportunities/learning-summary`：只读返回分 cohort 的描述统计和门槛状态，固定 `auto_adjustment=false`。
+- `GET /api/v1/opportunities/snapshots?limit=...`：只读列出冻结时间、qualification 三轨计数、旧聚合统计数，以及 5/20 日“已回填 / 等待目标日 / 已到目标日但缺行情”进度；`underlying_path_candidate_count / underlying_path_progress` 以加法字段单列 v2 标的路径审计范围，`full_research_candidate_count / full_research_progress` 单列严格完整研究统计范围；
+- `POST /api/v1/opportunities/snapshots/{snapshot_key}/evaluate`：只为已经到达目标交易日的窗口追加结果；尚未到目标日、日历异常或关键数据缺失时不写伪结果；
+- `GET /api/v1/opportunities/learning-summary`：只读返回分 cohort 的描述统计、自动维护状态和门槛状态，固定 `auto_adjustment=false`。
 
-当前自动保存版本只包含确定性基础榜；页面异步取得的 underlying overview、ATM IV、期权墙和异常成交尚未进入冻结 payload，也不会被事后拼接到旧快照。`run_type` 仍固定 `morning_prior_close`；未来 `open_refresh / intraday_refresh` 必须使用新合同，不能把上一完整交易日 OHLCV、T-1 OI 或延迟数据显示成盘中刚发生的信号。
+Snapshot 读取合同以向后兼容方式保留 `validation_eligible / eligibility_reasons`，并追加可选 `analysis_quality_eligible / analysis_quality_reasons` 与 `qualification`。`qualification` 返回 assessment identity、policy、发布状态、analysis quality 和三轨汇总；前端把 snake_case 深层映射为 camelCase。严格 5D/20D 面板只读取 `full_research_progress`，若 raw-path 已开始回填但完整研究尚未入样，则另行显示“标的路径审计”，不得把它混成完整研究命中率。旧快照或旧服务响应可能省略新字段，消费者必须回退旧聚合 UI 或显示“历史质量口径未知”，不能把缺字段默认为 `true`。旧 boolean 只作为兼容字段，不再被描述为 publication、analysis quality、causal window 与 downstream analysis 四个问题的唯一答案。
 
-### 5.2 XNYS 因果时间与结果口径
+旧 v1 历史版本与当前 canonical foundation run 都只冻结确定性基础榜；页面异步取得的 underlying overview、ATM IV、期权墙和异常成交尚未进入任一冻结 payload，也不会被事后拼接到旧快照。`run_type` 仍固定 `morning_prior_close`；未来 `open_refresh / intraday_refresh` 必须使用新合同，不能把上一完整交易日 OHLCV、T-1 OI 或延迟数据显示成盘中刚发生的信号。
 
-冻结候选的参考交易日记为 `S`，下一 XNYS 常规交易日记为 `E`。只有 `S` 正式收盘后、且严格早于 `E` 常规开盘的 freeze 才具有 `validation_eligible=true` 并进入正式学习样本。早于 `S close` 无法证明输入是完整日线；到达或晚于 `E open` 才冻结（包括盘中或盘后补冻）已经看到入场交易日信息，因此快照仍为审计记录，但永久排除于结果样本。
+### 5.2 三轨 Qualification 与独立证据轴
+
+`opportunity_qualification_v2` 将原先混在 `validation_eligible` 内的事实拆开：
+
+- snapshot 级 `publication_state`：`canonical_published / audit_frozen / legacy_unverified`，只有数据库 terminal event 与 attempt/snapshot identity 一致才能证明 canonical；
+- snapshot 级 `analysis_quality_state`：`ready / degraded / blocked / unassessed`，只回答完整研究输入质量；
+- candidate 级 `causal_window_state`：`prospective / retrospective / premature / unverified`，只回答冻结发生在信号收盘与下一常规开盘的哪个位置；
+- candidate 级 `observation_state`：`ready / partial / unavailable`，只回答 underlying 参考 session、close 与 source 是否可审计。
+
+每个候选在相同事实之上生成三条用途不同、互不替代的决策：
+
+1. **标的路径**（内部 key `raw_underlying_path_v1`）：只判断是否存在足以保存 underlying 价格路径的参考观察；它不声称 setup、Regime、方向或完整研究已通过。自动维护还会额外要求该 track 为 `qualified` 且 causal window 为 `prospective`。
+2. **日线选股**（内部 key `underlying_daily_selection_v1`）：要求可证明的官方/前瞻日线选择、可用 underlying 观察、候选未 blocked，且 analysis quality 不是 blocked/unassessed；支持证据 degraded 不会自动抹掉已经冻结的日线选择事实。
+3. **完整研究**（内部 key `canonical_full_research_v1`）：在日线选股之上继续要求 analysis quality `ready`、`research_ready`、数据完整、方向可操作且 SPY benchmark anchor 可审计；只有该 track 的 qualified prospective outcome 才可进入完整研究 cohort 与描述性命中率。
+
+因此 `canonical_published + analysis_quality=degraded` 不是自相矛盾：只要 underlying 观察与因果窗口成立，标的路径仍可 qualified prospective 并在 5D/20D 到期后追加；完整研究 track 会以 `analysis_quality_degraded` 明确 excluded，这些 raw-path outcome 永远不会被学习摘要当成完整研究命中/失败。`qualified` 只对指定 track 有意义，不得跨 track 传播。
+
+Qualification v2 进一步令方向性标的路径与实际回填合同一致：`retrospective` 冻结版本在 raw-path track 中也明确 `excluded`，不能因为价格数据可见就被描述成前瞻合格。严格完整研究 track 在 assessment 缺失、policy 未回填或读取异常时一律 fail closed，不再回退旧 `validation_eligible`；旧布尔兼容只保留给已知旧快照的 prospective raw-path 读取。
+
+### 5.3 XNYS 因果时间与结果口径
+
+冻结候选的参考交易日记为 `S`，下一 XNYS 常规交易日记为 `E`。`S close <= freeze < E open` 形成 `causal_window_state=prospective`；早于 `S close` 为 `premature`，到达或晚于 `E open` 为 `retrospective`，日历/证据无法证明时为 `unverified`。`validation_eligible` 继续保留给旧消费者，但 v2 结果维护逐候选选择“标的路径 `qualified` 且 `prospective`”，完整研究摘要再选择“完整研究 `qualified` 且 `prospective`”，不再用一个整批 boolean 同时回答两种分析用途。没有 qualification 的旧快照才按旧 candidate eligibility 做兼容读取，且不能因此伪造三轨 assessment。
 
 交易日、节假日、提前收盘和常规开收盘时刻全部由 `exchange-calendars` 的 `XNYS` 日历解析，日历不可用时 fail closed，不以工作日加减近似。依赖已在 `requirements.txt` 中，本机验收版本为 `exchange-calendars 4.13.2`。
 
@@ -195,14 +246,14 @@ Python SDK `10.9.6908` 的只读 Quote Context 已接入 [`get_option_underlying
 
 方向为 `mixed / unknown` 时仍可保存原始 close/entry proxy 路径，但 `signed_*`、MFE、MAE 和 signed relative-SPY 必须为空，只使用 `NON_DIRECTIONAL / DIRECTION_UNKNOWN` 标签，不进入方向命中率分母。参考 close 发生复权/修订不一致、冻结与评估的数据源不连续、重复/缺失 session、目标 close 缺失或 SPY 无法严格对齐时，系统 fail closed：结果保持 pending/data gap，或把有目标 close 的 partial 结果单列；关键质量缺口从学习摘要排除，不跨来源补值。
 
-### 5.3 Cohort 与学习护栏
+### 5.4 Cohort 与学习护栏
 
-5D 与 20D 分开统计。不同 `signal_version`、`playbook_version`、universe、requested limit、ranking/freeze policy/scope，以及不同结构 setup signature、Regime、direction 的记录生成不同 cohort，绝不为了凑样本混算；同 ticker、同信号交易日、同 horizon、同 cohort 也只计一次。
+5D 与 20D 分开统计，并且学习摘要先排除不属于 `canonical_full_research_v1 = qualified + prospective` 的 outcome。标的路径回填只保存“后来怎么走”，不会自动成为完整研究策略样本。通过该 track 后，不同 `signal_version`、`playbook_version`、universe、requested limit、ranking/freeze policy/scope，以及不同结构 setup signature、Regime、direction 的记录仍生成不同 cohort，绝不为了凑样本混算；同 ticker、同信号交易日、同 horizon、同 cohort 也只计一次。
 
 门槛固定为：
 
-- 同一 cohort、同一 horizon 至少有 10 个 LONG/SHORT 成熟方向样本，才显示描述性 `CONTEXT_HIT` 比例；不足时只显示 collecting 和样本数；
-- 至少 20 个成熟方向样本，且来自 20 个不同 signal sessions，才标记 `investigation_ready`，含义仅是可以人工调查；
+- 同一 cohort、同一 horizon 至少有 20 个 LONG/SHORT 已回填方向样本，且覆盖 20 个不同 signal sessions，才显示描述性 `CONTEXT_HIT` 比例；不足时只显示 collecting 和方向样本数，不返回 hit/miss/neutral 细分；
+- 同一门槛达到后才标记 `investigation_ready`，含义仅是可以人工调查；
 - 任意样本量都不会自动调整排名或证据权重。若人工形成新规则，必须另起版本、做 walk-forward 验证并由用户确认，不能回写旧快照。
 
 本阶段有意不生成 `TRUE_POSITIVE / FALSE_POSITIVE`、`missed opportunity` 或 `regime mismatch`：前两者会把“方向上下文”误装成完整预测，missed opportunity 需要冻结的 `trade_taken=false` 与预定义触发条件，regime mismatch 需要预先定义的失效规则与因果证据；当前快照都不具备这些事实。这里只使用 `CONTEXT_HIT / CONTEXT_MISS / NEUTRAL / NON_DIRECTIONAL / DIRECTION_UNKNOWN` 的描述标签，不做交易归因。
@@ -216,18 +267,19 @@ Python SDK `10.9.6908` 的只读 Quote Context 已接入 [`get_option_underlying
 3. **TradePlan / Playbook**：用户确认 setup、DTE、delta、时段、事件和风险规则后，才把 `style_match` 从 `unknown` 升级。
 4. **盘中场外成交（可选付费源）**：接入带 TRF/condition/correction 的逐笔数据，不把 print 单独解释为方向。
 5. **结果合同扩展**：不可变基础榜、5/20 XNYS 交易日标的路径、MFE/MAE 与相对 SPY 已交付；下一步先冻结预定义 trigger/invalidation 和 `trade_taken` 事实，再评估是否建立“触发/未触发”与真实交易关联，未冻结前不做事后归因。
-6. **学习验证**：当前 10 样本才显示描述命中率、20 样本且 20 独立 session 才允许人工调查；样本成熟后仍需 walk-forward 和用户确认的新版本，绝不自动调权。
+6. **学习验证**：当前须同时满足 20 个已回填方向样本与 20 个独立 signal sessions 才显示描述命中率并允许人工调查；结果回填后仍需 walk-forward 和用户确认的新版本，绝不自动调权。
 
 ## 7. 当前限制
 
 - 初版是研究清单，不是全市场扫描器；扫描本地自选前 20 只或 `STOCK_LIST`，首屏只展示 Top 5。TradingView 当前通过官方 TXT 导入合并，不是账户实时同步。
 - 初版只对美股期权 underlying 生成研究候选；其他市场保留 blocked 状态等待独立交易日历、Regime 和期权数据合同。
-- 普通 OpportunityRun 请求本身仍不保存；Web 只在合法 XNYS 盘前窗口通过 `snapshots/ensure` 自动保存该日第一份研究版本，周末、休市、盘中和盘后跳过。历史上未保存的预览不能事后重建成因果样本。
+- 普通 OpportunityRun 请求本身仍不保存；Web 先读 canonical status，页面加载不再自动调用 `/premarket/run`。窗口外 `/daily` 结果只是只读预览，旧 v1 `snapshots/ensure` 也不再由该页面默认调用；服务端 scheduler 只在 09:12/09:17 ET 使用正式研究池，历史上未保存的预览不能事后重建成因果样本。
 - 没有经用户确认的结构化 Playbook，个人风格匹配保持未知。
 - Moomoo OpenD 10.9.6918 / Python SDK 10.9.6908 已可读取官方 underlying overview 与异常期权事件，但尚未持久化期权域逐日快照、测量账户级延迟或完成历史回测；overview 的 IV Rank 是供应商统计字段，不是本项目验证出的择时 edge。
 - 期权墙尚未保存为逐日历史序列，也未通过用户交易样本验证其对触墙、穿越、钉仓或后续收益的预测增量；当前只可作为研究上下文。
 - 异常成交事件的 Moomoo 方向、情绪和订单类型均为供应商分类；缺少开平仓、参与者身份、真实主动方与 dealer inventory，当前不得据此推断 dealer 定位或生成买卖指令。
 - 当前结果学习只评估标的价格上下文，不包含期权收益、真实成交、trigger 是否触发或 trade_taken；异步 overview、ATM IV、期权墙和异常成交也尚未冻结进样本。
+- 自动结果任务只追加真正到达目标交易日的 underlying 结果；当前没有 `TriggerSpec`、期权合约收益或 `trade_taken` 事实，不能据此生成“错过机会”或真实交易胜率。
 - 单票详情尚未提供完整合约级 bid/ask size、spread、期限结构、skew、可成交滑点和用户风险预算；这些缺口不会由聚合 Volume/OI、IV 或 Gross Gamma 补推。
 - 结果摘要是严格 cohort 内的小样本描述，不是策略胜率；达到人工调查门槛也不会自动修改排名。
 - FINRA 公共数据不具备当日时效；第三方 TRF 源尚未配置。

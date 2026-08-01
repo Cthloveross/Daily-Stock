@@ -19,6 +19,7 @@ const apiMocks = vi.hoisted(() => ({
   fetchOptionEvents: vi.fn(),
   fetchOptionOverview: vi.fn(),
   fetchOptionWalls: vi.fn(),
+  fetchSnapshotDetail: vi.fn(),
   getHistory: vi.fn(),
 }));
 
@@ -28,6 +29,7 @@ vi.mock('../../api/opportunities', () => ({
   fetchOpportunityOptionEvents: apiMocks.fetchOptionEvents,
   fetchOpportunityOptionOverview: apiMocks.fetchOptionOverview,
   fetchOpportunityOptionWalls: apiMocks.fetchOptionWalls,
+  fetchOpportunitySnapshotDetail: apiMocks.fetchSnapshotDetail,
 }));
 
 vi.mock('../../api/stocks', () => ({
@@ -184,6 +186,38 @@ const callOiLevel: OpportunityOptionWallLevel = {
   shareOfBucketPercent: 12,
   unit: 'contracts',
   method: 'sum_open_interest',
+  side: 'call',
+  metricBasis: 'settled_open_interest_prior_session',
+  quoteEvidence: 'partial',
+  expiryBreakdown: {
+    topExpiries: [
+      {
+        expiry: '2026-08-21',
+        dte: 29,
+        metricValue: 12_000,
+        shareOfLevelPercent: 60,
+        contractCount: 1,
+        quote: {
+          ivPercent: 42.1,
+          bid: null,
+          ask: null,
+          mark: null,
+          quoteAsOf: '2026-07-23 09:59:00',
+        },
+        quoteEvidence: 'partial',
+      },
+      {
+        expiry: '2026-09-18',
+        dte: 57,
+        metricValue: 6_000,
+        shareOfLevelPercent: 30,
+        contractCount: 1,
+        quote: { ivPercent: null, bid: null, ask: null, mark: null, quoteAsOf: null },
+        quoteEvidence: 'unavailable',
+      },
+    ],
+    other: { expiryCount: 2, metricValue: 2_000, shareOfLevelPercent: 10 },
+  },
 };
 
 const putOiLevel: OpportunityOptionWallLevel = {
@@ -191,12 +225,18 @@ const putOiLevel: OpportunityOptionWallLevel = {
   strike: 90,
   distanceFromSpotPercent: -10,
   metricValue: 18_000,
+  side: 'put',
+  quoteEvidence: null,
+  expiryBreakdown: null,
 };
 
 const callVolumeLevel: OpportunityOptionWallLevel = {
   ...callOiLevel,
   metricValue: 4_000,
   method: 'sum_session_volume',
+  metricBasis: 'current_session_cumulative_volume',
+  quoteEvidence: null,
+  expiryBreakdown: null,
 };
 
 const gammaLevel: OpportunityOptionWallLevel = {
@@ -206,10 +246,14 @@ const gammaLevel: OpportunityOptionWallLevel = {
   metricValue: 250_000,
   unit: 'usd_delta_change_per_1pct_move',
   method: 'gross_gamma_concentration_1pct',
+  side: 'call_put_aggregate',
+  metricBasis: 'model_from_settled_oi_and_snapshot_greeks',
+  quoteEvidence: null,
+  expiryBreakdown: null,
 };
 
 const optionWalls: OpportunityOptionWallResponse = {
-  schemaVersion: '1.0',
+  schemaVersion: 'option-wall/1.2',
   marketDateEt: '2026-07-23',
   generatedAt: '2026-07-23T10:00:00-04:00',
   items: [{
@@ -220,6 +264,13 @@ const optionWalls: OpportunityOptionWallResponse = {
     quoteAsOf: '2026-07-23 10:00:00',
     formulaVersion: 'fixture-v1',
     spot: 100,
+    atmCallIv: {
+      state: 'ready',
+      expiry: '2026-08-21',
+      strike: 100,
+      atmCallIvPercent: 42.5,
+      selectionMethod: 'nearest_expiry_atm_call_from_same_wall_snapshot',
+    },
     scope: {
       dteMin: 0,
       dteMax: 45,
@@ -343,14 +394,41 @@ const dailyHistory: StockHistory = {
   ],
 };
 
-function renderPage() {
+function renderPage(initialEntry = '/regime/opportunity/COIN') {
   return render(
-    <MemoryRouter initialEntries={['/regime/opportunity/COIN']}>
+    <MemoryRouter initialEntries={[initialEntry]}>
       <Routes>
         <Route path="/regime/opportunity/:ticker" element={<OpportunityDetailPage />} />
       </Routes>
     </MemoryRouter>,
   );
+}
+
+const officialSnapshotKey = `ops_${'b'.repeat(64)}`;
+
+function snapshotDetailResponse() {
+  return {
+    schemaVersion: 'opportunity-snapshot-detail/1.0',
+    snapshot: {
+      schemaVersion: 'opportunity-snapshot/1.0',
+      snapshotKey: officialSnapshotKey,
+      marketDateEt: '2026-07-22',
+      sourceRunId: 'opr_official',
+      frozenAt: '2026-07-22T12:05:00+00:00',
+      signalVersion: 'fixture-v1',
+      candidateCount: 1,
+      eligibleCandidateCount: 1,
+      validationEligible: true,
+      eligibilityReasons: [],
+      outcomeProgress: [],
+      idempotentReplay: false,
+    },
+    run: {
+      ...opportunityRun,
+      runId: 'opr_official',
+      marketDateEt: '2026-07-22',
+    },
+  };
 }
 
 describe('OpportunityDetailPage', () => {
@@ -360,7 +438,106 @@ describe('OpportunityDetailPage', () => {
     apiMocks.fetchOptionEvents.mockReset().mockResolvedValue(optionEvents);
     apiMocks.fetchOptionOverview.mockReset().mockResolvedValue(optionOverview);
     apiMocks.fetchOptionWalls.mockReset().mockResolvedValue(optionWalls);
+    apiMocks.fetchSnapshotDetail.mockReset().mockResolvedValue(snapshotDetailResponse());
     apiMocks.getHistory.mockReset().mockResolvedValue(history);
+  });
+
+  it('binds to the official frozen snapshot instead of a fresh scan when snapshotKey is present', async () => {
+    renderPage(`/regime/opportunity/COIN?snapshotKey=${officialSnapshotKey}`);
+
+    expect(await screen.findByText(/官方快照 ops_bbbbbbbb…/)).toBeInTheDocument();
+    expect(screen.getByText(/冻结于 2026-07-22T12:05:00\+00:00/)).toBeInTheDocument();
+    expect(apiMocks.fetchSnapshotDetail).toHaveBeenCalledWith(officialSnapshotKey);
+    // 冻结候选存在时不得再用即时扫描覆盖榜单证据。
+    expect(apiMocks.fetchDailyOpportunities).not.toHaveBeenCalled();
+    expect(screen.queryByText('即时扫描 · 未绑定官方快照')).not.toBeInTheDocument();
+    // 信号日来自冻结 run，而不是今天的即时扫描。
+    expect(screen.getAllByText(/信号日 2026-07-22/).length).toBeGreaterThan(0);
+  });
+
+  it('shows the frozen-vs-current drift strip only under official binding', async () => {
+    apiMocks.fetchOptionWalls.mockResolvedValue({
+      ...optionWalls,
+      items: [{ ...optionWalls.items[0], spot: 103, quoteAsOf: '2026-07-23 10:00:00' }],
+    });
+    renderPage(`/regime/opportunity/COIN?snapshotKey=${officialSnapshotKey}`);
+
+    expect(await screen.findByLabelText('冻结与当前差异')).toHaveTextContent('+3.00%');
+    expect(screen.getByLabelText('冻结与当前差异')).toHaveTextContent('冻结基准 close 100');
+    expect(screen.getByLabelText('冻结与当前差异')).toHaveTextContent('不改变冻结榜单结论');
+  });
+
+  it('hides the drift strip on live scans and when spot evidence is missing', async () => {
+    renderPage();
+    expect(await screen.findByText('即时扫描 · 未绑定官方快照')).toBeInTheDocument();
+    expect(screen.queryByLabelText('冻结与当前差异')).not.toBeInTheDocument();
+  });
+
+  it('labels live enhancement values with as-of notes in the officially bound summary (D-4 copy audit)', async () => {
+    renderPage(`/regime/opportunity/COIN?snapshotKey=${officialSnapshotKey}`);
+
+    // 增强数据数值（option-overview 的 IV Rank）织入摘要句时必须带 as-of + 非冻结声明。
+    const aside = await screen.findByLabelText('专业解读');
+    const positioning = await within(aside).findByText(/IV Rank 80%/);
+    expect(positioning.textContent).toContain(
+      'IV Rank 80%（当前增强数据 07/23 10:00 ET，非冻结榜单证据）',
+    );
+
+    // 冻结 bundle 数值（前 20 日区间 / 日线 EMA13）不需要也不得被标成增强数据。
+    const confirmation = within(aside).getByText(/前 20 日高点 105/);
+    expect(confirmation.textContent).toContain('EMA13 97');
+    expect(confirmation.textContent).not.toContain('当前增强数据');
+    expect(confirmation.textContent).not.toContain('非冻结榜单证据');
+
+    // 模型终值区间的 IV 输入同为增强数据；价格基准 as-of 已由 modelBasisLabel（Moomoo spot · 时点）携带。
+    const summarySection = screen
+      .getByRole('heading', { name: '专业结论与波动情景' })
+      .closest('section') as HTMLElement;
+    expect(
+      await within(summarySection).findByText(/IV 为当前增强数据（07\/23 10:00 ET），非冻结榜单证据/),
+    ).toBeInTheDocument();
+
+    // 审计代理：结论侧栏任何「增强指标名 + 数字」的句子都必须带非冻结声明，
+    // 防止后续有人把新的增强数值织入摘要而不加标注。
+    // 局限：按词面模式（IV/IV Rank/Spot/现价 后跟数字）识别，无法捕捉未命名的裸数字。
+    const liveValuePattern = /(?:IV Rank|IV|Spot|spot|现价)\s*[$\d]/;
+    const paragraphs = Array.from(aside.querySelectorAll('p'));
+    expect(paragraphs.length).toBeGreaterThan(0);
+    for (const paragraph of paragraphs) {
+      const text = paragraph.textContent ?? '';
+      if (liveValuePattern.test(text)) {
+        expect(text, `摘要句含增强数值但缺少非冻结标注: ${text}`).toContain('非冻结榜单证据');
+      }
+    }
+  });
+
+  it('keeps the live-scan summary free of enhancement as-of labels', async () => {
+    renderPage();
+
+    expect(await screen.findByText('即时扫描 · 未绑定官方快照')).toBeInTheDocument();
+    const aside = await screen.findByLabelText('专业解读');
+    const positioning = await within(aside).findByText(/IV Rank 80%/);
+    // 即时扫描视图没有冻结证据束，增强数据即当前数据，不加「非冻结」标注。
+    expect(positioning.textContent).not.toContain('当前增强数据');
+    expect(screen.queryByText(/非冻结榜单证据/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/当前增强数据/)).not.toBeInTheDocument();
+  });
+
+  it('falls back to a labelled live scan when the official snapshot is unavailable', async () => {
+    apiMocks.fetchSnapshotDetail.mockRejectedValue(new Error('404'));
+    renderPage(`/regime/opportunity/COIN?snapshotKey=${officialSnapshotKey}`);
+
+    expect(await screen.findByText(/官方快照读取失败，以下为即时扫描结果。/)).toBeInTheDocument();
+    expect(apiMocks.fetchDailyOpportunities).toHaveBeenCalledWith(['COIN'], 1, { refresh: false });
+    expect(screen.getByText('即时扫描 · 未绑定官方快照')).toBeInTheDocument();
+  });
+
+  it('labels the page as a live scan when no snapshotKey is provided', async () => {
+    renderPage();
+
+    expect(await screen.findByText('即时扫描 · 未绑定官方快照')).toBeInTheDocument();
+    expect(apiMocks.fetchSnapshotDetail).not.toHaveBeenCalled();
+    expect(apiMocks.fetchDailyOpportunities).toHaveBeenCalledWith(['COIN'], 1, { refresh: false });
   });
 
   it('updates the model interval when switching from 1D to 5D', async () => {
@@ -386,6 +563,49 @@ describe('OpportunityDetailPage', () => {
     expect(await within(summary as HTMLElement).findByText('约 68% 模型终值区间 · 5 个交易日')).toBeInTheDocument();
     await waitFor(() => expect(range?.textContent).not.toBe(oneDayRange));
     expect(screen.getByRole('button', { name: '5D' })).toHaveAttribute('aria-pressed', 'true');
+  });
+
+  it('pins the IV model-interval copy to calibration boundaries (D-5 概率展示校准边界)', async () => {
+    renderPage();
+
+    const summarySection = screen
+      .getByRole('heading', { name: '专业结论与波动情景' })
+      .closest('section') as HTMLElement;
+
+    // (a) 模型终值区间块必须始终携带「不是胜率/方向预测」声明。
+    await within(summarySection).findByText('约 68% 模型终值区间 · 1 个交易日');
+    expect(
+      within(summarySection).getByText('IV 模型终值分布 · 不是历史真实胜率、盘中触及概率或方向预测'),
+    ).toBeInTheDocument();
+
+    // (b) 方向概率未校准提示必须存在。
+    const calibrationNote = within(summarySection).getByText(/方向概率尚未校准/);
+    expect(calibrationNote.textContent).toContain(
+      '需要历史同类信号的样本外结果后才能显示真实统计',
+    );
+
+    // (c) 页面任何位置不得出现伪概率文案（「上涨概率」或「胜率 + 数字」）。
+    // 唯一允许出现「上涨概率」字样的是校准提示里的否定引用（“不能直接变成
+    // ‘上涨概率’”），因此先剔除该提示原文，再对整页文本做守卫扫描。
+    const fakeProbabilityPattern = /上涨概率|胜率\s*\d/;
+    const guardedPageText = () =>
+      (document.body.textContent ?? '').replace(calibrationNote.textContent ?? '', '');
+    expect(guardedPageText()).not.toMatch(fakeProbabilityPattern);
+
+    // 切换概率期限后声明仍在，且不得引入伪概率。
+    fireEvent.click(screen.getByRole('button', { name: '20D' }));
+    await within(summarySection).findByText('约 68% 模型终值区间 · 20 个交易日');
+    expect(
+      within(summarySection).getByText('IV 模型终值分布 · 不是历史真实胜率、盘中触及概率或方向预测'),
+    ).toBeInTheDocument();
+    expect(within(summarySection).getByText(/方向概率尚未校准/)).toBeInTheDocument();
+    expect(guardedPageText()).not.toMatch(fakeProbabilityPattern);
+
+    // 逐个研究 tab 扫描，防止未来在 tab 内容里引入未校准的伪概率展示。
+    for (const tabName of ['期权墙', /异常成交/, '数据说明', '波动与情景'] as const) {
+      fireEvent.click(screen.getByRole('button', { name: tabName }));
+      expect(guardedPageText()).not.toMatch(fakeProbabilityPattern);
+    }
   });
 
   it('renders only the active research tab content', async () => {
@@ -414,6 +634,35 @@ describe('OpportunityDetailPage', () => {
     expect(screen.queryByText('查看各期限历史波动率')).not.toBeInTheDocument();
     expect(screen.queryByText('查看当日成交量集中位')).not.toBeInTheDocument();
     expect(screen.queryByText(/BUY \/ SELL、情绪与订单类型/)).not.toBeInTheDocument();
+  });
+
+  it('renders per-level expiry breakdown with explicit missing-quote markers in the walls tab', async () => {
+    renderPage();
+
+    await screen.findByText('查看各期限历史波动率');
+    fireEvent.click(screen.getByRole('button', { name: '期权墙' }));
+
+    expect(
+      screen.getByText('到期分布 · OI＝T-1 清算 · 报价证据部分缺失'),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        '2026-08-21 · DTE 29 · 占该位 60% · IV 42.1% · Bid/Ask/Mark 标缺（快照未含盘口报价） · 2026-07-23 09:59:00',
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        '2026-09-18 · DTE 57 · 占该位 30% · IV 标缺 · Bid/Ask/Mark 标缺（快照未含盘口报价）',
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText('其余 2 个到期日 · 占该位 10%')).toBeInTheDocument();
+    expect(
+      screen.getByText('标缺字段为快照未提供的数据，未用估算或旧值回填。'),
+    ).toBeInTheDocument();
+    // Honesty framing stays: concentration context, not dealer GEX.
+    expect(
+      screen.getByText(/总 Gamma 为绝对值集中度，不是 dealer GEX 或 gamma flip/),
+    ).toBeInTheDocument();
   });
 
   it('defaults intraday charts to regular hours and recomputes EMA from the selected visible bars', async () => {

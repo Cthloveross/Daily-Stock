@@ -567,6 +567,20 @@ def test_position_episode_case_focus_ranks_without_mutating_build() -> None:
         "OPEN",
     ]
 
+    weakest_evidence = get_latest_position_episode_page(
+        case_focus="weakest_evidence",
+        per_page=10,
+    )
+    assert weakest_evidence.total == 4
+    weakest_scores = [
+        item.completeness_score for item in weakest_evidence.items
+    ]
+    # 证据最不完整在前：completeness_score 升序，且不过滤任何生命周期状态。
+    assert weakest_scores == sorted(weakest_scores)
+    assert {item.underlying for item in weakest_evidence.items} == {
+        "WIN", "LOSS", "MID", "OPEN",
+    }
+
     # Existing status filters remain intersections, not overrides.
     impossible = get_latest_position_episode_page(
         lifecycle_status="open",

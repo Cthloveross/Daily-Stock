@@ -136,7 +136,11 @@
 
 | Secret 名稱 | 說明 | 必填 |
 |------------|------|:----:|
-| `STOCK_LIST` | 自選股代碼，如 `600519,hk00700,AAPL,TSLA` | ✅ |
+| `STOCK_LIST` | 一般分析自選股，如 `600519,hk00700,AAPL,TSLA`；官方期權盤前研究池需在 `/watchlist` 明確儲存 | ✅ |
+| `PREMARKET_RESEARCH_SCHEDULER_ENABLED` | 啟用唯讀 XNYS 官方盤前排程（09:12 ET，必要時 09:17 恢復）；需先儲存研究池並重啟 Web | 可選 |
+| `OPPORTUNITY_OUTCOME_SCHEDULER_ENABLED` | 在精確 XNYS 收盤後自動成熟已凍結的 5D/20D 標的結果；不改權重、不下單 | 可選 |
+| `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY` | 可選 Alpaca 美股盤前分鐘線增強；兩項必須成對設定 | 可選 |
+| `FINNHUB_API_KEY` | 可選 Finnhub 財報/經濟日曆；子域獨立降級，免費 Key 不保證 Economic Calendar | 可選 |
 | `TAVILY_API_KEYS` | [Tavily](https://tavily.com/) 搜索 API（新聞搜索） | 推薦 |
 | `ANSPIRE_API_KEYS` | [Anspire AI Search](https://aisearch.anspire.cn/) 針對中文內容特別優化（可有效增強A股分析效果） | 可選 |
 | `MINIMAX_API_KEYS` | [MiniMax](https://platform.minimaxi.com/) Coding Plan Web Search（結構化搜索結果） | 可選 |
@@ -162,6 +166,8 @@
 | `AGENT_MAX_STEPS` | Agent 最大推理步數上限（預設 `10`）；保持預設時各子 Agent 依自身預設步數運行；主動調高到高於預設值時，所有子 Agent 統一採用該值；若設定值低於某子 Agent 的預設步數，則仍按該值作為上限進行限制 | 可選 |
 | `AGENT_SKILLS` | 逗號分隔的策略技能 id。留空時使用 metadata 宣告的主預設策略 skill（內建預設為 `bull_trend`）；使用 `all` 可啟用所有已載入策略技能。 | 可選 |
 | `AGENT_SKILL_DIR` | 自訂策略技能目錄（預設沿用內建 `strategies/` 相容路徑） | 可選 |
+
+期權研究憑據、權限、冒煙測試與付費來源邊界見 [期權研究資料/API 設定指南](../integrations/options-research-data-setup.md)。
 
 #### 3. 啟用 Actions
 

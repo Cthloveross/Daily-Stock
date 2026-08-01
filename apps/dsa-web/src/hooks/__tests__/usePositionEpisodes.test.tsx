@@ -120,7 +120,7 @@ describe('usePositionEpisodes', () => {
     const listCallsBeforeBuild = apiMocks.fetchPositionEpisodes.mock.calls.length;
 
     await act(async () => {
-      await result.current.buildCanonical(true);
+      await result.current.buildCanonical(true, false);
     });
 
     expect(apiMocks.createCanonicalPositionEpisodeBuild).toHaveBeenCalledWith({
@@ -128,6 +128,7 @@ describe('usePositionEpisodes', () => {
       canonicalSetSha256: 'a'.repeat(64),
       buildKey: 'b'.repeat(64),
       acceptAssumedFlat: true,
+      acceptGroupFeeScope: false,
     });
     expect(apiMocks.fetchPositionEpisodes).toHaveBeenCalledTimes(listCallsBeforeBuild);
     expect(result.current.canonicalBuildResult?.build.id).toBe(9);

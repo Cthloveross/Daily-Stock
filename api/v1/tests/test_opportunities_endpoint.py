@@ -12,6 +12,7 @@ from starlette.testclient import TestClient
 
 from api.v1.endpoints import opportunities
 from src.opportunities.engine import DailyHistoryInput
+from src.opportunities import maintenance_repository
 from src.services import opportunity_snapshot_service
 
 
@@ -114,6 +115,8 @@ def _snapshot_item() -> dict:
         "eligible_candidate_count": 1,
         "validation_eligible": True,
         "eligibility_reasons": [],
+        "analysis_quality_eligible": True,
+        "analysis_quality_reasons": [],
         "outcome_progress": [
             {
                 "horizon_sessions": horizon,
@@ -190,17 +193,18 @@ def test_snapshot_list_and_learning_summary_are_read_only(monkeypatch):
             "generated_at": "2026-07-22T13:00:00+00:00",
             "strategy_state": "collecting",
             "auto_adjustment": False,
-            "minimum_summary_samples": 10,
+            "minimum_summary_samples": 20,
             "minimum_investigation_samples": 20,
             "horizons": [
                 {
                     "horizon_sessions": horizon,
                     "mature_count": 0,
                     "distinct_signal_sessions": 0,
-                    "context_hit_count": 0,
-                    "context_miss_count": 0,
-                    "neutral_count": 0,
-                    "non_directional_count": 0,
+                    "directional_sample_count": 0,
+                    "context_hit_count": None,
+                    "context_miss_count": None,
+                    "neutral_count": None,
+                    "non_directional_count": None,
                     "context_hit_rate_percent": None,
                     "summary_visible": False,
                     "investigation_ready": False,
@@ -209,6 +213,17 @@ def test_snapshot_list_and_learning_summary_are_read_only(monkeypatch):
             ],
             "limitations": ["underlying only"],
         },
+    )
+    monkeypatch.setattr(
+        maintenance_repository,
+        "get_latest_outcome_maintenance",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "src.config.get_config",
+        lambda: SimpleNamespace(
+            opportunity_outcome_scheduler_enabled=True,
+        ),
     )
 
     client = _client()
@@ -219,6 +234,75 @@ def test_snapshot_list_and_learning_summary_are_read_only(monkeypatch):
     assert snapshots.json()["items"][0]["snapshot_key"] == "ops_test"
     assert summary.status_code == 200
     assert summary.json()["auto_adjustment"] is False
+    assert summary.json()["automatic_maintenance_enabled"] is True
+    assert summary.json()["minimum_summary_samples"] == 20
+
+
+_VALID_SNAPSHOT_KEY = "ops_" + "a" * 64
+
+
+def test_snapshot_detail_returns_frozen_run_verbatim(monkeypatch):
+    frozen_run = {
+        "run_id": "opr_frozen",
+        "market_date_et": "2026-07-22",
+        "signal_version": "daily_completed_bars_v1",
+        "candidates": [{"ticker": "NVDA", "candidate_id": "cand_1"}],
+    }
+    captured = {}
+
+    def detail(snapshot_key):
+        captured["key"] = snapshot_key
+        return {
+            "schema_version": "opportunity-snapshot-detail/1.0",
+            "snapshot": _snapshot_item(),
+            "run": frozen_run,
+        }
+
+    monkeypatch.setattr(
+        opportunity_snapshot_service, "get_snapshot_detail", detail
+    )
+
+    response = _client().get(
+        f"/api/v1/opportunities/snapshots/{_VALID_SNAPSHOT_KEY}"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert captured["key"] == _VALID_SNAPSHOT_KEY
+    assert body["schema_version"] == "opportunity-snapshot-detail/1.0"
+    assert body["snapshot"]["snapshot_key"] == "ops_test"
+    assert body["run"] == frozen_run
+
+
+def test_snapshot_detail_unknown_key_returns_404(monkeypatch):
+    monkeypatch.setattr(
+        opportunity_snapshot_service,
+        "get_snapshot_detail",
+        lambda snapshot_key: None,
+    )
+
+    response = _client().get(
+        f"/api/v1/opportunities/snapshots/{_VALID_SNAPSHOT_KEY}"
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["error"] == "snapshot_not_found"
+
+
+def test_snapshot_detail_rejects_malformed_key_without_touching_storage(
+    monkeypatch,
+):
+    def must_not_be_called(snapshot_key):
+        raise AssertionError("malformed key must fail closed before storage")
+
+    monkeypatch.setattr(
+        opportunity_snapshot_service, "get_snapshot_detail", must_not_be_called
+    )
+
+    response = _client().get("/api/v1/opportunities/snapshots/ops_not-a-key")
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["error"] == "snapshot_not_found"
 
 
 def test_evaluate_unknown_snapshot_returns_404(monkeypatch):
@@ -428,6 +512,79 @@ def test_single_flight_shares_one_in_progress_scan(monkeypatch):
     assert results == [{"shared": True}] * 4
 
 
+def test_daily_scan_cache_key_isolated_by_et_market_date():
+    assert opportunities._scan_cache_key(
+        ["AAPL"],
+        1,
+        market_date_et=date(2026, 7, 22),
+    ) != opportunities._scan_cache_key(
+        ["AAPL"],
+        1,
+        market_date_et=date(2026, 7, 23),
+    )
+
+
+def test_expired_flight_generation_cannot_overwrite_replacement_cache():
+    key = ("expired-generation",)
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_factory():
+        started.set()
+        assert release.wait(timeout=2)
+        return {"generation": "stale"}
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        stale_future = executor.submit(
+            opportunities._get_or_compute_scan,
+            key,
+            slow_factory,
+            lease_seconds=0.05,
+            wait_timeout_seconds=0.05,
+        )
+        assert started.wait(timeout=1)
+        time.sleep(0.07)
+        replacement = opportunities._get_or_compute_scan(
+            key,
+            lambda: {"generation": "fresh"},
+            lease_seconds=1,
+            wait_timeout_seconds=1,
+        )
+        release.set()
+        with pytest.raises(opportunities.OpportunityScanTimeoutError):
+            stale_future.result(timeout=1)
+
+    cached = opportunities._get_or_compute_scan(
+        key,
+        lambda: pytest.fail("fresh generation should remain cached"),
+    )
+    assert replacement == cached == {"generation": "fresh"}
+
+
+def test_daily_timeout_is_explicit_retryable_504(monkeypatch):
+    monkeypatch.setattr(
+        opportunities,
+        "_get_or_compute_scan",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            opportunities.OpportunityScanTimeoutError("sensitive provider detail")
+        ),
+    )
+
+    response = _client().post(
+        "/api/v1/opportunities/daily",
+        json={"symbols": ["AAPL"], "limit": 1},
+    )
+
+    assert response.status_code == 504
+    assert response.json()["detail"] == {
+        "error": "opportunity_scan_timeout",
+        "message": "行情研究仍在执行或已超时，请稍后重试。",
+        "retryable": True,
+        "retry_after_seconds": 2,
+    }
+    assert "sensitive provider detail" not in response.text
+
+
 def test_one_request_reuses_manager_and_caps_history_fetch_concurrency(monkeypatch):
     manager = _FakeManager()
     monkeypatch.setattr(opportunities, "_create_data_fetcher_manager", lambda: manager)
@@ -467,8 +624,18 @@ def test_one_request_reuses_manager_and_caps_history_fetch_concurrency(monkeypat
 def test_mixed_universe_skips_non_us_fetch_without_failing_batch(monkeypatch):
     manager = _FakeManager()
     calls = []
+    execute_daily_scan = opportunities._execute_daily_scan
     monkeypatch.setattr(opportunities, "_create_data_fetcher_manager", lambda: manager)
     monkeypatch.setattr(opportunities, "_load_current_regime", lambda market_date: None)
+    monkeypatch.setattr(
+        opportunities,
+        "_execute_daily_scan",
+        lambda symbols, limit: execute_daily_scan(
+            symbols,
+            limit,
+            as_of=datetime(2026, 7, 22, 14, 0, tzinfo=timezone.utc),
+        ),
+    )
 
     def load_history(symbol: str, *, as_of: datetime, manager):
         calls.append(symbol)
@@ -661,6 +828,9 @@ def test_option_context_rejects_more_than_three_or_non_us_symbols():
 def _wall_snapshot(*, complete: bool = True, include_gamma: bool = True):
     contracts = (
         SimpleNamespace(
+            code="US.TEST260724C105000",
+            expiry="2026-07-24",
+            dte=2,
             right="C",
             strike=105.0,
             open_interest=1_000,
@@ -668,8 +838,12 @@ def _wall_snapshot(*, complete: bool = True, include_gamma: bool = True):
             gamma=0.02 if include_gamma else None,
             contract_size=100 if include_gamma else None,
             update_time="2026-07-22 10:00:00",
+            implied_volatility=0.425,
         ),
         SimpleNamespace(
+            code="US.TEST260724P095000",
+            expiry="2026-07-24",
+            dte=2,
             right="P",
             strike=95.0,
             open_interest=1_500,
@@ -677,6 +851,7 @@ def _wall_snapshot(*, complete: bool = True, include_gamma: bool = True):
             gamma=0.03 if include_gamma else None,
             contract_size=100 if include_gamma else None,
             update_time="2026-07-22 10:00:01",
+            implied_volatility=0.51,
         ),
     )
     return SimpleNamespace(
@@ -710,12 +885,21 @@ def test_option_walls_disabled_is_explicit_and_never_queries_moomoo(monkeypatch)
     item = response.json()["items"][0]
     assert item["state"] == "not_configured"
     assert item["walls"]["call_oi"] == []
+    assert item["atm_call_iv"]["state"] == "not_configured"
+    assert item["atm_call_iv"]["atm_call_iv_percent"] is None
     assert item["scope"]["standard_contracts_only"] is True
     assert any("Dealer GEX" in value for value in item["limitations"])
 
 
 def test_option_walls_return_ranked_observable_and_gamma_levels(monkeypatch):
     monkeypatch.setattr(opportunities, "_moomoo_opend_enabled", lambda: True)
+    monkeypatch.setattr(
+        opportunities,
+        "_compute_atm_iv_moomoo",
+        lambda symbol: pytest.fail(
+            "wall response must derive ATM IV from its own snapshot"
+        ),
+    )
     monkeypatch.setattr(
         opportunities,
         "_compute_option_wall_moomoo",
@@ -736,7 +920,72 @@ def test_option_walls_return_ranked_observable_and_gamma_levels(monkeypatch):
     assert item["walls"]["gross_gamma_concentration"]
     assert item["coverage"]["coverage_percent"] == 100
     assert item["quote_as_of"] == "2026-07-22 10:00:01"
-    assert response.json()["schema_version"] == "option-wall/1.0"
+
+    call_oi_level = item["walls"]["call_oi"][0]
+    assert call_oi_level["side"] == "call"
+    assert call_oi_level["metric_basis"] == "settled_open_interest_prior_session"
+    assert call_oi_level["quote_evidence"] == "partial"
+    assert call_oi_level["expiry_breakdown"] == {
+        "top_expiries": [
+            {
+                "expiry": "2026-07-24",
+                "dte": 2,
+                "metric_value": 1_000,
+                "share_of_level_percent": 100.0,
+                "contract_count": 1,
+                "quote": {
+                    "iv_percent": 42.5,
+                    "bid": None,
+                    "ask": None,
+                    "mark": None,
+                    "quote_as_of": "2026-07-22 10:00:00",
+                },
+                "quote_evidence": "partial",
+            }
+        ],
+        "other": None,
+    }
+    assert item["walls"]["call_volume"][0]["metric_basis"] == (
+        "current_session_cumulative_volume"
+    )
+    assert item["walls"]["gross_gamma_concentration"][0]["metric_basis"] == (
+        "model_from_settled_oi_and_snapshot_greeks"
+    )
+    assert item["walls"]["gross_gamma_concentration"][0]["side"] == (
+        "call_put_aggregate"
+    )
+
+    assert item["atm_call_iv"] == {
+        "state": "ready",
+        "expiry": "2026-07-24",
+        "strike": 105.0,
+        "atm_call_iv_percent": 42.5,
+        "selection_method": (
+            "nearest_expiry_atm_call_from_same_wall_snapshot"
+        ),
+    }
+    assert response.json()["schema_version"] == "option-wall/1.2"
+
+
+def test_option_wall_level_schema_accepts_legacy_levels_without_breakdown():
+    from api.v1.schemas.opportunities import OptionWallLevel
+
+    level = OptionWallLevel.model_validate(
+        {
+            "rank": 1,
+            "strike": 105.0,
+            "distance_from_spot_percent": 5.0,
+            "metric_value": 1_000,
+            "share_of_bucket_percent": 40.0,
+            "unit": "contracts",
+            "method": "sum_open_interest",
+        }
+    )
+
+    assert level.side is None
+    assert level.metric_basis is None
+    assert level.quote_evidence is None
+    assert level.expiry_breakdown is None
 
 
 def test_option_walls_keep_oi_visible_when_gamma_or_snapshot_coverage_is_partial(
@@ -762,6 +1011,45 @@ def test_option_walls_keep_oi_visible_when_gamma_or_snapshot_coverage_is_partial
     assert item["walls"]["call_oi"]
     assert item["walls"]["gross_gamma_concentration"] == []
     assert item["coverage"]["gamma_contracts"] == 0
+
+
+def test_option_walls_overlap_top_five_scans_and_preserve_request_order(
+    monkeypatch,
+):
+    monkeypatch.setattr(opportunities, "_moomoo_opend_enabled", lambda: True)
+    release = threading.Event()
+    state_lock = threading.Lock()
+    active = 0
+    peak_active = 0
+    started: list[str] = []
+
+    def compute(symbol, *, dte_min, dte_max):
+        nonlocal active, peak_active
+        assert (dte_min, dte_max) == (0, 45)
+        with state_lock:
+            active += 1
+            peak_active = max(peak_active, active)
+            started.append(symbol)
+            if len(started) == 5:
+                release.set()
+        try:
+            assert release.wait(timeout=3)
+            return _wall_snapshot()
+        finally:
+            with state_lock:
+                active -= 1
+
+    monkeypatch.setattr(opportunities, "_compute_option_wall_moomoo", compute)
+    symbols = ["TSLA", "NVDA", "AAPL", "META", "COIN"]
+
+    response = _client().post(
+        "/api/v1/opportunities/option-walls",
+        json={"symbols": symbols, "dte_min": 0, "dte_max": 45},
+    )
+
+    assert response.status_code == 200
+    assert peak_active == 5
+    assert [item["ticker"] for item in response.json()["items"]] == symbols
 
 
 def test_option_walls_validate_symbols_and_dte_range(monkeypatch):
@@ -973,18 +1261,18 @@ def test_request_bounds_are_enforced():
 
 
 def test_main_v1_router_registers_opportunity_paths():
+    # Newer Starlette wraps included routers in objects without a flat
+    # ``path`` attribute; assert against the mounted FastAPI app's openapi
+    # paths so the check stays version-robust.
+    from fastapi import FastAPI
+
     from api.v1.router import router
 
-    assert any(route.path == "/api/v1/opportunities/daily" for route in router.routes)
-    assert any(
-        route.path == "/api/v1/opportunities/option-context"
-        for route in router.routes
-    )
-    assert any(
-        route.path == "/api/v1/opportunities/option-walls"
-        for route in router.routes
-    )
-    assert any(
-        route.path == "/api/v1/opportunities/option-events"
-        for route in router.routes
-    )
+    app = FastAPI()
+    app.include_router(router)
+    paths = set(app.openapi()["paths"])
+
+    assert "/api/v1/opportunities/daily" in paths
+    assert "/api/v1/opportunities/option-context" in paths
+    assert "/api/v1/opportunities/option-walls" in paths
+    assert "/api/v1/opportunities/option-events" in paths

@@ -11,6 +11,8 @@
 """
 
 import logging
+import os
+import re
 import sys
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -53,6 +55,115 @@ DEFAULT_QUIET_LOGGERS = [
 ]
 
 
+def _env_non_negative_int(name: str, default: int = 0) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            "%s=%r 不是整数，按 %d（关闭）处理", name, raw, default
+        )
+        return default
+    return max(value, 0)
+
+
+def cleanup_old_logs(
+    log_dir: str,
+    log_prefix: str,
+    *,
+    retention_days: int = 0,
+    max_total_bytes: int = 0,
+) -> List[Path]:
+    """按天数与总体积清理本模块自己生成的按日期日志文件。
+
+    安全边界（fail closed，宁可少删不多删）：
+    - 只匹配 ``{prefix}_{YYYYMMDD}.log`` / ``{prefix}_debug_{YYYYMMDD}.log``
+      及其 RotatingFileHandler 备份 ``*.log.N``；其他文件一概不碰；
+    - 只看 ``log_dir`` 顶层，不递归，因此 ``logs/archive/`` 等归档目录不受影响；
+    - 年龄以文件名内嵌日期为准（而非 mtime），当天文件永不删除；
+    - ``retention_days<=0`` 且 ``max_total_bytes<=0`` 时不做任何事；
+    - 单个文件删除失败只告警，不中断调用方。
+
+    Returns:
+        实际删除的文件路径列表。
+    """
+
+    if retention_days <= 0 and max_total_bytes <= 0:
+        return []
+
+    log_path = Path(log_dir)
+    if not log_path.is_dir():
+        return []
+
+    pattern = re.compile(
+        rf"^{re.escape(log_prefix)}(?:_debug)?_(\d{{8}})\.log(?:\.\d+)?$"
+    )
+    today = datetime.now().strftime("%Y%m%d")
+
+    dated_files: list[tuple[str, Path, int]] = []
+    for entry in log_path.iterdir():
+        if not entry.is_file():
+            continue
+        match = pattern.match(entry.name)
+        if match is None:
+            continue
+        file_date = match.group(1)
+        if file_date >= today:
+            continue
+        try:
+            size = entry.stat().st_size
+        except OSError:
+            continue
+        dated_files.append((file_date, entry, size))
+
+    deleted: List[Path] = []
+    logger = logging.getLogger(__name__)
+
+    def _delete(entry: Path) -> bool:
+        try:
+            entry.unlink()
+        except OSError as exc:
+            logger.warning("日志 retention 删除 %s 失败：%s", entry, exc)
+            return False
+        deleted.append(entry)
+        return True
+
+    survivors: list[tuple[str, Path, int]] = []
+    if retention_days > 0:
+        cutoff = datetime.now().date()
+        for file_date, entry, size in dated_files:
+            try:
+                parsed = datetime.strptime(file_date, "%Y%m%d").date()
+            except ValueError:
+                survivors.append((file_date, entry, size))
+                continue
+            if (cutoff - parsed).days > retention_days:
+                if not _delete(entry):
+                    survivors.append((file_date, entry, size))
+            else:
+                survivors.append((file_date, entry, size))
+    else:
+        survivors = dated_files
+
+    if max_total_bytes > 0:
+        survivors.sort(key=lambda item: item[0])  # 最旧日期在前
+        total = sum(size for _, _, size in survivors)
+        for _, entry, size in survivors:
+            if total <= max_total_bytes:
+                break
+            if _delete(entry):
+                total -= size
+
+    if deleted:
+        logger.info(
+            "日志 retention 清理了 %d 个历史日志文件（天数上限 %d，体积上限 %d 字节）",
+            len(deleted), retention_days, max_total_bytes,
+        )
+    return deleted
+
+
 def setup_logging(
     log_prefix: str = "app",
     log_dir: str = "./logs",
@@ -84,6 +195,15 @@ def setup_logging(
     # 创建日志目录
     log_path = Path(log_dir)
     log_path.mkdir(parents=True, exist_ok=True)
+
+    # 跨日期 retention：默认关闭（0），由 LOG_RETENTION_DAYS /
+    # LOG_RETENTION_MAX_TOTAL_MB 显式开启；只清理本前缀的按日期文件。
+    cleanup_old_logs(
+        log_dir,
+        log_prefix,
+        retention_days=_env_non_negative_int("LOG_RETENTION_DAYS"),
+        max_total_bytes=_env_non_negative_int("LOG_RETENTION_MAX_TOTAL_MB") * 1024 * 1024,
+    )
 
     # 日志文件路径（按日期分文件）
     today_str = datetime.now().strftime('%Y%m%d')

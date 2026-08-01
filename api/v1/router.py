@@ -20,6 +20,8 @@ from api.v1.endpoints import (
     history,
     journal,
     journal_ai,
+    journal_positions,
+    journal_reviews,
     opportunities,
     portfolio,
     regime,
@@ -93,6 +95,18 @@ router.include_router(
 
 router.include_router(
     journal_ai.router,
+    prefix="/journal",
+    tags=["Journal"]
+)
+
+router.include_router(
+    journal_positions.router,
+    prefix="/journal",
+    tags=["Journal"]
+)
+
+router.include_router(
+    journal_reviews.router,
     prefix="/journal",
     tags=["Journal"]
 )

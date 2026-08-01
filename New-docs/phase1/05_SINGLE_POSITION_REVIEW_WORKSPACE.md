@@ -1,8 +1,8 @@
 # Phase 1.5 · 单合约复盘工作台
 
-> 状态：单个 PositionEpisode 的案例精选、七档 K 线、常规/扩展时段、ET 横轴、EMA8/EMA13、成交证据联动、证据复盘与按需模型增强已落地（2026-07-22）。
+> 状态：单个 PositionEpisode 的案例精选、七档 K 线、常规/扩展时段、ET 横轴、EMA8/EMA13、成交证据联动、证据复盘、按需模型增强、ReviewAnnotation v1 与 Review Queue 已落地（2026-07-23）。
 >
-> 产品边界：页面只读取不可变 Episode evidence 与底层行情，不写交易账本，不读取交易密码，不解锁交易，不下单、改单或撤单。
+> 产品边界：页面只读不可变 Episode evidence 与底层行情；只有用户显式保存时才会向隔离的 ReviewAnnotation 追加一版自述，不修改券商证据账本、canonical、Episode 经济字段或 P&L，不读取交易密码，不解锁交易，不下单、改单或撤单。
 >
 > 口径边界：这是单合约仓位生命周期的复盘页，不是已经完成多腿归组的 StrategyEpisode，也不把未验证边界下的条件性结果升级为正式收益。
 
@@ -156,7 +156,7 @@ POST /api/v1/journal/v2/position-episodes/{episode_id}/ai-review?build_id=...&en
 
 点击“尝试模型增强”时同一端点使用 `enhance=true`。响应始终把确定性事实层放在 `evidence_markdown`；只有模型成功时才另外返回 `model_analysis_markdown`，界面将其放在独立“模型推断层”，不能替换事实层。模型成功时返回 `analysis_mode=model_enhanced`、`analysis_source=configured_llm`；模型失败时不丢弃结果，而是保留 `evidence_markdown`、令模型字段为空，并标记 `data_state=llm_unavailable`。旧 `analysis_markdown` 暂时保留原语义供旧客户端兼容，并已标记 deprecated。模型等待期间，页面继续显示已经生成的证据复盘。
 
-页面在复盘助手前提供六项“交易逻辑草稿”：策略假设、进场触发、失效点与止损、仓位/合约理由、实际出场原因和事后反思。前四项只能被视为对进场前计划的事后回忆，后两项属于结果已知后的记录；界面和模型指令都禁止把事后补录倒推成当时已经写下或已知的 setup。草稿只在当前浏览器的 `localStorage` 持久化，键同时包含 `build_id` 与 `episode_id`，不会写入 Moomoo、append-only 证据账本或 Episode。清空草稿只删除对应浏览器键。点击本地证据复盘时，非空草稿会发送给本机服务但不调用外部模型；点击模型增强时，同一批非空文字还会发送给用户已经配置的第三方模型供应商。
+页面在复盘助手前提供六项“交易逻辑草稿”：策略假设、进场触发、失效点与止损、仓位/合约理由、实际出场原因和事后反思，并可填写复盘标签与错误类型。前四项只能被视为对进场前计划的事后回忆，后两项属于结果已知后的记录；界面和模型指令都禁止把事后补录倒推成当时已经写下或已知的 setup。未提交更改会按 `build_id + episode_id` 自动保存在当前浏览器的 `localStorage`；进入页面时若同时存在服务器版本和本机未提交草稿，优先保留本机草稿并提示服务器最新 revision，避免静默覆盖。清空草稿只删除对应浏览器键，不删除已保存版本。点击本地证据复盘时，非空的六字段自述会发送给本机服务但不调用外部模型；点击模型增强时，同一批非空文字还会发送给用户已经配置的第三方模型供应商。
 
 生成复盘时，只有非空字段会作为本次请求的可选 body 发送：
 
@@ -173,7 +173,7 @@ POST /api/v1/journal/v2/position-episodes/{episode_id}/ai-review?build_id=...&en
 }
 ```
 
-每项最多 2,000 字符，六项去空白后的合计最多 6,000 字符；浏览器和服务端双重限制，服务端还会拒绝额外字段。上下文在事实包中固定标记为 `self_report_not_independently_verified`、`recorded_in_system_before_entry=false` 和 `post_trade_recall_of_pre_trade_plan`；确定性复盘只会逐项展示并列出缺失内容，模型增强才可检查计划与执行的一致性，而且“无法验证”不能写成“不一致”。没有 body 的旧调用完全兼容。
+每项最多 2,000 字符，六项去空白后的合计最多 6,000 字符；标签和错误类型各最多 20 项、每项最多 64 字符，并做去空白、去重和稳定排序。浏览器和服务端双重限制，服务端还会拒绝额外字段。上下文在事实包中固定标记为 `self_report_not_independently_verified`、`recorded_in_system_before_entry=false` 和 `post_trade_recall_of_pre_trade_plan`；确定性复盘只会逐项展示并列出缺失内容，模型增强才可检查计划与执行的一致性，而且“无法验证”不能写成“不一致”。没有 body 的旧调用完全兼容。
 
 两条请求都固定绑定当前 `episode_id` 和页面实际展示的 `build_id`。服务端读取不可变 Episode/evidence、底层标的与 SPY 的同期行情，以及开仓日附近七天内可用的 Regime；生成文本不写回 Journal、annotation、canonical set 或任何交易状态，重新生成也不会改变既有事实。
 
@@ -197,7 +197,39 @@ POST /api/v1/journal/v2/position-episodes/{episode_id}/ai-review?build_id=...&en
 
 失败采用可审计降级：单个底层/SPY 行情读取失败时，对应收益代理保持未知并写入 warning；Regime 不可用时明确禁止相关归因；LLM 未配置、超时、报错、结构不完整或返回空文本时，响应为 `data_state=llm_unavailable`，但 `analysis_markdown` 仍是完整的本地证据复盘，不再是空泛的“稍后重试”。未知 Episode/构建返回 404，无效开仓时间返回 422。K 线、原始 evidence 和本地证据复盘始终不依赖模型供应商。
 
-## 7. 边界与 P&L
+## 7. ReviewAnnotation v1 与 Review Queue
+
+ReviewAnnotation 是用户对一笔既有交易的**事后自述**，不是券商事实、交易前计划证明或模型结论。页面只有在用户点击“保存进行中”或“标记复盘完成”后才调用服务器；自动保存到浏览器、生成本地证据复盘和请求模型增强都不会创建 annotation。
+
+当前提供三个接口：
+
+```text
+GET  /api/v1/journal/v2/position-episodes/{episode_id}/review-annotations/latest?build_id=...
+GET  /api/v1/journal/v2/position-episodes/{episode_id}/review-annotations?build_id=...
+POST /api/v1/journal/v2/position-episodes/{episode_id}/review-annotations
+```
+
+POST body 显式携带 `build_id`、`review_status`、六个自述字段、`tags` 和 `error_types`。接口只接受用户提交的这些字段，不接受或隐式复制 `evidence_markdown`、`model_analysis_markdown` 等 AI 输出。
+
+状态口径固定为：
+
+| Review Queue | 持久化状态 | 含义 |
+|---|---|---|
+| 待复盘 | `not_started`（派生） | 当前 immutable build + PositionEpisode 没有任何 annotation；数据库不为“空状态”写占位行 |
+| 进行中 | `in_progress` | 最新 revision 被用户保存为仍需继续 |
+| 已完成 | `completed` | 最新 revision 被用户标记完成；至少要有一个六字段自述，只有标签或错误类型不能完成复盘 |
+
+持久化与审计边界：
+
+- annotation 同时绑定 `account_key + episode_build_id + position_episode_id`；构建不匹配返回 404，不能把一个 build 的自述静默挪到另一个 build；
+- 每次非重复保存只会追加下一 revision，并通过 `previous_annotation_id` 串联历史；历史按最新 revision 优先返回，不提供覆盖更新或删除路径；
+- 规范化内容的 `content_sha256` 相同且仍是最新版本时，重复提交幂等返回原 revision，不制造重复版本；
+- annotation 表继续受 append-only UPDATE/DELETE 拒绝保护；它与 broker order/fill/fee evidence、canonical set、Episode allocation、经济字段、P&L 和 Headline eligibility 隔离；
+- annotation 只代表 `user self-report · not independently verified`。AI 可以在一次复盘请求中读取用户当前提供的文字，但不会自动创建、完成、修改或删除 annotation。
+
+PositionEpisode 列表响应的 `review_queue` 在当前 build 与标的、生命周期、完整度、案例精选等非复盘筛选范围内返回 `pending / in_progress / completed / total`。可选 `review_status=not_started|in_progress|completed` 只筛列表项目，不改变这组队列基数；每行同时返回最新状态、revision 和更新时间。这样用户可以从“待复盘 → 进行中 → 已完成”继续工作，同时始终知道状态属于哪一个不可变事实版本。
+
+## 8. 边界与 P&L
 
 `assumed_flat_unverified` 不会因为进入工作台而改变：
 
@@ -208,23 +240,25 @@ POST /api/v1/journal/v2/position-episodes/{episode_id}/ai-review?build_id=...&en
 
 行情 K 线与 evidence 对齐用于复盘上下文，不会改变 Episode、allocation、canonical set 或默认构建。
 
-## 8. 错误与空状态
+## 9. 错误与空状态
 
 - 无效 Episode ID、构建不匹配或详情读取失败时展示可重试错误，并保留返回仓位复盘入口；
 - 行情读取失败时展示行情错误，证据详情仍可独立审阅；
 - 没有 bars 时明确说明不会移动 evidence，也不会用邻近日线伪装精确入场；
 - 没有 execution evidence 时不生成 marker，并明确显示没有可展示的执行证据；
 - 模型不可用时返回完整本地证据复盘和确定性市场上下文，不把供应商失败扩大成整页失败；
+- 服务器 annotation 读取失败时保留本机草稿继续编辑；保存失败时不清除草稿，用户可重试；
+- 没有已保存 annotation 时显示“待复盘”，版本历史为空而不是报错；
 - 图表按需加载单个 Episode，不把 1,441 个生命周期的全部证据一次载入浏览器。
 
-## 9. 本次不包含
+## 10. 本次不包含
 
 - 不进行 StrategyEpisode 多腿、spread、roll、行权或指派分组；
 - 不导入 opening/closing position snapshot，不提升 headline P&L 资格；
 - 不提供期权合约自身的历史价格、IV、Greeks、bid/ask 或 OI 曲线；
 - 不计算 MFE、MAE、滑点、利润捕获率或进场形态结论；
-- 不保存 ReviewAnnotation、交易计划、情绪、错误标签或 Playbook 规则；
-- 不把本地或模型复盘文本持久化为交易事实，不将相关性包装成确定性盈亏原因或已验证 edge；
+- 不把 ReviewAnnotation 冒充预先存在的 TradePlan，也不保存情绪、RuleEvaluation 或 Playbook 规则；
+- 不自动保存本地证据复盘或模型增强文本，不把它们写入 annotation 或交易事实，不将相关性包装成确定性盈亏原因或已验证 edge；
 - 不提供实时信号、交易解锁或任何订单执行能力。
 
-下一步应先用“大赚/大亏/高费用/长持有”案例精选抽查真实复杂生命周期、现金流买卖方向和多周期时间对齐，再加入经用户确认的 StrategyEpisode 分组、持久化复盘注释，以及有明确 provenance 的期权/市场快照。Moomoo 边界永久保持只读。
+下一步应先用 Review Queue 与“大赚/大亏/高费用/长持有”案例精选抽查真实复杂生命周期、现金流买卖方向和多周期时间对齐，再加入经用户确认的 StrategyEpisode 分组、TradePlan/RuleEvaluation，以及有明确 provenance 的期权/市场快照。Moomoo 边界永久保持只读。

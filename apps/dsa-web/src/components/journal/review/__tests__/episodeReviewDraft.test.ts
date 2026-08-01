@@ -7,6 +7,7 @@ import {
   episodeReviewDraftCharacterCount,
   episodeReviewDraftStorageKey,
   episodeReviewTextCharacterCount,
+  hasEpisodeReviewDraft,
   limitEpisodeReviewText,
   loadEpisodeReviewDraft,
   saveEpisodeReviewDraft,
@@ -59,6 +60,30 @@ describe('position episode review local draft', () => {
     const restored = loadEpisodeReviewDraft(9, 44);
     expect(episodeReviewDraftCharacterCount(restored)).toBe(EPISODE_REVIEW_TOTAL_MAX_CHARS);
     expect(restored.positionRationale).toBe('');
+  });
+
+  it('migrates a legacy v1 text-only draft and keeps classification-only drafts', () => {
+    window.localStorage.setItem(
+      episodeReviewDraftStorageKey(9, 45),
+      JSON.stringify({
+        version: 1,
+        updatedAt: '2026-07-21T00:00:00Z',
+        draft: { setupThesis: '旧版草稿' },
+      }),
+    );
+    expect(loadEpisodeReviewDraft(9, 45)).toEqual({
+      ...emptyEpisodeReviewDraft(),
+      setupThesis: '旧版草稿',
+    });
+
+    const classificationOnly = {
+      ...emptyEpisodeReviewDraft(),
+      tags: ['趋势延续'],
+      errorTypes: ['追高'],
+    };
+    expect(hasEpisodeReviewDraft(classificationOnly)).toBe(true);
+    expect(saveEpisodeReviewDraft(9, 46, classificationOnly)).toBe(true);
+    expect(loadEpisodeReviewDraft(9, 46)).toEqual(classificationOnly);
   });
 
   it('clears only the selected episode draft and rejects malformed storage', () => {

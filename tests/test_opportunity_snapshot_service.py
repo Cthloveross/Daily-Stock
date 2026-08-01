@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -9,6 +10,7 @@ from src.opportunities.repository import (
     StoredOutcome,
     StoredSnapshot,
     StoredSnapshotCandidate,
+    list_snapshots,
 )
 from src.services import opportunity_snapshot_service as service
 from src.storage import DatabaseManager
@@ -119,10 +121,69 @@ def test_freeze_is_premarket_eligible_and_same_slot_is_idempotent(isolated_db):
     )
 
     assert first["validation_eligible"] is True
+    assert first["analysis_quality_eligible"] is True
+    assert first["analysis_quality_reasons"] == []
     assert first["eligible_candidate_count"] == 1
+    assert first["underlying_path_candidate_count"] == 1
+    assert first["full_research_candidate_count"] == 0
+    assert [item["eligible_count"] for item in first["full_research_progress"]] == [
+        0,
+        0,
+    ]
     assert first["idempotent_replay"] is False
     assert replay["snapshot_key"] == first["snapshot_key"]
     assert replay["idempotent_replay"] is True
+
+
+def test_snapshot_projects_analysis_quality_separately_from_causal_eligibility(
+    isolated_db,
+):
+    result = service.freeze_daily_snapshot(
+        _run("GOOGL"),
+        db_manager=isolated_db,
+        frozen_at=datetime(2026, 7, 22, 13, 5, tzinfo=UTC),
+        history_loader=_bars,
+        analysis_quality_eligible=False,
+        analysis_quality_reasons=(
+            "regime_supporting_events_degraded",
+            "regime_supporting_premarket_degraded",
+        ),
+    )
+
+    assert result["analysis_quality_eligible"] is False
+    assert result["analysis_quality_reasons"] == [
+        "regime_supporting_events_degraded",
+        "regime_supporting_premarket_degraded",
+    ]
+    assert result["validation_eligible"] is False
+    assert result["eligible_candidate_count"] == 0
+
+
+def test_legacy_snapshot_quality_is_unknown_instead_of_assumed_ready(
+    isolated_db,
+):
+    result = service.freeze_daily_snapshot(
+        _run("META"),
+        db_manager=isolated_db,
+        frozen_at=datetime(2026, 7, 22, 13, 5, tzinfo=UTC),
+        history_loader=_bars,
+    )
+    stored = list_snapshots(db_manager=isolated_db)[0]
+    # Simulate the immutable payload shape produced before quality metadata
+    # existed. The projection must fail closed instead of treating absence as
+    # proof that the historical research bundle was complete.
+    legacy_payload = dict(stored.payload)
+    legacy_meta = dict(legacy_payload.get("snapshot_meta") or {})
+    legacy_meta.pop("analysis_quality_eligible", None)
+    legacy_meta.pop("analysis_quality_reasons", None)
+    legacy_payload["snapshot_meta"] = legacy_meta
+    legacy = replace(stored, payload=legacy_payload)
+
+    item = service.snapshot_item(legacy, db_manager=isolated_db)
+
+    assert result["analysis_quality_eligible"] is True
+    assert item["analysis_quality_eligible"] is None
+    assert item["analysis_quality_reasons"] == []
 
 
 def test_freeze_after_entry_open_is_saved_but_excluded(isolated_db):
@@ -136,6 +197,22 @@ def test_freeze_after_entry_open_is_saved_but_excluded(isolated_db):
     assert result["validation_eligible"] is False
     assert result["eligible_candidate_count"] == 0
     assert "not_frozen_before_entry_open" in result["eligibility_reasons"]
+
+
+def test_freeze_publish_guard_fails_before_append_at_hard_deadline(isolated_db):
+    with pytest.raises(service.SnapshotPublishWindowClosedError):
+        service.freeze_daily_snapshot(
+            _run("NVDA"),
+            db_manager=isolated_db,
+            frozen_at=datetime(2026, 7, 22, 13, 19, tzinfo=UTC),
+            benchmark_context=({}, None),
+            publish_deadline=datetime(2026, 7, 22, 13, 20, tzinfo=UTC),
+            publish_guard_clock=lambda: datetime(
+                2026, 7, 22, 13, 20, tzinfo=UTC
+            ),
+        )
+
+    assert list_snapshots(db_manager=isolated_db) == ()
 
 
 def test_ensure_daily_snapshot_saves_only_official_premarket_slot(isolated_db):
@@ -224,6 +301,74 @@ def test_evaluation_appends_only_mature_target_close(isolated_db):
     assert twenty_day["mature_count"] == 0
 
 
+def test_due_maintenance_preflight_makes_zero_provider_calls_before_target(
+    isolated_db,
+):
+    service.freeze_daily_snapshot(
+        _run(),
+        db_manager=isolated_db,
+        frozen_at=datetime(2026, 7, 22, 13, 5, tzinfo=UTC),
+        history_loader=_bars,
+    )
+    calls = []
+
+    result = service.evaluate_due_snapshots(
+        db_manager=isolated_db,
+        evaluated_at=datetime(2026, 7, 23, 21, 0, tzinfo=UTC),
+        history_loader=lambda symbol: calls.append(symbol) or _bars(symbol),
+    )
+
+    assert result["due_snapshot_count"] == 0
+    assert result["evaluated_snapshot_count"] == 0
+    assert calls == []
+
+
+def test_due_maintenance_reuses_symbol_histories_across_snapshots(monkeypatch):
+    snapshots = (_stored_snapshot(0), _stored_snapshot(1))
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        service,
+        "list_snapshots",
+        lambda **_kwargs: snapshots,
+    )
+    monkeypatch.setattr(
+        service,
+        "snapshot_item",
+        lambda *_args, **_kwargs: {
+            "outcome_progress": [
+                {
+                    "horizon_sessions": 5,
+                    "data_gap_count": 1,
+                    "partial_count": 0,
+                }
+            ]
+        },
+    )
+
+    def evaluate(snapshot_key: str, *, history_loader, **_kwargs):
+        history_loader("AAPL")
+        history_loader("SPY")
+        return {
+            "snapshot_key": snapshot_key,
+            "inserted_outcomes": 1,
+            "already_recorded": 0,
+            "pending_horizons": 1,
+            "data_gap_horizons": 0,
+        }
+
+    monkeypatch.setattr(service, "evaluate_snapshot", evaluate)
+
+    result = service.evaluate_due_snapshots(
+        evaluated_at=datetime(2026, 4, 1, 21, 0, tzinfo=UTC),
+        history_loader=lambda symbol: calls.append(symbol) or _bars(symbol),
+    )
+
+    assert result["evaluated_snapshot_count"] == 2
+    assert result["inserted_outcomes"] == 2
+    assert calls == ["AAPL", "SPY"]
+
+
 def _stored_outcome(
     index: int,
     *,
@@ -308,7 +453,18 @@ def _stored_snapshot(
     )
 
 
+def _allow_all_qualification_tracks(monkeypatch):
+    monkeypatch.setattr(
+        service,
+        "_qualified_track_candidate_keys",
+        lambda snapshot, **_kwargs: {
+            candidate.candidate_key for candidate in snapshot.candidates
+        },
+    )
+
+
 def test_learning_summary_hides_small_samples_and_never_auto_adjusts(monkeypatch):
+    _allow_all_qualification_tracks(monkeypatch)
     monkeypatch.setattr(
         service,
         "list_snapshots",
@@ -340,13 +496,14 @@ def test_learning_summary_hides_small_samples_and_never_auto_adjusts(monkeypatch
 
 
 def test_learning_summary_does_not_mix_signal_version_cohorts(monkeypatch):
+    _allow_all_qualification_tracks(monkeypatch)
     current_snapshots = tuple(
         _stored_snapshot(index, signal_version="signal_v2")
-        for index in range(10, 20)
+        for index in range(20, 40)
     )
     legacy_snapshots = tuple(
         _stored_snapshot(index, signal_version="signal_v1")
-        for index in range(10)
+        for index in range(20)
     )
     monkeypatch.setattr(
         service,
@@ -357,10 +514,10 @@ def test_learning_summary_does_not_mix_signal_version_cohorts(monkeypatch):
         service,
         "list_candidate_outcomes",
         lambda **_kwargs: (
-            *(_stored_outcome(index) for index in range(10, 20)),
+            *(_stored_outcome(index) for index in range(20, 40)),
             *(
                 _stored_outcome(index, label="CONTEXT_MISS")
-                for index in range(10)
+                for index in range(20)
             ),
         ),
     )
@@ -370,31 +527,32 @@ def test_learning_summary_does_not_mix_signal_version_cohorts(monkeypatch):
     )
     five_day = summary["horizons"][0]
 
-    assert five_day["mature_count"] == 10
-    assert five_day["context_hit_count"] == 10
+    assert five_day["mature_count"] == 20
+    assert five_day["context_hit_count"] == 20
     assert five_day["context_miss_count"] == 0
     assert five_day["context_hit_rate_percent"] == 100.0
 
 
 def test_learning_summary_excludes_critical_reference_quality_gaps(monkeypatch):
+    _allow_all_qualification_tracks(monkeypatch)
     monkeypatch.setattr(
         service,
         "list_snapshots",
-        lambda **_kwargs: tuple(_stored_snapshot(index) for index in range(12)),
+        lambda **_kwargs: tuple(_stored_snapshot(index) for index in range(22)),
     )
     monkeypatch.setattr(
         service,
         "list_candidate_outcomes",
         lambda **_kwargs: (
-            *(_stored_outcome(index) for index in range(10)),
+            *(_stored_outcome(index) for index in range(20)),
             _stored_outcome(
-                10,
+                20,
                 label="CONTEXT_MISS",
                 result_state="partial",
                 data_gaps=("reference_revision_mismatch",),
             ),
             _stored_outcome(
-                11,
+                21,
                 label="CONTEXT_MISS",
                 result_state="partial",
                 data_gaps=("reference_close_refetch_missing",),
@@ -407,11 +565,100 @@ def test_learning_summary_excludes_critical_reference_quality_gaps(monkeypatch):
     )
     five_day = summary["horizons"][0]
 
-    assert five_day["mature_count"] == 10
+    assert five_day["mature_count"] == 20
     assert five_day["excluded_quality_count"] == 2
-    assert five_day["context_hit_count"] == 10
+    assert five_day["context_hit_count"] == 20
     assert five_day["context_miss_count"] == 0
     assert five_day["context_hit_rate_percent"] == 100.0
+
+
+def test_learning_summary_requires_twenty_distinct_signal_sessions(monkeypatch):
+    _allow_all_qualification_tracks(monkeypatch)
+    monkeypatch.setattr(
+        service,
+        "list_snapshots",
+        lambda **_kwargs: tuple(_stored_snapshot(index) for index in range(20)),
+    )
+    repeated_session = "2026-01-02"
+    monkeypatch.setattr(
+        service,
+        "list_candidate_outcomes",
+        lambda **_kwargs: tuple(
+            replace(
+                _stored_outcome(index),
+                result={
+                    "reference_session_date": repeated_session,
+                    "provenance": {"horizon": {"data_gaps": []}},
+                },
+            )
+            for index in range(20)
+        ),
+    )
+
+    summary = service.learning_summary(
+        generated_at=datetime(2026, 4, 1, tzinfo=UTC)
+    )
+    five_day = summary["horizons"][0]
+
+    assert five_day["directional_sample_count"] == 20
+    assert five_day["distinct_signal_sessions"] == 1
+    assert five_day["summary_visible"] is False
+    assert five_day["context_hit_count"] is None
+    assert five_day["context_hit_rate_percent"] is None
+
+
+def test_learning_summary_fails_closed_without_full_research_qualification(
+    monkeypatch,
+    isolated_db,
+):
+    snapshots = tuple(_stored_snapshot(index) for index in range(20))
+    monkeypatch.setattr(
+        service,
+        "list_snapshots",
+        lambda **_kwargs: snapshots,
+    )
+    monkeypatch.setattr(
+        service,
+        "list_candidate_outcomes",
+        lambda **_kwargs: tuple(
+            _stored_outcome(index) for index in range(20)
+        ),
+    )
+
+    summary = service.learning_summary(
+        db_manager=isolated_db,
+        generated_at=datetime(2026, 4, 1, tzinfo=UTC),
+    )
+
+    five_day = summary["horizons"][0]
+    assert five_day["mature_count"] == 0
+    assert five_day["directional_sample_count"] == 0
+    assert five_day["context_hit_rate_percent"] is None
+
+
+def test_qualification_lookup_error_fails_closed_for_every_track(
+    monkeypatch,
+):
+    import src.opportunities.qualification_repository as repository
+
+    def fail_lookup(*_args, **_kwargs):
+        raise RuntimeError("qualification store unavailable")
+
+    monkeypatch.setattr(
+        repository,
+        "get_snapshot_qualification",
+        fail_lookup,
+    )
+    snapshot = _stored_snapshot(0)
+
+    assert service._qualified_track_candidate_keys(
+        snapshot,
+        track_key="raw_underlying_path_v1",
+    ) == set()
+    assert service._qualified_track_candidate_keys(
+        snapshot,
+        track_key="canonical_full_research_v1",
+    ) == set()
 
 
 def test_due_horizon_without_outcome_is_data_gap_not_pending(isolated_db):

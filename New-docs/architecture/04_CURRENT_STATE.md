@@ -1,11 +1,11 @@
-# Daily-Stock — 当前架构与功能（2026-07-20 审计快照）
+# Daily-Stock — 当前架构与功能（2026-07-30 审计快照）
 
 > 这份文档说明 fork 当前的实际形态。**和上游 `ZhuLinsen/daily_stock_analysis` 已经显著分叉**：
 > - Phase 0 v4 Mirror 层（完工于 2026-04-20）—— Journal / Regime / Breakout / Options / LEAP
 > - Moomoo OpenAPI 集成 Phase A/B/C/D（完工于 2026-04-29）
 > - macOS LaunchAgent "always-on" 部署 + sessionStorage 缓存 + 实时突破 daemon
 >
-> 2026-07-20 运行审计发现旧 LaunchAgent 在 OpenD 离线时会被 SDK 同步连接阻塞并无限刷日志，三项服务现已暂停。快速失败、资源回收、日志硬上限和只读探测已有测试与真实 smoke，但仍需 24 小时观察；旧 Journal sync 因账户选择与费用口径不可信而明确禁用，不随服务恢复。产品实施顺序以 [`05_PRODUCT_CHARTER_AND_ROADMAP.md`](./05_PRODUCT_CHARTER_AND_ROADMAP.md) 为准。
+> 2026-07-20 运行审计发现旧 LaunchAgent 在 OpenD 离线时会被 SDK 同步连接阻塞并无限刷日志，三项服务因此暂停。快速失败、资源回收、日志硬上限和只读探测已有测试与真实 smoke，但仍需 24 小时观察；旧 Journal sync 因账户选择与费用口径不可信而明确禁用，不随服务恢复。2026-07-30 已新增独立的当前期权持仓双采样证据链，但它不会倒推旧 Episode 的期初仓位。产品实施顺序以 [`05_PRODUCT_CHARTER_AND_ROADMAP.md`](./05_PRODUCT_CHARTER_AND_ROADMAP.md) 为准。
 >
 > 旧的"配股票池 → 跑分析 → 推 Telegram"链路保留作为兼容路径，但本 fork 的核心已转向**单人交易终端 + 实时陪跑系统**。
 
@@ -54,7 +54,7 @@
 | `/regime` | RegimePage | 半圆速度表 (Fear & Greed 风) · 6 维度 Contributions + ❓悬浮说明 · Watchlist 表(TickerPicker autocomplete + did-you-mean) · 行点击 → 表下方内联 TradingView K 线 · 30/60/90 天 history |
 | `/watchlist` | WatchlistPage | 全列 DataTable · 列选 / CSV export / filter / Sparkline / 行点跳详情 |
 | `/stocks/:ticker` | StockDetailPage | Moomoo 实时 K 线 (1m/5m/15m/1h/1D/1W/1M) · MA 8/13/144/169 · News (5 档 sentiment 箭头) · 中文总结 tab · invalid-ticker 自动 typo 提示 |
-| `/journal` | JournalPage | 8 tabs: Overview / Analysis / Trades / Reality / Framework / Ask AI / Reviews / Import |
+| `/journal` | JournalPage | 默认仓位复盘、案例筛选、当前期权持仓只读快照（双采样、30 分钟时效、账户/publication currentness）、交易证据导入/刷新与隔离的 legacy 分析页 |
 | `/backtest` | BacktestPage | 历史 AI 预测准确率 |
 | `/settings` | SettingsPage | LLM 通道 / API 密钥 / 通知 |
 
@@ -79,6 +79,7 @@
   /stats, /stats-by-style     统计 + 按 trade_style 聚合
   /qa                         用户 framework + 最近交易 → LLM 中文回答
   /sync-live                  409：旧入库链路暂停，不创建 SDK Context、不写库
+  /v2/position-snapshots/*   当前期权持仓双采样 preview / confirm / latest；过期或账户/锚点变化后降为历史快照，只作未来证据锚点
   /reviews/{ym}, /reviews/{y}/{m}/generate   月度 AI 复盘
   /import                     上传 CSV
 /system
@@ -221,7 +222,7 @@ OpenD 本身在 macOS 系统设置 → 通用 → 登录项里勾上"Moomoo Open
 - **本地 watchlist**：`useUserWatchlistStore` (zustand+persist) → `dsa-user-watchlist` localStorage key，刷新不丢。
 - **Journal framework**：`useJournalFrameworkStore` → `dsa-journal-framework`，用户写一段文本作 AI 分析交割单的"大前提"。
 - **TickerPicker autocomplete**：`useStockIndex` 加载 `public/stock-index.json`，前缀匹配 + Levenshtein fuzzy 兜底（"amaz" → "AMZN" did-you-mean）。
-- **MoomooBadge** in TopBar：每 30s 拉一次 `/api/v1/system/moomoo-status`，3 态：Moomoo 可达且只读（绿）/ Moomoo offline（黄）/ yfinance（灰）。`connected` 当前只表示有界 TCP 探测成功，不表示交割单已经同步；端点不能为轮询创建一个会无限重连的 SDK Context。
+- **MoomooBadge** in TopBar：同一标签内由模块级监控器合并全部组件订阅；多个可见标签通过 Web Locks 竞争单次探测，并以 `localStorage` + `BroadcastChannel` 共享结果，正常状态整个浏览器 profile 最多每 60s 请求一次 `/api/v1/system/moomoo-status`。隐藏标签停止轮询，重新可见或浏览器恢复 online 时立即参与刷新；请求失败显示“状态未知”并按 15/30/60/120s 退避，成功结果超过 75s 不再继续冒充实时状态。3 个已确认状态仍为：Moomoo 可达且只读（绿）/ Moomoo offline（黄）/ yfinance（灰）。`connected` 只表示有界 TCP 探测成功，不表示交割单已经同步；端点不能为轮询创建一个会无限重连的 SDK Context。
 
 ---
 

@@ -60,6 +60,45 @@ class TestMacroPenalty:
     def test_clean_day_zero(self):
         assert score_macro_penalty({}) == 0
 
+    def test_degraded_economic_calendar_keeps_ready_earnings_penalty(self):
+        assert score_macro_penalty(
+            {
+                "_status": "degraded",
+                "_readiness": {
+                    "economic_calendar": "unavailable",
+                    "earnings_calendar": "ready",
+                },
+                # Unknown economic flags must not be scored.
+                "fomc_today": True,
+                "cpi_today": True,
+                "nfp_today": True,
+                "earnings_count_watchlist": 2,
+            }
+        ) == -5
+
+    def test_degraded_earnings_calendar_keeps_ready_economic_penalty(self):
+        assert score_macro_penalty(
+            {
+                "_status": "degraded",
+                "_readiness": {
+                    "economic_calendar": "ready",
+                    "earnings_calendar": "unavailable",
+                },
+                "fomc_today": True,
+                # An unready earnings count must not be scored.
+                "earnings_count_watchlist": 4,
+            }
+        ) == -30
+
+    def test_legacy_degraded_payload_without_readiness_stays_fail_closed(self):
+        assert score_macro_penalty(
+            {
+                "_status": "degraded",
+                "fomc_today": True,
+                "earnings_count_watchlist": 4,
+            }
+        ) == 0
+
 
 class TestSectorRotation:
     def test_broad_risk_on(self):

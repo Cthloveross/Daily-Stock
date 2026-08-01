@@ -135,8 +135,15 @@ class MoomooOpenApiPreviewResponse(BaseModel):
     window_end: datetime
     source_timezone: str
     order_observations: int
+    ordinary_order_observations: int = 0
+    unclassified_parent_observations: int = 0
     fill_observations: int
     fee_observations: int
+    contract_spec_observations: int = 0
+    execution_group_observations: int = 0
+    execution_group_leg_observations: int = 0
+    execution_group_fill_links: int = 0
+    execution_group_fee_observations: int = 0
     fee_totals_by_currency: dict[str, str] = Field(default_factory=dict)
     journal_database_written: bool = False
 
@@ -145,12 +152,20 @@ class OpenApiSourceScope(BaseModel):
     environment: str
     market: str
     account_selection: str
+    account_bound: bool = False
     window_start: datetime
     window_end: datetime
     source_timezone: str
     order_observations: int
+    ordinary_order_observations: int = 0
+    unclassified_parent_observations: int = 0
     fill_observations: int
     fee_observations: int
+    contract_spec_observations: int = 0
+    execution_group_observations: int = 0
+    execution_group_leg_observations: int = 0
+    execution_group_fill_links: int = 0
+    execution_group_fee_observations: int = 0
     fee_totals_by_currency: dict[str, str] = Field(default_factory=dict)
 
 
@@ -169,6 +184,8 @@ class OpenApiCoverage(BaseModel):
     matched_orders: int
     csv_only_in_window: int
     api_only_orders: int
+    overlap_api_only_orders: int = 0
+    incremental_api_only_orders: int = 0
     ambiguous_identity_keys: int
     covered_base_orders: int
     base_orders: int
@@ -179,8 +196,14 @@ class OpenApiCoverage(BaseModel):
 class OpenApiWritePlan(BaseModel):
     already_imported: bool
     order_observations: int
+    ordinary_order_observations: int = 0
+    unclassified_parent_observations: int = 0
     fill_observations: int
     fee_observations: int
+    execution_group_observations: int = 0
+    execution_group_leg_observations: int = 0
+    execution_group_fill_links: int = 0
+    execution_group_fee_observations: int = 0
     order_identity_links: int
     deal_identity_links: int
     fill_set_attestations: int
@@ -199,6 +222,10 @@ class OpenApiCanonicalImpact(BaseModel):
     blocking_issues: int
     analysis_ready: bool
     canonical_set_sha256: str
+    input_execution_group_observations: int = 0
+    canonical_execution_groups: int = 0
+    canonical_execution_group_legs: int = 0
+    duplicate_execution_group_observations: int = 0
 
 
 class OpenApiPlanIssue(BaseModel):
@@ -226,10 +253,59 @@ class MoomooOpenApiPlanResponse(BaseModel):
     journal_database_written: bool = False
 
 
+class MoomooJournalRefreshRequest(BaseModel):
+    """Safe controls for one server-owned LIVE/US read-only acquisition."""
+
+    overlap_days: int = Field(default=7, ge=1, le=30)
+
+
+class MoomooJournalRefreshSource(BaseModel):
+    retrieval_complete: bool
+    coverage_complete: bool
+    has_activity: bool
+    broker_queried_through: datetime
+    latest_fill_at: Optional[datetime] = None
+    order_observations: int
+    ordinary_order_observations: int = 0
+    unclassified_parent_observations: int = 0
+    fill_observations: int
+    fee_observations: int
+    contract_spec_observations: int = 0
+    execution_group_observations: int = 0
+    execution_group_leg_observations: int = 0
+    execution_group_fill_links: int = 0
+    execution_group_fee_observations: int = 0
+
+
+class MoomooJournalRefreshPreviewResponse(BaseModel):
+    artifact_id: int
+    artifact_key: str
+    expires_at: datetime
+    source: MoomooJournalRefreshSource
+    plan: MoomooOpenApiPlanResponse
+    evidence_written: bool = False
+    trading_action_performed: bool = False
+
+
+class MoomooJournalRefreshConfirmRequest(BaseModel):
+    preview_key: str = Field(
+        ...,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+    )
+    acknowledge_partial_window: bool = False
+
+
 class OpenApiAppendedCounts(BaseModel):
     orders: int = 0
+    ordinary_orders: int = 0
     fills: int = 0
     fees: int = 0
+    execution_groups: int = 0
+    execution_group_legs: int = 0
+    execution_group_fill_links: int = 0
+    execution_group_fees: int = 0
     order_links: int = 0
     deal_links: int = 0
     fill_set_attestations: int = 0
@@ -239,6 +315,8 @@ class OpenApiAppendedCounts(BaseModel):
 class OpenApiConfirmedCanonical(BaseModel):
     orders: int
     fills: int
+    execution_groups: int = 0
+    execution_group_legs: int = 0
     shadowed_csv_fills: int
     shadowed_aggregate_orders: int
     blocking_issues: int
@@ -258,6 +336,56 @@ class MoomooOpenApiConfirmResponse(BaseModel):
     episode_build_triggered: bool = False
     trading_action_performed: bool = False
     message: str
+
+
+class MoomooJournalRefreshPublication(BaseModel):
+    publication_id: int
+    broker_queried_through: datetime
+    latest_fill_at: Optional[datetime] = None
+    evidence_published_through: datetime
+    recorded_at: datetime
+
+
+class MoomooJournalRefreshConfirmResponse(BaseModel):
+    artifact_id: int
+    publication: MoomooJournalRefreshPublication
+    imported: MoomooOpenApiConfirmResponse
+    trading_action_performed: bool = False
+
+
+class JournalRefreshStatusResponse(BaseModel):
+    refresh_enabled: bool
+    refresh_configured: bool
+    freshness_state: Literal[
+        "never_synced",
+        "stale",
+        "evidence_blocked",
+        "evidence_current",
+        "build_ready",
+        "current",
+    ]
+    pending_stage: Literal["refresh", "confirm", "build", "activate", "none"]
+    expected_complete_through: datetime
+    broker_queried_through: Optional[datetime] = None
+    latest_fill_at: Optional[datetime] = None
+    evidence_published_through: Optional[datetime] = None
+    publication_recorded_at: Optional[datetime] = None
+    latest_artifact_id: Optional[int] = None
+    latest_artifact_confirm_allowed: Optional[bool] = None
+    latest_artifact_expires_at: Optional[datetime] = None
+    latest_canonical_set_id: Optional[int] = None
+    latest_canonical_set_sha256: Optional[str] = None
+    latest_canonical_source_through: Optional[datetime] = None
+    latest_canonical_build_id: Optional[int] = None
+    latest_canonical_build_key: Optional[str] = None
+    latest_canonical_build_source_through: Optional[datetime] = None
+    active_selection_source: Literal["activation", "csv_fallback", "none"]
+    active_activation_id: Optional[int] = None
+    active_build_id: Optional[int] = None
+    active_build_key: Optional[str] = None
+    active_canonical_set_id: Optional[int] = None
+    active_source_through: Optional[datetime] = None
+    account_bound: bool
 
 
 class LedgerImportResponse(BaseModel):
@@ -301,12 +429,20 @@ class EpisodeBuildMetadata(BaseModel):
     source_kind: str = "csv_batch"
     canonical_set_id: Optional[int] = None
     canonical_set_sha256: Optional[str] = None
+    source_window_start: datetime
     source_cutoff_at: datetime
     position_episode_count: int
     unresolved_evidence_count: int
     completeness_score: str
     opening_boundary_policy: str
     assumed_flat_unverified: bool
+    execution_group_count: int = 0
+    group_fee_affected_episode_count: int = 0
+    retained_execution_group_fee_total: str = "0"
+    fee_conservation_by_currency: dict[str, dict[str, str]] = Field(
+        default_factory=dict
+    )
+    leg_fee_attribution_complete: bool = True
     partial_reasons: list[str] = Field(default_factory=list)
     recorded_at: datetime
 
@@ -357,6 +493,7 @@ class PositionEpisodeSummaryResponse(BaseModel):
     left_censored_episode_count: int
     incomplete_episode_count: int
     aggregate_only_episode_count: int
+    group_fee_affected_episode_count: int = 0
     headline_pnl: EpisodeHeadlinePnl
     conditional_pnl: EpisodeConditionalPnl
 
@@ -366,6 +503,12 @@ PositionEpisodeCaseFocus = Literal[
     "top_loss",
     "largest_fee",
     "longest_hold",
+    "weakest_evidence",
+]
+PositionEpisodeReviewStatus = Literal[
+    "not_started",
+    "in_progress",
+    "completed",
 ]
 
 
@@ -391,6 +534,7 @@ class PositionEpisodeQuality(BaseModel):
     is_left_censored: bool
     is_right_censored: bool
     pnl_summary_eligible: bool
+    group_fee_unallocated: bool = False
     pnl_exclusion_reasons: list[str] = Field(default_factory=list)
 
 
@@ -416,6 +560,16 @@ class PositionEpisodeItem(BaseModel):
     total_fee: Optional[str] = None
     realized_pnl_net: Optional[str] = None
     quality: PositionEpisodeQuality
+    review_status: PositionEpisodeReviewStatus = "not_started"
+    review_revision: Optional[int] = None
+    review_updated_at: Optional[datetime] = None
+
+
+class PositionEpisodeReviewQueue(BaseModel):
+    pending: int = Field(default=0, ge=0)
+    in_progress: int = Field(default=0, ge=0)
+    completed: int = Field(default=0, ge=0)
+    total: int = Field(default=0, ge=0)
 
 
 class PositionEpisodeEvidenceItem(BaseModel):
@@ -443,6 +597,9 @@ class PositionEpisodeListResponse(BaseModel):
     total: int
     page: int
     per_page: int
+    review_queue: PositionEpisodeReviewQueue = Field(
+        default_factory=PositionEpisodeReviewQueue
+    )
     items: list[PositionEpisodeItem] = Field(default_factory=list)
 
 
@@ -485,9 +642,17 @@ class CanonicalEpisodeBuildPlanResponse(BaseModel):
     planned_closed_episode_count: int = 0
     source_known_fee_total: Optional[str] = None
     allocated_known_fee_total: Optional[str] = None
+    retained_execution_group_fee_total: Optional[str] = None
+    fee_conservation_by_currency: dict[str, dict[str, str]] = Field(
+        default_factory=dict
+    )
     fee_conserved: bool = False
+    execution_group_count: int = 0
+    group_fee_affected_episode_count: int = 0
+    leg_fee_attribution_complete: bool = True
     opening_boundary_policy: Optional[str] = None
     requires_assumed_flat_acceptance: bool = False
+    requires_group_fee_scope_acceptance: bool = False
     default_build_id: Optional[int] = None
     default_position_episode_count: int = 0
     episode_count_delta: int = 0
@@ -511,6 +676,46 @@ class CanonicalEpisodeBuildConfirmRequest(BaseModel):
         pattern=r"^[0-9a-fA-F]{64}$",
     )
     accept_assumed_flat: bool = False
+    accept_group_fee_scope: bool = False
+
+
+class EpisodeBuildActivationStateResponse(BaseModel):
+    account_key: str
+    selection_source: Literal["activation", "csv_fallback", "none"]
+    current_activation_id: Optional[int] = None
+    current_activation_sequence: Optional[int] = None
+    current_build_id: Optional[int] = None
+    current_build_key: Optional[str] = None
+    canonical_set_id: Optional[int] = None
+    canonical_set_sha256: Optional[str] = None
+    previous_activation_id: Optional[int] = None
+    previous_build_id: Optional[int] = None
+    activated_at: Optional[datetime] = None
+
+
+class EpisodeBuildActivationRequest(BaseModel):
+    expected_build_key: str = Field(
+        ...,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+    )
+    expected_current_activation_id: Optional[int] = Field(default=None, ge=1)
+    expected_current_build_id: Optional[int] = Field(default=None, ge=1)
+    accept_assumed_flat: bool = False
+    accept_group_fee_scope: bool = False
+    # Required whenever the target build has left-censored openings (a
+    # snapshot-fence future build inheriting positions with no broker cost).
+    accept_left_censored_openings: bool = False
+
+
+class EpisodeBuildActivationResponse(BaseModel):
+    activation_id: int
+    activation_key: str
+    duplicate: bool
+    state: EpisodeBuildActivationStateResponse
+    message: str
+    trading_action_performed: bool = False
 
 
 class TradeUpdateRequest(BaseModel):

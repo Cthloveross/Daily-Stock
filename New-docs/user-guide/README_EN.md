@@ -140,7 +140,11 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 
 | Secret Name | Description | Required |
 |------------|------|:----:|
-| `STOCK_LIST` | Watchlist codes, e.g., `600519,AAPL,hk00700` | ✅ |
+| `STOCK_LIST` | General analysis watchlist, e.g., `600519,AAPL,hk00700`; the official options premarket pool must be saved explicitly in `/watchlist` | ✅ |
+| `PREMARKET_RESEARCH_SCHEDULER_ENABLED` | Enable the read-only XNYS-relative official premarket scheduler (09:12 ET, recovery at 09:17); requires a persisted research pool and Web restart | Optional |
+| `OPPORTUNITY_OUTCOME_SCHEDULER_ENABLED` | Mature due frozen 5D/20D underlying outcomes after the exact XNYS close; never changes weights or places orders | Optional |
+| `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY` | Optional Alpaca stock premarket-minute enhancement; both values are required | Optional |
+| `FINNHUB_API_KEY` | Optional Finnhub earnings/economic calendars; each subdomain degrades independently and the free key may not include Economic Calendar | Optional |
 | `TAVILY_API_KEYS` | [Tavily](https://tavily.com/) Search API (for news) | Recommended |
 | `ANSPIRE_API_KEYS` | [Anspire AI Search](https://aisearch.anspire.cn/) Specially optimized for Chinese content (effectively enhances A-share analysis) | Optional |
 | `MINIMAX_API_KEYS` | [MiniMax](https://platform.minimaxi.com/) Coding Plan Web Search (structured search results) | Optional |
@@ -168,6 +172,8 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 | `AGENT_MAX_STEPS` | Max reasoning-step limit for Agent mode (default `10`); at the default each sub-agent keeps its own preset, when raised above the default all sub-agents adopt this value, and when lowered below a sub-agent's preset that sub-agent is capped at this value | Optional |
 | `AGENT_SKILLS` | Comma-separated active strategy-skill ids. Leave empty to use the primary default strategy skill declared in metadata (built-in default: `bull_trend`); use `all` to activate every loaded strategy skill. | Optional |
 | `AGENT_SKILL_DIR` | Custom strategy-skill directory (default built-in `strategies/` compatibility path) | Optional |
+
+For exact options-research credentials, entitlements, smoke tests, and paid-source boundaries, see the [options research data/API setup guide](../integrations/options-research-data-setup.md).
 
 **Stock Code Format**
 

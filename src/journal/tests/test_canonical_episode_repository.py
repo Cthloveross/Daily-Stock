@@ -9,7 +9,8 @@ import json
 from zoneinfo import ZoneInfo
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, text, update
+from sqlalchemy.exc import IntegrityError
 
 from src.journal.brokers.moomoo_openapi_export import (
     OpenApiBatchMetadata,
@@ -24,19 +25,28 @@ from src.journal.brokers.moomoo_statement import (
     StatementParseResult,
 )
 from src.journal.ledger.canonical import canonicalize_observations
+from src.journal.ledger.activation_repository import (
+    EpisodeBuildActivationError,
+    activate_episode_build,
+    get_episode_build_activation_state,
+)
 from src.journal.ledger.episode_repository import (
     EpisodeRepositoryError,
+    _resolved_payload_instrument,
     append_canonical_position_episode_build,
     append_latest_position_episode_build,
     get_episode_summary,
     get_latest_episode_summary,
+    get_latest_position_episode_detail,
     get_latest_position_episode_page,
     get_position_episode_detail,
     get_position_episode_page,
+    load_verified_canonical_episode_evidence_projection,
     preview_canonical_position_episodes,
 )
 from src.journal.ledger.models import (
     EpisodeBuild,
+    EpisodeBuildActivation,
     EpisodeBuildCanonicalSource,
 )
 from src.journal.ledger.repository import (
@@ -52,6 +62,32 @@ ET = ZoneInfo("America/New_York")
 UTC = timezone.utc
 ACCOUNT_KEY = "default_moomoo_us"
 SYMBOL = "EXAMPLE260821C200000"
+
+
+def test_unfilled_option_order_does_not_require_an_execution_multiplier():
+    payload = {
+        "broker": "moomoo",
+        "account_key": ACCOUNT_KEY,
+        "raw_symbol": "MU260722P960000",
+        "asset_type": "option",
+        "underlying": "MU",
+        "currency": "USD",
+        "expiry": "2026-07-22",
+        "strike": "960",
+        "option_right": "P",
+        "contract_multiplier": None,
+        "contract_multiplier_basis": "unknown",
+    }
+
+    instrument = _resolved_payload_instrument(
+        payload,
+        {},
+        require_proved_multiplier=False,
+    )
+
+    assert instrument.contract_multiplier is None
+    with pytest.raises(EpisodeRepositoryError, match="no proved multiplier"):
+        _resolved_payload_instrument(payload, {})
 
 
 @pytest.fixture(autouse=True)
@@ -289,6 +325,81 @@ def _append_canonical(seed: _SeededCanonical, preview):
     )
 
 
+def _append_second_canonical_build(seed: _SeededCanonical):
+    inputs = load_canonical_observation_inputs(ACCOUNT_KEY)
+    canonical = canonicalize_observations(inputs.orders, inputs.fills)
+    stored = append_canonical_evidence_set(
+        canonical,
+        account_key=ACCOUNT_KEY,
+        source_cutoff_at=datetime(2026, 7, 23, tzinfo=UTC),
+        confirmed=True,
+    )
+    second_seed = replace(
+        seed,
+        canonical_set_id=stored.canonical_set_id,
+        canonical_set_sha256=stored.canonical_set_sha256,
+    )
+    preview = _canonical_preview(second_seed)
+    return second_seed, _append_canonical(second_seed, preview)
+
+
+def _append_invalid_canonical_build(
+    source_build_id: int,
+    *,
+    status: str,
+    unresolved_evidence_count: int,
+    key_character: str,
+) -> tuple[int, str]:
+    db = get_db()
+    with db.session_scope() as session:
+        source = session.get(EpisodeBuild, source_build_id)
+        source_link = session.execute(
+            select(EpisodeBuildCanonicalSource).where(
+                EpisodeBuildCanonicalSource.episode_build_id == source_build_id
+            )
+        ).scalar_one()
+        assert source is not None
+        build_key = key_character * 64
+        clone = EpisodeBuild(
+            build_key=build_key,
+            broker=source.broker,
+            account_key=source.account_key,
+            builder_name=source.builder_name,
+            builder_version=source.builder_version,
+            builder_config_sha256=source.builder_config_sha256,
+            evidence_set_sha256=source.evidence_set_sha256,
+            source_batch_ids_json=source.source_batch_ids_json,
+            source_cutoff_at=source.source_cutoff_at,
+            status=status,
+            strategy_episode_count=source.strategy_episode_count,
+            position_episode_count=source.position_episode_count,
+            unresolved_evidence_count=unresolved_evidence_count,
+            reconciliation_status=source.reconciliation_status,
+            build_report_json=source.build_report_json,
+            completeness_score=source.completeness_score,
+            completeness_json=source.completeness_json,
+            provenance_json=source.provenance_json,
+        )
+        session.add(clone)
+        session.flush()
+        session.add(
+            EpisodeBuildCanonicalSource(
+                link_key=("f" if key_character != "f" else "e") * 64,
+                episode_build_id=int(clone.id),
+                canonical_set_id=source_link.canonical_set_id,
+                canonical_set_sha256=source_link.canonical_set_sha256,
+                projection_name=source_link.projection_name,
+                projection_version=source_link.projection_version,
+                canonical_source_cutoff_at=(
+                    source_link.canonical_source_cutoff_at
+                ),
+                source_batch_ids_json=source_link.source_batch_ids_json,
+            )
+        )
+        session.flush()
+        return int(clone.id), build_key
+
+
 def test_preview_replays_frozen_set_and_ignores_submitted_order_amount():
     seed = _seed_cross_source_canonical()
 
@@ -327,6 +438,39 @@ def test_preview_replays_frozen_set_and_ignores_submitted_order_amount():
     assert replay.evidence_set_sha256 == first.evidence_set_sha256
     assert replay.source_batch_ids == first.source_batch_ids
     assert tuple(replay.episodes) == tuple(first.episodes)
+
+
+def test_full_verified_projection_shares_boundary_and_builder_replay():
+    seed = _seed_cross_source_canonical()
+    db = get_db()
+
+    with db.session_scope() as session:
+        projection = load_verified_canonical_episode_evidence_projection(
+            session,
+            ACCOUNT_KEY,
+            seed.canonical_set_id,
+            max_member_count=100,
+        )
+
+        assert projection.boundary.canonical_set_id == seed.canonical_set_id
+        assert projection.boundary.canonical_set_sha256 == (
+            seed.canonical_set_sha256
+        )
+        assert {item.selected_observation_id for item in projection.boundary.orders} == {
+            item.observation_id for item in projection.orders
+        }
+        assert {item.selected_observation_id for item in projection.boundary.fills} == {
+            item.observation_id for item in projection.fills
+        }
+        assert projection.max_multiplier_proof_residual >= 0
+
+        with pytest.raises(EpisodeRepositoryError, match="preview limit"):
+            load_verified_canonical_episode_evidence_projection(
+                session,
+                ACCOUNT_KEY,
+                seed.canonical_set_id,
+                max_member_count=1,
+            )
 
 
 def test_canonical_append_requires_confirmation_and_is_idempotent():
@@ -422,3 +566,335 @@ def test_canonical_append_does_not_change_default_csv_build():
     )
     assert explicit_detail is not None
     assert explicit_detail.episode.build_id == canonical.build_id
+
+
+def test_activation_state_uses_csv_fallback_until_explicit_activation():
+    empty = get_episode_build_activation_state(ACCOUNT_KEY)
+    assert empty.selection_source == "none"
+    assert empty.current_activation_id is None
+    assert empty.current_build_id is None
+
+    seed = _seed_cross_source_canonical()
+    canonical = _append_canonical(seed, _canonical_preview(seed))
+
+    state = get_episode_build_activation_state(ACCOUNT_KEY)
+    summary = get_latest_episode_summary(ACCOUNT_KEY)
+    page = get_latest_position_episode_page(ACCOUNT_KEY)
+
+    assert canonical.build_id != seed.legacy_build_id
+    assert state.selection_source == "csv_fallback"
+    assert state.current_activation_id is None
+    assert state.current_activation_sequence is None
+    assert state.current_build_id == seed.legacy_build_id
+    assert summary is not None
+    assert summary.build_id == seed.legacy_build_id
+    assert page.build_id == seed.legacy_build_id
+
+
+def test_activation_switches_latest_readers_and_retry_is_idempotent():
+    seed = _seed_cross_source_canonical()
+    canonical = _append_canonical(seed, _canonical_preview(seed))
+    initial = get_episode_build_activation_state(ACCOUNT_KEY)
+
+    with pytest.raises(
+        EpisodeBuildActivationError,
+        match="assumed-flat|acceptance",
+    ):
+        activate_episode_build(
+            canonical.build_id,
+            canonical.build_key,
+            account_key=ACCOUNT_KEY,
+            expected_current_activation_id=initial.current_activation_id,
+            expected_current_build_id=initial.current_build_id,
+        )
+
+    first = activate_episode_build(
+        canonical.build_id,
+        canonical.build_key,
+        account_key=ACCOUNT_KEY,
+        accept_assumed_flat=True,
+        expected_current_activation_id=initial.current_activation_id,
+        expected_current_build_id=initial.current_build_id,
+    )
+    retry = activate_episode_build(
+        canonical.build_id,
+        canonical.build_key,
+        account_key=ACCOUNT_KEY,
+        accept_assumed_flat=True,
+        expected_current_activation_id=initial.current_activation_id,
+        expected_current_build_id=initial.current_build_id,
+    )
+
+    assert first.duplicate is False
+    assert retry.duplicate is True
+    assert retry.activation_id == first.activation_id
+    assert first.state.selection_source == "activation"
+    assert first.state.current_activation_sequence == 1
+    assert first.state.current_build_id == canonical.build_id
+    assert first.state.previous_build_id == seed.legacy_build_id
+
+    summary = get_latest_episode_summary(ACCOUNT_KEY)
+    page = get_latest_position_episode_page(ACCOUNT_KEY)
+    assert summary is not None
+    assert summary.build_id == canonical.build_id
+    assert page.build_id == canonical.build_id
+    detail = get_latest_position_episode_detail(
+        page.items[0].episode_id,
+        ACCOUNT_KEY,
+    )
+    assert detail is not None
+    assert detail.episode.build_id == canonical.build_id
+
+    db = get_db()
+    with db.session_scope() as session:
+        assert session.execute(
+            select(func.count(EpisodeBuildActivation.id))
+        ).scalar_one() == 1
+
+
+def test_activation_cas_rejects_stale_activation_or_build():
+    seed = _seed_cross_source_canonical()
+    canonical = _append_canonical(seed, _canonical_preview(seed))
+    first = activate_episode_build(
+        canonical.build_id,
+        canonical.build_key,
+        account_key=ACCOUNT_KEY,
+        accept_assumed_flat=True,
+        expected_current_activation_id=None,
+        expected_current_build_id=seed.legacy_build_id,
+    )
+
+    with pytest.raises(EpisodeBuildActivationError, match="state changed"):
+        activate_episode_build(
+            canonical.build_id,
+            canonical.build_key,
+            account_key=ACCOUNT_KEY,
+            accept_assumed_flat=True,
+            expected_current_activation_id=None,
+            expected_current_build_id=canonical.build_id,
+        )
+    with pytest.raises(EpisodeBuildActivationError, match="state changed"):
+        activate_episode_build(
+            canonical.build_id,
+            canonical.build_key,
+            account_key=ACCOUNT_KEY,
+            accept_assumed_flat=True,
+            expected_current_activation_id=first.activation_id,
+            expected_current_build_id=seed.legacy_build_id,
+        )
+
+    current = get_episode_build_activation_state(ACCOUNT_KEY)
+    assert current.current_activation_id == first.activation_id
+    db = get_db()
+    with db.session_scope() as session:
+        assert session.execute(
+            select(func.count(EpisodeBuildActivation.id))
+        ).scalar_one() == 1
+
+
+def test_activation_rejects_noncanonical_wrong_key_and_wrong_account():
+    seed = _seed_cross_source_canonical()
+    canonical = _append_canonical(seed, _canonical_preview(seed))
+    initial = get_episode_build_activation_state(ACCOUNT_KEY)
+    assert initial.current_build_key is not None
+
+    with pytest.raises(EpisodeBuildActivationError, match="canonical-linked"):
+        activate_episode_build(
+            seed.legacy_build_id,
+            initial.current_build_key,
+            account_key=ACCOUNT_KEY,
+            accept_assumed_flat=True,
+            expected_current_activation_id=None,
+            expected_current_build_id=seed.legacy_build_id,
+        )
+    with pytest.raises(EpisodeBuildActivationError, match="build changed"):
+        activate_episode_build(
+            canonical.build_id,
+            "0" * 64,
+            account_key=ACCOUNT_KEY,
+            accept_assumed_flat=True,
+            expected_current_activation_id=None,
+            expected_current_build_id=seed.legacy_build_id,
+        )
+    with pytest.raises(EpisodeBuildActivationError, match="does not exist"):
+        activate_episode_build(
+            canonical.build_id,
+            canonical.build_key,
+            account_key="different-account",
+            accept_assumed_flat=True,
+            expected_current_activation_id=None,
+            expected_current_build_id=None,
+        )
+
+    db = get_db()
+    with db.session_scope() as session:
+        assert session.execute(
+            select(func.count(EpisodeBuildActivation.id))
+        ).scalar_one() == 0
+
+
+@pytest.mark.parametrize(
+    ("status", "unresolved_evidence_count", "key_character", "message"),
+    (
+        ("failed", 0, "d", "succeeded or partial"),
+        ("partial", 1, "e", "unresolved evidence"),
+    ),
+)
+def test_activation_rejects_failed_or_unresolved_canonical_build(
+    status,
+    unresolved_evidence_count,
+    key_character,
+    message,
+):
+    seed = _seed_cross_source_canonical()
+    canonical = _append_canonical(seed, _canonical_preview(seed))
+    invalid_id, invalid_key = _append_invalid_canonical_build(
+        canonical.build_id,
+        status=status,
+        unresolved_evidence_count=unresolved_evidence_count,
+        key_character=key_character,
+    )
+
+    with pytest.raises(EpisodeBuildActivationError, match=message):
+        activate_episode_build(
+            invalid_id,
+            invalid_key,
+            account_key=ACCOUNT_KEY,
+            accept_assumed_flat=True,
+            expected_current_activation_id=None,
+            expected_current_build_id=seed.legacy_build_id,
+        )
+
+    assert get_episode_build_activation_state(
+        ACCOUNT_KEY
+    ).current_build_id == seed.legacy_build_id
+
+
+def test_activation_history_supports_a_b_a_rollback():
+    seed = _seed_cross_source_canonical()
+    build_a = _append_canonical(seed, _canonical_preview(seed))
+    first = activate_episode_build(
+        build_a.build_id,
+        build_a.build_key,
+        account_key=ACCOUNT_KEY,
+        accept_assumed_flat=True,
+        expected_current_activation_id=None,
+        expected_current_build_id=seed.legacy_build_id,
+    )
+    _second_seed, build_b = _append_second_canonical_build(seed)
+    second = activate_episode_build(
+        build_b.build_id,
+        build_b.build_key,
+        account_key=ACCOUNT_KEY,
+        accept_assumed_flat=True,
+        expected_current_activation_id=first.activation_id,
+        expected_current_build_id=build_a.build_id,
+    )
+    third = activate_episode_build(
+        build_a.build_id,
+        build_a.build_key,
+        account_key=ACCOUNT_KEY,
+        accept_assumed_flat=True,
+        expected_current_activation_id=second.activation_id,
+        expected_current_build_id=build_b.build_id,
+    )
+
+    assert [
+        first.state.current_activation_sequence,
+        second.state.current_activation_sequence,
+        third.state.current_activation_sequence,
+    ] == [1, 2, 3]
+    assert first.state.previous_activation_id is None
+    assert first.state.previous_build_id == seed.legacy_build_id
+    assert second.state.previous_activation_id == first.activation_id
+    assert second.state.previous_build_id == build_a.build_id
+    assert third.state.previous_activation_id == second.activation_id
+    assert third.state.previous_build_id == build_b.build_id
+    assert get_episode_build_activation_state(
+        ACCOUNT_KEY
+    ).current_build_id == build_a.build_id
+    assert get_latest_episode_summary(ACCOUNT_KEY).build_id == build_a.build_id
+
+    same_target = activate_episode_build(
+        build_a.build_id,
+        build_a.build_key,
+        account_key=ACCOUNT_KEY,
+        accept_assumed_flat=True,
+        expected_current_activation_id=third.activation_id,
+        expected_current_build_id=build_a.build_id,
+    )
+    assert same_target.duplicate is True
+    assert same_target.activation_id == third.activation_id
+
+    with pytest.raises(EpisodeBuildActivationError, match="state changed"):
+        activate_episode_build(
+            build_a.build_id,
+            build_a.build_key,
+            account_key=ACCOUNT_KEY,
+            accept_assumed_flat=True,
+            expected_current_activation_id=None,
+            expected_current_build_id=seed.legacy_build_id,
+        )
+
+    db = get_db()
+    with db.session_scope() as session:
+        rows = session.execute(
+            select(EpisodeBuildActivation).order_by(
+                EpisodeBuildActivation.activation_sequence
+            )
+        ).scalars().all()
+        assert len(rows) == 3
+        assert [int(row.episode_build_id) for row in rows] == [
+            build_a.build_id,
+            build_b.build_id,
+            build_a.build_id,
+        ]
+
+
+def test_activation_rows_are_sqlite_append_only():
+    seed = _seed_cross_source_canonical()
+    canonical = _append_canonical(seed, _canonical_preview(seed))
+    activated = activate_episode_build(
+        canonical.build_id,
+        canonical.build_key,
+        account_key=ACCOUNT_KEY,
+        accept_assumed_flat=True,
+        expected_current_activation_id=None,
+        expected_current_build_id=seed.legacy_build_id,
+    )
+    db = get_db()
+
+    with db.session_scope() as session:
+        trigger_names = set(
+            session.execute(
+                text(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'trigger' "
+                    "AND tbl_name = "
+                    "'journal_v2_episode_build_activations'"
+                )
+            ).scalars()
+        )
+    assert trigger_names == {
+        "trg_journal_v2_episode_build_activations_update_immutable",
+        "trg_journal_v2_episode_build_activations_delete_immutable",
+    }
+
+    with pytest.raises(IntegrityError, match="append-only"):
+        with db.session_scope() as session:
+            session.execute(
+                update(EpisodeBuildActivation)
+                .where(EpisodeBuildActivation.id == activated.activation_id)
+                .values(episode_build_key="0" * 64)
+            )
+    with pytest.raises(IntegrityError, match="append-only"):
+        with db.session_scope() as session:
+            session.execute(
+                delete(EpisodeBuildActivation).where(
+                    EpisodeBuildActivation.id == activated.activation_id
+                )
+            )
+
+    assert get_episode_build_activation_state(
+        ACCOUNT_KEY
+    ).current_activation_id == activated.activation_id

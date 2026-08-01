@@ -4,6 +4,7 @@ const JOURNAL_CONTEXT_KEYS = [
   'status',
   'completeness',
   'case',
+  'review_status',
   'page',
 ] as const;
 

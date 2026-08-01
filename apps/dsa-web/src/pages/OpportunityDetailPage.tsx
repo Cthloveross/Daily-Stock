@@ -1,9 +1,10 @@
 import type React from 'react';
-import { useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 import { ArrowLeft, Clock3, RefreshCw, ShieldCheck, TriangleAlert } from 'lucide-react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import {
   fetchDailyOpportunities,
+  fetchOpportunitySnapshotDetail,
   fetchOpportunityOptionContext,
   fetchOpportunityOptionEvents,
   fetchOpportunityOptionOverview,
@@ -11,6 +12,7 @@ import {
 } from '../api/opportunities';
 import { stocksApi } from '../api/stocks';
 import { CandlestickChart, type Candle, type MAOverlay } from '../components/charts/CandlestickChart';
+import { WallLevelExpiryBreakdown } from '../components/opportunities/WallLevelExpiryBreakdown';
 import { Tabs } from '../components/ui';
 import type {
   OpportunityCandidate,
@@ -23,6 +25,7 @@ import type {
   OpportunityOptionWallLevel,
 } from '../types/opportunities';
 import type { StockHistory, StockKLine, Timeframe } from '../types/stockHistory';
+import { computeSmaSeededEmaSeries } from '../utils/ema';
 import { calculateImpliedMove } from '../utils/impliedMove';
 import {
   filterByUsTradingSession,
@@ -105,17 +108,6 @@ function toCandles(klines: StockKLine[]): Candle[] {
     }))
     .filter((bar) => Number.isFinite(bar.time) && bar.time > 0)
     .sort((left, right) => Number(left.time) - Number(right.time));
-}
-
-/** Standard EMA with adjust=false semantics: first close is the seed. */
-function computeEma(candles: Candle[], period: number): MAOverlay['data'] {
-  if (candles.length === 0) return [];
-  const alpha = 2 / (period + 1);
-  let ema = candles[0].close;
-  return candles.map((bar, index) => {
-    if (index > 0) ema = (bar.close * alpha) + (ema * (1 - alpha));
-    return { time: bar.time, value: ema };
-  });
 }
 
 function formatNumber(value: number | null | undefined, digits = 2): string {
@@ -227,15 +219,24 @@ function WallTable({ title, levels }: { title: string; levels: OpportunityOption
           </thead>
           <tbody className="divide-y divide-subtle">
             {levels.slice(0, 3).map((level) => (
-              <tr key={`${level.method}-${level.rank}-${level.strike}`} className="font-mono text-mono-xs tabular-nums text-text-2">
-                <td className="py-2 text-text-1">{formatNumber(level.strike)}</td>
-                <td className="py-2 text-right">{level.distanceFromSpotPercent > 0 ? '+' : ''}{formatPercent(level.distanceFromSpotPercent)}</td>
-                <td className="py-2 text-right">
-                  {level.unit === 'usd_delta_change_per_1pct_move'
-                    ? `${formatCompact(level.metricValue, true)} / 1%`
-                    : formatCompact(level.metricValue)}
-                </td>
-              </tr>
+              <Fragment key={`${level.method}-${level.rank}-${level.strike}`}>
+                <tr className="font-mono text-mono-xs tabular-nums text-text-2">
+                  <td className="py-2 text-text-1">{formatNumber(level.strike)}</td>
+                  <td className="py-2 text-right">{level.distanceFromSpotPercent > 0 ? '+' : ''}{formatPercent(level.distanceFromSpotPercent)}</td>
+                  <td className="py-2 text-right">
+                    {level.unit === 'usd_delta_change_per_1pct_move'
+                      ? `${formatCompact(level.metricValue, true)} / 1%`
+                      : formatCompact(level.metricValue)}
+                  </td>
+                </tr>
+                {level.expiryBreakdown && level.expiryBreakdown.topExpiries.length > 0 && (
+                  <tr>
+                    <td colSpan={3} className="pb-2">
+                      <WallLevelExpiryBreakdown level={level} />
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
             ))}
           </tbody>
         </table>
@@ -250,9 +251,21 @@ function eventContract(event: OpportunityOptionEvent): string {
   return event.symbol ?? event.optionCode;
 }
 
+type OfficialBinding =
+  | { state: 'official'; snapshotKey: string; frozenAt: string }
+  | { state: 'fallback'; snapshotKey: string; reason: string }
+  | { state: 'live_scan' };
+
+const SNAPSHOT_KEY_PATTERN = /^ops_[0-9a-f]{64}$/;
+
 const OpportunityDetailPage: React.FC = () => {
   const { ticker: tickerParam = '' } = useParams<{ ticker: string }>();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const requestedSnapshotKey = searchParams.get('snapshotKey');
+  const officialSnapshotKey = requestedSnapshotKey && SNAPSHOT_KEY_PATTERN.test(requestedSnapshotKey)
+    ? requestedSnapshotKey
+    : null;
   const ticker = tickerParam.trim().toUpperCase();
   const [refreshKey, setRefreshKey] = useState(0);
   const [timeframe, setTimeframe] = useState<Timeframe>('5m');
@@ -264,6 +277,7 @@ const OpportunityDetailPage: React.FC = () => {
   const [runMeta, setRunMeta] = useState<{ marketDateEt: string; asOf: string; signalVersion: string } | null>(null);
   const [candidateLoading, setCandidateLoading] = useState(true);
   const [candidateError, setCandidateError] = useState<string | null>(null);
+  const [officialBinding, setOfficialBinding] = useState<OfficialBinding>({ state: 'live_scan' });
 
   const [overview, setOverview] = useState<OpportunityOptionOverviewItem | null>(null);
   const [overviewLoading, setOverviewLoading] = useState(true);
@@ -287,13 +301,52 @@ const OpportunityDetailPage: React.FC = () => {
     let cancelled = false;
     const refresh = refreshKey > 0;
 
-    void fetchDailyOpportunities([ticker], 1, { refresh })
-      .then((run) => {
-        if (cancelled) return;
-        setCandidateError(null);
-        setCandidate(run.candidates.find((item) => item.ticker.toUpperCase() === ticker) ?? run.candidates[0] ?? null);
-        setRunMeta({ marketDateEt: run.marketDateEt, asOf: run.asOf, signalVersion: run.signalVersion });
-      })
+    const resolveCandidate = async () => {
+      if (officialSnapshotKey) {
+        try {
+          const detail = await fetchOpportunitySnapshotDetail(officialSnapshotKey);
+          if (cancelled) return;
+          const frozen = detail.run.candidates
+            .find((item) => item.ticker.toUpperCase() === ticker) ?? null;
+          if (frozen) {
+            setCandidateError(null);
+            setCandidate(frozen);
+            setRunMeta({
+              marketDateEt: detail.run.marketDateEt,
+              asOf: detail.run.asOf,
+              signalVersion: detail.run.signalVersion,
+            });
+            setOfficialBinding({
+              state: 'official',
+              snapshotKey: officialSnapshotKey,
+              frozenAt: detail.snapshot.frozenAt,
+            });
+            return;
+          }
+          setOfficialBinding({
+            state: 'fallback',
+            snapshotKey: officialSnapshotKey,
+            reason: '官方快照中没有该标的的冻结候选，以下为即时扫描结果。',
+          });
+        } catch {
+          if (cancelled) return;
+          setOfficialBinding({
+            state: 'fallback',
+            snapshotKey: officialSnapshotKey,
+            reason: '官方快照读取失败，以下为即时扫描结果。',
+          });
+        }
+      } else {
+        setOfficialBinding({ state: 'live_scan' });
+      }
+      const run = await fetchDailyOpportunities([ticker], 1, { refresh });
+      if (cancelled) return;
+      setCandidateError(null);
+      setCandidate(run.candidates.find((item) => item.ticker.toUpperCase() === ticker) ?? run.candidates[0] ?? null);
+      setRunMeta({ marketDateEt: run.marketDateEt, asOf: run.asOf, signalVersion: run.signalVersion });
+    };
+
+    void resolveCandidate()
       .catch((error: unknown) => { if (!cancelled) setCandidateError(requestError(error)); })
       .finally(() => { if (!cancelled) setCandidateLoading(false); });
 
@@ -338,7 +391,7 @@ const OpportunityDetailPage: React.FC = () => {
       .finally(() => { if (!cancelled) setEventsLoading(false); });
 
     return () => { cancelled = true; };
-  }, [refreshKey, ticker]);
+  }, [officialSnapshotKey, refreshKey, ticker]);
 
   useEffect(() => {
     if (!ticker) return;
@@ -368,8 +421,8 @@ const OpportunityDetailPage: React.FC = () => {
     [allCandles, intradayTimeframe, tradingSession],
   );
   const overlays = useMemo<MAOverlay[]>(() => [
-    { period: 8, label: 'EMA 8', color: '#d29922', data: computeEma(candles, 8) },
-    { period: 13, label: 'EMA 13', color: '#5b8def', data: computeEma(candles, 13) },
+    { period: 8, label: 'EMA 8', color: '#d29922', data: computeSmaSeededEmaSeries(candles, 8) },
+    { period: 13, label: 'EMA 13', color: '#5b8def', data: computeSmaSeededEmaSeries(candles, 13) },
   ], [candles]);
 
   const range = getObjectEvidence(candidate, 'prior_20d_range_position');
@@ -409,13 +462,19 @@ const OpportunityDetailPage: React.FC = () => {
       ? `上一完整日收盘低于前 20 日低点 ${formatNumber(priorLow)}；EMA 结构为 ${emaContext}。这是破位背景，不等于自动做空条件。`
       : `价格仍在前 20 日区间 ${formatNumber(priorLow)}–${formatNumber(priorHigh)} 内；EMA 结构为 ${emaContext}。`;
   const ivRank = overview?.ivRankPercent;
+  const isOfficialBinding = officialBinding.state === 'official';
+  // D-4 摘要同证据束：官方绑定时，摘要句中织入的增强数据数值（非冻结 bundle）必须带 as-of 内联标注；
+  // 冻结 bundle 数值（20 日区间 / EMA / 量能比率）不加注，页头已声明冻结绑定。
+  const liveEnhancementNote = isOfficialBinding
+    ? `（当前增强数据 ${formatEtTime(overview?.fetchedAt)}，非冻结榜单证据）`
+    : '';
   const volatilityZone = typeof ivRank !== 'number'
     ? 'IV Rank 暂不可用，不能判断当前 IV 在自身历史区间的位置。'
     : ivRank >= 75
-      ? `IV Rank ${formatPercent(ivRank)}，处于数据商历史区间偏高位置；高 IV 仍可能继续上升，不自动等于卖出波动率。`
+      ? `IV Rank ${formatPercent(ivRank)}${liveEnhancementNote}，处于数据商历史区间偏高位置；高 IV 仍可能继续上升，不自动等于卖出波动率。`
       : ivRank <= 25
-        ? `IV Rank ${formatPercent(ivRank)}，处于数据商历史区间偏低位置；低 IV 不自动等于应买入期权。`
-        : `IV Rank ${formatPercent(ivRank)}，位于数据商历史区间中段。`;
+        ? `IV Rank ${formatPercent(ivRank)}${liveEnhancementNote}，处于数据商历史区间偏低位置；低 IV 不自动等于应买入期权。`
+        : `IV Rank ${formatPercent(ivRank)}${liveEnhancementNote}，位于数据商历史区间中段。`;
   const callOiWall = wall?.walls.callOi[0]?.strike;
   const putOiWall = wall?.walls.putOi[0]?.strike;
   const confirmationReadout = priorHigh === null || priorLow === null
@@ -504,7 +563,49 @@ const OpportunityDetailPage: React.FC = () => {
           <span>K线 {history?.period ?? timeframe} · {formatEtTime(latestVisibleBarAt)}</span>
           <span>Volume {overview?.sessionVolumeDate ?? '—'} 当日累计</span>
           <span>OI {overview?.openInterestAsOf ?? '—'} · T-1 清算</span>
+          {officialBinding.state === 'official' ? (
+            <span className="inline-flex items-center gap-1 rounded-ds-sm border border-[color:var(--accent-subtle-border)] bg-[color:var(--accent-subtle-bg)] px-2 py-0.5 font-medium text-accent">
+              官方快照 {officialBinding.snapshotKey.slice(0, 12)}… · 冻结于 {officialBinding.frozenAt}
+            </span>
+          ) : (
+            <span className="inline-flex items-center gap-1 rounded-ds-sm border border-subtle px-2 py-0.5 text-text-3">
+              即时扫描 · 未绑定官方快照
+            </span>
+          )}
         </section>
+
+        {officialBinding.state === 'fallback' && (
+          <section
+            className="border border-[color:var(--warning-subtle-border,#8a6d1a)] bg-bg-1 px-4 py-2 text-caption text-text-2"
+            role="status"
+          >
+            {officialBinding.reason}（请求的快照 {officialBinding.snapshotKey.slice(0, 12)}…）
+          </section>
+        )}
+
+        {officialBinding.state === 'official'
+          && candidate?.referenceClose != null
+          && Number.isFinite(candidate.referenceClose)
+          && candidate.referenceClose > 0
+          && wall?.spot != null
+          && Number.isFinite(wall.spot) && (
+          <section
+            className="border border-subtle bg-bg-1 px-4 py-2 text-caption text-text-3"
+            aria-label="冻结与当前差异"
+          >
+            冻结基准 close {formatNumber(candidate.referenceClose)}
+            （{candidate.referenceSessionDate ?? '日期未报告'} 收盘）
+            {' → '}当前 spot {formatNumber(wall.spot)}
+            （{wall.quoteAsOf ?? '时点未报告'} · Moomoo）：
+            <span className="font-mono text-text-2">
+              {(() => {
+                const drift = ((wall.spot - candidate.referenceClose) / candidate.referenceClose) * 100;
+                return `${drift >= 0 ? '+' : ''}${drift.toFixed(2)}%`;
+              })()}
+            </span>
+            。差异只反映快照冻结后的价格变动，不改变冻结榜单结论。
+          </section>
+        )}
 
         <section className="border border-subtle bg-bg-1" aria-labelledby="professional-summary-title">
           <header className="flex flex-wrap items-start justify-between gap-3 border-b border-subtle px-4 py-3">
@@ -549,6 +650,9 @@ const OpportunityDetailPage: React.FC = () => {
                     <div className="text-right text-caption text-text-3">
                       <div>IV {formatPercent(impliedMove.annualizedIvPercent)}</div>
                       <div className="mt-0.5">{modelBasisLabel}</div>
+                      {isOfficialBinding && (
+                        <div className="mt-0.5">IV 为当前增强数据（{formatEtTime(overview?.fetchedAt)}），非冻结榜单证据</div>
+                      )}
                     </div>
                   </div>
 

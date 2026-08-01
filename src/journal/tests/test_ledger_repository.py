@@ -2,9 +2,11 @@
 """Tests for append-only Journal v2 statement persistence."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import threading
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -20,6 +22,8 @@ from src.journal.brokers.moomoo_statement import (
 )
 from src.journal.brokers.moomoo_openapi_export import (
     OpenApiBatchMetadata,
+    OpenApiComboLegObservation,
+    OpenApiContractSpecObservation,
     OpenApiExportPreview,
     OpenApiFeeObservation,
     OpenApiFillObservation,
@@ -27,18 +31,45 @@ from src.journal.brokers.moomoo_openapi_export import (
     OpenApiReconciliation,
 )
 from src.journal.ledger.canonical import canonicalize_observations
+from src.journal.ledger.activation_repository import (
+    EpisodeBuildActivationError,
+    activate_episode_build,
+)
+from src.journal.ledger.episode_repository import (
+    EpisodeRepositoryError,
+    append_canonical_position_episode_build,
+    get_episode_summary,
+    preview_canonical_position_episodes,
+)
 from src.journal.ledger.models import (
+    BrokerExecutionGroupFeeObservation,
+    BrokerExecutionGroupFillLink,
+    BrokerExecutionGroupLegObservation,
+    BrokerExecutionGroupObservation,
     BrokerFillObservation,
     BrokerFeeObservation,
     BrokerOrderObservation,
     CanonicalEvidenceMemberRecord,
     CanonicalEvidenceProvenanceRecord,
     CanonicalEvidenceSetRecord,
+    CanonicalExecutionGroupFillLinkRecord,
+    CanonicalExecutionGroupLegRecord,
+    CanonicalExecutionGroupMemberRecord,
+    CanonicalExecutionGroupProvenanceRecord,
     DealIdentityLink,
+    EpisodeBuild,
+    EpisodeBuildActivation,
     ImportBatch,
     OrderFillSetAttestation,
     OrderIdentityLink,
+    PositionEpisode,
+    PositionEpisodeEvidence,
     ReconciliationAttestation,
+)
+from src.journal.ledger.openapi_repository import (
+    confirm_openapi_import_plan,
+    OpenApiPlanError,
+    plan_openapi_import,
 )
 from src.journal.ledger.repository import (
     LedgerImportError,
@@ -50,9 +81,10 @@ from src.journal.ledger.repository import (
     append_order_identity_link,
     get_latest_data_health,
     import_statement_batch,
+    init_ledger_schema,
     load_canonical_observation_inputs,
 )
-from src.storage import get_db
+from src.storage import DatabaseManager, get_db
 
 
 ET = ZoneInfo("America/New_York")
@@ -255,6 +287,776 @@ def _openapi_preview(
         fills=fills,
         fees=fees,
     )
+
+
+def _openapi_payload(preview: OpenApiExportPreview) -> dict[str, object]:
+    return {
+        "schema": preview.metadata.source_schema,
+        "mode": "read_only",
+        "journal_database_written": False,
+        "window": {
+            "start": preview.metadata.window_start.isoformat(),
+            "end": preview.metadata.window_end.isoformat(),
+            "timezone": preview.metadata.source_timezone,
+        },
+        "summary": {"analysis_ready": preview.metadata.analysis_ready},
+        "records": {
+            "orders": [
+                {
+                    "order_id": order.source_order_id,
+                    "code": order.raw_symbol,
+                    "trd_side": order.side,
+                    "qty": order.order_quantity,
+                    "create_time": order.ordered_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    "order_status": order.status,
+                    "dealt_qty": order.summary_filled_quantity,
+                    "dealt_avg_price": order.summary_average_fill_price,
+                }
+                for order in preview.orders
+            ],
+            "deals": [
+                {
+                    "deal_id": fill.source_deal_id,
+                    "order_id": fill.source_order_id,
+                    "qty": fill.quantity,
+                    "price": fill.price,
+                }
+                for fill in preview.fills
+            ],
+            "fees": [
+                {
+                    "order_id": fee.source_order_id,
+                    "fee_amount": fee.total_fee,
+                    "fee_details": list(fee.fee_components),
+                }
+                for fee in preview.fees
+            ],
+        },
+    }
+
+
+def _openapi_preview_with_api_only_order(
+    *,
+    ordered_at: datetime,
+) -> OpenApiExportPreview:
+    preview = _openapi_preview(batch_suffix="7")
+    tail_order_id = "broker-order-tail"
+    tail_order = replace(
+        preview.orders[0],
+        source_order_id=tail_order_id,
+        order_quantity=Decimal("1"),
+        order_price=Decimal("2.75"),
+        ordered_at=ordered_at,
+        source_updated_at=ordered_at,
+        summary_filled_quantity=Decimal("1"),
+        summary_average_fill_price=Decimal("2.75"),
+        source_record_sha256="5" * 64,
+    )
+    tail_fill = replace(
+        preview.fills[0],
+        source_deal_id="broker-deal-tail",
+        source_order_id=tail_order_id,
+        quantity=Decimal("1"),
+        price=Decimal("2.75"),
+        filled_at=ordered_at,
+        source_record_sha256="6" * 64,
+    )
+    tail_fee = replace(
+        preview.fees[0],
+        source_order_id=tail_order_id,
+        source_record_sha256="7" * 64,
+    )
+    orders = (*preview.orders, tail_order)
+    fills = (*preview.fills, tail_fill)
+    fees = (*preview.fees, tail_fee)
+    metadata = replace(
+        preview.metadata,
+        source_sha256="8" * 64,
+        evidence_sha256="9" * 64,
+        batch_key="d" * 64,
+        account_binding="e" * 64,
+        window_end=ordered_at + timedelta(minutes=1),
+        order_observation_count=len(orders),
+        fill_observation_count=len(fills),
+        fee_observation_count=len(fees),
+    )
+    return replace(
+        preview,
+        metadata=metadata,
+        orders=orders,
+        fills=fills,
+        fees=fees,
+    )
+
+
+def _openapi_preview_with_combo_tail(
+    *,
+    ordered_at: datetime,
+) -> OpenApiExportPreview:
+    """Return one matched ordinary order plus one complete two-leg combo."""
+    preview = _openapi_preview_with_api_only_order(ordered_at=ordered_at)
+    group_id = "broker-combo-tail"
+    long_symbol = "US.EXAMPLE260731C200000"
+    short_symbol = "US.EXAMPLE260731C210000"
+    combo_order = replace(
+        preview.orders[-1],
+        source_order_id=group_id,
+        raw_symbol="US.EXAMPLE-COMBO",
+        stock_name="Deidentified vertical spread",
+        side="BUY",
+        order_quantity=Decimal("2"),
+        order_price=Decimal("-7.00"),
+        summary_filled_quantity=Decimal("2"),
+        summary_average_fill_price=Decimal("-7.00"),
+        strategy_type="SPREAD",
+        combo_legs=(
+            OpenApiComboLegObservation(
+                raw_symbol=long_symbol,
+                side="BUY",
+                quantity_ratio=Decimal("1"),
+            ),
+            OpenApiComboLegObservation(
+                raw_symbol=short_symbol,
+                side="SELL",
+                quantity_ratio=Decimal("1"),
+            ),
+        ),
+        source_record_sha256="5" * 64,
+    )
+    combo_fills = (
+        replace(
+            preview.fills[-1],
+            source_deal_id="broker-combo-long-1",
+            source_order_id=group_id,
+            raw_symbol=long_symbol,
+            stock_name="Deidentified long option",
+            side="BUY",
+            quantity=Decimal("1"),
+            price=Decimal("24.30"),
+            filled_at=ordered_at,
+            source_record_sha256="6" * 64,
+        ),
+        replace(
+            preview.fills[-1],
+            source_deal_id="broker-combo-long-2",
+            source_order_id=group_id,
+            raw_symbol=long_symbol,
+            stock_name="Deidentified long option",
+            side="BUY",
+            quantity=Decimal("1"),
+            price=Decimal("24.30"),
+            filled_at=ordered_at + timedelta(seconds=1),
+            source_record_sha256="7" * 64,
+        ),
+        replace(
+            preview.fills[-1],
+            source_deal_id="broker-combo-short-1",
+            source_order_id=group_id,
+            raw_symbol=short_symbol,
+            stock_name="Deidentified short option",
+            side="SELL",
+            quantity=Decimal("1"),
+            price=Decimal("31.30"),
+            filled_at=ordered_at + timedelta(seconds=2),
+            source_record_sha256="8" * 64,
+        ),
+        replace(
+            preview.fills[-1],
+            source_deal_id="broker-combo-short-2",
+            source_order_id=group_id,
+            raw_symbol=short_symbol,
+            stock_name="Deidentified short option",
+            side="SELL",
+            quantity=Decimal("1"),
+            price=Decimal("31.30"),
+            filled_at=ordered_at + timedelta(seconds=3),
+            source_record_sha256="9" * 64,
+        ),
+    )
+    combo_fee = replace(
+        preview.fees[-1],
+        source_order_id=group_id,
+        total_fee=Decimal("8.08"),
+        fee_components=(
+            ("Commission", Decimal("4.00")),
+            ("Platform Fees", Decimal("4.08")),
+        ),
+        source_record_sha256="a" * 64,
+    )
+    contract_specs = (
+        OpenApiContractSpecObservation(
+            raw_symbol=long_symbol,
+            lot_size=Decimal("100"),
+            option_contract_size=Decimal("100"),
+            option_contract_multiplier=Decimal("100"),
+            resolved_multiplier=Decimal("100"),
+            source_record_sha256="b" * 64,
+        ),
+        OpenApiContractSpecObservation(
+            raw_symbol=short_symbol,
+            lot_size=Decimal("100"),
+            option_contract_size=Decimal("100"),
+            option_contract_multiplier=Decimal("100"),
+            resolved_multiplier=Decimal("100"),
+            source_record_sha256="c" * 64,
+        ),
+    )
+    orders = (*preview.orders[:-1], combo_order)
+    fills = (*preview.fills[:-1], *combo_fills)
+    fees = (*preview.fees[:-1], combo_fee)
+    metadata = replace(
+        preview.metadata,
+        source_sha256="d" * 64,
+        evidence_sha256="e" * 64,
+        batch_key="f" * 64,
+        analysis_ready=True,
+        reconciliation_status="passed",
+        reconciliation=replace(
+            preview.metadata.reconciliation,
+            unsupported_combo_orders=1,
+        ),
+        warnings=("execution_group_observations=1",),
+        order_observation_count=len(orders),
+        fill_observation_count=len(fills),
+        fee_observation_count=len(fees),
+        contract_spec_observation_count=len(contract_specs),
+        contract_spec_status="complete",
+    )
+    return replace(
+        preview,
+        metadata=metadata,
+        orders=orders,
+        fills=fills,
+        fees=fees,
+        contract_specs=contract_specs,
+    )
+
+
+def _combo_persistence_counts() -> tuple[int, ...]:
+    """Snapshot all tables that a combo confirmation can append to."""
+    models = (
+        ImportBatch,
+        BrokerOrderObservation,
+        BrokerFillObservation,
+        BrokerFeeObservation,
+        BrokerExecutionGroupObservation,
+        BrokerExecutionGroupLegObservation,
+        BrokerExecutionGroupFillLink,
+        BrokerExecutionGroupFeeObservation,
+        CanonicalEvidenceSetRecord,
+        CanonicalEvidenceMemberRecord,
+        CanonicalEvidenceProvenanceRecord,
+        CanonicalExecutionGroupMemberRecord,
+        CanonicalExecutionGroupLegRecord,
+        CanonicalExecutionGroupFillLinkRecord,
+        CanonicalExecutionGroupProvenanceRecord,
+    )
+    db = get_db()
+    with db.session_scope() as session:
+        return tuple(
+            int(session.execute(select(func.count(model.id))).scalar_one())
+            for model in models
+        )
+
+
+def test_openapi_plan_and_confirm_accept_authoritative_incremental_tail():
+    statement = _statement()
+    statement = replace(
+        statement,
+        rows_total=2,
+        orders=(statement.orders[0],),
+    )
+    import_statement_batch(statement)
+    preview = _openapi_preview_with_api_only_order(
+        ordered_at=datetime(2026, 7, 20, 10, 0, tzinfo=ET),
+    )
+    payload = _openapi_payload(preview)
+
+    plan = plan_openapi_import(preview, payload)
+
+    assert plan.confirm_allowed is True
+    assert plan.scope_is_full_batch is True
+    assert plan.coverage["scope"] == "incremental_tail"
+    assert plan.coverage["matched_orders"] == 1
+    assert plan.coverage["api_only_orders"] == 1
+    assert plan.coverage["overlap_api_only_orders"] == 0
+    assert plan.coverage["incremental_api_only_orders"] == 1
+    assert plan.canonical_impact.canonical_orders == 2
+    assert plan.canonical_impact.canonical_fills == 3
+
+    result = confirm_openapi_import_plan(
+        preview,
+        payload,
+        preview_key=plan.preview_key,
+        acknowledge_partial_window=False,
+    )
+
+    assert result.status == "appended"
+    assert result.scope == "incremental_tail"
+    assert result.appended["orders"] == 2
+    assert result.appended["fills"] == 3
+
+
+def test_openapi_plan_blocks_api_only_order_inside_csv_baseline_window():
+    statement = _statement()
+    statement = replace(
+        statement,
+        rows_total=2,
+        orders=(statement.orders[0],),
+    )
+    import_statement_batch(statement)
+    preview = _openapi_preview_with_api_only_order(
+        ordered_at=datetime(2026, 7, 20, 9, 29, tzinfo=ET),
+    )
+
+    payload = _openapi_payload(preview)
+    plan = plan_openapi_import(preview, payload)
+
+    assert plan.confirm_allowed is False
+    assert plan.coverage["api_only_orders"] == 1
+    assert plan.coverage["overlap_api_only_orders"] == 1
+    assert plan.coverage["incremental_api_only_orders"] == 0
+    assert "cross_source_identity_blocked" in {
+        issue.code for issue in plan.issues
+    }
+
+
+@pytest.mark.parametrize(
+    ("ordered_at", "expected_issue"),
+    [
+        (
+            datetime(2026, 7, 20, 9, 29, tzinfo=ET),
+            "combo_outside_csv_baseline_unprovable",
+        ),
+        (
+            datetime(2026, 7, 20, 10, 0, tzinfo=ET),
+            "combo_csv_overlap_unprovable",
+        ),
+    ],
+)
+def test_openapi_plan_blocks_combo_outside_provable_incremental_tail(
+    ordered_at: datetime,
+    expected_issue: str,
+):
+    import_statement_batch(_statement(), allow_partial=True)
+    preview = _openapi_preview_with_combo_tail(ordered_at=ordered_at)
+    payload = _openapi_payload(preview)
+    before = _combo_persistence_counts()
+    plan = plan_openapi_import(preview, payload)
+
+    assert plan.confirm_allowed is False
+    assert plan.scope_is_full_batch is False
+    assert plan.coverage["scope"] == "partial_window"
+    blocking_codes = {
+        issue.code for issue in plan.issues if issue.severity == "blocking"
+    }
+    assert expected_issue in blocking_codes
+    assert {
+        code
+        for code in blocking_codes
+        if code.startswith("combo_") or code.startswith("execution_group_")
+    } == {expected_issue}
+    assert "combo_order_requires_group_projection" not in blocking_codes
+    assert plan.write_plan["execution_group_observations"] == 1
+    assert plan.write_plan["execution_group_leg_observations"] == 2
+    assert plan.write_plan["execution_group_fill_links"] == 4
+    assert plan.write_plan["execution_group_fee_observations"] == 1
+    assert _combo_persistence_counts() == before
+    with pytest.raises(OpenApiPlanError, match="plan_contains_blocking_issues"):
+        confirm_openapi_import_plan(
+            preview,
+            payload,
+            preview_key=plan.preview_key,
+            acknowledge_partial_window=True,
+        )
+    assert _combo_persistence_counts() == before
+
+
+def test_openapi_plan_confirms_complete_incremental_combo_and_replays_hash():
+    statement = replace(
+        _statement(),
+        rows_total=2,
+        orders=(_statement().orders[0],),
+    )
+    import_statement_batch(statement)
+    preview = _openapi_preview_with_combo_tail(
+        ordered_at=datetime(2026, 7, 20, 10, 0, tzinfo=ET),
+    )
+    payload = _openapi_payload(preview)
+
+    plan = plan_openapi_import(preview, payload)
+
+    assert plan.confirm_allowed is True
+    assert plan.scope_is_full_batch is True
+    assert plan.coverage["scope"] == "incremental_tail"
+    assert plan.write_plan["order_observations"] == 2
+    assert plan.write_plan["ordinary_order_observations"] == 1
+    assert plan.write_plan["execution_group_observations"] == 1
+    assert plan.write_plan["execution_group_leg_observations"] == 2
+    assert plan.write_plan["execution_group_fill_links"] == 4
+    assert plan.write_plan["execution_group_fee_observations"] == 1
+    assert plan.canonical_impact.canonical_execution_groups == 1
+    assert plan.canonical_impact.canonical_execution_group_legs == 2
+    planned_hash = plan.canonical_impact.canonical_set_sha256
+    assert len(planned_hash) == 64
+
+    result = confirm_openapi_import_plan(
+        preview,
+        payload,
+        preview_key=plan.preview_key,
+        acknowledge_partial_window=False,
+    )
+
+    assert result.status == "appended"
+    assert result.duplicate is False
+    assert result.canonical_set_sha256 == planned_hash
+    assert result.appended["ordinary_orders"] == 1
+    assert result.appended["execution_groups"] == 1
+    assert result.appended["execution_group_legs"] == 2
+    assert result.appended["execution_group_fill_links"] == 4
+    assert result.appended["execution_group_fees"] == 1
+    assert result.canonical["execution_groups"] == 1
+    assert result.canonical["execution_group_legs"] == 2
+
+    db = get_db()
+    with db.session_scope() as session:
+        assert session.execute(
+            select(func.count(BrokerOrderObservation.id)).where(
+                BrokerOrderObservation.source_order_id == "broker-combo-tail"
+            )
+        ).scalar_one() == 0
+        group_row = session.execute(
+            select(BrokerExecutionGroupObservation).where(
+                BrokerExecutionGroupObservation.source_execution_group_id
+                == "broker-combo-tail"
+            )
+        ).scalar_one()
+        assert session.execute(
+            select(func.count(BrokerExecutionGroupLegObservation.id)).where(
+                BrokerExecutionGroupLegObservation.execution_group_observation_id
+                == group_row.id
+            )
+        ).scalar_one() == 2
+        group_fills = session.execute(
+            select(BrokerFillObservation)
+            .where(BrokerFillObservation.source_order_id == "broker-combo-tail")
+            .order_by(BrokerFillObservation.source_deal_id)
+        ).scalars().all()
+        assert len(group_fills) == 4
+        assert all(item.broker_order_observation_id is None for item in group_fills)
+        assert all(item.contract_multiplier == Decimal("100") for item in group_fills)
+        assert all(item.total_fee is None for item in group_fills)
+        assert all(item.fee_components_json is None for item in group_fills)
+        assert all(item.fee_allocation_method is None for item in group_fills)
+        group_fee = session.execute(
+            select(BrokerExecutionGroupFeeObservation).where(
+                BrokerExecutionGroupFeeObservation.execution_group_observation_id
+                == group_row.id
+            )
+        ).scalar_one()
+        assert group_fee.total_fee == Decimal("8.0800000000")
+
+    replay_inputs = load_canonical_observation_inputs()
+    replayed = canonicalize_observations(
+        replay_inputs.orders,
+        replay_inputs.fills,
+        execution_group_observations=replay_inputs.execution_groups,
+    )
+    assert replayed.analysis_ready is True
+    assert replayed.canonical_set_sha256 == planned_hash
+    group_canonical_fills = [
+        item
+        for item in replayed.fills
+        if item.execution_group_identity is not None
+    ]
+    assert len(group_canonical_fills) == 4
+    assert all(item.evidence.total_fee is None for item in group_canonical_fills)
+
+    episode_preview = preview_canonical_position_episodes(
+        canonical_set_id=result.canonical_set_id,
+    )
+    assert episode_preview is not None
+    group_symbols = {
+        "EXAMPLE260731C200000",
+        "EXAMPLE260731C210000",
+    }
+    group_episodes = [
+        item
+        for item in episode_preview.episodes
+        if item.instrument.raw_symbol in group_symbols
+    ]
+    assert len(group_episodes) == 2
+    assert sum(len(item.evidence) for item in group_episodes) == 4
+    assert {item.direction for item in group_episodes} == {"long", "short"}
+    assert all(item.total_fee is None for item in group_episodes)
+    assert all(item.realized_pnl_net is None for item in group_episodes)
+    assert all(
+        allocation.allocated_fee is None
+        for item in group_episodes
+        for allocation in item.evidence
+    )
+    assert episode_preview.execution_group_count == 1
+    assert episode_preview.group_fee_affected_episode_count == 2
+    assert episode_preview.leg_fee_attribution_complete is False
+    assert (
+        episode_preview.retained_execution_group_fee_total
+        == Decimal("8.0800000000")
+    )
+    assert episode_preview.fee_conserved is True
+    assert episode_preview.fee_conservation_by_currency == {
+        "USD": {
+            "ordinary_source": Decimal("0.3002000000"),
+            "ordinary_allocated": Decimal("0.3002000000"),
+            "retained_execution_group": Decimal("8.0800000000"),
+            "source_known": Decimal("8.3802000000"),
+            "accounted": Decimal("8.3802000000"),
+        }
+    }
+    assert episode_preview.headline_exclusion_counts[
+        "group_fee_unallocated"
+    ] == 2
+    assert episode_preview.headline_episode_count == 0
+    assert episode_preview.headline_total_fee is None
+    assert episode_preview.headline_realized_pnl_net is None
+
+    with pytest.raises(
+        EpisodeRepositoryError,
+        match="execution-group fee.*explicit acceptance",
+    ):
+        append_canonical_position_episode_build(
+            result.canonical_set_id,
+            expected_canonical_set_sha256=planned_hash,
+            expected_build_key=episode_preview.build_key,
+            accept_assumed_flat=True,
+            accept_group_fee_scope=False,
+        )
+    with db.session_scope() as session:
+        assert session.execute(
+            select(func.count(EpisodeBuild.id))
+        ).scalar_one() == 0
+
+    episode_build = append_canonical_position_episode_build(
+        result.canonical_set_id,
+        expected_canonical_set_sha256=planned_hash,
+        expected_build_key=episode_preview.build_key,
+        accept_assumed_flat=True,
+        accept_group_fee_scope=True,
+    )
+    assert episode_build.duplicate is False
+    assert episode_build.position_episode_count == 3
+    assert episode_build.evidence_allocation_count == 6
+    stored_summary = get_episode_summary(episode_build.build_id)
+    assert stored_summary is not None
+    assert stored_summary.retained_execution_group_fee_total == Decimal(
+        "8.0800000000"
+    )
+    assert stored_summary.group_fee_affected_episode_count == 2
+    assert stored_summary.leg_fee_attribution_complete is False
+    assert stored_summary.fee_conserved is True
+    assert stored_summary.headline_exclusion_counts[
+        "group_fee_unallocated"
+    ] == 2
+
+    with db.session_scope() as session:
+        stored_group_episodes = session.execute(
+            select(PositionEpisode).where(
+                PositionEpisode.episode_build_id == episode_build.build_id,
+                PositionEpisode.raw_symbol.in_(group_symbols),
+            )
+        ).scalars().all()
+        assert len(stored_group_episodes) == 2
+        assert all(item.total_fee is None for item in stored_group_episodes)
+        assert all(item.realized_pnl_net is None for item in stored_group_episodes)
+        assert all(
+            '"group_fee_unallocated":true' in item.evidence_summary_json
+            for item in stored_group_episodes
+        )
+        assert all(
+            '"leg_fee_attribution_complete":false' in item.completeness_json
+            for item in stored_group_episodes
+        )
+        stored_group_episode_ids = {item.id for item in stored_group_episodes}
+        stored_group_allocations = session.execute(
+            select(PositionEpisodeEvidence).where(
+                PositionEpisodeEvidence.position_episode_id.in_(
+                    stored_group_episode_ids
+                )
+            )
+        ).scalars().all()
+        assert len(stored_group_allocations) == 4
+        assert all(item.allocated_fee is None for item in stored_group_allocations)
+
+    with pytest.raises(
+        EpisodeBuildActivationError,
+        match="execution-group fee.*explicit acceptance",
+    ):
+        activate_episode_build(
+            episode_build.build_id,
+            episode_build.build_key,
+            expected_current_activation_id=None,
+            expected_current_build_id=None,
+            accept_assumed_flat=True,
+            accept_group_fee_scope=False,
+        )
+    with db.session_scope() as session:
+        assert session.execute(
+            select(func.count(EpisodeBuildActivation.id))
+        ).scalar_one() == 0
+
+    activation = activate_episode_build(
+        episode_build.build_id,
+        episode_build.build_key,
+        expected_current_activation_id=None,
+        expected_current_build_id=None,
+        accept_assumed_flat=True,
+        accept_group_fee_scope=True,
+    )
+    assert activation.duplicate is False
+    assert activation.state.current_build_id == episode_build.build_id
+
+    replay_plan = plan_openapi_import(preview, payload)
+    assert replay_plan.confirm_allowed is True
+    assert replay_plan.write_plan["already_imported"] is True
+    assert replay_plan.canonical_impact.canonical_set_sha256 == planned_hash
+    replay_result = confirm_openapi_import_plan(
+        preview,
+        payload,
+        preview_key=replay_plan.preview_key,
+        acknowledge_partial_window=False,
+    )
+    assert replay_result.status == "already_present"
+    assert replay_result.duplicate is True
+    assert replay_result.canonical_set_sha256 == planned_hash
+    assert not any(replay_result.appended.values())
+
+
+def test_openapi_plan_blocks_legacy_source_without_combo_capability_proof():
+    statement = replace(
+        _statement(),
+        rows_total=2,
+        orders=(_statement().orders[0],),
+    )
+    import_statement_batch(statement)
+    preview = _openapi_preview(batch_suffix="6")
+    preview = replace(
+        preview,
+        orders=(
+            replace(
+                preview.orders[0],
+                combo_definition_available=False,
+            ),
+        ),
+    )
+
+    payload = _openapi_payload(preview)
+    before = _combo_persistence_counts()
+    plan = plan_openapi_import(preview, payload)
+
+    assert plan.confirm_allowed is False
+    assert plan.coverage["scope"] == "full_batch"
+    issue_codes = {issue.code for issue in plan.issues}
+    assert {
+        issue.code
+        for issue in plan.issues
+        if issue.entity_kind == "source_capability"
+    } == {
+        "combo_definition_capability_unproved"
+    }
+    assert "combo_order_requires_group_projection" not in issue_codes
+    assert plan.write_plan["unclassified_parent_observations"] == 1
+    assert plan.write_plan["execution_group_observations"] == 0
+    assert _combo_persistence_counts() == before
+    with pytest.raises(OpenApiPlanError, match="plan_contains_blocking_issues"):
+        confirm_openapi_import_plan(
+            preview,
+            payload,
+            preview_key=plan.preview_key,
+            acknowledge_partial_window=True,
+        )
+    assert _combo_persistence_counts() == before
+
+
+def test_openapi_plan_blocks_unbound_incremental_tail():
+    statement = replace(
+        _statement(),
+        rows_total=2,
+        orders=(_statement().orders[0],),
+    )
+    import_statement_batch(statement)
+    preview = _openapi_preview_with_api_only_order(
+        ordered_at=datetime(2026, 7, 20, 10, 0, tzinfo=ET),
+    )
+    preview = replace(
+        preview,
+        metadata=replace(preview.metadata, account_binding=None),
+    )
+
+    plan = plan_openapi_import(preview, _openapi_payload(preview))
+
+    assert plan.confirm_allowed is False
+    assert "incremental_tail_account_unbound" in {
+        issue.code for issue in plan.issues
+    }
+
+
+def test_concurrent_cold_start_never_publishes_uninitialized_database(
+    monkeypatch,
+):
+    DatabaseManager.reset_instance()
+    original_initialize = DatabaseManager._initialize
+    initialize_entered = threading.Event()
+    allow_initialize = threading.Event()
+    first_call_lock = threading.Lock()
+    first_call = True
+
+    def delayed_initialize(self, db_url=None):
+        nonlocal first_call
+        with first_call_lock:
+            should_delay = first_call
+            first_call = False
+        if should_delay:
+            initialize_entered.set()
+            if not allow_initialize.wait(timeout=5):
+                raise RuntimeError("test did not release database initialization")
+        return original_initialize(self, db_url)
+
+    monkeypatch.setattr(
+        DatabaseManager,
+        "_initialize",
+        delayed_initialize,
+    )
+
+    second_started = threading.Event()
+
+    def second_get_db():
+        second_started.set()
+        return get_db()
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        first = executor.submit(get_db)
+        assert initialize_entered.wait(timeout=2)
+
+        second = executor.submit(second_get_db)
+        assert second_started.wait(timeout=2)
+        with pytest.raises(FutureTimeout):
+            second.result(timeout=0.1)
+
+        allow_initialize.set()
+        first_db = first.result(timeout=5)
+        second_db = second.result(timeout=5)
+
+        assert first_db is second_db
+        assert first_db._initialized is True
+        assert first_db._engine is not None
+
+        # The exact first-request path may call the ledger schema initializer
+        # concurrently after the shared DatabaseManager becomes available.
+        futures = [
+            executor.submit(init_ledger_schema)
+            for _ in range(3)
+        ]
+        for future in futures:
+            future.result(timeout=5)
 
 
 def test_partial_statement_requires_explicit_permission(isolated_sqlite):

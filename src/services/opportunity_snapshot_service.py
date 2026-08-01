@@ -26,6 +26,7 @@ from src.opportunities.outcomes import (
 )
 from src.opportunities.repository import (
     CandidateOutcomeInput,
+    SnapshotAppendResult,
     SnapshotCandidateInput,
     SnapshotRunInput,
     StoredOutcome,
@@ -46,16 +47,24 @@ FREEZE_POLICY_VERSION = "premarket_prior_close_xnys_v1"
 PLAYBOOK_VERSION = "unverified"
 SCOPE_KEY = "web_daily_opportunity"
 SNAPSHOT_SCHEMA_VERSION = "opportunity-snapshot/1.0"
-MINIMUM_SUMMARY_SAMPLES = 10
+MINIMUM_SUMMARY_SAMPLES = 20
 MINIMUM_INVESTIGATION_SAMPLES = 20
 _HORIZONS = (5, 20)
 _MAX_FETCH_WORKERS = 4
 
 HistoryLoader = Callable[[str], tuple[Sequence[Mapping[str, Any]], Optional[str]]]
+SnapshotAppender = Callable[
+    [SnapshotRunInput, Sequence[SnapshotCandidateInput]],
+    SnapshotAppendResult,
+]
 
 
 class OpportunitySnapshotNotFoundError(LookupError):
     """Raised when an explicit immutable snapshot key does not exist."""
+
+
+class SnapshotPublishWindowClosedError(RuntimeError):
+    """Raised when canonical publication reaches its hard deadline."""
 
 
 def _aware_utc(value: datetime) -> datetime:
@@ -145,15 +154,17 @@ def _base_run_input(
     frozen_at: datetime,
     validation_eligible: bool,
     eligibility_reasons: Sequence[str],
+    freeze_policy_version: str = FREEZE_POLICY_VERSION,
+    scope_key: str = SCOPE_KEY,
 ) -> SnapshotRunInput:
     return SnapshotRunInput(
         market_date_et=_parse_date(run_payload.get("market_date_et"), "market_date_et"),
         run_type=str(run_payload.get("run_type") or ""),
         signal_version=str(run_payload.get("signal_version") or ""),
         schema_version=str(run_payload.get("schema_version") or ""),
-        freeze_policy_version=FREEZE_POLICY_VERSION,
+        freeze_policy_version=freeze_policy_version,
         playbook_version=PLAYBOOK_VERSION,
-        scope_key=SCOPE_KEY,
+        scope_key=scope_key,
         universe=tuple(str(item) for item in (run_payload.get("universe") or ())),
         requested_limit=int(run_payload.get("requested_limit") or 0),
         source_run_id=str(run_payload.get("run_id") or ""),
@@ -228,14 +239,40 @@ def _load_benchmark_anchors(
                 }
         return anchors, None if anchors else "SPY reference close unavailable"
     except Exception as exc:  # noqa: BLE001 - benchmark absence is explicit partial context
-        logger.debug("[opportunity-snapshot] SPY anchor unavailable: %s", exc)
-        return {}, f"{type(exc).__name__}: {exc}"
+        logger.debug(
+            "[opportunity-snapshot] SPY anchor unavailable error_type=%s",
+            type(exc).__name__,
+        )
+        return {}, f"provider_error:{type(exc).__name__}"
     finally:
         if manager is not None:
             try:
                 manager.close()
             except Exception as exc:  # noqa: BLE001 - best-effort resource cleanup
-                logger.debug("[opportunity-snapshot] manager close failed: %s", exc)
+                logger.debug(
+                    "[opportunity-snapshot] manager close failed error_type=%s",
+                    type(exc).__name__,
+                )
+
+
+def prepare_snapshot_benchmark_context(
+    run_payload: Mapping[str, Any],
+    *,
+    fetched_at: datetime,
+    history_loader: Optional[HistoryLoader] = None,
+) -> tuple[dict[str, dict[str, Any]], Optional[str]]:
+    """Prefetch benchmark anchors before the final local persistence section."""
+
+    reference_dates: list[date] = []
+    for raw in run_payload.get("candidates") or ():
+        reference_date, _reference_close = _candidate_reference(dict(raw))
+        if reference_date is not None:
+            reference_dates.append(reference_date)
+    return _load_benchmark_anchors(
+        reference_dates,
+        frozen_at=_aware_utc(fetched_at),
+        history_loader=history_loader,
+    )
 
 
 def _candidate_eligibility(
@@ -280,6 +317,17 @@ def freeze_daily_snapshot(
     db_manager=None,
     frozen_at: Optional[datetime] = None,
     history_loader: Optional[HistoryLoader] = None,
+    freeze_policy_version: str = FREEZE_POLICY_VERSION,
+    scope_key: str = SCOPE_KEY,
+    analysis_quality_eligible: bool = True,
+    analysis_quality_reasons: Sequence[str] = (),
+    benchmark_context: Optional[
+        tuple[Mapping[str, Mapping[str, Any]], Optional[str]]
+    ] = None,
+    publish_deadline: Optional[datetime] = None,
+    publish_guard_clock: Optional[Callable[[], datetime]] = None,
+    snapshot_appender: Optional[SnapshotAppender] = None,
+    snapshot_session=None,
 ) -> dict[str, Any]:
     """Append the first immutable daily slot; later calls reuse that slot."""
 
@@ -290,11 +338,22 @@ def freeze_daily_snapshot(
         frozen_at=frozen_utc,
         validation_eligible=False,
         eligibility_reasons=(),
+        freeze_policy_version=freeze_policy_version,
+        scope_key=scope_key,
     )
     snapshot_key = build_snapshot_key(provisional)
-    existing = get_snapshot(snapshot_key, db_manager=db_manager)
+    existing = get_snapshot(
+        snapshot_key,
+        db_manager=db_manager,
+        session=snapshot_session,
+    )
     if existing is not None:
-        return snapshot_item(existing, db_manager=db_manager, idempotent_replay=True)
+        return snapshot_item(
+            existing,
+            db_manager=db_manager,
+            idempotent_replay=True,
+            snapshot_session=snapshot_session,
+        )
 
     prepared: list[dict[str, Any]] = []
     reference_dates: list[date] = []
@@ -321,21 +380,45 @@ def freeze_daily_snapshot(
             }
         )
 
-    benchmark_anchors, benchmark_error = _load_benchmark_anchors(
-        reference_dates,
-        frozen_at=frozen_utc,
-        history_loader=history_loader,
-    )
+    if benchmark_context is None:
+        benchmark_anchors, benchmark_error = _load_benchmark_anchors(
+            reference_dates,
+            frozen_at=frozen_utc,
+            history_loader=history_loader,
+        )
+    else:
+        supplied_anchors, benchmark_error = benchmark_context
+        benchmark_anchors = copy.deepcopy(dict(supplied_anchors))
     candidate_inputs: list[SnapshotCandidateInput] = []
+    normalized_quality_reasons = sorted(
+        {
+            str(reason).strip()
+            for reason in analysis_quality_reasons
+            if str(reason).strip()
+        }
+    )
+    if not analysis_quality_eligible and not normalized_quality_reasons:
+        normalized_quality_reasons = ["analysis_quality_not_eligible"]
     for item in prepared:
         candidate = item["candidate"]
         reference_date = item["reference_date"]
         anchor = benchmark_anchors.get(reference_date.isoformat()) if reference_date else None
+        effective_reasons = sorted(
+            set(item["reasons"]).union(
+                () if analysis_quality_eligible else normalized_quality_reasons
+            )
+        )
+        effective_eligible = bool(
+            item["eligible"] and analysis_quality_eligible
+        )
         candidate["outcome_validation"] = {
-            "freeze_policy_version": FREEZE_POLICY_VERSION,
+            "freeze_policy_version": freeze_policy_version,
             "frozen_at": frozen_utc.isoformat(),
-            "eligible": item["eligible"],
-            "eligibility_reasons": item["reasons"],
+            "eligible": effective_eligible,
+            "learning_eligible": effective_eligible,
+            "eligibility_reasons": effective_reasons,
+            "analysis_quality_eligible": bool(analysis_quality_eligible),
+            "analysis_quality_reasons": normalized_quality_reasons,
             "schedule": item["schedule"],
             "benchmark_anchor": anchor,
             "benchmark_error": benchmark_error if anchor is None else None,
@@ -365,17 +448,28 @@ def freeze_daily_snapshot(
                     or "prior_completed_close"
                 ),
                 reference_source=candidate.get("source"),
-                validation_eligible=bool(item["eligible"]),
-                eligibility_reasons=tuple(item["reasons"]),
+                validation_eligible=effective_eligible,
+                eligibility_reasons=tuple(effective_reasons),
             )
         )
 
-    eligible_count = sum(1 for item in prepared if item["eligible"])
+    eligible_count = sum(
+        1
+        for item in prepared
+        if item["eligible"] and analysis_quality_eligible
+    )
     run_reasons = [] if eligible_count else sorted(
         {
             reason
             for item in prepared
-            for reason in item["reasons"]
+            for reason in (
+                list(item["reasons"])
+                + (
+                    []
+                    if analysis_quality_eligible
+                    else normalized_quality_reasons
+                )
+            )
         }
     )
     if not prepared:
@@ -383,13 +477,16 @@ def freeze_daily_snapshot(
     payload = copy.deepcopy(dict(run_payload))
     payload["snapshot_meta"] = {
         "schema_version": SNAPSHOT_SCHEMA_VERSION,
-        "freeze_policy_version": FREEZE_POLICY_VERSION,
+        "freeze_policy_version": freeze_policy_version,
         "playbook_version": PLAYBOOK_VERSION,
-        "scope_key": SCOPE_KEY,
+        "scope_key": scope_key,
         "frozen_at": frozen_utc.isoformat(),
         "validation_eligible": eligible_count > 0,
+        "learning_eligible": eligible_count > 0,
         "eligible_candidate_count": eligible_count,
         "eligibility_reasons": run_reasons,
+        "analysis_quality_eligible": bool(analysis_quality_eligible),
+        "analysis_quality_reasons": normalized_quality_reasons,
         "benchmark_anchors": benchmark_anchors,
         "benchmark_error": benchmark_error,
         "underlying_only": True,
@@ -400,13 +497,32 @@ def freeze_daily_snapshot(
         frozen_at=frozen_utc,
         validation_eligible=eligible_count > 0,
         eligibility_reasons=run_reasons,
+        freeze_policy_version=freeze_policy_version,
+        scope_key=scope_key,
     )
-    appended = append_snapshot(
-        run_input,
-        tuple(candidate_inputs),
+    if publish_deadline is not None:
+        deadline_utc = _aware_utc(publish_deadline)
+        guard_clock = publish_guard_clock or (
+            lambda: datetime.now(timezone.utc)
+        )
+        if _aware_utc(guard_clock()) >= deadline_utc:
+            raise SnapshotPublishWindowClosedError(
+                "snapshot publication reached its hard deadline"
+            )
+    appended = (
+        snapshot_appender(run_input, tuple(candidate_inputs))
+        if snapshot_appender is not None
+        else append_snapshot(
+            run_input,
+            tuple(candidate_inputs),
+            db_manager=db_manager,
+        )
+    )
+    stored = get_snapshot(
+        appended.snapshot_key,
         db_manager=db_manager,
+        session=snapshot_session,
     )
-    stored = get_snapshot(appended.snapshot_key, db_manager=db_manager)
     if stored is None:  # pragma: no cover - repository transaction invariant
         raise RuntimeError("snapshot append completed without a readable row")
     logger.info(
@@ -420,6 +536,7 @@ def freeze_daily_snapshot(
         stored,
         db_manager=db_manager,
         idempotent_replay=appended.duplicate,
+        snapshot_session=snapshot_session,
     )
 
 
@@ -509,21 +626,99 @@ def snapshot_item(
     db_manager=None,
     idempotent_replay: bool = False,
     observed_at: Optional[datetime] = None,
+    snapshot_session=None,
 ) -> dict[str, Any]:
     outcomes = list_snapshot_outcomes(
         snapshot.snapshot_key,
         evaluator_version=FORMULA_VERSION,
         db_manager=db_manager,
+        session=snapshot_session,
     )
     eligible_keys = {
         candidate.candidate_key
         for candidate in snapshot.candidates
         if candidate.validation_eligible
     }
+    underlying_path_keys = _qualified_track_candidate_keys(
+        snapshot,
+        track_key="raw_underlying_path_v1",
+        db_manager=db_manager,
+        require_prospective=True,
+    )
+    full_research_keys = _qualified_track_candidate_keys(
+        snapshot,
+        track_key="canonical_full_research_v1",
+        db_manager=db_manager,
+        require_prospective=True,
+    )
     candidate_by_key = {
         candidate.candidate_key: candidate for candidate in snapshot.candidates
     }
     now = _aware_utc(observed_at or datetime.now(timezone.utc))
+    progress = _outcome_progress_for_keys(
+        snapshot,
+        outcomes=outcomes,
+        eligible_keys=eligible_keys,
+        candidate_by_key=candidate_by_key,
+        observed_at=now,
+    )
+    underlying_path_progress = _outcome_progress_for_keys(
+        snapshot,
+        outcomes=outcomes,
+        eligible_keys=underlying_path_keys,
+        candidate_by_key=candidate_by_key,
+        observed_at=now,
+    )
+    full_research_progress = _outcome_progress_for_keys(
+        snapshot,
+        outcomes=outcomes,
+        eligible_keys=full_research_keys,
+        candidate_by_key=candidate_by_key,
+        observed_at=now,
+    )
+    meta = snapshot.payload.get("snapshot_meta") or {}
+    qualification = _snapshot_qualification_summary(
+        snapshot.snapshot_key,
+        db_manager=db_manager,
+    )
+    analysis_quality_eligible = (
+        bool(meta.get("analysis_quality_eligible"))
+        if "analysis_quality_eligible" in meta
+        else None
+    )
+    return {
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "snapshot_key": snapshot.snapshot_key,
+        "market_date_et": snapshot.market_date_et.isoformat(),
+        "source_run_id": str(snapshot.payload.get("run_id") or ""),
+        "frozen_at": _aware_utc(snapshot.frozen_at).isoformat(),
+        "signal_version": snapshot.signal_version,
+        "candidate_count": len(snapshot.candidates),
+        "eligible_candidate_count": len(eligible_keys),
+        "validation_eligible": snapshot.validation_eligible,
+        "eligibility_reasons": list(meta.get("eligibility_reasons") or ()),
+        "analysis_quality_eligible": analysis_quality_eligible,
+        "analysis_quality_reasons": list(
+            meta.get("analysis_quality_reasons") or ()
+        ),
+        "qualification": qualification,
+        "outcome_progress": progress,
+        "underlying_path_candidate_count": len(underlying_path_keys),
+        "underlying_path_progress": underlying_path_progress,
+        "full_research_candidate_count": len(full_research_keys),
+        "full_research_progress": full_research_progress,
+        "idempotent_replay": idempotent_replay,
+    }
+
+
+def _outcome_progress_for_keys(
+    snapshot: StoredSnapshot,
+    *,
+    outcomes: Sequence[StoredOutcome],
+    eligible_keys: set[str],
+    candidate_by_key: Mapping[str, Any],
+    observed_at: datetime,
+) -> list[dict[str, Any]]:
     progress = []
     for horizon in _HORIZONS:
         mature = [
@@ -548,7 +743,7 @@ def snapshot_item(
                     stock_bars=(),
                     spy_bars=(),
                     spy_reference_close=_finite_positive(anchor.get("reference_close")),
-                    now=now,
+                    now=observed_at,
                 )["horizons"][f"{horizon}d"]["state"]
             except Exception:  # noqa: BLE001 - calendar failure is a visible gap
                 schedule_state = STATE_DATA_GAP
@@ -568,20 +763,145 @@ def snapshot_item(
                 "data_gap_count": data_gap_count,
             }
         )
-    meta = snapshot.payload.get("snapshot_meta") or {}
+    return progress
+
+
+def _qualified_track_candidate_keys(
+    snapshot: StoredSnapshot,
+    *,
+    track_key: str,
+    db_manager=None,
+    require_prospective: bool = False,
+) -> set[str]:
+    """Select one persisted track with track-specific legacy behavior.
+
+    Strict selection and learning tracks never fall back to the historical
+    aggregate boolean.  The raw path keeps a narrow compatibility fallback
+    only for known pre-qualification v1 snapshots; canonical publications and
+    repository read failures fail closed.
+    """
+
+    try:
+        from src.opportunities.qualification import (
+            TRACK_RAW_UNDERLYING_PATH,
+        )
+        from src.opportunities.qualification_repository import (
+            get_snapshot_qualification,
+        )
+
+        qualification = get_snapshot_qualification(
+            snapshot.snapshot_key,
+            db_manager=db_manager,
+            initialize=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - qualification is an integrity gate
+        logger.debug(
+            "[opportunity-qualification] track lookup unavailable "
+            "error_type=%s",
+            type(exc).__name__,
+        )
+        return set()
+    if qualification is None:
+        canonical_cycle = snapshot.payload.get("canonical_cycle")
+        known_legacy = (
+            not isinstance(canonical_cycle, Mapping)
+            and (
+                snapshot.scope_key == SCOPE_KEY
+                or snapshot.freeze_policy_version == FREEZE_POLICY_VERSION
+            )
+        )
+        if track_key == TRACK_RAW_UNDERLYING_PATH and known_legacy:
+            return {
+                candidate.candidate_key
+                for candidate in snapshot.candidates
+                if candidate.validation_eligible
+            }
+        return set()
     return {
-        "schema_version": SNAPSHOT_SCHEMA_VERSION,
-        "snapshot_key": snapshot.snapshot_key,
-        "market_date_et": snapshot.market_date_et.isoformat(),
-        "source_run_id": str(snapshot.payload.get("run_id") or ""),
-        "frozen_at": _aware_utc(snapshot.frozen_at).isoformat(),
-        "signal_version": snapshot.signal_version,
-        "candidate_count": len(snapshot.candidates),
-        "eligible_candidate_count": len(eligible_keys),
-        "validation_eligible": snapshot.validation_eligible,
-        "eligibility_reasons": list(meta.get("eligibility_reasons") or ()),
-        "outcome_progress": progress,
-        "idempotent_replay": idempotent_replay,
+        item.candidate_key
+        for item in qualification.candidate_tracks
+        if (
+            item.track_key == track_key
+            and item.qualification_state == "qualified"
+            and (
+                not require_prospective
+                or item.causal_window_state == "prospective"
+            )
+        )
+    }
+
+
+def _snapshot_qualification_summary(
+    snapshot_key: str,
+    *,
+    db_manager=None,
+) -> Optional[dict[str, Any]]:
+    """Project persisted policy facts without making a read endpoint write."""
+
+    try:
+        from src.opportunities.qualification import TRACK_KEYS
+        from src.opportunities.qualification_repository import (
+            get_snapshot_qualification,
+        )
+
+        qualification = get_snapshot_qualification(
+            snapshot_key,
+            db_manager=db_manager,
+            initialize=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - optional additive projection
+        logger.debug(
+            "[opportunity-qualification] read unavailable error_type=%s",
+            type(exc).__name__,
+        )
+        return None
+    if qualification is None:
+        return None
+
+    tracks = []
+    for track_key in TRACK_KEYS:
+        rows = [
+            item
+            for item in qualification.candidate_tracks
+            if item.track_key == track_key
+        ]
+        tracks.append(
+            {
+                "track_key": track_key,
+                "qualified_count": sum(
+                    1 for item in rows
+                    if item.qualification_state == "qualified"
+                ),
+                "excluded_count": sum(
+                    1 for item in rows
+                    if item.qualification_state == "excluded"
+                ),
+                "unverified_count": sum(
+                    1 for item in rows
+                    if item.qualification_state == "unverified"
+                ),
+                "prospective_count": sum(
+                    1 for item in rows
+                    if item.causal_window_state == "prospective"
+                ),
+                "retrospective_count": sum(
+                    1 for item in rows
+                    if item.causal_window_state == "retrospective"
+                ),
+                "observation_ready_count": sum(
+                    1 for item in rows
+                    if item.observation_state == "ready"
+                ),
+            }
+        )
+    return {
+        "assessment_key": qualification.assessment_key,
+        "policy_version": qualification.policy_version,
+        "publication_state": qualification.publication_state,
+        "analysis_quality_state": qualification.analysis_quality_state,
+        "assessed_at": qualification.assessed_at.isoformat(),
+        "reason_codes": list(qualification.reason_codes),
+        "tracks": tracks,
     }
 
 
@@ -591,6 +911,27 @@ def list_snapshot_items(*, limit: int = 10, db_manager=None) -> dict[str, Any]:
         for snapshot in list_snapshots(limit=limit, db_manager=db_manager)
     ]
     return {"schema_version": "opportunity-snapshot-list/1.0", "items": items}
+
+
+def get_snapshot_detail(
+    snapshot_key: str,
+    *,
+    db_manager=None,
+) -> Optional[dict[str, Any]]:
+    """Return one immutable snapshot summary plus its frozen run payload.
+
+    Read-only: the frozen run payload is returned verbatim (deep copy) so the
+    caller can rebuild the exact board evidence a candidate was published with.
+    """
+
+    snapshot = get_snapshot(snapshot_key, db_manager=db_manager)
+    if snapshot is None:
+        return None
+    return {
+        "schema_version": "opportunity-snapshot-detail/1.0",
+        "snapshot": snapshot_item(snapshot, db_manager=db_manager),
+        "run": copy.deepcopy(dict(snapshot.payload)),
+    }
 
 
 def _load_evaluation_histories(
@@ -795,7 +1136,17 @@ def evaluate_snapshot(
     if snapshot is None:
         raise OpportunitySnapshotNotFoundError(snapshot_key)
     now = _aware_utc(evaluated_at or datetime.now(timezone.utc))
-    eligible = [candidate for candidate in snapshot.candidates if candidate.validation_eligible]
+    tracking_keys = _qualified_track_candidate_keys(
+        snapshot,
+        track_key="raw_underlying_path_v1",
+        db_manager=db_manager,
+        require_prospective=True,
+    )
+    eligible = [
+        candidate
+        for candidate in snapshot.candidates
+        if candidate.candidate_key in tracking_keys
+    ]
     existing = list_snapshot_outcomes(
         snapshot_key,
         evaluator_version=FORMULA_VERSION,
@@ -956,18 +1307,197 @@ def evaluate_snapshot(
         "snapshot_key": snapshot.snapshot_key,
         "evaluated_at": now.isoformat(),
         "candidate_count": len(snapshot.candidates),
+        "tracking_candidate_count": len(eligible),
         "inserted_outcomes": inserted,
         "already_recorded": already_recorded,
         "pending_horizons": pending,
         "data_gap_horizons": data_gaps,
         "outcome_progress": item["outcome_progress"],
+        "underlying_path_progress": item["underlying_path_progress"],
+        "full_research_progress": item["full_research_progress"],
+        "message": message,
+    }
+
+
+def _snapshot_has_due_outcome_work(item: Mapping[str, Any]) -> bool:
+    """Use the local XNYS schedule projection before touching a provider."""
+
+    return any(
+        int(progress.get("data_gap_count") or 0) > 0
+        or int(progress.get("partial_count") or 0) > 0
+        for progress in (
+            item.get("underlying_path_progress")
+            or item.get("outcome_progress")
+            or ()
+        )
+        if isinstance(progress, Mapping)
+    )
+
+
+def evaluate_due_snapshots(
+    *,
+    db_manager=None,
+    evaluated_at: Optional[datetime] = None,
+    history_loader: Optional[HistoryLoader] = None,
+    limit: int = 500,
+) -> dict[str, Any]:
+    """Evaluate only snapshots with a locally proven due/partial horizon.
+
+    The preflight calls ``snapshot_item`` with no market-data fetch.  This is
+    important after a 5D result matures: the still-pending 20D horizon must not
+    trigger another full history download on every daily scheduler tick.
+    A request-scoped loader cache also prevents the same ticker or SPY history
+    from being fetched once per snapshot when several horizons mature together.
+    """
+
+    now = _aware_utc(evaluated_at or datetime.now(timezone.utc))
+    snapshots = list_snapshots(
+        limit=max(1, min(500, int(limit))),
+        db_manager=db_manager,
+    )
+    due: list[StoredSnapshot] = []
+    for snapshot in snapshots:
+        item = snapshot_item(
+            snapshot,
+            db_manager=db_manager,
+            observed_at=now,
+        )
+        if _snapshot_has_due_outcome_work(item):
+            due.append(snapshot)
+
+    if not due:
+        return {
+            "schema_version": "opportunity-outcome-maintenance/1.0",
+            "evaluated_at": now.isoformat(),
+            "scanned_snapshot_count": len(snapshots),
+            "due_snapshot_count": 0,
+            "evaluated_snapshot_count": 0,
+            "failed_snapshot_count": 0,
+            "inserted_outcomes": 0,
+            "already_recorded": 0,
+            "pending_horizons": 0,
+            "data_gap_horizons": 0,
+            "evaluated_snapshot_keys": [],
+            "failed_snapshot_keys": [],
+            "message": "没有已到期且尚未完成的 5D/20D 结果。",
+        }
+
+    cache: dict[str, tuple[list[Mapping[str, Any]], Optional[str]]] = {}
+    cache_errors: dict[str, Exception] = {}
+    manager = None
+    source_loader = history_loader
+    if source_loader is None:
+        from data_provider.base import DataFetcherManager
+
+        tracking_keys_by_snapshot = {
+            snapshot.snapshot_key: _qualified_track_candidate_keys(
+                snapshot,
+                track_key="raw_underlying_path_v1",
+                db_manager=db_manager,
+                require_prospective=True,
+            )
+            for snapshot in due
+        }
+        earliest_reference = min(
+            candidate.reference_session_date
+            for snapshot in due
+            for candidate in snapshot.candidates
+            if candidate.candidate_key
+            in tracking_keys_by_snapshot[snapshot.snapshot_key]
+            and candidate.reference_session_date is not None
+        )
+        start = earliest_reference - timedelta(days=7)
+        end = now.date() + timedelta(days=1)
+        days = max(180, (end - start).days + 10)
+        manager = DataFetcherManager()
+
+        def source_loader(symbol: str):
+            return _default_history_loader(
+                symbol,
+                manager=manager,
+                start_date=start,
+                end_date=end,
+                days=days,
+            )
+
+    def shared_loader(symbol: str):
+        normalized = str(symbol).strip().upper()
+        if normalized in cache_errors:
+            raise cache_errors[normalized]
+        if normalized not in cache:
+            try:
+                rows, source = source_loader(normalized)
+                cache[normalized] = (list(rows), source)
+            except Exception as exc:  # noqa: BLE001 - cache one provider failure
+                cache_errors[normalized] = exc
+                raise
+        return cache[normalized]
+
+    aggregate = {
+        "inserted_outcomes": 0,
+        "already_recorded": 0,
+        "pending_horizons": 0,
+        "data_gap_horizons": 0,
+    }
+    evaluated_keys: list[str] = []
+    failed_keys: list[str] = []
+    try:
+        for snapshot in due:
+            try:
+                result = evaluate_snapshot(
+                    snapshot.snapshot_key,
+                    db_manager=db_manager,
+                    evaluated_at=now,
+                    history_loader=shared_loader,
+                )
+            except Exception as exc:  # noqa: BLE001 - isolate one snapshot
+                logger.warning(
+                    "[opportunity-outcomes] maintenance snapshot=%s failed "
+                    "error_type=%s",
+                    snapshot.snapshot_key,
+                    type(exc).__name__,
+                )
+                failed_keys.append(snapshot.snapshot_key)
+                continue
+            evaluated_keys.append(snapshot.snapshot_key)
+            for field_name in aggregate:
+                aggregate[field_name] += int(result.get(field_name) or 0)
+    finally:
+        if manager is not None:
+            try:
+                manager.close()
+            except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+                logger.debug(
+                    "[opportunity-outcomes] maintenance manager close failed: %s",
+                    exc,
+                )
+
+    message = (
+        f"检查 {len(due)} 个到期快照，新增 "
+        f"{aggregate['inserted_outcomes']} 条成熟结果；"
+        f"{aggregate['data_gap_horizons']} 个到期窗口仍缺数据。"
+    )
+    return {
+        "schema_version": "opportunity-outcome-maintenance/1.0",
+        "evaluated_at": now.isoformat(),
+        "scanned_snapshot_count": len(snapshots),
+        "due_snapshot_count": len(due),
+        "evaluated_snapshot_count": len(evaluated_keys),
+        "failed_snapshot_count": len(failed_keys),
+        **aggregate,
+        "evaluated_snapshot_keys": evaluated_keys,
+        "failed_snapshot_keys": failed_keys,
         "message": message,
     }
 
 
 def _strategy_base_key(snapshot: StoredSnapshot) -> str:
+    from src.opportunities.qualification import QUALIFICATION_POLICY_VERSION
+
     return canonical_sha256(
         {
+            "outcome_formula_version": FORMULA_VERSION,
+            "qualification_policy_version": QUALIFICATION_POLICY_VERSION,
             "signal_version": snapshot.signal_version,
             "freeze_policy_version": snapshot.freeze_policy_version,
             "playbook_version": snapshot.playbook_version,
@@ -1024,6 +1554,8 @@ def _critical_quality_gap(outcome: StoredOutcome) -> bool:
 def _cohort_records(
     outcomes: Sequence[StoredOutcome],
     snapshots: Sequence[StoredSnapshot],
+    *,
+    db_manager=None,
 ) -> tuple[
     Optional[str],
     dict[tuple[int, str], list[StoredOutcome]],
@@ -1033,7 +1565,23 @@ def _cohort_records(
     if not snapshots:
         return None, {}, {}, {}
     by_snapshot = {snapshot.snapshot_key: snapshot for snapshot in snapshots}
-    latest = next((snapshot for snapshot in snapshots if snapshot.validation_eligible), snapshots[0])
+    full_research_keys = {
+        snapshot.snapshot_key: _qualified_track_candidate_keys(
+            snapshot,
+            track_key="canonical_full_research_v1",
+            db_manager=db_manager,
+            require_prospective=True,
+        )
+        for snapshot in snapshots
+    }
+    latest = next(
+        (
+            snapshot
+            for snapshot in snapshots
+            if full_research_keys[snapshot.snapshot_key]
+        ),
+        snapshots[0],
+    )
     active_base = _strategy_base_key(latest)
     candidates = {
         (snapshot.snapshot_key, candidate.candidate_key): candidate
@@ -1048,6 +1596,11 @@ def _cohort_records(
         snapshot = by_snapshot.get(outcome.snapshot_key)
         candidate = candidates.get((outcome.snapshot_key, outcome.candidate_key))
         if snapshot is None or candidate is None:
+            continue
+        if (
+            outcome.candidate_key
+            not in full_research_keys.get(snapshot.snapshot_key, set())
+        ):
             continue
         if _strategy_base_key(snapshot) != active_base:
             continue
@@ -1087,6 +1640,7 @@ def learning_summary(*, db_manager=None, generated_at: Optional[datetime] = None
     _active_base, grouped, excluded, cohort_labels = _cohort_records(
         outcomes,
         snapshots,
+        db_manager=db_manager,
     )
     horizons = []
     for horizon_sessions in _HORIZONS:
@@ -1121,7 +1675,10 @@ def learning_summary(*, db_manager=None, generated_at: Optional[datetime] = None
             for outcome in current
             if outcome.result.get("reference_session_date")
         }
-        summary_visible = directional_count >= MINIMUM_SUMMARY_SAMPLES
+        summary_visible = (
+            directional_count >= MINIMUM_SUMMARY_SAMPLES
+            and len(sessions) >= MINIMUM_SUMMARY_SAMPLES
+        )
         investigation_ready = (
             directional_count >= MINIMUM_INVESTIGATION_SAMPLES
             and len(sessions) >= MINIMUM_INVESTIGATION_SAMPLES
@@ -1131,10 +1688,13 @@ def learning_summary(*, db_manager=None, generated_at: Optional[datetime] = None
                 "horizon_sessions": horizon_sessions,
                 "mature_count": len(current),
                 "distinct_signal_sessions": len(sessions),
-                "context_hit_count": hit,
-                "context_miss_count": miss,
-                "neutral_count": neutral,
-                "non_directional_count": non_directional,
+                "directional_sample_count": directional_count,
+                "context_hit_count": hit if summary_visible else None,
+                "context_miss_count": miss if summary_visible else None,
+                "neutral_count": neutral if summary_visible else None,
+                "non_directional_count": (
+                    non_directional if summary_visible else None
+                ),
                 "context_hit_rate_percent": (
                     round(hit / directional_count * 100.0, 2)
                     if summary_visible and directional_count
@@ -1171,7 +1731,7 @@ def learning_summary(*, db_manager=None, generated_at: Optional[datetime] = None
         "horizons": horizons,
         "limitations": [
             "这里只验证冻结候选后的标的价格路径，不是期权收益或真实成交 P&L。",
-            "方向样本不足 10 个时不显示命中率；5 日与 20 日绝不混算。",
+            "同一 cohort 不足 20 个方向样本或 20 个独立信号交易日时不显示命中率；5 日与 20 日绝不混算。",
             "至少 20 个方向样本且来自 20 个独立信号交易日才进入人工调查。",
             "任何样本量都不会自动修改排名权重；新版本必须另做 walk-forward 验证并由用户确认。",
             "摘要只展示当前 signal/playbook/universe 下同一 setup、Regime、方向的 cohort，不混算版本。",
@@ -1187,6 +1747,7 @@ __all__ = [
     "MINIMUM_SUMMARY_SAMPLES",
     "OpportunitySnapshotNotFoundError",
     "ensure_daily_snapshot",
+    "evaluate_due_snapshots",
     "evaluate_snapshot",
     "freeze_daily_snapshot",
     "learning_summary",

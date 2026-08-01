@@ -4,13 +4,35 @@ from __future__ import annotations
 
 from datetime import date, timedelta, timezone
 
-from src.regime.classifier import RegimeResult
+import pytest
+
+from src.regime.classifier import RegimeResult, current_market_date
 from src.regime.storage import (
     get_recent_scores,
     get_regime_score,
     init_regime_schema,
     save_regime_score,
 )
+from src.storage import DatabaseManager
+
+
+@pytest.fixture(autouse=True)
+def isolated_db(tmp_path, monkeypatch):
+    """Keep storage tests out of the developer's live regime history."""
+
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "regime_storage.db"))
+    import src.config as config_module
+
+    monkeypatch.setattr(
+        config_module.Config,
+        "_parse_stock_email_groups",
+        classmethod(lambda _cls: []),
+    )
+    config_module.Config.reset_instance()
+    DatabaseManager.reset_instance()
+    yield
+    DatabaseManager.reset_instance()
+    config_module.Config.reset_instance()
 
 
 def _mk_result(d: date, score: int = 60, label: str = "standard") -> RegimeResult:
@@ -53,8 +75,9 @@ def test_upsert_updates_existing():
 
 
 def test_recent_scores():
+    market_today = current_market_date()
     for i in range(5):
-        save_regime_score(_mk_result(date.today() - timedelta(days=i)))
+        save_regime_score(_mk_result(market_today - timedelta(days=i)))
     rows = get_recent_scores(days=3)
     assert len(rows) == 4  # today + 3 previous
     assert rows[0]["date"] >= rows[-1]["date"]  # descending order

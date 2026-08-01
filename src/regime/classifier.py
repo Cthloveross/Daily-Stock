@@ -47,6 +47,9 @@ class RegimeResult:
     d6_premarket: int
     snapshot: dict = field(default_factory=dict)
     version: str = "v1"
+    generated_at: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
 
 
 def classify(score: int, *, aggressive: int = 75, standard: int = 55, cautious: int = 35) -> tuple[str, str]:
@@ -73,13 +76,21 @@ def compute_regime_score(
     watchlist: Optional[list[str]] = None,
     save_to_db: bool = True,
     thresholds: Optional[dict] = None,
+    as_of: Optional[datetime] = None,
 ) -> RegimeResult:
     """End-to-end: fetch data -> 6 scorers -> classify -> persist.
 
     Thresholds default to (75, 55, 35) but can be overridden for backtesting.
+    ``as_of`` freezes every premarket provider read to one timezone-aware UTC
+    instant.  Omitting it preserves the live behavior and captures the clock
+    once at the beginning of this computation.
     """
+    frozen_as_of = _aware_utc(
+        as_of or datetime.now(timezone.utc),
+        field_name="as_of",
+    )
     if target_date is None:
-        target_date = current_market_date()
+        target_date = current_market_date(frozen_as_of)
     if watchlist is None:
         watchlist = _default_watchlist()
 
@@ -91,7 +102,11 @@ def compute_regime_score(
         vix = fetcher.get_vix(target_date)
         sectors = fetcher.get_sector_performance(target_date)
         prev_day = fetcher.get_prev_day_structure(target_date)
-        premarket = fetcher.get_premarket_activity(watchlist, target_date)
+        premarket = fetcher.get_premarket_activity(
+            watchlist,
+            target_date,
+            as_of=frozen_as_of,
+        )
         events = fetcher.get_macro_events(target_date, watchlist)
     finally:
         close_fetcher = getattr(fetcher, "close", None)
@@ -158,6 +173,7 @@ def compute_regime_score(
         d6_premarket=d6,
         snapshot=snapshot,
         version="v2",
+        generated_at=datetime.now(timezone.utc),
     )
 
     if save_to_db:
@@ -166,6 +182,14 @@ def compute_regime_score(
         save_regime_score(result)
 
     return result
+
+
+def _aware_utc(value: datetime, *, field_name: str) -> datetime:
+    if not isinstance(value, datetime):
+        raise ValueError(f"{field_name} must be a datetime")
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field_name} must be timezone-aware")
+    return value.astimezone(timezone.utc)
 
 
 def _default_watchlist() -> list[str]:

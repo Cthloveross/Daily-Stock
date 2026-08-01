@@ -842,6 +842,7 @@ class SystemConfigServiceTestCase(unittest.TestCase):
                 {"key": "RUN_IMMEDIATELY", "value": "false"},
                 {"key": "SCHEDULE_ENABLED", "value": "true"},
                 {"key": "SCHEDULE_RUN_IMMEDIATELY", "value": "true"},
+                {"key": "MOOMOO_PREMARKET_PREFETCH_ENABLED", "value": "false"},
             ],
             reload_now=True,
         )
@@ -861,6 +862,7 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertIn("非 schedule 模式", run_warning)
         self.assertNotIn("以 schedule 模式", run_warning)
         self.assertIn("SCHEDULE_RUN_IMMEDIATELY", schedule_warning)
+        self.assertIn("MOOMOO_PREMARKET_PREFETCH_ENABLED", schedule_warning)
         self.assertIn("不会自动重建 scheduler", schedule_warning)
         self.assertIn("以 schedule 模式重新启动后生效", schedule_warning)
         self.assertNotIn("它属于启动期单次运行配置", schedule_warning)

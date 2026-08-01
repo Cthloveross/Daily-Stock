@@ -12,8 +12,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 
+- [新功能] Journal“仓位复盘”新增 Moomoo LIVE/US 期权当前持仓只读双采样、短期服务端 preview、显式 future-only confirm 与独立 append-only 快照账本；完整空仓可保存，查询失败或边界变化不会伪装为空仓，且全链路不解锁或执行交易。
+- [修复] 当前持仓证据保存两轮规范化边界并重算 hash/差异，逐字段交叉验证采集与 summary 计数，只接受规范 Decimal 字符串，并拒绝未来偏差超过 2 分钟、采集超过 5 分钟或完成后超过 30 分钟的陈旧首次确认，防止伪造稳定性或把旧 payload 当作当前锚点。
+- [改进] 当前持仓确认冻结并事务内重验最新 Journal refresh publication、账户 binding 与连续性 hash；读取确认记录时重算表头、provenance、member/instrument key 和成员集合，并保持当前状态与历史 opening boundary、证据窗口末数量及券商成本上下文严格隔离。
+- [测试] 2026-07-30 真实 OpenD 零写检查得到 7 个活动美股期权持仓行、7 个完整合约规格、0 个 validation issue，并过滤当次返回的 19 条 `qty=0` 非活动缓存行；两次边界一致，正式数据库文件未变化且没有交易动作；另补双读篡改、陈旧/未来时间、publication 锚定、存储篡改、幂等与历史 Episode 零写回归。
+- [文档] 新增 `New-docs/phase1/11_CURRENT_POSITION_SNAPSHOTS.md`，记录 Moomoo 当前持仓 API 语义、双采样证据、新鲜度门禁、显式确认、append-only 存储、真实验收及未来 Episode boundary 所需的成交连续性 fence；专题细节未重复写入根 README。
+- [修复] 当前持仓 latest 状态改为在同一 SQLite 读事务中核对最新 Journal publication、账户 binding、publication anchor、30 分钟 freshness 与 2 分钟未来时钟偏差；过期、时钟异常、旧账户或被新刷新取代的确认记录明确降为“历史快照”，不再永久显示为当前仓位或当前空仓，同时仍允许为正确账户重新只读检查。
+- [修复] 当前持仓早期 SQLite 表会按当前模型补齐缺少的 additive nullable 列，应用数据库初始化即安装三张快照表的 UPDATE/DELETE 拒绝触发器，避免热重载旧 schema 或全局 `create_all` 留下兼容与不可变保护缺口。
+- [新功能] Journal 当前持仓新增零写 Episode continuity-fence readiness：以保守的采集完成时点为 boundary，核对同账户后续 refresh/publication 链、canonical 来源、守护区成交、aggregate-only 时间歧义、跨界普通单/组合单及期权身份；只输出 `no_snapshot / awaiting_refresh / blocked / ready`，不会生成或激活 Episode。
+- [改进] “仓位复盘”把未来边界流程收敛为等待快照、等待后续刷新、门禁阻断和连续性已证明四个状态；历史快照不因超过 30 分钟而失去边界候选资格，同时明确 `ready` 只允许进入下一步零写 build preview，不表示收益或构建已经验证。
+- [测试] 新增 continuity-fence 只读连接、缺快照/缺后续刷新、覆盖缺口、守护区成交、汇总成交变化、跨边界 fill set/组合执行组、未发布来源、期权身份与稳定 fence key 回归，并覆盖 Web 深层 camelCase 与矛盾状态 fail-closed。
+- [文档] 更新 `New-docs/phase1/11_CURRENT_POSITION_SNAPSHOTS.md`，记录 continuity fence 的边界时间、证据链门禁、页面状态、零写保证和接入新版 Episode build 前的剩余条件；专题细节未重复写入根 README。
+- [新功能] Journal 新增 fence-bound 未来 Episode 零写构建预览：服务端在同一只读 SQLite 事务中重算 continuity fence、严格重放 snapshot/publication/canonical 证据并仅投影 boundary 后的美股期权事件，返回确定性 build/evidence hash、生命周期计数与费用守恒，但不保存构建、不改变默认 activation 且不执行交易。
+- [修复] Canonical 严格读取补验 set key、root/stored provenance、reader/counts、source batch keys/kinds，并强制 in-session continuity helper 使用同一 SQLite bind、显式事务与 `query_only=1`；fence v1.1 额外冻结 target source cutoff，blocked 状态不再暴露 full projection，预览预算覆盖 order/fill/group/leg/fill-link。
+- [测试] 新增 stale fence、可变/零填充 OCC 身份、父 detail order、snapshot 成本隔离、left-censored P&L、费用守恒、只读事务误用、canonical set key/provenance 篡改与零业务写入回归；API 另校验生命周期计数和全部 no-write/no-trade 标志。
+- [文档] 扩展 `New-docs/phase1/11_CURRENT_POSITION_SNAPSHOTS.md`，记录 future Episode preview 的唯一 fence 输入、严格 boundary 规则、摘要响应、left-censored 限制、零写合同及正式 append-only 构建前的剩余步骤；根 README 未重复专题实现细节。
+- [新功能] Journal 只读证据链新增 append-only Moomoo execution-group/leg/fill-link/group-fee 模型与 canonical provenance；完整、终态、腿数量平衡且严格位于 CSV 基线后的组合单可进入单腿 PositionEpisode，父组合不再伪装成普通订单。
+- [改进] Moomoo 只读刷新为所有实际成交的期权合约批量冻结 market snapshot 合约规格，不再只读取组合腿；已成交合约缺 multiplier 继续 fail closed，未成交失败单不会因无执行乘数阻断仓位构建。
+- [修复] 组合费用按币种仅在 execution-group scope 精确保留，不猜测分摊到腿；受影响回合的 Fee/Net 保持空值并从 Headline 排除，生成与激活均要求独立 `accept_group_fee_scope` 确认。
+- [改进] Journal“交易证据”和“仓位复盘”页面分开展示普通单、组合组/腿/成交关联/组费/合约规格、逐币种费用守恒及受影响回合，并用明确文案解释腿级净收益为何不可用。
+- [测试] 真实 OpenD 零写验收通过 759 orders / 1,649 fills / 740 fees / 255 contract specs、1 group / 2 legs / 4 fill links；临时正式库副本构建 1,615 个回合，USD 174,531.05 普通费用与 8.08 组费守恒，正式库保持未发布、未构建、未激活。
+- [文档] 更新 Journal 每日只读刷新与 canonical Episode 专题，记录组合增量尾部门禁、组级费用语义、显式确认、真实副本验收和仍保持 fail-closed 的 CSV overlap/腿级费用限制；细节未重复写入根 README。
+- [修复] Journal 每日只读刷新与状态水位统一截止到最近已完成的 XNYS session close：盘前/盘中不再把当天尚未结算的成交和缺失费用混入上一日正式批次，周末、节假日与半日市使用交易所真实 session；日历不可解析时 preview fail closed。
+- [改进] Journal 刷新按钮改为“检查上一完整交易日”，并明确当前盘中、盘后和夜盘不会进入正式日终证据预览。
+- [新功能] 新增默认关闭的 `MOOMOO_PREMARKET_PREFETCH_ENABLED` 影子证据生产器：按 XNYS `open-22m` 冻结 SPY + 持久化 Top 5 的共同 `target_as_of`，最迟 `open-21m` 启动并在 `open-19m` 硬终止；Moomoo 只在可取消的 spawn 子进程中读取，父进程以 DB lease、owner/attempt fencing 和单向 Pipe 管理，正常完成后原子追加 `ready / partial / unavailable` 审计 bundle。正式 Regime、排名、UI 与 API 当前不消费该证据。
+- [新功能] 新增 `regime_premarket_prefetch_runs` 可恢复协调表与 append-only `regime_premarket_artifact_bundles`：bundle 保存统一日期/session/universe/as-of/freshness、规范 payload 与 SHA-256，SQLite 拒绝 UPDATE/DELETE；正式 selector 预留但 fail closed，真实影子窗口验收前不得接入 consumer。
+- [测试] 新增盘前影子预取的纯证据合同、跨 worker DB claim/heartbeat/lease recovery、append+settle 原子性、不可变触发器、因果 selector、真实 multiprocessing spawn 成功/卡死回收、调度窗口、FastAPI 生命周期及正式 Regime 零消费回归。
+- [文档] 更新服务端盘前编排专题，记录影子预取的默认关闭开关、09:08–09:11 ET 窗口、独立进程/数据库边界、正常 partial 与 timeout/crash 语义，以及真实 shadow 验收和正式接入门槛；专题细节未重复写入根 README。
+- [新功能] 盘前影子证据新增 append-only `regime_premarket_artifact_ingestions` 一对一数据库回执：SQLite 先原子提交 bundle + succeeded run，再在第二事务用 `STRFTIME` 数据库时钟生成毫秒级 UTC `ingested_at`，确保回执不早于 artifact 首次 commit；调用方不能传入或回填，崩溃恢复与旧 bundle 只按恢复/迁移当下数据库时间登记。
+- [修复] 正式 artifact selector 改用可信入库回执证明因果可见性，要求 `ingested_at + 1ms <= consumer as_of`，并重验 fetched/claimed 不晚于回执容差上界且回执不越过 hard deadline；截止后才恢复的回执会保留审计记录并将 run 明确置为 failed，当前正式回执发布与选择在非 SQLite 方言上整体 fail closed。
+- [改进] 盘前证据 schema 初始化完成后，普通读路径只做轻量只读 readiness 检查，不再为每次 selector/status 查询争抢 SQLite writer lock；正式 Regime、排名、UI 与 API 仍未消费影子数据，真实 09:08–09:11 ET 窗口仍待验收。
+- [测试] 新增 after-commit 数据库回执生成与不可变、两阶段崩溃后无回执 fail-closed/重放恢复、截止后恢复转 failed、幂等保留原回执、legacy 迁移使用当下 DB 时钟、事后 artifact 对历史 consumer 不可见、时间顺序/deadline fail-closed 及 schema readiness 读路径回归。
+- [文档] 更新服务端盘前编排专题，将影子持久化修正为 run、bundle、ingestion receipt 三类记录，记录数据库时钟、迁移边界、selector 因果门禁、读锁优化及正式 consumer/真实窗口的剩余退出条件；专题细节未重复写入根 README。
+- [修复] 盘前影子 artifact 入库改为严格重放 schema、交叉核对 run/quality/coverage、规范化等价 payload 后再哈希，并拒绝晚于 fetch 的证据、非五分钟 policy 与非有限 JSON；正式 selector 同时按 consumer 视角检查每条实际证据 freshness，截止后 failed/timed_out 重放不再改写终态。
+- [修复] FastAPI lifespan 分别隔离各 scheduler 的 stop 异常，单一关闭失败不再跳过其余 scheduler 与 app state 清理。
+- [测试] 固化影子 producer 默认关闭零启动、真实 XNYS DST/early-close/非交易日、语义等价 payload 幂等、伪造 coverage、未来证据、NaN 腐坏 fail-closed、截止后终态只读重放与 teardown 隔离回归。
+- [新功能] Opportunity Snapshot 新增 `opportunity_qualification_v2` append-only assessment：将数据库证明的发布状态、analysis quality、逐候选 causal/observation 与“标的路径 / 日线选股 / 完整研究”三条 `qualified / excluded / unverified` 决策分离保存；canonical 发布同事务写入，显式历史 backfill 只追加新 policy，不改写旧事实。v2 将 retrospective raw path 明确排除，并令完整研究在 assessment 缺失或读取异常时 fail closed。
+- [改进] `/regime` 官方盘前卡继续分开展示发布状态、数据质量和统计入样；有 qualification 时第三轴显示“标的路径 X/Y、日线选股 X/Y、完整研究 X/Y”且不暴露技术 track key，旧 API 缺字段时保持既有聚合 UI。候选列使用“研究用途”，5D/20D 使用“已回填 / 等待目标日”，零入样显示“尚无可统计样本”。
+- [改进] 结果自动维护 policy 升级为 `xnys-close-qualified-raw-path-v2`：逐候选只回填标的路径 track 为 `qualified` 且 `prospective` 的 5D/20D outcome，不再按整批 `validation_eligible` 跳过 degraded canonical；Snapshot API 与页面分别展示 raw-path 审计进度和完整研究进度，学习摘要仍只接纳完整研究 track 同时 `qualified + prospective` 的 outcome，raw path 不得填充命中率。
+- [测试] 新增 qualification 三轨纯分类、append-only/幂等/冲突、canonical 同事务回滚、显式 backfill、API 深层 camelCase、ready/degraded/legacy UI，以及 maintenance v2 raw-path 与完整研究隔离回归。
+- [文档] 更新每日机会、服务端盘前编排与自动结果维护专题，记录 qualification 三轨、analysis quality/causal window 分离、degraded canonical 的 raw-path 回填边界和 v2 maintenance slot 语义；专题细节未重复写入根 README。
+- [修复] Regime 计算为盘前 provider 冻结同一个 timezone-aware UTC `as_of` 并拒绝 naive 时间；带 `date/Date` 或 `DatetimeIndex` 的 SPY/VIX/板块日线在指标计算前过滤 `target_date` 之后的 future rows，避免未来数据污染当日快照。
+- [文档] 明确 Moomoo 盘前适配器虽已只读验收但尚未接入正式 Regime；约 32 秒的同步冷调用不得进入 canonical 关键路径，下一步必须先实现可终止独立进程与带日期/as-of/hash/质量证明的 append-only artifact，缺失或过期继续降级。
+- [修复] `/regime` Top 5 机会榜不再与 0–45 DTE 期权墙并发调用独立 `/option-context`：`option-wall/1.1` 复用同批动态合约快照返回最近到期 ATM Call IV，使默认五标冷加载保持每标最多两个链窗口、合计最多 10 次 `get_option_chain`，避免第 11 次调用触发 Moomoo 10 次/30 秒限频并令末位标的部分覆盖。
+- [测试] 新增同一墙快照最近到期/最近执行价 ATM Call IV、精确 ATM 缺 IV fail-closed、endpoint 不调用独立 ATM 读取、Top 5 selected 零 `/option-context` 请求，以及切换墙 DTE 范围不改变固定 0–45 ATM 语义的回归。
+- [文档] 更新每日机会与期权数据配置专题，记录 `option-wall/1.1` 的 ATM IV 选择合同、单页 10 次链查询预算、独立 endpoint 兼容边界及多标签页仍可能竞争供应商额度的剩余风险。
+- [修复] Web 顶栏 Moomoo 状态改为共享监控器：同标签请求/定时器去重，跨标签以 Web Locks、localStorage 与 BroadcastChannel 协调为每 60 秒最多一次健康探测，隐藏页暂停，失败按 15/30/60/120 秒退避并显示“状态未知”，网络恢复或页面重新可见时主动恢复且成功状态最多保留 75 秒。
+- [测试] 新增 Moomoo 状态多组件单请求/单时钟、跨标签新鲜结果复用、隐藏页暂停与 online 恢复回归测试。
+- [改进] 今日机会研究新增“基础榜 → 期权概览 → Top 5 墙”三阶段状态与请求日、基础证据日期和 ET 生成时间；刷新期间保留并标明上一成功结果，可选增强失败或期权墙部分覆盖时明确降级，Regime 首次加载不再阻塞机会榜。
+- [新功能] Canonical Premarket Research Cycle v1 新增服务端有序研究池版本、唯一 cycle slot、append-only attempt/stage/lease、跨 worker 单 owner claim 与重启状态恢复；本地低噪声 scheduler 在 XNYS 09:12 ET 首次生成、09:17 ET 恢复，09:18 后拒绝新 leader、09:20 硬截止。2026-07-24 已完成首轮真实窗口验收；完整 draft/finalizer、pool 生效交易日、服务端 last-good、外部进程监管与期权增强冻结仍待完成。
+- [修复] 官方盘前 snapshot、候选、`persist_snapshot=completed` 与 `attempt_finished=published` 改为同一数据库事务；cycle slot 锁内以权威时间生成全部 provenance，并在构造后再次检查 09:20 deadline 与 lease，跨截止或终态失败会整包回滚。
+- [修复] 官方盘前发布契约将保序研究池与 Snapshot canonical universe 按规范化 symbols 集合核对，修复真实非字母顺序研究池在发布阶段被误判为 scope 不一致的问题。
+- [修复] FastAPI lifespan 关闭盘前 scheduler 时会等待正在执行的只读 tick 完整退出；有限等待超时时保留 live thread 引用并拒绝同一 host 重启，避免 reload 后遗留 provider thread 与新 scheduler 重叠。
+- [改进] 今日机会页以“官方盘前研究 / 官方版本 / 只读预览”展示 scheduler、研究池版本和最近 attempt；页面加载不再自动 run 或设置窗口 timer，只有明确点击才发送 `manual=true`，运行中只短期轮询只读 status 并禁止并发普通扫描。
+- [新功能] Watchlist 新增本地列表与官方盘前研究池差异核对及显式保存；正式池仅接受按顺序去重的前 20 个美股期权标的，`STOCK_LIST` 与 TradingView 导入都不会被后台静默启用。
+- [测试] 新增研究池幂等/版本、append-only trigger、租约竞争/过期接管/旧 owner 拒绝、两次 attempt 上限、重启恢复、缺池零 provider、09:12 手动门禁、scheduler due/retry/lifespan 与 Web 只读加载回归。
+- [文档] 新增 `New-docs/phase1/08_SERVER_OWNED_PREMARKET_ORCHESTRATION.md`，记录服务端研究池、09:12/09:17 时序、持久化 attempt/lease、低噪声 scheduler、安全边界、真实窗口验收缺口与回滚。
+- [测试] 2026-07-24 真实盘前窗口验证 09:12 自动 attempt 失败整包回滚、09:17 自动恢复发布及 09:20 后幂等；新增非字母顺序研究池的原子发布回归测试，并记录辅助 Regime 权限降级不等同于发布故障。
+- [修复] Finnhub 第三方 HTTP 失败诊断移除完整 query string，并脱敏 `token/api_key/key` 与当前配置 key，只保留异常类型、状态和不含查询参数的路径；现存旧日志不会被自动改写，仍按既有轮转与保留策略处置。
 - [改进] 今日机会研究收敛为 Watchlist Top 5 主清单：Top 5 自动批量加载并直出 0–45 DTE Call/Put 执行价墙，其余候选、排名外增强与 5D/20D 学习口径默认折叠。
-- [修复] 研究状态改由新鲜完整日线、方向结构和独立量能/成交额确认共同决定；降级或缺失 Regime 不再把所有候选统一标为等待状态，页面同步展示“重点研究 / 等待确认 / 背景观察 / 数据阻断”及确认、失效观察。
+- [修复] 研究用途改由新鲜完整日线、方向结构和独立量能/成交额确认共同决定；降级或缺失 Regime 不再把所有候选统一标为等待交易触发，页面同步展示“基础门禁通过 / 基础候选·非信号 / 仅作背景 / 精确数据阻断”及研究确认、失效观察。
 - [新功能] 本地 Watchlist 支持合并导入 TradingView 官方 TXT 导出；机会扫描使用前 20 只自选并显示来源，避免把 TradingView 的 broker/Charting Library API 误称为个人账户 Watchlist 同步接口。
 - [新功能] 新增 Moomoo History CSV 的 loss-aware parser、去标识化只读对账 CLI 和可信证据导入预览：保留重复表头的位置语义、逐笔 fill、订单汇总、九项费用与 ET 时间证据，并将批次分为 `exact` / `partial` / `blocked`。
 - [新功能] 新增 append-only `journal_v2_*` 证据账本、预览/确认导入/data-health API 与 Journal 导入交互；相同源文件幂等，partial 必须显式确认，旧 Journal/FIFO 表不被重建或混用，Data Health 明确区分整批范围与局部 API 对账窗口。
@@ -167,11 +225,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] 异常期权成交按标的使用 30 秒服务端 TTL/single-flight、请求数量上限与前端旧响应保护，并通过独立只读 QuoteContext lane 避免被大型期权墙扫描阻塞；明确供应商分类不能证明开平仓、真实主动买卖方、参与者目的或 dealer 定位，事件暂不进入候选排名、不持久化且无历史回测。
 - [文档] 更新每日机会专题，记录 Moomoo 10.9 只读升级验收、`option-events` 字段与时效口径、官方限频和 UI 用途，并将异常成交的证据边界与后续样本外验证顺序固化；专题细节未重复写入根 README。
 - [修复] Moomoo 环境变量示例、订阅说明与旧 LaunchAgent 注释不再建议解锁或模拟/真实交易，也不将 `LIVE` 当作执行开关；`LIVE` 仅表示只读真实账户历史，旧 writer 仍固定暂停。
-- [新功能] 每日机会研究新增显式不可变快照与 5/20 XNYS 交易日结果 API：`snapshots/freeze`、`snapshots`、`snapshots/{snapshot_key}/evaluate` 和 `learning-summary` 分别冻结当前基础榜、只读列出进度、追加成熟结果与返回受门槛保护的描述统计；普通 `/daily` 预览继续零写入。
+- [新功能] 每日机会研究新增显式不可变快照与 5/20 XNYS 交易日结果 API：`snapshots/freeze`、`snapshots`、`snapshots/{snapshot_key}/evaluate` 和 `learning-summary` 分别冻结当前基础榜、只读列出进度、追加已到目标日结果与返回受门槛保护的描述统计；普通 `/daily` 预览继续零写入。
 - [新功能] 新增 `opportunity_snapshot_runs`、`opportunity_snapshot_candidates`、`opportunity_candidate_outcomes` 三张隔离的 append-only 表和 UPDATE/DELETE 拒绝 trigger；run/candidate 原子写入、相同重试幂等、冲突快照拒绝，partial 与 complete 结果只追加不原地修订，本地升级前数据库备份继续由 `data/` ignore 规则排除于仓库。
 - [改进] 结果评估以 `exchange-calendars` XNYS 日历固定 `S close < freeze < E open` 因果窗口，分别保存冻结 close 与 next-open proxy 的 5D/20D 标的收益、MFE/MAE 和相对 SPY；5D 使用 ±0.5%、20D 使用 ±1.0% 的方向上下文阈值，mixed/unknown 不生成 signed 指标，参考复权或来源连续性无法核对的样本排除于学习。
-- [改进] 学习摘要严格隔离 signal/playbook/universe/结构 setup/Regime/direction/horizon cohort：10 个成熟方向样本才显示描述命中率，20 个样本且来自 20 个独立 signal sessions 才允许人工调查；不生成 TP/FP、missed opportunity 或 regime mismatch，不把 underlying proxy 冒充期权收益，且任何样本量都不会自动调整排名权重。
-- [测试] 新增机会快照日槽幂等/冲突与 SQLite 不可变 trigger、S-close/E-open 门禁、XNYS 节假日、5D/20D 成熟度、close/next-open/MFE/MAE/SPY、mixed/unknown 空 signed 字段、来源/复权缺口、API 显式写入边界和学习样本门槛回归测试。
+- [改进] 学习摘要严格隔离 signal/playbook/universe/结构 setup/Regime/direction/horizon cohort：须同时满足 20 个已回填方向样本和 20 个独立 signal sessions 才显示描述命中率并允许人工调查；不足门槛不返回 hit/miss/neutral 细分，不生成 TP/FP、missed opportunity 或 regime mismatch，不把 underlying proxy 冒充期权收益，且任何样本量都不会自动调整排名权重。
+- [测试] 新增机会快照日槽幂等/冲突与 SQLite 不可变 trigger、S-close/E-open 门禁、XNYS 节假日、5D/20D 目标日状态、close/next-open/MFE/MAE/SPY、mixed/unknown 空 signed 字段、来源/复权缺口、API 显式写入边界和学习样本门槛回归测试。
 - [测试] 离线门禁不再受本地 ignored `.env`、固定历史日期或手工联网诊断脚本影响，并补齐 requirements 已声明的 JSON repair 本地测试依赖；真实行情、LLM 与通知诊断只在 `network` 测试中执行。
 - [文档] 扩充每日机会专题，记录三表/API、因果冻结窗口、5/20 结果公式、严格 cohort、样本门槛和永久不自动调权边界；专题细节未重复写入根 README。
 - [新功能] 每日机会研究接入 Moomoo Python SDK 10.9 的只读 `get_option_underlying_overview`：通过 `POST /api/v1/opportunities/option-overview` 为全部合格候选批量展示供应商 IV、IV Rank/Percentile、HV，以及 Call/Put Volume 与 OI 概览；任一标的失败均独立降级，全链路不解锁、不下单。
@@ -188,8 +246,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] Regime 新增 `regime-quality-v1` 快照质量合同：空 Sector/昨日结构/盘前不再产生 −5/−2/+3 伪分，SPY/VIX 核心缺失时 fail closed 且不展示成真实 no_trade，API/Web 明确 degraded、缺失域与非权威边界；今日日期统一为纽约市场日。
 - [改进] Regime 重算改为 Moomoo-first 有界取数：SPY/11 个板块/昨日结构复用本地只读日线，VIX 缺少 Moomoo 覆盖时使用 3 秒 Cboe 官方 CSV fallback；Finnhub 合并为两个 7 日区间请求并识别 403/timeout，Alpaca SPY 失败停止逐股扩散，避免远端串行请求令页面超时或把权限失败伪装成零事件。
 - [修复] Regime 仪表盘色带与后端 35/55/75 分档阈值重新对齐，degraded 状态改为 `CONTEXT ONLY · PROVISIONAL` 且不再给出执行指令；重算同时刷新 UTC 证据时间，Web 始终按纽约时区显示，修复本地时间误标为 ET。
-
-## [3.12.0] - 2026-04-01
+- [新功能] 单合约复盘新增服务端 ReviewAnnotation v1 与 Review Queue：用户可显式保存六字段自述、标签和错误类型，按绑定 immutable build + PositionEpisode 的 append-only revision 查看历史，并从未开始/进行中/已完成计数、筛选和行状态继续复盘；相同最新内容幂等，AI 不自动写入，annotation 不修改券商证据、canonical、Episode 经济字段或 P&L。
+- [修复] DatabaseManager 冷启动改为并发安全初始化，避免首批并发请求取得缺少 `_engine` 的半初始化单例；Journal v2 首次建表与 append-only trigger 安装同步串行化。
+- [新功能] 新增服务端 5D/20D 机会结果自动维护：按精确 XNYS 收盘后 30 分钟首次检查、收盘后 4.5 小时最多重试一次，使用数据库租约和两次 attempt 上限支持多 worker、重启及周末接续，并避开 08:45–09:30 ET 官方盘前研究窗口。
+- [改进] 结果维护先用本地 XNYS 日历筛出真正到期或 partial 的冻结快照，未到期时零行情请求；同轮跨快照共享 ticker/SPY 历史缓存，冻结快照和结果继续 append-only，运行租约只作为可恢复的可变协调状态。
+- [修复] Alpaca 盘前涨跌改用纽约 04:00–09:30 内已完成且新鲜的 1 分钟 bar，并以精确上一 XNYS session 收盘价为分母；未来日期、缺前收、前收日期错误、未完成分钟或过期行情全部降级，不再把未知编码为 0%。
+- [修复] Alpaca 股票 bars 保持空列表兼容的同时记录请求状态，Regime 能区分 401/403 权限、429 限频、timeout 与真实空分钟，不再把供应商拒绝误报为 `no_completed_premarket_bar`。
+- [新功能] 新增只读 Moomoo 专用盘前适配器：固定读取未复权的 04:00–09:30 ET 已完成 1 分钟 bar，以精确上一 XNYS session 的 `last_close` 为基准；真实 SPY 冷调用字段验证通过，但约 32 秒且同步 SDK 不可安全取消，因此暂不接入正式 Regime fallback。
+- [改进] Regime 同轮 Alpaca SPY/watchlist 盘前请求冻结同一 `as_of`，并持久化 `_attempted_sources`、`_reason` 与具体 provider reason；Moomoo 整篮子 fallback 延后到可终止独立进程生成 append-only 盘前 artifact 后启用，不能用跨交易日 last-good 或共享线程 worker 替代。
+- [测试] 新增 Alpaca 403 状态与 Regime reason 透传、Moomoo 未复权/扩展时段/未完成分钟/5 分钟 freshness/`last_close` 证据回归，并完成本机只读 SPY 字段和延迟冒烟。
+- [修复] Finnhub 经济日历与财报日历分别记录 readiness；一个子域无权限或失败时只屏蔽对应证据，另一个成功子域继续参与 Regime，旧 degraded 载荷仍保守不计分。
+- [修复] 单合约复盘证据 marker 不再把首根 K 线之前的成交前推到未来 candle；分钟图只映射到同一纽约交易日、同一盘段且不晚于证据时间的 bar，并覆盖开盘前与收盘边界回归。
+- [改进] 设置页与 `.env.example` 补齐 Alpaca、Finnhub 和结果维护开关；学习面板展示服务端自动回填状态，手动操作收敛为“重试到期缺口”。
+- [文档] 新增期权研究数据/API 配置指南和自动结果维护合同，区分已接入、免费增强、候选未接入及付费来源，记录 Moomoo/Alpaca/Finnhub/OpenAI 权限、冒烟测试、统计门槛、运维与回滚。
+- [测试] 新增结果维护并发租约、失败恢复、早收盘、保护窗口、到期前零 provider、跨快照缓存、20 日统计门槛、Alpaca/Finnhub partial readiness 与复盘 marker 会话边界回归。
+- [改进] Top 5 期权墙由逐标串行改为最多五条彼此隔离、可复用且逐次独占的 Moomoo QuoteContext lane 并发读取，继续保留逐标 30 秒 TTL/single-flight、请求顺序、真实 coverage 与失败降级；本机同组冷缓存从 30.47 秒降至 9.64 秒且 10,374/10,374 张合约完整返回。
+- [测试] 新增 Top 5 墙位五路重叠与响应顺序、QuoteContext lane 独占/复用回归；期权 Moomoo 快照与机会 API 定向测试 68 项通过。
+- [文档] 每日机会与期权数据接入指南补充墙位并发边界、Moomoo 单次 400 代码/30 秒 60 次快照额度、真实计时证据及避免多页面重试风暴的操作说明。
+- [新功能] Journal 新增默认关闭的服务端 OpenD 只读刷新：从最新可信水位自动选择重叠窗口，将去标识化结果冻结为短期 server-owned artifact，网页先预览 overlap/tail/阻断再显式发布；preview 零业务证据写入，所有响应固定声明零交易动作。
+- [修复] Moomoo 对账区分历史 overlap 冲突与严格晚于旧 cutoff 的 authoritative incremental tail；完整查询但零成交现在也能推进 broker 查询水位，同秒新增记录依赖 broker 稳定 ID 去重，账户 HMAC 与窗口连续性不成立时 fail closed。
+- [新功能] Canonical PositionEpisode build 新增 append-only 显式激活：构建成功不自动切换默认复盘，激活以 build key 和当前 activation/build compare-and-swap，重复请求幂等、A→B→A 回退保留完整历史，并再次要求确认 `assumed_flat_unverified` 边界。
+- [改进] Journal“交易证据”首屏改为每日只读刷新状态机，分开展示券商查询水位、最新成交、证据发布与当前复盘版本；CSV/JSON 收入首次导入高级区，刷新确认后联动更新 Data Health 和仓位复盘。
+- [测试] 补齐只读空窗口、账户 binding、合法 incremental tail、overlap 冲突、窗口缺口、server-owned preview/confirm/幂等发布、构建激活/CAS/append-only 与 Web 刷新交互回归。
+- [文档] 新增 `New-docs/phase1/10_JOURNAL_READONLY_REFRESH.md`，记录每日只读刷新配置、四阶段状态机、连续性门禁、水位、激活与剩余 contract multiplier/opening snapshot 限制；专题细节未重复写入根 README。
+- [修复] Moomoo 只读成交导入在稳定订单/声明组合腿精确关联且父单一秒内完成更新时，允许带审计告警的亚秒级成交/订单时间反序；保留原始时间，超出护栏或其他证据不一致仍保持阻断。
+- [改进] Journal 只读刷新保留并结构化识别 Moomoo `strategy_type/combo_legs`，且要求非空 OpenD 订单响应证明字段能力；组合父单按逐腿代码、方向和数量比例核对，并按 CSV 基线前、重叠区和增量尾部分别给出执行组投影阻断，不再误报为普通单腿代码、方向、数量与 VWAP 冲突或静默伪装成股票。
+- [改进] Journal 只读预览将缺逐笔成交、孤立成交、数量/标的/方向/均价差异与缺券商费用等对账 warning 映射为面向交易复盘的中文原因，不再直接展示内部字段名。
+- [修复] Episode continuity fence 改为在显式 SQLite `mode=ro` / `query_only` 读事务中统一读取全部证据，严格重验 snapshot artifact/provenance/member、OpenD refresh artifact/accepted batch/publication 与 frozen canonical root/member/source/group/multiplier 投影，并按 OCC semantic identity 判断边界，避免并发混读、无效刷新、raw observation 旁路及 strike 零填充造成假 `ready`。
+- [文档] 明确 continuity fence 的“零写”只承诺零业务表与零 Schema 写入；SQLite 在 WAL 模式下仍可能为读取协调创建或维护 `-wal` / `-shm` sidecar，不承诺数据库目录在文件系统层面完全无字节变化。
+- [文档] 新增 `New-docs/HANDOFF.md` 总交接手册，统一记录产品目标、证据架构、正式库与运行快照、Moomoo 永久只读边界、Web/API 日常流程、Git/GitHub 同步真相、验证矩阵、风险、故障排查和分阶段验收路线；专题细节未重复写入根 README。
+- [修复] 前端图表 EMA 统一为共享 SMA-seeded 实现 `apps/dsa-web/src/utils/ema.ts`：机会详情页原从首 close 递推的 overlay 改为与 Journal 复盘 overlay 及后端 `_ema_last` 同一语义（前 period 根 close 均值作 seed 落在第 period 根 bar，样本不足 fail closed），消除同一标的两处图表 EMA 起始段可见差异。
+- [测试] 新增 `utils/__tests__/ema.test.ts`：手算小样本、后端 `_ema_last` 同输入 parity fixture、seed 位置与不足样本/非法 period fail-closed 回归；机会榜测试补数据时点提示断言。
+- [修复] 每日机会榜数据时点提示不再把基础相对量列总括为“Volume＝本交易日累计”：现明确“相对量能＝上一完整交易日（相对之前 20 个 session）”，仅期权 Call/Put Volume 标注为当前交易日累计。
+- [新功能] 新增只读端点 `GET /api/v1/opportunities/snapshots/{snapshot_key}`（`opportunity-snapshot-detail/1.0`）：返回单个不可变机会快照 summary 与冻结 run payload 原文；key 格式不合法或不存在返回 404，存储异常返回 503，均不触碰冻结证据。
+- [新功能] 机会详情页与官方榜单实现同版本证据绑定：canonical 榜单跳详情携带 `?snapshotKey=`，详情页优先读取冻结候选与冻结信号日并显示“官方快照 … · 冻结于 …”；快照缺失或不含该标的时显式提示并回退即时扫描，无绑定时明确标注“即时扫描 · 未绑定官方快照”，preview 榜单不伪装官方绑定。
+- [测试] 后端补 snapshot detail 端点 200/404/非法 key fail-closed 测试；前端补 canonical 深链携带 snapshotKey、详情页官方绑定不再触发即时扫描、快照不可用回退提示与无绑定标注共 4 个回归。
+- [修复] `test_iv_rank.py` 补 autouse fixture 禁用 Moomoo IV 优先路径：此前套件中任一测试触发 `get_config()` 加载 `.env` 后，本机 `MOOMOO_OPEND_ENABLED=true` 会让 `compute_atm_iv` 单元测试打到真实 OpenD 实时期权报价（盘中间歇性失败且违反 `-m "not network"` 封闭性）；现在 yfinance fallback 被确定性隔离测试。
+- [新功能] 应用日志新增跨日期 retention：`LOG_RETENTION_DAYS`（保留天数）与 `LOG_RETENTION_MAX_TOTAL_MB`（同前缀总体积上限）在 `setup_logging` 时清理按日期命名的历史日志；默认 0＝关闭不改变现有行为，只匹配本前缀 `*_{YYYYMMDD}.log` 及轮转备份，当天文件与 `logs/archive/` 归档目录永不受影响，删除失败仅告警不中断启动。
+- [测试] 新增 `tests/test_log_retention.py` 7 项安全边界回归：默认关闭零删除、只删同前缀过期日期文件、不递归 archive 子目录、体积上限从最旧删起且不动当天、unlink 失败继续、环境变量畸形值按关闭处理。
+- [改进] 机会详情页官方绑定时新增「冻结与当前差异」条：显示冻结基准 close（信号日收盘）与当前 spot（Moomoo 时点）的百分比变化并注明不改变冻结榜单结论；任一数值缺失整条隐藏，即时扫描页不显示，补 2 个前端回归。
+- [新功能] 新增 `GET /api/v1/system/health-layers` 分层健康端点：api 进程、OpenD TCP、Moomoo SDK、Journal 刷新配置就绪度、盘前官方发布水位、outcome 维护水位六层独立只读探测；单层失败只降级该层不 500，secret 永不回显，补 4 项端点回归。
+- [新功能] TopBar 新增「健康」分层弹层：点击按需拉取 health-layers 并按 ok/降级/不可用/未启用着色展示各层与说明；接口失败显示有界错误文案，后端新增未知层按原名展示；补 3 项组件回归。
+- [文档] 新增 `New-docs/phase1/12_FORMAL_FUTURE_BUILD_CONTRACT.md`：阶段 B 正式 future build 的切片划分与切片 1 写合同设计冻结稿（端点、CAS 重验序列、snapshot-fence link 表、preview in-session 重构、T1-T9 测试合同、activation 扩展的已知 schema 约束）；实现尚未开始。
+- [新功能] Journal 新增正式 future Episode build confirm 写路径 `POST /api/v1/journal/v2/episode-builds/position-snapshot`：在同一 `BEGIN IMMEDIATE` 写事务内重跑 fence-bound preview 核心，CAS 对比 fence key / planned build key / evidence hash，强制费用守恒、complete-snapshot 边界与 left-censored / group-fee 显式接受后，append-only 追加 EpisodeBuild 及新 `journal_v2_episode_build_snapshot_fence_sources` link 行（UPDATE/DELETE deny triggers 同批安装）；build_key 幂等且 duplicate 必须核对存量 link 身份，默认 activation 与默认视图不变，零交易动作。
+- [改进] fence-bound future preview 核心拆出 in-session 版本供 confirm 写事务复用，公开 `preview_fenced_position_episodes` 签名与零写语义不变；`planned_build_key` 派生按写合同补齐 snapshot key、target canonical set key、target publication key 与 projection 身份；CSV fallback 默认读显式排除 snapshot-fence build，episode summary 读回正确标注 `position_snapshot_fenced_canonical` 来源。
+- [测试] 新增正式 future build 的 T1-T9 回归：happy path 追加 build+link、同参数重放 duplicate 零新行、真实 detail fill 证据行与费用守恒、stale fence / hash 不匹配 / 缺 acceptance 全部 409 且表计数与内容摘要零变化、link 表 UPDATE/DELETE 被拒、同 build_key 但 link 身份不符拒绝、API 层请求校验 / 409 映射 / 读回一致性守卫。
+- [测试] 补 fence build 与 CSV-backed build 并存时的默认视图回归：CSV 基线批次不破坏 continuity fence，且 fence build 更新时默认读取仍是 CSV fallback（对抗性验证发现的覆盖缺口）。
+- [新功能] 仓位复盘案例精选新增「证据最不完整」（`weakest_evidence`）：按 `completeness_score` 升序把证据最差的仓位回合排在前面，帮助优先复核缺证据案例；不过滤生命周期状态，其他筛选仍为交集；前后端枚举、URL 白名单、OpenAPI 合同测试同步更新。
+- [修复] `position_snapshot_models` 显式注册 `refresh_models` 到共享 metadata：修复单独运行 episode repository 测试时 snapshot artifact 表对 `journal_v2_refresh_publications` 的外键在 `create_all` 中解析失败（全量套件因导入顺序掩盖的隔离缺陷）。
+- [文档] HANDOFF 排障章节新增「官方发布每天 degraded」根因诊断：Finnhub 经济日历 403（免费档无权限）导致 events 降级、无 Alpaca key 导致 premarket 域不可用；两者均为配置/权限缺口而非代码缺陷，附解决选项与影响边界（full_research track 持续为 0 的原因之一）。
+- [新功能] Web「仓位复盘」未来回合预览新增「写入正式 Future Build」显式确认块：展示计划 build key / 证据指纹 / 计划回合数，left-censored 与组费仅组级精确按需强制勾选后才可写入；成功与幂等重放均明确提示「已构建 ≠ 已生效：默认复盘视图不变（activation 尚未支持 future build）」，409 冲突时作废旧预览并要求重新运行零写预览后再确认，全程不自动触发写入。
+- [测试] 前端补 future build confirm 客户端与卡片回归：POST 请求体与三个 64-hex key 的本地校验（畸形 key 不发请求）、回显 build/fence 身份漂移与 activation 越权 fail-closed、无预览时确认块隐藏、acceptance 勾选门禁、写入中禁用、成功 / duplicate / 409 清空预览路径。
+- [修复] Playwright E2E 后端改为隔离启动：独立端口 8765、独立 `ENV_FILE` 与一次性空白 SQLite（`apps/dsa-web/e2e/.artifacts/`，已 gitignore），认证与全部 Moomoo / 盘前 / 回填调度器显式关闭，绝不复用本机常驻正式后端或真实 `.env` / `data/stock_analysis.db`；vite dev 代理目标支持 `DSA_WEB_API_PROXY_TARGET` 覆盖，chromium 项目改用本机 Chrome（`channel: 'chrome'`）以避免依赖 bundled 浏览器下载。
+- [测试] 重写 `apps/dsa-web/e2e/smoke.spec.ts` 为当前 UI 语义（HANDOFF §14.3）：断言 `/` 与 `/login` 在无认证时落到 `/regime`、官方盘前研究未发布空态与“数据时点”口径行、分层健康弹层 OpenD / Journal / 盘前发布 / 结果回填全为“未启用”、`/journal` 仓位复盘与交易证据空态无未预期 console/page error、`/regime/opportunity/AAPL` 深链呈现“即时扫描 · 未绑定官方快照”；旧 `report-markdown.spec.ts` 因依赖已下线 UI 显式 `test.describe.skip` 并标注 TODO。
+- [新功能] Regime 宏观事件域改用零成本官方年度日程（`src/regime/official_schedule.py` + `src/regime/data/official_economic_schedule_2026.json`）：FOMC 决议日（两日会议第二天）、CPI、非农发布日直接取自 federalreserve.gov / bls.gov 官方页面并随仓库版本化，含 per-series `source_url` / `retrieved_at` / coverage；`target_date + 7 天`窗口超出 coverage 时 fail closed 为 `unavailable`，过期日程不会伪装成“今天没有事件”。
+- [改进] `get_macro_events` 不再调用 Finnhub 付费 `/calendar/economic`（免费档每日 403 导致 events 域恒为 degraded）：经济序列以官方日程为主源，Finnhub 只保留 earnings 日历；官方日程覆盖窗口内经济序列 readiness=ready，events 域在 earnings 同时可用时恢复 ready，消除每日 `regime_supporting_events_degraded`。`_readiness`/`_status` 合同与 scorer 字段名保持不变，仅追加 `_economic_calendar` 可观测元数据。
+- [测试] 新增官方日程 provider 单测（决议日/发布日标志、两日会议第一天不标记、非事件日、7 天 agenda 窗口、coverage 边界 fail-closed、缺 series/坏文件 fail-closed、多年度文件合并）与 `get_macro_events` 集成回归（无 Finnhub 时经济序列仍 ready、earnings 正常时 events 整域 ready、超出 coverage 降级、不再调用经济日历端点）。
+- [文档] HANDOFF「官方发布每天 degraded」排障条目更新：events 侧已由官方年度日程解决，premarket 侧仍需 Alpaca key；补充年度运维步骤——来年官方日程发布后需刷新 `src/regime/data/official_economic_schedule_*.json`，否则 coverage 到期前一周起 events 会诚实地重新降级。
+- [新功能] 期权墙逐层合同增量（`option-wall/1.2`）：每个墙位 level additive 新增 `side`、`metric_basis`（OI＝T-1 清算 / Volume＝当日累计 / Gamma＝模型值）、按贡献排序的 top 3 到期日 `expiry_breakdown`（expiry/dte/metric_value/share_of_level_percent/contract_count + other 汇总桶）与逐到期 quote 上下文（单行快照支撑时附 IV 与 quote_as_of），缺失字段保持 null 并以 `quote_evidence`（observed/partial/unavailable）显式标缺；旧字段与端点签名不变，旧 payload 仍可通过 schema 校验。
+- [改进] Web 期权墙逐层可展开到期分布：`/regime/opportunity/:ticker` 期权墙 tab 与今日机会候选详情共用 `WallLevelExpiryBreakdown`，逐到期显示占比、DTE、IV 与「Bid/Ask/Mark 标缺（快照未含盘口报价）」等显式标缺文案，保留「集中度区域，非 dealer GEX / gamma flip」诚实框架；期权墙前后端缓存 key 升为 v1.2。
+- [测试] 期权墙逐层合同回归：builder 多到期 fixture 的 top 3 + other 分桶、share 总和 ≤ 100、多合约单元不归属报价、缺 IV 行显式 unavailable、全报价行 observed、三种 metric_basis 语义与 payload 无任何 dealer-sign 字段；API 端点断言逐层 breakdown 与 legacy level 兼容校验；前端补墙位 tab 到期分布与标缺文案渲染断言。
+- [文档] HANDOFF §9.2 更新为 `option-wall/1.2` 已落地逐层字段清单与对照目标合同仍缺项（逐层 bid/ask/mark 需扩展 Moomoo 墙快照 adapter；dealer sign 红线不变）。
+- [新功能] Episode build activation 资格扩展到 snapshot-fence 正式 future build（阶段 B 切片 2）：不改 activation 表 schema，fence build 激活时把 fence link 冻结的目标事实集身份写入 `canonical_set_id/sha256`（其回合正是该冻结集在快照边界后的窗口重放）；目标集行缺失或指纹不一致时激活与后续默认读取均 fail closed，无任一 source link 的 CSV build 仍不可激活，零激活时 CSV fallback 语义不变。
+- [新功能] 激活新增 additive `accept_left_censored_openings` 确认（默认 false）：目标 build 报告含 left-censored 回合（snapshot 继承仓位、无券商成本）时必须显式勾选，否则 409 拒绝且零写；activation key 仅在该 flag 置真时参与派生，历史激活记录的幂等重放不受影响。
+- [改进] data-health（journal refresh status）对激活的 fence build 按其冻结目标事实集对齐：目标集即最新 canonical set 时不再要求重复 activate 最新 canonical build，其余水位与阶段判定不变；激活响应消息按 build 来源标注 canonical / snapshot-fence future。
+- [改进] Web「仓位复盘」显式查看 canonical / snapshot-fence build 时新增独立「设为默认复盘构建」卡片：按目标 build 实际口径强制 assumed-flat / 组费 / left-censored 勾选，确认区明示「激活后默认视图切换，可再激活其他构建切回，但无法回到零激活的 CSV 默认状态」；future build 写入成功提示同步改为「激活前默认复盘视图不变，需显式打开该构建后单独激活」。
+- [测试] 新增 fence build 激活回归：happy path 默认读取切换与幂等重放、缺 left-censored 确认零写拒绝、陈旧 CAS 拒绝、fence link 指纹篡改在激活与默认读取双向 fail closed、激活前 CSV fallback 不变、data-health 三阶段对齐；API 补新 flag 透传与 409 映射；前端补两处激活卡片的勾选门禁、请求载荷与文案回归。
 
 ### 发布亮点
 
@@ -237,6 +359,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] 飞书群机器人通知现在支持 `FEISHU_WEBHOOK_SECRET` / `FEISHU_WEBHOOK_KEYWORD`，并在 Web 设置与文档中明确区分 Webhook 推送和 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 应用模式，降低误配导致的推送失败。
 - [改进] 🤖 **普通分析链路支持 LiteLLM 流式生成与更细任务进度** — 常规股票分析在 LLM 阶段会优先尝试 `stream=True` 并在服务端累积 chunk，首页任务 SSE 新增 `task_progress` 事件与更细的 `message/progress` 更新；仅在最终 JSON 解析成功后才持久化历史报告，不支持流式的 provider 会在首个 chunk 前自动回退到原非流式调用。
 - [新功能] Web AI 模型配置支持按渠道调用 `/models` 获取可用模型，并在渠道编辑器中以多选方式写回 `LLM_{CHANNEL}_MODELS`，获取失败时仍保留手动输入作为降级路径。
+- [新功能] Journal 新增零写模式观察聚合 `GET /api/v1/journal/v2/review-insights`（Playbook 合同切片 C-1）：按最新复盘标注的标签/错误类型 × 方向 × 边界口径分桶；胜率/均值等比率仅在 ≥10 笔且 ≥5 个独立交易日的已验证 P&L 样本上显示，条件性 P&L（假设平仓/左截断/组费影响）单独计数且永不进入统计，未标注回合只汇总为单一未复盘计数。
+- [新功能] Journal“仓位复盘”页新增「模式观察」面板：展示分桶计数、样本不足与条件性 P&L 的 fail-closed 文案，并注明“观察到的模式 ≠ 已验证规则；晋升到 Playbook 需要显式操作（后续切片）”。
+- [改进] Episode P&L 可统计口径（`pnl_summary_eligible` 排除原因）收敛为仓储层单一实现 `position_episode_pnl_exclusion_reasons`，API 投影与模式观察聚合共用同一定义，避免口径漂移。
+- [测试] 新增 review-insights 仓储与 API 合同回归：分桶键不混轨、10 笔/5 交易日阈值边界、条件性 P&L 超阈值仍被排除、latest-revision 聚合、未复盘/未构建空态与零写断言；Web 端补「模式观察」面板计数/统计/条件标注/空态渲染测试。
+- [文档] `New-docs/phase1/13_PLAYBOOK_PROMOTION_CONTRACT.md` 切片 C-1 标记为已实现并补实现锚点；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` 同步 C-1 状态。
+- [新功能] Journal Playbook 切片 C-2：新增 append-only `journal_v2_playbook_candidates`（L2 候选）与 `journal_v2_playbook_rules`（L3 规则版本链）两张表，均纳入 SQLite UPDATE/DELETE 拒绝触发器；创建候选与晋升规则时在同一会话内重跑 C-1 聚合冻结证据快照（build 身份、成员回合 id ≤200、最新标注修订、含条件性分桶的计数、阈值与 as-of），桶或默认构建不存在时 fail closed 拒绝写入。
+- [新功能] 新增 Playbook 端点：`GET /api/v1/journal/v2/playbook`、`POST .../playbook/candidates`、`POST .../playbook/candidates/{candidate_key}/promote`、`POST .../playbook/rules/{lineage_key}/retire`；晋升/退役全部为显式用户动作 + CAS（重放幂等、陈旧期望与已退役 lineage 的再晋升缺显式 new-version 意图时返回 409），退役追加 `retired` 新版本并逐字复制晋升时冻结的快照，规则永不反写任何评分、榜单或 AI prompt。
+- [新功能] Journal“仓位复盘”页「模式观察」每个分桶新增「保存为候选」内联表单（标题 + 规则描述，空内容禁用提交），并在其下方新增 Playbook 面板：候选可显式「晋升为规则」、规则显示版本/状态并支持显式「退役」，两者均带确认步骤与“规则不会影响系统评分或榜单，仅是你的决策清单”文案。
+- [测试] 新增 Playbook 仓储回归（快照冻结内容、幂等重放、桶缺失/无构建 fail-closed 零写、CAS 陈旧拒绝、退役复制快照、重晋升需显式意图、两表 deny trigger、列表排序）、API 合同（round-trip + 409/422）与 Web 组件测试（表单 gating、晋升/退役确认流、诚实文案断言）。
+- [文档] `New-docs/phase1/13_PLAYBOOK_PROMOTION_CONTRACT.md` 切片 C-2 标记为已实现并补实现锚点；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` 同步 C-2 状态。
+- [改进] `/regime/opportunity/:ticker` 摘要同证据束（D-4）：官方快照绑定时，「交易研究结论」摘要句中织入的增强数据数值（option-overview 的 IV Rank）强制带「（当前增强数据 as-of ET，非冻结榜单证据）」内联标注，模型终值区间的 IV 输入同步加注（价格基准 as-of 已由 modelBasisLabel 携带）；冻结 bundle 数值（20 日区间 / EMA / 量能比率）不加注，即时扫描视图不加注。
+- [测试] 详情页文案审计回归：官方绑定下增强数值必须带非冻结标注、冻结数值不得被标注、即时扫描无任何增强标注；审计按「指标名+数字」词面模式扫描结论侧栏段落，防止新增无标注增强数值（局限：不识别未命名裸数字）。
+- [文档] `New-docs/HANDOFF.md` §9.3 摘要同证据束项标记已完成并记录标注方式；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` D-4 状态更新为已验收。
+- [新功能] Journal Playbook 切片 C-3：新增零写反向链接端点 `GET /api/v1/journal/v2/position-episodes/{episode_id}/playbook-links?build_id=...`，返回冻结证据快照中引用该回合的候选与规则（每条 lineage 只取最新版本）；只匹配快照 `build_id` 与给定构建一致的引用，快照样本被截断（冻结时成员 >200）而无法确认成员关系时，仅在冻结桶回显与回合当前标签/方向/边界口径一致时以独立 `possible_truncated` 条目返回，绝不伪装为已确认；未知回合/构建与 review-annotation 读路径一致返回 404。
+- [新功能] 单笔复盘页（`/journal/review/:episodeId`）新增「Playbook 关联」面板：按已确认规则（`规则 v{n} · 生效中/已退役`）→ 已确认候选 → 「可能相关（无法确认）」排序展示，均带冻结桶回显（标签/错误类型 · 值 · 方向 · 边界口径）；截断条目标注「证据快照抽样截断，无法确认该回合是否在样本内」，空态为「该回合未被任何 Playbook 候选或规则引用」。
+- [测试] 新增 C-3 仓储回归（确认链接排序与桶回显、lineage 最新版本含退役状态、构建不匹配排除、截断样本 possible 标注与桶不匹配省略、零写断言、未知 scope fail-closed）、API 合同（链接契约 + 空链接 + 404/422）与 Web 组件测试（规则/候选标签、截断不确定性标注、空态与错误态渲染）。
+- [文档] `New-docs/phase1/13_PLAYBOOK_PROMOTION_CONTRACT.md` 切片 C-3 标记为已实现并补实现锚点；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` 同步 C-3 状态。
+- [文档] 新增 `New-docs/phase1/14_ARTIFACT_GC_CONTRACT.md`（F-2 短期 artifact GC 设计冻结稿）：核实过期 refresh / position-snapshot preview artifact 表全部处于 SQLite deny-trigger 保护内（原“非 append-only 保护范围”假设不成立），冻结删除谓词（过期 ≥7 天且从未确认且无 publication/snapshot 引用且非账户最新）、单事务受控删除 + append-only 回执 + 备份前置的执行模型与 T1-T10 零误删测试合同；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` F-2 状态同步为设计已冻结。
+- [测试] 概率展示校准边界（D-5）自动化断言：`/regime/opportunity/:ticker` 详情页测试固定模型终值区间块必须携带「IV 模型终值分布 · 不是历史真实胜率、盘中触及概率或方向预测」声明与「方向概率尚未校准」提示，并对整页（含期限切换与各研究 tab）扫描禁止出现「上涨概率 / 胜率+数字」伪概率文案（校准提示中的否定引用为唯一豁免）。
+- [新功能] 分层健康端点 `GET /api/v1/system/health-layers` 新增第 7 层 `economic_schedule_coverage`（E-5 年度日程续期预警）：读取官方 Fed/BLS 日程数据文件的 coverage_through，余量 >30 天为 ok、≤30 天 degraded（提示在到期前放入下一年度数据文件）、超出覆盖或数据文件不可用为 down；`src/regime/official_schedule.py` 增加公共缓存访问器 `get_cached_official_schedule`，前端健康弹层补「经济日程覆盖」层名，三态与不可用态均有回归测试。
+- [测试] Moomoo env 测试隔离系统化（Q-2 / HANDOFF §15 P1.9）：新增仓库根 `conftest.py` autouse fixture，非 network 测试统一把 `MOOMOO_OPEND_ENABLED` 等 5 个 live-integration 开关强制为 false（network 标记与单测试 `monkeypatch.setenv` 仍可 opt-in），杜绝 `get_config()` 载入宿主 `.env` 后 `-m "not network"` 套件打到真实 OpenD/调度器；新增 `tests/test_env_isolation_conftest.py` 回归证明，`test_iv_rank.py` 局部隔离 fixture 保留作纵深防御。
+- [新功能] 短期 artifact GC 切片 F-2a（合同 `New-docs/phase1/14_ARTIFACT_GC_CONTRACT.md`）：新增 `scripts/artifact_gc.py` 显式 CLI（默认零写 dry-run，以 SQLite `mode=ro` 只读打开正式库）与 `src/journal/ledger/artifact_gc.py` 单事务执行器，仅回收「过期超 7 天宽限 + 从未确认（无 publication / confirmed snapshot 引用）+ 非该账户最新一条」的 `journal_v2_refresh_artifacts` / `journal_v2_position_snapshot_artifacts` 预览行；apply 必须提供当日经 `integrity_check` 验证的备份，先在事务内重算谓词、只摘 DELETE 触发器、有界删除并断言 rowcount，再从属主模块共享 DDL 常量重建触发器并断言在位，任何失败整体回滚；每次运行（含空集与 dry-run `--receipt`）追加不可变回执到新表 `journal_v2_artifact_gc_receipts`（入 `_APPEND_ONLY_TABLE_NAMES` 保护），无任何后台/启动/API 清扫路径，`regime_premarket_*`、`opportunity_*` 与全部证据表明确禁区。
+- [测试] artifact GC 合同 T1-T10 全绿（`src/journal/tests/test_artifact_gc.py`）：死行删除与回执一致、被引用行永不删除、宽限期/未过期保留、每账户最新一条保留且 `get_journal_refresh_status` 逐字段不变、dry-run 零写且候选集与 apply 将删集合一致、幂等二次 apply 删 0 行、触发器在位/外部写仍被 ABORT/rowcount 注入失败回滚、禁区表 count+content hash 不变、无备份或备份损坏或非 SQLite fail closed、回执表 append-only 且 `deleted_ids_sha256` 可由 `deleted_ids_json` 复算。
+- [文档] `New-docs/phase1/14_ARTIFACT_GC_CONTRACT.md` 状态行标记 F-2a 已实现（正式库 apply 仍待用户确认 + 当日备份）；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` F-2 行同步；`New-docs/HANDOFF.md` §5.2 / §15 P3.7 过期清理技术债措辞更新为已实现，可恢复异步 job 与持久化 last failure 仍为技术债。
+- [文档] F-4 clean-clone 演练完成并更新 `New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` F-4 行为 ✅（2026-08-01，clone bc74bc6）：干净克隆 pushed 分支后 `pip install -r requirements.txt`（含 scipy）、`pip install flake8 pytest` + `./scripts/ci_gate.sh`（2636 passed / 6 network deselected）、`npm ci && npm run build`、`main.py --serve-only`（隔离空库 + 全开关关闭，/api/health 与 /api/v1/system/health-layers 均 200）全部通过，零依赖原工作树/.env/数据库；README 待改小缺口仅记录未修：方式二把 `cp .env.example .env` 呈现为必需步骤（serve-only 冒烟无 .env 可跑）、启动方式自动构建写 `npm install` 而贡献节写 `npm ci` 不一致、未演练无 Node 环境下 `WEBUI_AUTO_BUILD` 默认自动构建的失败路径。
 
 ## [3.11.0] - 2026-03-27
 

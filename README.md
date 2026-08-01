@@ -45,7 +45,7 @@
 >
 > **当前状态 / 路由速查 → [`New-docs/architecture/04_CURRENT_STATE.md`](New-docs/architecture/04_CURRENT_STATE.md)**
 >
-> 其它专题：[Phase 1.1 Moomoo 证据账本](New-docs/phase1/01_MOOMOO_EVIDENCE_LEDGER.md) · [Phase 1.2 PositionEpisode](New-docs/phase1/02_POSITION_EPISODES.md) · [Phase 1.3B OpenAPI/canonical persistence](New-docs/phase1/03_OPENAPI_CANONICAL.md) · [Phase 1.4 canonical 对比构建](New-docs/phase1/04_CANONICAL_EPISODE_BUILD.md) · [Moomoo 路线图](New-docs/integrations/moomoo-roadmap.md) · [Moomoo 订阅 API](New-docs/integrations/moomoo-subscription.md) · [Phase 0 各 stage](New-docs/phase0/README.md) · [HOW_TO_USE](New-docs/phase0/HOW_TO_USE.md) · [设计系统](New-docs/design/Design_system.md)
+> 其它专题：[Phase 1.1 Moomoo 证据账本](New-docs/phase1/01_MOOMOO_EVIDENCE_LEDGER.md) · [Phase 1.2 PositionEpisode](New-docs/phase1/02_POSITION_EPISODES.md) · [Phase 1.3B OpenAPI/canonical persistence](New-docs/phase1/03_OPENAPI_CANONICAL.md) · [Phase 1.4 canonical 对比构建](New-docs/phase1/04_CANONICAL_EPISODE_BUILD.md) · [期权研究数据/API 配置](New-docs/integrations/options-research-data-setup.md) · [Moomoo 路线图](New-docs/integrations/moomoo-roadmap.md) · [Moomoo 订阅 API](New-docs/integrations/moomoo-subscription.md) · [Phase 0 各 stage](New-docs/phase0/README.md) · [HOW_TO_USE](New-docs/phase0/HOW_TO_USE.md) · [设计系统](New-docs/design/Design_system.md)
 
 ## 💖 赞助商 (Sponsors)
 <div align="center">
@@ -209,7 +209,11 @@
 
 | Secret 名称 | 说明 | 必填 |
 |------------|------|:----:|
-| `STOCK_LIST` | 自选股代码，如 `600519,hk00700,AAPL,TSLA` | ✅ |
+| `STOCK_LIST` | 通用分析自选股代码，如 `600519,hk00700,AAPL,TSLA`；官方期权盘前研究池需在 `/watchlist` 显式保存，不会静默沿用此值 | ✅ |
+| `PREMARKET_RESEARCH_SCHEDULER_ENABLED` | 启用只读官方盘前研究调度（XNYS 09:12 ET，必要时 09:17 恢复）；需先保存服务端研究池并重启 Web，详见 [服务端盘前编排](New-docs/phase1/08_SERVER_OWNED_PREMARKET_ORCHESTRATION.md) | 可选 |
+| `OPPORTUNITY_OUTCOME_SCHEDULER_ENABLED` | 在精确 XNYS 收盘后自动成熟冻结候选的 5D/20D 标的结果；只追加到期证据、不自动调权、不下单，详见 [自动结果维护](New-docs/phase1/09_AUTOMATIC_OUTCOME_MAINTENANCE.md) | 可选 |
+| `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY` | 可选 Alpaca 股票盘前分钟线增强；必须成对配置，盘前涨跌使用上一 XNYS 收盘价 | 可选 |
+| `FINNHUB_API_KEY` | 可选 Finnhub 财报/经济日历；子域权限分别降级，免费 Key 不保证 Economic Calendar | 可选 |
 | `TAVILY_API_KEYS` | [Tavily](https://tavily.com/) 搜索 API（新闻搜索） | 推荐 |
 | `ANSPIRE_API_KEYS` | [Anspire AI Search](https://aisearch.anspire.cn/) 针对中文内容特别优化 (可有效增强A股分析效果) | 可选 |
 | `MINIMAX_API_KEYS` | [MiniMax](https://platform.minimaxi.com/) Coding Plan Web Search（结构化搜索结果） | 可选 |
@@ -300,7 +304,8 @@ git clone https://github.com/ZhuLinsen/daily_stock_analysis.git && cd daily_stoc
 # 安装依赖
 pip install -r requirements.txt
 
-# 配置环境变量
+# 配置环境变量（可选：不配置也能启动 Web 界面并浏览；
+# 运行分析、通知与券商/行情集成需要相应 key）
 cp .env.example .env && vim .env
 
 # 运行分析
@@ -461,11 +466,13 @@ LITELLM_MODEL=openai/deepseek-chat
    python main.py --webui       # 启动 Web 界面 + 执行定时分析
    python main.py --webui-only  # 仅启动 Web 界面
    ```
-   启动时会在 `apps/dsa-web` 自动执行 `npm install && npm run build`。
+   启动时会在 `apps/dsa-web` 自动执行 `npm ci && npm run build`（无 lockfile 时
+   回退 `npm install`；要求本机已安装 Node，无 Node 环境请关闭自动构建并使用
+   预构建产物）。
    如需关闭自动构建，设置 `WEBUI_AUTO_BUILD=false`，并改为手动执行：
    ```bash
    cd ./apps/dsa-web
-   npm install && npm run build
+   npm ci && npm run build
    cd ../..
    ```
 

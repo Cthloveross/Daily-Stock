@@ -212,12 +212,13 @@ def test_schema_is_reentrant_and_installs_all_append_only_triggers(isolated_db):
             ).scalars()
         )
 
-    assert tables == {
+    snapshot_tables = {
         "opportunity_snapshot_runs",
         "opportunity_snapshot_candidates",
         "opportunity_candidate_outcomes",
     }
-    for table_name in tables:
+    assert snapshot_tables <= tables
+    for table_name in snapshot_tables:
         assert f"trg_{table_name}_update_immutable" in triggers
         assert f"trg_{table_name}_delete_immutable" in triggers
 

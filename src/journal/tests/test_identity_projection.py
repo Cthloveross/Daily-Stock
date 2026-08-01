@@ -518,6 +518,85 @@ def test_projection_requires_passed_unambiguous_order_reconciliation() -> None:
         )
 
 
+def test_projection_keeps_incremental_tail_as_broker_stable_evidence() -> None:
+    reconciliation = replace(
+        _reconciliation(),
+        api_orders=2,
+        api_only_orders=1,
+        overlap_api_only_orders=0,
+        incremental_api_only_orders=1,
+    )
+    tail = replace(
+        _order(3, source_kind="openapi"),
+        source_order_id="broker-tail-order",
+        observation_key="openapi-tail-order",
+        source_record_sha256=_sha(303),
+        ordered_at=ORDER_TIME + timedelta(hours=1),
+        source_updated_at=ORDER_TIME + timedelta(hours=1),
+        status="CANCELLED_ALL",
+        order_quantity=Decimal("1"),
+        order_amount=Decimal("0"),
+        summary_filled_quantity=Decimal("0"),
+        summary_average_fill_price=None,
+        total_fee=Decimal("0"),
+        evidence_level="not_filled",
+    )
+
+    result = project_reconciled_identities(
+        reconciliation=reconciliation,
+        order_observations=[*_orders(), tail],
+        fill_observations=[],
+    )
+
+    projected_tail = next(
+        item for item in result.orders if item.source_order_id == tail.source_order_id
+    )
+    assert len(result.order_links) == 1
+    assert projected_tail == tail
+    assert projected_tail.identity_strength == "broker_stable"
+
+
+def test_projection_allows_zero_matches_only_for_empty_overlap() -> None:
+    tail = replace(
+        _order(3, source_kind="openapi"),
+        source_order_id="broker-tail-order",
+        observation_key="openapi-tail-order",
+    )
+    empty_overlap = replace(
+        _reconciliation(),
+        statement_orders=0,
+        api_orders=1,
+        matched_orders=0,
+        api_only_orders=1,
+        matched_filled_orders=0,
+        statement_fee_total=Decimal("0"),
+        api_fee_total=Decimal("0"),
+        matches=(),
+        incremental_api_only_orders=1,
+    )
+
+    result = project_reconciled_identities(
+        reconciliation=empty_overlap,
+        order_observations=[tail],
+        fill_observations=[],
+    )
+
+    assert result.orders == (tail,)
+    assert result.order_links == ()
+
+    blocking_overlap = replace(
+        empty_overlap,
+        overlap_api_only_orders=1,
+        incremental_api_only_orders=0,
+    )
+    with pytest.raises(IdentityProjectionError, match="overlap_api_only_orders"):
+        project_reconciled_identities(
+            reconciliation=blocking_overlap,
+            order_observations=[tail],
+            fill_observations=[],
+        )
+
+
 def test_attestation_key_excludes_local_database_ids() -> None:
     fills = [
         _fill(

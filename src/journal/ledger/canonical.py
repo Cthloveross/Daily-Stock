@@ -30,7 +30,7 @@ import json
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from src.journal.ledger.episodes import (
     CanonicalFillEvidence,
@@ -43,6 +43,8 @@ __all__ = [
     "CANONICAL_READER_VERSION",
     "CanonicalEvidenceSet",
     "CanonicalFill",
+    "CanonicalExecutionGroup",
+    "CanonicalExecutionGroupLeg",
     "CanonicalIssue",
     "CanonicalOrder",
     "CanonicalProvenance",
@@ -51,13 +53,15 @@ __all__ = [
     "stable_source_sequence",
     "EvidenceRef",
     "FillObservationInput",
+    "ExecutionGroupLegObservationInput",
+    "ExecutionGroupObservationInput",
     "OrderObservationInput",
     "canonicalize_observations",
 ]
 
 
 CANONICAL_READER_NAME = "stable_broker_identity_reader"
-CANONICAL_READER_VERSION = "1.0.0"
+CANONICAL_READER_VERSION = "1.1.0"
 _ZERO = Decimal("0")
 _VWAP_ABSOLUTE_TOLERANCE = Decimal("0.0001")
 _VWAP_RELATIVE_TOLERANCE = Decimal("0.000001")
@@ -279,6 +283,14 @@ class FillObservationInput:
     # one-to-one deal links.
     fill_set_role: str = "ordinary"
     fill_set_attestation_key: Optional[str] = None
+    # Combo fills retain the broker parent ID in ``source_order_id`` for
+    # audit, but they are linked to an execution group/declared leg rather
+    # than to a one-instrument canonical order.
+    execution_group_id: Optional[str] = None
+    execution_group_leg_key: Optional[str] = None
+    execution_group_fill_link_id: Optional[int] = None
+    execution_group_fill_link_key: Optional[str] = None
+    execution_group_fill_link_sha256: Optional[str] = None
 
     def __post_init__(self) -> None:
         _validate_common(self, kind="fill")
@@ -316,6 +328,232 @@ class FillObservationInput:
                 "attested fill-set rows require canonical_order_id and "
                 "fill_set_attestation_key"
             )
+        group_fields = (
+            self.execution_group_id,
+            self.execution_group_leg_key,
+            self.execution_group_fill_link_id,
+            self.execution_group_fill_link_key,
+            self.execution_group_fill_link_sha256,
+        )
+        if any(value is not None for value in group_fields):
+            if any(value is None for value in group_fields):
+                raise CanonicalizationInputError(
+                    "execution-group fill linkage must be complete"
+                )
+            if (
+                not str(self.execution_group_id).strip()
+                or not str(self.execution_group_leg_key).strip()
+                or not str(self.execution_group_fill_link_key).strip()
+                or not str(self.execution_group_fill_link_sha256).strip()
+                or not isinstance(self.execution_group_fill_link_id, int)
+                or self.execution_group_fill_link_id <= 0
+            ):
+                raise CanonicalizationInputError(
+                    "execution-group fill linkage is invalid"
+                )
+            if self.canonical_order_id is not None or role != "ordinary":
+                raise CanonicalizationInputError(
+                    "execution-group fills cannot also be ordinary order links"
+                )
+
+
+@dataclass(frozen=True)
+class ExecutionGroupLegObservationInput:
+    """One immutable declared leg attached to a broker execution group."""
+
+    observation_id: int
+    import_batch_id: int
+    batch_key: str
+    source_kind: str
+    observation_key: str
+    source_record_sha256: str
+    broker: str
+    account_key: str
+    group_observation_id: int
+    leg_key: str
+    raw_symbol: str
+    asset_type: str
+    underlying: str
+    side: str
+    currency: str
+    quantity_ratio: Decimal
+    recorded_at: datetime
+    expiry: Optional[date] = None
+    strike: Optional[Decimal] = None
+    option_right: Optional[str] = None
+    contract_multiplier: Optional[Decimal] = None
+    contract_multiplier_basis: str = "unknown"
+    source_row_number: Optional[int] = None
+    source_updated_at: Optional[datetime] = None
+
+    def __post_init__(self) -> None:
+        _validate_common(self, kind="execution_group_leg")
+        if self.group_observation_id <= 0:
+            raise CanonicalizationInputError(
+                "execution_group_leg group_observation_id must be positive"
+            )
+        if not self.leg_key.strip():
+            raise CanonicalizationInputError(
+                "execution_group_leg leg_key cannot be empty"
+            )
+        _require_decimal(
+            self.quantity_ratio,
+            field_name="execution_group_leg.quantity_ratio",
+            allow_none=False,
+        )
+        if self.quantity_ratio <= 0:
+            raise CanonicalizationInputError(
+                "execution_group_leg quantity_ratio must be positive"
+            )
+
+
+@dataclass(frozen=True)
+class ExecutionGroupObservationInput:
+    """Database-neutral parent/group observation plus its declared legs."""
+
+    observation_id: int
+    import_batch_id: int
+    batch_key: str
+    source_kind: str
+    observation_key: str
+    source_record_sha256: str
+    broker: str
+    account_key: str
+    source_group_id: str
+    identity_strength: str
+    environment: str
+    raw_group_symbol: str
+    group_side: str
+    strategy_type: str
+    status: str
+    currency: str
+    ordered_at: datetime
+    source_updated_at: datetime
+    package_quantity: Decimal
+    filled_package_quantity: Decimal
+    order_net_price: Optional[Decimal]
+    average_net_price: Optional[Decimal]
+    total_fee: Optional[Decimal]
+    fee_evidence_status: str
+    recorded_at: datetime
+    legs: tuple[ExecutionGroupLegObservationInput, ...]
+    fee_components: tuple[tuple[str, Decimal], ...] = ()
+    fee_observation_id: Optional[int] = None
+    fee_observation_key: Optional[str] = None
+    fee_source_record_sha256: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.observation_id <= 0 or self.import_batch_id <= 0:
+            raise CanonicalizationInputError(
+                "execution_group observation identity must be positive"
+            )
+        for field_name in (
+            "batch_key",
+            "source_kind",
+            "observation_key",
+            "source_record_sha256",
+            "broker",
+            "account_key",
+            "source_group_id",
+            "identity_strength",
+            "environment",
+            "raw_group_symbol",
+            "group_side",
+            "strategy_type",
+            "status",
+            "currency",
+            "fee_evidence_status",
+        ):
+            if not str(getattr(self, field_name)).strip():
+                raise CanonicalizationInputError(
+                    f"execution_group {field_name} cannot be empty"
+                )
+        _aware_utc(self.ordered_at, field_name="execution_group.ordered_at")
+        _aware_utc(
+            self.source_updated_at,
+            field_name="execution_group.source_updated_at",
+        )
+        _aware_utc(self.recorded_at, field_name="execution_group.recorded_at")
+        for field_name in (
+            "package_quantity",
+            "filled_package_quantity",
+            "order_net_price",
+            "average_net_price",
+            "total_fee",
+        ):
+            _require_decimal(
+                getattr(self, field_name),
+                field_name=f"execution_group.{field_name}",
+                allow_none=field_name
+                in {"order_net_price", "average_net_price", "total_fee"},
+            )
+        if self.package_quantity <= 0 or self.filled_package_quantity < 0:
+            raise CanonicalizationInputError(
+                "execution_group package quantities are invalid"
+            )
+        # Combo package prices can be signed (credit/debit convention).  They
+        # remain audit-only, so only the broker fee is constrained nonnegative.
+        if self.total_fee is not None and self.total_fee < 0:
+            raise CanonicalizationInputError(
+                "execution_group total_fee cannot be negative"
+            )
+        if len(self.legs) < 2:
+            raise CanonicalizationInputError(
+                "execution_group requires at least two declared legs"
+            )
+        if len({leg.leg_key for leg in self.legs}) != len(self.legs):
+            raise CanonicalizationInputError(
+                "execution_group leg keys must be unique"
+            )
+        if any(
+            leg.group_observation_id != self.observation_id
+            or leg.import_batch_id != self.import_batch_id
+            or leg.account_key != self.account_key
+            or leg.broker != self.broker
+            or leg.currency != self.currency
+            for leg in self.legs
+        ):
+            raise CanonicalizationInputError(
+                "execution_group legs do not bind to their parent"
+            )
+        for component in self.fee_components:
+            if (
+                not isinstance(component, tuple)
+                or len(component) != 2
+                or not str(component[0]).strip()
+            ):
+                raise CanonicalizationInputError(
+                    "execution_group fee component is invalid"
+                )
+            _require_decimal(
+                component[1],
+                field_name="execution_group.fee_component",
+                allow_none=False,
+            )
+        if self.fee_components and self.total_fee is None:
+            raise CanonicalizationInputError(
+                "execution_group fee components require total_fee"
+            )
+        fee_values = (
+            self.fee_observation_id,
+            self.fee_observation_key,
+            self.fee_source_record_sha256,
+        )
+        if any(value is not None for value in fee_values):
+            if any(value is None for value in fee_values):
+                raise CanonicalizationInputError(
+                    "execution_group fee provenance must be complete"
+                )
+            if (
+                not isinstance(self.fee_observation_id, int)
+                or self.fee_observation_id <= 0
+                or not str(self.fee_observation_key).strip()
+                or not str(self.fee_source_record_sha256).strip()
+                or self.total_fee is None
+            ):
+                raise CanonicalizationInputError(
+                    "execution_group fee provenance is invalid"
+                )
 
 
 def _normalized_source_kind(value: str) -> str:
@@ -466,6 +704,68 @@ def _refs(values: Iterable[OrderObservationInput | FillObservationInput]) -> tup
     return tuple(sorted({_ref(value) for value in values}, key=lambda item: item.sort_key))
 
 
+def _execution_group_ref(value: ExecutionGroupObservationInput) -> EvidenceRef:
+    return EvidenceRef(
+        evidence_kind="execution_group",
+        observation_id=value.observation_id,
+        import_batch_id=value.import_batch_id,
+        batch_key=value.batch_key.strip(),
+        source_kind=_normalized_source_kind(value.source_kind),
+        observation_key=value.observation_key.strip(),
+        source_record_sha256=value.source_record_sha256.strip().lower(),
+    )
+
+
+def _execution_group_leg_ref(
+    value: ExecutionGroupLegObservationInput,
+) -> EvidenceRef:
+    return EvidenceRef(
+        evidence_kind="execution_group_leg",
+        observation_id=value.observation_id,
+        import_batch_id=value.import_batch_id,
+        batch_key=value.batch_key.strip(),
+        source_kind=_normalized_source_kind(value.source_kind),
+        observation_key=value.observation_key.strip(),
+        source_record_sha256=value.source_record_sha256.strip().lower(),
+    )
+
+
+def _execution_group_fee_ref(
+    value: ExecutionGroupObservationInput,
+) -> Optional[EvidenceRef]:
+    if value.fee_observation_id is None:
+        return None
+    assert value.fee_observation_key is not None
+    assert value.fee_source_record_sha256 is not None
+    return EvidenceRef(
+        evidence_kind="execution_group_fee",
+        observation_id=value.fee_observation_id,
+        import_batch_id=value.import_batch_id,
+        batch_key=value.batch_key.strip(),
+        source_kind=_normalized_source_kind(value.source_kind),
+        observation_key=value.fee_observation_key.strip(),
+        source_record_sha256=value.fee_source_record_sha256.strip().lower(),
+    )
+
+
+def _execution_group_fill_link_ref(
+    value: FillObservationInput,
+) -> Optional[EvidenceRef]:
+    if value.execution_group_fill_link_id is None:
+        return None
+    assert value.execution_group_fill_link_key is not None
+    assert value.execution_group_fill_link_sha256 is not None
+    return EvidenceRef(
+        evidence_kind="execution_group_fill_link",
+        observation_id=value.execution_group_fill_link_id,
+        import_batch_id=value.import_batch_id,
+        batch_key=value.batch_key.strip(),
+        source_kind=_normalized_source_kind(value.source_kind),
+        observation_key=value.execution_group_fill_link_key.strip(),
+        source_record_sha256=value.execution_group_fill_link_sha256.strip().lower(),
+    )
+
+
 def _identity_is_stable(value: str) -> bool:
     return value.strip().lower() in _STABLE_IDENTITY_STRENGTHS
 
@@ -493,6 +793,8 @@ def _fill_identity(value: FillObservationInput) -> tuple[str, str, str]:
 
 
 def _linked_order_identity(value: FillObservationInput) -> Optional[tuple[str, str, str]]:
+    if value.execution_group_id is not None:
+        return None
     linked_id = value.canonical_order_id or value.source_order_id
     if linked_id is None or not linked_id.strip():
         return None
@@ -766,6 +1068,10 @@ class _SelectedFill:
     observations: tuple[FillObservationInput, ...]
     evidence_refs: tuple[EvidenceRef, ...]
     linked_order_identity: Optional[tuple[str, str, str]]
+    execution_group_identity: Optional[tuple[str, str, str]]
+    execution_group_leg_key: Optional[str]
+    execution_group_fill_link_ref: Optional[EvidenceRef]
+    execution_group_fill_link_refs: tuple[EvidenceRef, ...]
     total_fee: Optional[Decimal]
 
 
@@ -817,6 +1123,9 @@ class CanonicalFill:
     evidence: CanonicalFillEvidence
     selected_ref: EvidenceRef
     evidence_refs: tuple[EvidenceRef, ...]
+    execution_group_identity: Optional[tuple[str, str, str]] = None
+    execution_group_leg_key: Optional[str] = None
+    execution_group_fill_link_ref: Optional[EvidenceRef] = None
 
     def canonical_payload(self) -> dict[str, Any]:
         item = self.evidence
@@ -835,8 +1144,114 @@ class CanonicalFill:
                 if self.source_order_id is None
                 else (self.identity[0], self.identity[1], self.source_order_id)
             ),
+            "execution_group_identity": self.execution_group_identity,
+            "execution_group_leg_key": self.execution_group_leg_key,
+            "execution_group_fill_link_ref": (
+                None
+                if self.execution_group_fill_link_ref is None
+                else self.execution_group_fill_link_ref.canonical_payload()
+            ),
             "selected_ref": self.selected_ref.canonical_payload(),
             "evidence_refs": [ref.canonical_payload() for ref in self.evidence_refs],
+        }
+
+
+@dataclass(frozen=True)
+class CanonicalExecutionGroupLeg:
+    """One canonical declared leg and the broker fills assigned to it."""
+
+    identity: tuple[str, str, str, str, str]
+    leg_key: str
+    instrument: InstrumentIdentity
+    side: str
+    quantity_ratio: Decimal
+    expected_filled_quantity: Decimal
+    filled_quantity: Decimal
+    fill_identities: tuple[tuple[str, str, str], ...]
+    fill_link_refs: tuple[EvidenceRef, ...]
+    selected_ref: EvidenceRef
+    evidence_refs: tuple[EvidenceRef, ...]
+
+    def canonical_payload(self) -> dict[str, Any]:
+        return {
+            "identity": self.identity,
+            "leg_key": self.leg_key,
+            "instrument": self.instrument.canonical_payload(),
+            "side": self.side,
+            "quantity_ratio": self.quantity_ratio,
+            "expected_filled_quantity": self.expected_filled_quantity,
+            "filled_quantity": self.filled_quantity,
+            "fill_identities": self.fill_identities,
+            "fill_link_refs": [
+                item.canonical_payload() for item in self.fill_link_refs
+            ],
+            "selected_ref": self.selected_ref.canonical_payload(),
+            "evidence_refs": [
+                item.canonical_payload() for item in self.evidence_refs
+            ],
+        }
+
+
+@dataclass(frozen=True)
+class CanonicalExecutionGroup:
+    """One immutable broker combo execution retained as an atomic group."""
+
+    identity: tuple[str, str, str]
+    source_group_id: str
+    strategy_type: str
+    raw_group_symbol: str
+    group_side: str
+    status: str
+    currency: str
+    ordered_at: datetime
+    package_quantity: Decimal
+    broker_reported_filled_package_quantity: Decimal
+    broker_reported_order_net_price: Optional[Decimal]
+    broker_reported_average_net_price: Optional[Decimal]
+    proved_executed_group_quantity: Optional[Decimal]
+    total_fee: Optional[Decimal]
+    fee_components: tuple[tuple[str, Decimal], ...]
+    fee_evidence_status: str
+    fee_ref: Optional[EvidenceRef]
+    legs: tuple[CanonicalExecutionGroupLeg, ...]
+    selected_ref: EvidenceRef
+    evidence_refs: tuple[EvidenceRef, ...]
+
+    def canonical_payload(self) -> dict[str, Any]:
+        return {
+            "identity": self.identity,
+            "strategy_type": self.strategy_type,
+            "raw_group_symbol": self.raw_group_symbol,
+            "group_side": self.group_side,
+            "status": self.status,
+            "currency": self.currency,
+            "ordered_at": self.ordered_at,
+            "package_quantity": self.package_quantity,
+            "broker_reported_filled_package_quantity": (
+                self.broker_reported_filled_package_quantity
+            ),
+            "broker_reported_order_net_price": (
+                self.broker_reported_order_net_price
+            ),
+            "broker_reported_average_net_price": (
+                self.broker_reported_average_net_price
+            ),
+            "proved_executed_group_quantity": (
+                self.proved_executed_group_quantity
+            ),
+            "total_fee": self.total_fee,
+            "fee_components": self.fee_components,
+            "fee_evidence_status": self.fee_evidence_status,
+            "fee_ref": (
+                None
+                if self.fee_ref is None
+                else self.fee_ref.canonical_payload()
+            ),
+            "legs": [item.canonical_payload() for item in self.legs],
+            "selected_ref": self.selected_ref.canonical_payload(),
+            "evidence_refs": [
+                item.canonical_payload() for item in self.evidence_refs
+            ],
         }
 
 
@@ -856,6 +1271,10 @@ class CanonicalProvenance:
     duplicate_fill_observation_count: int
     shadowed_fill_observation_count: int
     shadowed_aggregate_order_count: int
+    input_execution_group_observation_count: int
+    canonical_execution_group_count: int
+    canonical_execution_group_leg_count: int
+    duplicate_execution_group_observation_count: int
     blocking_issue_count: int
 
     def canonical_payload(self) -> dict[str, Any]:
@@ -872,6 +1291,18 @@ class CanonicalProvenance:
             "duplicate_fill_observation_count": self.duplicate_fill_observation_count,
             "shadowed_fill_observation_count": self.shadowed_fill_observation_count,
             "shadowed_aggregate_order_count": self.shadowed_aggregate_order_count,
+            "input_execution_group_observation_count": (
+                self.input_execution_group_observation_count
+            ),
+            "canonical_execution_group_count": (
+                self.canonical_execution_group_count
+            ),
+            "canonical_execution_group_leg_count": (
+                self.canonical_execution_group_leg_count
+            ),
+            "duplicate_execution_group_observation_count": (
+                self.duplicate_execution_group_observation_count
+            ),
             "blocking_issue_count": self.blocking_issue_count,
         }
 
@@ -882,6 +1313,7 @@ class CanonicalEvidenceSet:
 
     orders: tuple[CanonicalOrder, ...]
     fills: tuple[CanonicalFill, ...]
+    execution_groups: tuple[CanonicalExecutionGroup, ...]
     issues: tuple[CanonicalIssue, ...]
     evidence_refs: tuple[EvidenceRef, ...]
     provenance: CanonicalProvenance
@@ -1115,6 +1547,62 @@ def _select_fills(
             if linked is not None
         }
         linked = next(iter(linked_identities)) if len(linked_identities) == 1 else None
+        group_links = {
+            (
+                item.broker.strip().lower(),
+                item.account_key.strip(),
+                str(item.execution_group_id).strip(),
+                str(item.execution_group_leg_key).strip(),
+            )
+            for item in values
+            if item.execution_group_id is not None
+        }
+        group_linked_count = sum(
+            item.execution_group_id is not None for item in values
+        )
+        if len(group_links) > 1 or (
+            group_links and group_linked_count != len(values)
+        ):
+            _append_issue(
+                issues,
+                code="execution_group_fill_link_conflict",
+                entity_kind="fill",
+                identity=identity,
+                message=(
+                    "duplicate fill observations disagree on execution-group "
+                    "membership"
+                ),
+                evidence_refs=refs,
+                field_name="execution_group_id",
+            )
+        selected_group = next(iter(group_links)) if len(group_links) == 1 else None
+        group_identity = (
+            None
+            if selected_group is None
+            else selected_group[:3]
+        )
+        group_leg_key = (
+            None
+            if selected_group is None
+            else selected_group[3]
+        )
+        link_refs = {
+            ref
+            for ref in (
+                _execution_group_fill_link_ref(item) for item in values
+            )
+            if ref is not None
+        }
+        if group_identity is not None and not link_refs:
+            _append_issue(
+                issues,
+                code="execution_group_fill_link_missing",
+                entity_kind="fill",
+                identity=identity,
+                message="execution-group fill has no immutable group-leg link",
+                evidence_refs=refs,
+                field_name="execution_group_fill_link",
+            )
         total_fee = selected.total_fee
         if len(fee_values) == 1:
             total_fee = next(iter(fee_values))
@@ -1124,6 +1612,16 @@ def _select_fills(
             observations=values,
             evidence_refs=refs,
             linked_order_identity=linked,
+            execution_group_identity=group_identity,
+            execution_group_leg_key=group_leg_key,
+            execution_group_fill_link_ref=(
+                min(link_refs, key=lambda item: item.sort_key)
+                if link_refs
+                else None
+            ),
+            execution_group_fill_link_refs=tuple(
+                sorted(link_refs, key=lambda item: item.sort_key)
+            ),
             total_fee=total_fee,
         )
     return result
@@ -1362,9 +1860,556 @@ def _canonical_order_records(
     return tuple(result), by_identity
 
 
+def _execution_group_identity(
+    value: ExecutionGroupObservationInput,
+) -> tuple[str, str, str]:
+    return (
+        value.broker.strip().lower(),
+        value.account_key.strip(),
+        value.source_group_id.strip(),
+    )
+
+
+def _execution_group_priority(
+    value: ExecutionGroupObservationInput,
+) -> tuple[Any, ...]:
+    return (
+        _source_priority(value.source_kind),
+        int(value.total_fee is not None),
+        _aware_utc(
+            value.source_updated_at,
+            field_name="execution_group.source_updated_at",
+        ),
+        _execution_group_ref(value).sort_key,
+    )
+
+
+def _execution_group_definition(
+    value: ExecutionGroupObservationInput,
+) -> tuple[Any, ...]:
+    legs = tuple(
+        sorted(
+            (
+                _normalized_symbol(leg.raw_symbol),
+                _normalized_side(leg.side),
+                leg.quantity_ratio,
+            )
+            for leg in value.legs
+        )
+    )
+    return (
+        value.environment.strip().upper(),
+        value.raw_group_symbol.strip().upper(),
+        _normalized_side(value.group_side),
+        value.strategy_type.strip().upper(),
+        value.currency.strip().upper(),
+        _aware_utc(value.ordered_at, field_name="execution_group.ordered_at"),
+        value.package_quantity,
+        value.order_net_price,
+        legs,
+    )
+
+
+def _execution_group_leg_instrument(
+    values: Sequence[ExecutionGroupLegObservationInput],
+) -> InstrumentIdentity:
+    ordered = sorted(
+        values,
+        key=lambda item: (
+            _source_priority(item.source_kind),
+            int(item.contract_multiplier is not None),
+            _aware_utc(
+                item.source_updated_at or item.recorded_at,
+                field_name="execution_group_leg.source timestamp",
+            ),
+            _execution_group_leg_ref(item).sort_key,
+        ),
+        reverse=True,
+    )
+    selected = ordered[0]
+    multipliers = {
+        item.contract_multiplier
+        for item in values
+        if item.contract_multiplier is not None
+    }
+    multiplier = selected.contract_multiplier
+    if multiplier is None and len(multipliers) == 1:
+        multiplier = next(iter(multipliers))
+    basis = "unknown"
+    if multiplier is not None:
+        source = next(
+            item
+            for item in ordered
+            if item.contract_multiplier == multiplier
+        )
+        basis = source.contract_multiplier_basis.strip().lower()
+    return InstrumentIdentity(
+        broker=selected.broker.strip().lower(),
+        account_key=selected.account_key.strip(),
+        raw_symbol=_normalized_symbol(selected.raw_symbol) or "",
+        asset_type=selected.asset_type.strip().lower(),
+        underlying=selected.underlying.strip().upper(),
+        currency=selected.currency.strip().upper(),
+        expiry=selected.expiry,
+        strike=selected.strike,
+        option_right=_normalized_optional(selected.option_right),
+        contract_multiplier=multiplier,
+        contract_multiplier_basis=basis,
+    )
+
+
+def _canonical_execution_group_records(
+    observations: Sequence[ExecutionGroupObservationInput],
+    fill_selections: Mapping[tuple[str, str, str], _SelectedFill],
+    issues: list[CanonicalIssue],
+) -> tuple[
+    tuple[CanonicalExecutionGroup, ...],
+    dict[tuple[tuple[str, str, str], str], InstrumentIdentity],
+]:
+    grouped: dict[
+        tuple[str, str, str], list[ExecutionGroupObservationInput]
+    ] = {}
+    for item in observations:
+        grouped.setdefault(_execution_group_identity(item), []).append(item)
+
+    fills_by_group: dict[
+        tuple[str, str, str], list[_SelectedFill]
+    ] = {}
+    for fill in fill_selections.values():
+        if fill.execution_group_identity is not None:
+            fills_by_group.setdefault(
+                fill.execution_group_identity,
+                [],
+            ).append(fill)
+
+    result: list[CanonicalExecutionGroup] = []
+    instruments_by_leg: dict[
+        tuple[tuple[str, str, str], str], InstrumentIdentity
+    ] = {}
+    for identity in sorted(grouped):
+        values = tuple(grouped[identity])
+        selected = max(values, key=_execution_group_priority)
+        group_refs = tuple(
+            sorted(
+                {_execution_group_ref(item) for item in values},
+                key=lambda item: item.sort_key,
+            )
+        )
+        if not any(
+            _identity_is_stable(item.identity_strength) for item in values
+        ):
+            _append_issue(
+                issues,
+                code="unstable_execution_group_identity",
+                entity_kind="execution_group",
+                identity=identity,
+                message="execution group is not backed by a stable broker ID",
+                evidence_refs=group_refs,
+                field_name="identity_strength",
+            )
+        definitions = {_execution_group_definition(item) for item in values}
+        if len(definitions) != 1:
+            _append_issue(
+                issues,
+                code="execution_group_definition_conflict",
+                entity_kind="execution_group",
+                identity=identity,
+                message=(
+                    "same stable execution-group identity has conflicting "
+                    "strategy, package, time, price or leg definitions"
+                ),
+                evidence_refs=group_refs,
+                field_name="definition",
+            )
+
+        fee_values = {
+            item.total_fee for item in values if item.total_fee is not None
+        }
+        if len(fee_values) > 1:
+            _append_issue(
+                issues,
+                code="execution_group_fee_conflict",
+                entity_kind="execution_group",
+                identity=identity,
+                message="duplicate execution-group observations disagree on fee",
+                evidence_refs=group_refs,
+                field_name="total_fee",
+            )
+        total_fee = selected.total_fee
+        if len(fee_values) == 1:
+            total_fee = next(iter(fee_values))
+        fee_component_values = {
+            tuple(
+                sorted(
+                    (
+                        (name.strip(), amount)
+                        for name, amount in item.fee_components
+                    ),
+                    key=lambda component: component[0].lower(),
+                )
+            )
+            for item in values
+            if item.total_fee is not None
+        }
+        if len(fee_component_values) > 1:
+            _append_issue(
+                issues,
+                code="execution_group_fee_component_conflict",
+                entity_kind="execution_group",
+                identity=identity,
+                message=(
+                    "duplicate execution-group observations disagree on fee "
+                    "components"
+                ),
+                evidence_refs=group_refs,
+                field_name="fee_components",
+            )
+        fee_source = max(
+            (item for item in values if item.total_fee is not None),
+            key=_execution_group_priority,
+            default=None,
+        )
+        fee_components = (
+            ()
+            if fee_source is None
+            else tuple(
+                sorted(
+                    (
+                        (name.strip(), amount)
+                        for name, amount in fee_source.fee_components
+                    ),
+                    key=lambda component: component[0].lower(),
+                )
+            )
+        )
+        fee_refs = {
+            ref
+            for ref in (_execution_group_fee_ref(item) for item in values)
+            if ref is not None
+        }
+        fee_ref = (
+            max(fee_refs, key=lambda item: item.sort_key)
+            if fee_refs
+            else None
+        )
+
+        leg_rows: dict[
+            tuple[str, str, Decimal],
+            list[ExecutionGroupLegObservationInput],
+        ] = {}
+        for value in values:
+            for leg in value.legs:
+                key = (
+                    _normalized_symbol(leg.raw_symbol) or "",
+                    _normalized_side(leg.side),
+                    leg.quantity_ratio,
+                )
+                leg_rows.setdefault(key, []).append(leg)
+        selected_leg_keys = {
+            (
+                _normalized_symbol(leg.raw_symbol) or "",
+                _normalized_side(leg.side),
+                leg.quantity_ratio,
+            )
+            for leg in selected.legs
+        }
+        canonical_legs: list[CanonicalExecutionGroupLeg] = []
+        group_fills = fills_by_group.get(identity, [])
+        assigned_fill_identities: set[tuple[str, str, str]] = set()
+        for leg_identity in sorted(selected_leg_keys):
+            leg_values = tuple(leg_rows.get(leg_identity, ()))
+            if not leg_values:
+                continue
+            preferred_leg = max(
+                leg_values,
+                key=lambda item: (
+                    _source_priority(item.source_kind),
+                    int(item.contract_multiplier is not None),
+                    _aware_utc(
+                        item.source_updated_at or item.recorded_at,
+                        field_name="execution_group_leg.source timestamp",
+                    ),
+                    _execution_group_leg_ref(item).sort_key,
+                ),
+            )
+            leg_refs = tuple(
+                sorted(
+                    {_execution_group_leg_ref(item) for item in leg_values},
+                    key=lambda item: item.sort_key,
+                )
+            )
+            multiplier_values = {
+                item.contract_multiplier
+                for item in leg_values
+                if item.contract_multiplier is not None
+            }
+            if len(multiplier_values) > 1:
+                _append_issue(
+                    issues,
+                    code="execution_group_multiplier_conflict",
+                    entity_kind="execution_group",
+                    identity=identity,
+                    message="execution-group leg multiplier evidence conflicts",
+                    evidence_refs=leg_refs,
+                    field_name="contract_multiplier",
+                )
+            instrument = _execution_group_leg_instrument(leg_values)
+            instruments_by_leg[(identity, preferred_leg.leg_key)] = instrument
+            matching_fills = tuple(
+                sorted(
+                    (
+                        fill
+                        for fill in group_fills
+                        if fill.execution_group_leg_key == preferred_leg.leg_key
+                    ),
+                    key=lambda item: item.identity,
+                )
+            )
+            for fill in matching_fills:
+                assigned_fill_identities.add(fill.identity)
+                if (
+                    _normalized_symbol(fill.selected.raw_symbol)
+                    != instrument.raw_symbol
+                    or _normalized_side(fill.selected.side)
+                    != _normalized_side(preferred_leg.side)
+                ):
+                    _append_issue(
+                        issues,
+                        code="execution_group_fill_leg_conflict",
+                        entity_kind="execution_group",
+                        identity=identity,
+                        message=(
+                            "execution-group fill instrument or side disagrees "
+                            "with its declared leg"
+                        ),
+                        evidence_refs=tuple(
+                            sorted(
+                                {*leg_refs, *fill.evidence_refs},
+                                key=lambda item: item.sort_key,
+                            )
+                        ),
+                        field_name="leg_identity",
+                    )
+                if fill.total_fee is not None:
+                    _append_issue(
+                        issues,
+                        code="execution_group_fill_fee_must_be_null",
+                        entity_kind="execution_group",
+                        identity=identity,
+                        message=(
+                            "group-scoped broker fee cannot be copied onto a leg fill"
+                        ),
+                        evidence_refs=fill.evidence_refs,
+                        field_name="total_fee",
+                    )
+            filled_quantity = sum(
+                (fill.selected.quantity for fill in matching_fills),
+                _ZERO,
+            )
+            expected_quantity = (
+                selected.package_quantity * preferred_leg.quantity_ratio
+            )
+            link_refs = tuple(
+                sorted(
+                    {
+                        ref
+                        for fill in matching_fills
+                        for ref in fill.execution_group_fill_link_refs
+                    },
+                    key=lambda item: item.sort_key,
+                )
+            )
+            canonical_legs.append(
+                CanonicalExecutionGroupLeg(
+                    identity=(
+                        *identity,
+                        instrument.raw_symbol,
+                        _normalized_side(preferred_leg.side),
+                    ),
+                    leg_key=preferred_leg.leg_key,
+                    instrument=instrument,
+                    side=_normalized_side(preferred_leg.side),
+                    quantity_ratio=preferred_leg.quantity_ratio,
+                    expected_filled_quantity=expected_quantity,
+                    filled_quantity=filled_quantity,
+                    fill_identities=tuple(
+                        fill.identity for fill in matching_fills
+                    ),
+                    fill_link_refs=link_refs,
+                    selected_ref=_execution_group_leg_ref(preferred_leg),
+                    evidence_refs=leg_refs,
+                )
+            )
+
+        proved_group_quantity: Optional[Decimal] = None
+        if group_fills and canonical_legs and all(
+            leg.filled_quantity > 0 for leg in canonical_legs
+        ):
+            proved_quantities = tuple(
+                leg.filled_quantity / leg.quantity_ratio
+                for leg in canonical_legs
+            )
+            if (
+                max(proved_quantities) - min(proved_quantities)
+                <= _QUANTITY_TOLERANCE
+            ):
+                proved_group_quantity = proved_quantities[0]
+
+        executed = bool(group_fills or selected.filled_package_quantity > 0)
+        if executed:
+            if _normalized_status(selected.status) != "FILLED_ALL":
+                _append_issue(
+                    issues,
+                    code="execution_group_partial_semantics_unproved",
+                    entity_kind="execution_group",
+                    identity=identity,
+                    message=(
+                        "initial execution-group support requires terminal "
+                        "FILLED_ALL evidence"
+                    ),
+                    evidence_refs=group_refs,
+                    field_name="status",
+                )
+            for leg in canonical_legs:
+                if (
+                    abs(leg.filled_quantity - leg.expected_filled_quantity)
+                    > _QUANTITY_TOLERANCE
+                ):
+                    _append_issue(
+                        issues,
+                        code="execution_group_leg_quantity_mismatch",
+                        entity_kind="execution_group",
+                        identity=identity,
+                        message=(
+                            "leg fill quantity does not equal requested package "
+                            "quantity multiplied by its declared ratio"
+                        ),
+                        evidence_refs=tuple(
+                            sorted(
+                                {
+                                    *group_refs,
+                                    *leg.evidence_refs,
+                                    *leg.fill_link_refs,
+                                },
+                                key=lambda item: item.sort_key,
+                            )
+                        ),
+                        field_name="quantity",
+                    )
+                if (
+                    leg.instrument.asset_type.lower() == "option"
+                    and leg.instrument.contract_multiplier is None
+                ):
+                    _append_issue(
+                        issues,
+                        code="execution_group_contract_multiplier_unproved",
+                        entity_kind="execution_group",
+                        identity=identity,
+                        message=(
+                            "executed option leg has no frozen broker contract "
+                            "multiplier evidence"
+                        ),
+                        evidence_refs=leg.evidence_refs,
+                        field_name="contract_multiplier",
+                    )
+            if len(assigned_fill_identities) != len(group_fills):
+                _append_issue(
+                    issues,
+                    code="execution_group_fill_unassigned",
+                    entity_kind="execution_group",
+                    identity=identity,
+                    message="one or more group fills do not map to a declared leg",
+                    evidence_refs=tuple(
+                        sorted(
+                            {
+                                *group_refs,
+                                *(ref for fill in group_fills for ref in fill.evidence_refs),
+                            },
+                            key=lambda item: item.sort_key,
+                        )
+                    ),
+                    field_name="leg_key",
+                )
+            if total_fee is None or fee_ref is None:
+                _append_issue(
+                    issues,
+                    code="execution_group_fee_missing",
+                    entity_kind="execution_group",
+                    identity=identity,
+                    message="executed group requires one exact group-level fee",
+                    evidence_refs=group_refs,
+                    field_name="total_fee",
+                )
+
+        all_group_refs = tuple(
+            sorted(
+                {
+                    *group_refs,
+                    *(ref for leg in canonical_legs for ref in leg.evidence_refs),
+                    *(ref for leg in canonical_legs for ref in leg.fill_link_refs),
+                    *fee_refs,
+                },
+                key=lambda item: item.sort_key,
+            )
+        )
+        result.append(
+            CanonicalExecutionGroup(
+                identity=identity,
+                source_group_id=identity[2],
+                strategy_type=selected.strategy_type.strip().upper(),
+                raw_group_symbol=selected.raw_group_symbol.strip().upper(),
+                group_side=_normalized_side(selected.group_side),
+                status=_normalized_status(selected.status),
+                currency=selected.currency.strip().upper(),
+                ordered_at=_aware_utc(
+                    selected.ordered_at,
+                    field_name="execution_group.ordered_at",
+                ),
+                package_quantity=selected.package_quantity,
+                broker_reported_filled_package_quantity=(
+                    selected.filled_package_quantity
+                ),
+                broker_reported_order_net_price=selected.order_net_price,
+                broker_reported_average_net_price=selected.average_net_price,
+                proved_executed_group_quantity=proved_group_quantity,
+                total_fee=total_fee,
+                fee_components=fee_components,
+                fee_evidence_status=(
+                    "complete" if total_fee is not None else "missing"
+                ),
+                fee_ref=fee_ref,
+                legs=tuple(canonical_legs),
+                selected_ref=_execution_group_ref(selected),
+                evidence_refs=all_group_refs,
+            )
+        )
+
+    for group_identity, values in fills_by_group.items():
+        if group_identity in grouped:
+            continue
+        _append_issue(
+            issues,
+            code="orphan_execution_group_fill",
+            entity_kind="execution_group",
+            identity=group_identity,
+            message="fill references an execution group absent from canonical input",
+            evidence_refs=tuple(
+                sorted(
+                    {ref for fill in values for ref in fill.evidence_refs},
+                    key=lambda item: item.sort_key,
+                )
+            ),
+            field_name="execution_group_id",
+        )
+    return tuple(result), instruments_by_leg
+
+
 def _canonical_fill_records(
     selections: dict[tuple[str, str, str], _SelectedFill],
     orders: dict[tuple[str, str, str], CanonicalOrder],
+    execution_group_instruments: Mapping[
+        tuple[tuple[str, str, str], str], InstrumentIdentity
+    ],
     issues: list[CanonicalIssue],
 ) -> tuple[CanonicalFill, ...]:
     result: list[CanonicalFill] = []
@@ -1376,7 +2421,20 @@ def _canonical_fill_records(
             if selection.linked_order_identity is not None
             else None
         )
-        if order is None:
+        group_identity = selection.execution_group_identity
+        group_leg_key = selection.execution_group_leg_key
+        if group_identity is not None and group_leg_key is not None:
+            instrument = execution_group_instruments.get(
+                (group_identity, group_leg_key)
+            )
+            if instrument is None:
+                instrument = _resolved_instrument(
+                    selection.observations,
+                    preferred=selected,
+                )
+            order_observation_id = None
+            source_order_id = None
+        elif order is None:
             _append_issue(
                 issues,
                 code="orphan_fill",
@@ -1400,6 +2458,10 @@ def _canonical_fill_records(
             instrument = order.evidence.instrument
             order_observation_id = order.evidence.observation_id
             source_order_id = order.source_order_id
+        fill_refs = {
+            *selection.evidence_refs,
+            *selection.execution_group_fill_link_refs,
+        }
         evidence = CanonicalFillEvidence(
             observation_id=selected.observation_id,
             observation_key=selected.observation_key,
@@ -1410,7 +2472,11 @@ def _canonical_fill_records(
             quantity=selected.quantity,
             price=selected.price,
             amount=selected.amount,
-            total_fee=selection.total_fee,
+            total_fee=(
+                None
+                if group_identity is not None
+                else selection.total_fee
+            ),
             broker_order_observation_id=order_observation_id,
         )
         result.append(
@@ -1420,7 +2486,14 @@ def _canonical_fill_records(
                 source_order_id=source_order_id,
                 evidence=evidence,
                 selected_ref=_ref(selected),
-                evidence_refs=selection.evidence_refs,
+                evidence_refs=tuple(
+                    sorted(fill_refs, key=lambda item: item.sort_key)
+                ),
+                execution_group_identity=group_identity,
+                execution_group_leg_key=group_leg_key,
+                execution_group_fill_link_ref=(
+                    selection.execution_group_fill_link_ref
+                ),
             )
         )
     return tuple(result)
@@ -1482,6 +2555,9 @@ def _check_linked_fees(
 def canonicalize_observations(
     order_observations: Iterable[OrderObservationInput],
     fill_observations: Iterable[FillObservationInput],
+    execution_group_observations: Iterable[
+        ExecutionGroupObservationInput
+    ] = (),
 ) -> CanonicalEvidenceSet:
     """Merge overlapping immutable observations into one auditable fact set.
 
@@ -1493,6 +2569,7 @@ def canonicalize_observations(
     """
     order_inputs = tuple(order_observations)
     fill_inputs = tuple(fill_observations)
+    execution_group_inputs = tuple(execution_group_observations)
     issues: list[CanonicalIssue] = []
 
     (
@@ -1507,20 +2584,36 @@ def canonicalize_observations(
         shadowed_fill_refs_by_order,
         issues,
     )
+    execution_groups, execution_group_instruments = (
+        _canonical_execution_group_records(
+            execution_group_inputs,
+            fill_selections,
+            issues,
+        )
+    )
     fills = _canonical_fill_records(
         fill_selections,
         order_by_identity,
+        execution_group_instruments,
         issues,
     )
     _check_linked_fees(orders, fills, issues)
 
     issues_tuple = tuple(sorted(set(issues), key=lambda issue: issue.sort_key))
-    all_refs = tuple(
-        sorted(
-            {_ref(item) for item in (*order_inputs, *fill_inputs)},
-            key=lambda item: item.sort_key,
-        )
-    )
+    ref_values = {
+        _ref(item) for item in (*order_inputs, *fill_inputs)
+    }
+    for group in execution_group_inputs:
+        ref_values.add(_execution_group_ref(group))
+        ref_values.update(_execution_group_leg_ref(leg) for leg in group.legs)
+        fee_ref = _execution_group_fee_ref(group)
+        if fee_ref is not None:
+            ref_values.add(fee_ref)
+    for fill in fill_inputs:
+        link_ref = _execution_group_fill_link_ref(fill)
+        if link_ref is not None:
+            ref_values.add(link_ref)
+    all_refs = tuple(sorted(ref_values, key=lambda item: item.sort_key))
     batch_keys = tuple(sorted({item.batch_key for item in all_refs}))
     source_kinds = tuple(sorted({item.source_kind for item in all_refs}))
     provenance = CanonicalProvenance(
@@ -1541,6 +2634,17 @@ def canonicalize_observations(
         shadowed_aggregate_order_count=sum(
             item.aggregate_shadowed for item in orders
         ),
+        input_execution_group_observation_count=len(
+            execution_group_inputs
+        ),
+        canonical_execution_group_count=len(execution_groups),
+        canonical_execution_group_leg_count=sum(
+            len(item.legs) for item in execution_groups
+        ),
+        duplicate_execution_group_observation_count=max(
+            0,
+            len(execution_group_inputs) - len(execution_groups),
+        ),
         blocking_issue_count=sum(
             issue.severity == "blocking" for issue in issues_tuple
         ),
@@ -1551,12 +2655,16 @@ def canonicalize_observations(
         "provenance": provenance.canonical_payload(),
         "orders": [item.canonical_payload() for item in orders],
         "fills": [item.canonical_payload() for item in fills],
+        "execution_groups": [
+            item.canonical_payload() for item in execution_groups
+        ],
         "issues": [item.canonical_payload() for item in issues_tuple],
     }
     canonical_hash = hashlib.sha256(_canonical_json(payload).encode()).hexdigest()
     return CanonicalEvidenceSet(
         orders=orders,
         fills=fills,
+        execution_groups=execution_groups,
         issues=issues_tuple,
         evidence_refs=all_refs,
         provenance=provenance,

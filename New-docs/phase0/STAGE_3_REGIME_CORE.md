@@ -63,7 +63,7 @@ f.get_recommendation_trends('NVDA')
 - Finnhub 经济日历 + 财报日历
 - 11 个 S&P sector ETF 的 close vs MA20（定义 `sectors_above_ma20` + `defensive_leaders`）
 - SPY 前日 Low/High/Close → `close_vs_high_pct`
-- Alpaca premarket SPY + 每只 watchlist symbol（前 20 只）
+- Alpaca premarket SPY + watchlist 前 5 只
 
 每个 getter 都 defensive：缺 API key / 缺包 / 网络错不会 crash。`regime-quality-v1`
 通过 `_status=ready|degraded|unavailable` 声明输入质量；空或未就绪输入的 0 只表示
@@ -80,8 +80,20 @@ f.get_recommendation_trends('NVDA')
   unavailable，不再串行发起 11 次远端 fallback
 - Finnhub 经济日历与财报由逐日十几次请求合并为两个 7 日区间请求，自动实例单次 timeout
   2 秒；403/timeout 会显式标为 degraded/unavailable，不能被当成“今日无事件”
-- Alpaca 先读 SPY；SPY 失败便停止 watchlist fan-out，成功时也最多检查 5 个标的并按覆盖
-  完整度降级。整次 Regime fetcher 使用 18 秒工作预算，后续可选域不会挤占核心行情。
+- 盘前域冻结一个 UTC `as_of`，Alpaca 先读 SPY；SPY 失败便停止 watchlist
+  fan-out，成功时也最多检查 5 个标的并按覆盖完整度降级
+- Alpaca 适配器把 HTTP 401/403、429、timeout 与真实空分钟分别记录，并通过
+  `_reason` 保留到 Regime snapshot，不再统一误报 `no_completed_premarket_bar`
+- 已完成但尚未接入正式 Regime 的 Moomoo 专用适配器固定
+  `extended_time=True`、`AuType.NONE`、纽约
+  `04:00–09:30`，排除正在形成的分钟；最新证据超过 5 分钟、`last_close`
+  缺失或无法证明精确上一 XNYS session 时均 fail closed
+- 正式 Regime 暂不调用 Moomoo 盘前适配器：2026-07-24 本机真实冷调用虽然返回正确
+  SPY 证据，但约耗时 32 秒，无法被现有 18 秒工作预算或同步 SDK 安全中断。必须先
+  增加盘前预取/last-good 缓存，或实现可回收、可终止且不破坏共享 QuoteContext 的
+  worker，再启用整篮子 fallback
+- `_source`、`_attempted_sources`、`_reason` 与 `_reasons` 保存当前 Alpaca
+  取数和降级轨迹；整次 Regime fetcher 继续使用 18 秒工作预算。
 
 ### 5. 主入口 + 存储
 
@@ -147,8 +159,9 @@ sqlite3 data/daily_stock.db "SELECT date, score, label FROM regime_scores ORDER 
 
 - **晨报推送 + GitHub Actions cron** → Stage 4
 - **交易日历精度**：`backfill` 只跳 weekend，不查美国联邦假日。用 `src.core.trading_calendar` 精化留到 Phase 1。
-- **Premarket 数据源**：Alpaca 之外没备选。未配置、SPY 请求失败或 watchlist 覆盖不完整时
-  d6 的 0 表示未计分，整体质量标为 `degraded`，不是“盘前平盘”证据。
+- **Premarket 正式链路目前仍只有 Alpaca**：未配置、权限失败、SPY 请求失败或
+  watchlist 覆盖不完整时，d6 的 0 表示未计分，整体质量标为 `degraded`，不是
+  “盘前平盘”证据。Moomoo adapter 已验证字段正确，但因冷调用延迟尚未接线。
 - **Watchlist 来源**：优先读 config.stock_list；如果用户只有 A 股 watchlist（v1 默认），`compute_regime_score` 会跑到美股 symbol 也不奇怪——但 scorer 逻辑本身是市场宽度 + 大盘走势，对具体 watchlist 不敏感。
 - **反身性列** (`user_perceived_quality`、`user_did_trade`) 已在 schema 占位，Phase 1 激活。
 - **thresholds 自定义** 已支持但 CLI 没暴露；够用场景下留 argparse 未加。

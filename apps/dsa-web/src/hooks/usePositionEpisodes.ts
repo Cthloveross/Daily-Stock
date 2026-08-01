@@ -78,6 +78,7 @@ export function usePositionEpisodes({ active, filters }: UsePositionEpisodesOpti
     lifecycleStatus: filters.lifecycleStatus || '',
     completenessStatus: filters.completenessStatus || '',
     caseFocus: filters.caseFocus || '',
+    reviewStatus: filters.reviewStatus || '',
     buildId: filters.buildId ?? null,
     page: filters.page ?? 1,
     perPage: filters.perPage ?? 50,
@@ -184,7 +185,10 @@ export function usePositionEpisodes({ active, filters }: UsePositionEpisodesOpti
     }
   }, [reload]);
 
-  const buildCanonical = useCallback(async (acceptAssumedFlat: boolean) => {
+  const buildCanonical = useCallback(async (
+    acceptAssumedFlat: boolean,
+    acceptGroupFeeScope: boolean,
+  ) => {
     if (
       canonicalPreview?.canonicalSetId == null
       || !canonicalPreview.canonicalSetSha256
@@ -200,6 +204,7 @@ export function usePositionEpisodes({ active, filters }: UsePositionEpisodesOpti
         canonicalSetSha256: canonicalPreview.canonicalSetSha256,
         buildKey: canonicalPreview.buildKey,
         acceptAssumedFlat,
+        acceptGroupFeeScope,
       });
       setCanonicalBuildResult(response);
       return response;

@@ -4,12 +4,19 @@ import { ArrowLeft, Crosshair, Database, Sparkles, TriangleAlert } from 'lucide-
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { createPositionEpisodeAiReview, fetchPositionEpisodeDetail } from '../api/journal';
+import {
+  createPositionEpisodeAiReview,
+  fetchLatestPositionEpisodeReviewAnnotation,
+  fetchPositionEpisodeDetail,
+  fetchPositionEpisodeReviewAnnotationHistory,
+  savePositionEpisodeReviewAnnotation,
+} from '../api/journal';
 import { stocksApi } from '../api/stocks';
 import { parseApiError, type ParsedApiError } from '../api/error';
 import { ApiErrorAlert } from '../components/common/ApiErrorAlert';
 import { InlineAlert } from '../components/common/InlineAlert';
 import { CandlestickChart, type Candle } from '../components/charts/CandlestickChart';
+import { EpisodePlaybookLinksPanel } from '../components/journal/review/EpisodePlaybookLinksPanel';
 import { TradeLogicDraftPanel } from '../components/journal/review/TradeLogicDraftPanel';
 import {
   buildEmaOverlay,
@@ -22,15 +29,19 @@ import {
   type UsTradingSession,
 } from '../components/journal/review/episodeReviewMapping';
 import {
+  clearEpisodeReviewDraft,
   compactEpisodeReviewUserContext,
   emptyEpisodeReviewDraft,
+  episodeReviewAnnotationToDraft,
+  hasEpisodeReviewDraft,
   loadEpisodeReviewDraft,
 } from '../components/journal/review/episodeReviewDraft';
 import { journalReturnPath } from '../components/journal/review/journalReviewRouting';
 import type {
   PositionEpisodeAiReviewResponse,
-  PositionEpisodeTradeLogicDraft,
   PositionEpisodeDetailResponse,
+  PositionEpisodeReviewAnnotation,
+  PositionEpisodeReviewWorkspaceDraft,
 } from '../types/journal';
 import type { StockHistory, StockKLine, Timeframe } from '../types/stockHistory';
 
@@ -128,8 +139,8 @@ function directionLabel(direction: string): string {
 }
 
 function lifecycleLabel(status: string): string {
-  if (status === 'open') return '账单窗口内未归零';
-  if (status === 'closed') return '账单窗口内已归零';
+  if (status === 'open') return '证据窗口末未归零';
+  if (status === 'closed') return '证据窗口内已归零';
   return status;
 }
 
@@ -481,7 +492,7 @@ function AiReviewPanel({
 }: {
   episodeId: number;
   buildId: number;
-  userContext: PositionEpisodeTradeLogicDraft;
+  userContext: PositionEpisodeReviewWorkspaceDraft;
 }) {
   const navigate = useNavigate();
   const [review, setReview] = useState<PositionEpisodeAiReviewResponse | null>(null);
@@ -777,9 +788,18 @@ const JournalEpisodeReviewPage: React.FC = () => {
   const [tradingSession, setTradingSession] = useState<UsTradingSession>('regular');
   const [selectedEvidenceKey, setSelectedEvidenceKey] = useState<string | null>(null);
   const [reloadVersion, setReloadVersion] = useState(0);
-  const [tradeLogicDraft, setTradeLogicDraft] = useState<PositionEpisodeTradeLogicDraft>(
+  const [tradeLogicDraft, setTradeLogicDraft] = useState<PositionEpisodeReviewWorkspaceDraft>(
     () => emptyEpisodeReviewDraft(),
   );
+  const [reviewAnnotation, setReviewAnnotation] = useState<PositionEpisodeReviewAnnotation | null>(null);
+  const [reviewAnnotationLoading, setReviewAnnotationLoading] = useState(false);
+  const [reviewRestoreNotice, setReviewRestoreNotice] = useState<string | null>(null);
+  const [reviewSaving, setReviewSaving] = useState(false);
+  const [reviewSaveError, setReviewSaveError] = useState<string | null>(null);
+  const [reviewSaveNotice, setReviewSaveNotice] = useState<string | null>(null);
+  const [reviewHistory, setReviewHistory] = useState<PositionEpisodeReviewAnnotation[] | null>(null);
+  const [reviewHistoryLoading, setReviewHistoryLoading] = useState(false);
+  const [reviewHistoryError, setReviewHistoryError] = useState<string | null>(null);
 
   const returnToJournal = useCallback(() => {
     navigate(journalReturnPath(searchParams));
@@ -797,6 +817,15 @@ const JournalEpisodeReviewPage: React.FC = () => {
       setRequestedPeriod(null);
       setTradingSession('regular');
       setTradeLogicDraft(emptyEpisodeReviewDraft());
+      setReviewAnnotation(null);
+      setReviewAnnotationLoading(false);
+      setReviewRestoreNotice(null);
+      setReviewSaving(false);
+      setReviewSaveError(null);
+      setReviewSaveNotice(null);
+      setReviewHistory(null);
+      setReviewHistoryLoading(false);
+      setReviewHistoryError(null);
     });
     void fetchPositionEpisodeDetail(episodeId, buildId)
       .then((response) => {
@@ -816,6 +845,45 @@ const JournalEpisodeReviewPage: React.FC = () => {
       cancelled = true;
     };
   }, [buildId, episodeId, reloadVersion]);
+
+  useEffect(() => {
+    if (!detail || episodeId == null) return;
+    let cancelled = false;
+    setReviewAnnotationLoading(true);
+    setReviewRestoreNotice(null);
+    void fetchLatestPositionEpisodeReviewAnnotation(episodeId, detail.build.id)
+      .then((response) => {
+        if (cancelled) return;
+        const latest = response.annotation ?? null;
+        const localDraft = loadEpisodeReviewDraft(detail.build.id, episodeId);
+        setReviewAnnotation(latest);
+        if (hasEpisodeReviewDraft(localDraft)) {
+          setTradeLogicDraft(localDraft);
+          setReviewRestoreNotice(
+            latest
+              ? `检测到本机未提交草稿，已优先保留；服务器最新为版本 #${latest.revision}。`
+              : '已恢复本机未提交草稿；服务器尚无复盘版本。',
+          );
+        } else if (latest) {
+          setTradeLogicDraft(episodeReviewAnnotationToDraft(latest));
+          setReviewRestoreNotice(`已从服务器恢复复盘版本 #${latest.revision}。`);
+        } else {
+          setTradeLogicDraft(emptyEpisodeReviewDraft());
+          setReviewRestoreNotice('服务器尚无复盘版本；输入后先作为本机未提交草稿保存。');
+        }
+      })
+      .catch((reason) => {
+        if (cancelled) return;
+        const parsed = parseApiError(reason);
+        setReviewRestoreNotice(`服务器复盘读取失败：${parsed.message}。本机草稿仍可继续编辑。`);
+      })
+      .finally(() => {
+        if (!cancelled) setReviewAnnotationLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [detail, episodeId]);
 
   useEffect(() => {
     if (!detail) return;
@@ -884,6 +952,68 @@ const JournalEpisodeReviewPage: React.FC = () => {
       ? detail?.evidence.find((item) => item.evidenceKey === markerId)
       : findEvidenceAtChartTime(links, time);
     if (evidence) setSelectedEvidenceKey(evidence.evidenceKey);
+  };
+
+  const loadSavedReviewHistory = () => {
+    if (!detail || episodeId == null || reviewHistoryLoading || reviewHistory !== null) return;
+    setReviewHistoryLoading(true);
+    setReviewHistoryError(null);
+    void fetchPositionEpisodeReviewAnnotationHistory(episodeId, detail.build.id)
+      .then((response) => setReviewHistory(response.items))
+      .catch((reason) => {
+        setReviewHistory(null);
+        setReviewHistoryError(parseApiError(reason).message);
+      })
+      .finally(() => setReviewHistoryLoading(false));
+  };
+
+  const saveReviewWorkspace = async (reviewStatus: 'in_progress' | 'completed') => {
+    if (!detail || episodeId == null) return;
+    const selfAuthoredFieldCount = Object.keys(
+      compactEpisodeReviewUserContext(tradeLogicDraft),
+    ).length;
+    if (reviewStatus === 'completed' && selfAuthoredFieldCount === 0) {
+      setReviewSaveError('至少填写一项用户自述后才能标记复盘完成');
+      return;
+    }
+    if (!hasEpisodeReviewDraft(tradeLogicDraft)) {
+      setReviewSaveError('至少填写一项内容后才能保存复盘');
+      return;
+    }
+
+    setReviewSaving(true);
+    setReviewSaveError(null);
+    setReviewSaveNotice(null);
+    try {
+      const response = await savePositionEpisodeReviewAnnotation(episodeId, {
+        buildId: detail.build.id,
+        reviewStatus,
+        ...tradeLogicDraft,
+      });
+      setReviewAnnotation(response.annotation);
+      clearEpisodeReviewDraft(detail.build.id, episodeId);
+      setReviewRestoreNotice(null);
+      setReviewSaveNotice(
+        response.idempotentReplay
+          ? `内容未变化，沿用服务器版本 #${response.annotation.revision}。`
+          : `已保存服务器版本 #${response.annotation.revision}（${reviewStatus === 'completed' ? '已完成' : '进行中'}）。`,
+      );
+      try {
+        const savedHistory = await fetchPositionEpisodeReviewAnnotationHistory(
+          episodeId,
+          detail.build.id,
+        );
+        setReviewHistory(savedHistory.items);
+        setReviewHistoryError(null);
+      } catch {
+        setReviewHistory(null);
+        setReviewHistoryError('复盘已保存，但版本历史暂时读取失败');
+      }
+    } catch (reason) {
+      setReviewSaveError(parseApiError(reason).message);
+    } finally {
+      setReviewSaving(false);
+    }
   };
 
   if (episodeId == null) {
@@ -958,18 +1088,38 @@ const JournalEpisodeReviewPage: React.FC = () => {
         </span>
       </header>
 
+      <section className="rounded-ds-md border border-accent/20 bg-accent/5 p-4" aria-label="复盘口径">
+        <div className="text-label uppercase tracking-label text-accent">Historical reconstruction · Not live positions</div>
+        <h2 className="mt-1 text-h2 text-text-1">证据窗口与窗口末投影</h2>
+        <dl className="mt-3 grid gap-3 sm:grid-cols-2">
+          <div>
+            <dt className="text-caption text-text-3">证据窗口（ET）起—止</dt>
+            <dd className="mt-1 font-mono text-mono-xs text-text-1">
+              {toEt(detail.build.sourceWindowStart, true)} — {toEt(detail.build.sourceCutoffAt, true)}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-caption text-text-3">窗口末投影 as-of（ET）</dt>
+            <dd className="mt-1 font-mono text-mono-xs text-text-1">{toEt(detail.build.sourceCutoffAt, true)}</dd>
+          </div>
+        </dl>
+        <p className="mt-3 text-caption leading-relaxed text-text-3">
+          本页重放到上述 as-of 时点。“证据窗口末数量”只属于这段历史证据，不等于券商当前持仓。
+        </p>
+      </section>
+
       {item.quality.assumedFlatUnverified && (
         <InlineAlert
           variant="warning"
           title="期初持仓边界未验证"
-          message="左边界没有券商持仓快照证明；这里展示的是期初空仓假设下的条件性复盘，不能被人工操作改成 Verified，也不会进入 Headline。"
+          message="历史左边界没有券商持仓快照证明；即使另有当前时点的券商持仓快照，也不能倒推这个历史证据窗口的期初持仓。这里展示的是期初空仓假设下的条件性复盘，不能被人工操作改成 Verified，也不会进入 Headline。"
         />
       )}
       {item.lifecycleStatus === 'open' && (
         <InlineAlert
           variant="info"
-          title="“账单窗口内未归零”不等于当前持仓"
-          message="当前没有期末 position snapshot；Remaining 只表示导入证据回放到窗口末端时尚未归零。"
+          title="“证据窗口末未归零”不等于券商当前持仓"
+          message="系统没有证据窗口末之后的完整成交与持仓快照；证据窗口末数量只表示回放到该 as-of 时点时尚未归零。"
         />
       )}
 
@@ -978,9 +1128,9 @@ const JournalEpisodeReviewPage: React.FC = () => {
           ['方向', directionLabel(item.direction), '合约仓位方向'],
           ['开仓时间 ET', toEt(item.openedAt), '第一条分配证据'],
           ['期权开仓均价', formatDecimal(item.averageEntryPrice, true), '只显示，不画入底层价轴'],
-          ['期权平仓均价', formatDecimal(item.averageExitPrice, true), item.closedAt ? toEt(item.closedAt) : '尚未归零'],
+          ['期权平仓均价', formatDecimal(item.averageExitPrice, true), item.closedAt ? toEt(item.closedAt) : '证据窗口末未归零'],
           ['费用', formatDecimal(item.totalFee, true), '后端持久化结果'],
-          ['Net', formatDecimal(displayedNet, true), item.lifecycleStatus === 'open' ? '未归零不显示' : conditional ? '条件值' : 'Verified'],
+          ['Net', formatDecimal(displayedNet, true), item.lifecycleStatus === 'open' ? '证据窗口末未归零，不显示' : conditional ? '条件值' : 'Verified'],
         ].map(([label, value, caption]) => (
           <div key={label} className="rounded-ds-md border border-subtle bg-bg-1 p-3">
             <div className="text-caption text-text-3">{label}</div>
@@ -1129,7 +1279,31 @@ const JournalEpisodeReviewPage: React.FC = () => {
         episodeId={episodeId}
         buildId={detail.build.id}
         draft={tradeLogicDraft}
-        onChange={setTradeLogicDraft}
+        onChange={(nextDraft) => {
+          setTradeLogicDraft(nextDraft);
+          setReviewRestoreNotice(null);
+          setReviewSaveNotice(null);
+          setReviewSaveError(null);
+        }}
+        annotation={reviewAnnotation}
+        annotationLoading={reviewAnnotationLoading}
+        saving={reviewSaving}
+        saveError={reviewSaveError}
+        saveNotice={reviewSaveNotice}
+        restoreNotice={reviewRestoreNotice}
+        history={reviewHistory}
+        historyLoading={reviewHistoryLoading}
+        historyError={reviewHistoryError}
+        onSave={(status) => {
+          void saveReviewWorkspace(status);
+        }}
+        onLoadHistory={loadSavedReviewHistory}
+      />
+
+      <EpisodePlaybookLinksPanel
+        key={`playbook-links:${episodeId}:${detail.build.id}`}
+        episodeId={episodeId}
+        buildId={detail.build.id}
       />
 
       <AiReviewPanel

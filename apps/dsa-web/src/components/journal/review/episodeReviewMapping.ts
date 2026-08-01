@@ -1,6 +1,7 @@
 import type { Candle, CandleMarker, MAOverlay } from '../../charts/CandlestickChart';
 import type { PositionEpisodeEvidenceItem } from '../../../types/journal';
 import type { Timeframe } from '../../../types/stockHistory';
+import { computeSmaSeededEmaSeries } from '../../../utils/ema';
 import {
   filterByUsTradingSession,
   type UsTradingSession,
@@ -31,10 +32,45 @@ const PERIOD_SECONDS: Partial<Record<Timeframe, number>> = {
   '90m': 90 * 60,
 };
 
+const NEW_YORK_SESSION_CLOCK = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  hourCycle: 'h23',
+});
+
 function toUnixSeconds(value: number | string): number | null {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null;
   const parsed = Date.parse(value);
   return Number.isNaN(parsed) ? null : Math.floor(parsed / 1000);
+}
+
+function newYorkSessionPartition(value: number | string): string | null {
+  const seconds = toUnixSeconds(value);
+  if (seconds == null) return null;
+  const parts = NEW_YORK_SESSION_CLOCK.formatToParts(new Date(seconds * 1000));
+  const part = (type: Intl.DateTimeFormatPartTypes) => parts.find((item) => item.type === type)?.value;
+  const year = part('year');
+  const month = part('month');
+  const day = part('day');
+  const hour = Number(part('hour'));
+  const minute = Number(part('minute'));
+  if (!year || !month || !day || !Number.isInteger(hour) || !Number.isInteger(minute)) {
+    return null;
+  }
+
+  const minuteOfDay = hour * 60 + minute;
+  const session = minuteOfDay >= 4 * 60 && minuteOfDay < 9 * 60 + 30
+    ? 'premarket'
+    : minuteOfDay >= 9 * 60 + 30 && minuteOfDay < 16 * 60
+      ? 'regular'
+      : minuteOfDay >= 16 * 60 && minuteOfDay < 20 * 60
+        ? 'postmarket'
+        : null;
+  return session ? `${year}-${month}-${day}:${session}` : null;
 }
 
 export function filterCandlesByUsTradingSession(
@@ -132,14 +168,19 @@ export function mapEvidenceToCandles(
           high = middle - 1;
         }
       }
-      if (candidate >= 0 && eventSeconds - sortedCandles[candidate].seconds < interval) {
-        matched = sortedCandles[candidate].candle;
-      } else if (
-        candidate < 0
-        && sortedCandles[0]
-        && sortedCandles[0].seconds - eventSeconds < interval
-      ) {
-        matched = sortedCandles[0].candle;
+      if (candidate >= 0) {
+        const candidateCandle = sortedCandles[candidate];
+        const elapsed = eventSeconds - candidateCandle.seconds;
+        const eventSession = newYorkSessionPartition(eventSeconds);
+        const candleSession = newYorkSessionPartition(candidateCandle.seconds);
+        if (
+          elapsed >= 0
+          && elapsed < interval
+          && eventSession != null
+          && eventSession === candleSession
+        ) {
+          matched = candidateCandle.candle;
+        }
       }
     }
     return {
@@ -190,6 +231,7 @@ export function findEvidenceAtChartTime(
  * Builds a conventional EMA series seeded by the first full-period SMA.
  * Candle closes are always the underlying's prices on the review workspace;
  * option fills remain evidence markers and never enter this calculation.
+ * The math lives in the shared `utils/ema` implementation.
  */
 export function buildEmaOverlay(
   candles: Candle[],
@@ -197,24 +239,5 @@ export function buildEmaOverlay(
   color: string,
   label = `EMA ${period}`,
 ): MAOverlay {
-  if (!Number.isInteger(period) || period <= 0 || candles.length < period) {
-    return { period, color, label, data: [] };
-  }
-
-  const seed = candles
-    .slice(0, period)
-    .reduce((total, candle) => total + candle.close, 0) / period;
-  const multiplier = 2 / (period + 1);
-  let value = seed;
-  const data: MAOverlay['data'] = [{
-    time: candles[period - 1].time,
-    value,
-  }];
-
-  for (let index = period; index < candles.length; index += 1) {
-    value += (candles[index].close - value) * multiplier;
-    data.push({ time: candles[index].time, value });
-  }
-
-  return { period, color, label, data };
+  return { period, color, label, data: computeSmaSeededEmaSeries(candles, period) };
 }

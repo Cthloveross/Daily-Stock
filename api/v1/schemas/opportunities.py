@@ -11,6 +11,21 @@ _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9.^_-]{1,32}$")
 _US_OPTION_UNDERLYING_PATTERN = re.compile(r"^[A-Z]{1,5}(?:[.-][A-Z])?$")
 
 
+def _normalized_symbols(value: list[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in value:
+        symbol = str(raw or "").strip().upper()
+        if not symbol:
+            continue
+        if not _SYMBOL_PATTERN.fullmatch(symbol):
+            raise ValueError(f"invalid symbol: {raw!r}")
+        if symbol not in seen:
+            normalized.append(symbol)
+            seen.add(symbol)
+    return normalized
+
+
 class DailyOpportunityRequest(BaseModel):
     symbols: list[str] = Field(
         default_factory=list,
@@ -26,18 +41,55 @@ class DailyOpportunityRequest(BaseModel):
     @field_validator("symbols")
     @classmethod
     def normalize_symbols(cls, value: list[str]) -> list[str]:
-        normalized: list[str] = []
-        seen: set[str] = set()
-        for raw in value:
-            symbol = str(raw or "").strip().upper()
-            if not symbol:
-                continue
-            if not _SYMBOL_PATTERN.fullmatch(symbol):
-                raise ValueError(f"invalid symbol: {raw!r}")
-            if symbol not in seen:
-                normalized.append(symbol)
-                seen.add(symbol)
-        return normalized
+        return _normalized_symbols(value)
+
+
+class PremarketCycleRequest(BaseModel):
+    symbols: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        description=(
+            "兼容保留字段；canonical 盘前周期只使用服务端已持久化研究池，"
+            "不会把请求或 STOCK_LIST 隐式提升为正式 universe。"
+        ),
+    )
+    limit: int = Field(5, ge=1, le=15)
+    manual: bool = Field(
+        False,
+        description="只有显式人工操作才设为 true；页面状态读取不会启动研究。",
+    )
+
+    @field_validator("symbols")
+    @classmethod
+    def normalize_symbols(cls, value: list[str]) -> list[str]:
+        return _normalized_symbols(value)
+
+
+class PremarketUniversePutRequest(BaseModel):
+    symbols: list[str] = Field(min_length=1, max_length=20)
+    limit: int = Field(5, ge=1, le=15)
+
+    @field_validator("symbols")
+    @classmethod
+    def normalize_symbols(cls, value: list[str]) -> list[str]:
+        return _normalized_symbols(value)
+
+
+class PremarketUniverseResponse(BaseModel):
+    schema_version: str = "premarket-research-universe/1.0"
+    configured: bool
+    universe_version_key: Optional[str] = None
+    source: Literal[
+        "persisted",
+        "stock_list_fallback",
+        "request_fallback",
+        "unavailable",
+    ]
+    symbols: list[str] = Field(default_factory=list)
+    limit: int = Field(5, ge=1, le=15)
+    created_at: Optional[str] = None
+    duplicate: bool = False
+    message: str
 
 
 class ReadinessItem(BaseModel):
@@ -141,6 +193,41 @@ class OpportunityOutcomeProgress(BaseModel):
     data_gap_count: int = Field(default=0, ge=0)
 
 
+class OpportunityQualificationTrackSummary(BaseModel):
+    track_key: Literal[
+        "raw_underlying_path_v1",
+        "underlying_daily_selection_v1",
+        "canonical_full_research_v1",
+    ]
+    qualified_count: int = Field(ge=0)
+    excluded_count: int = Field(ge=0)
+    unverified_count: int = Field(ge=0)
+    prospective_count: int = Field(ge=0)
+    retrospective_count: int = Field(ge=0)
+    observation_ready_count: int = Field(ge=0)
+
+
+class OpportunityQualificationSummary(BaseModel):
+    assessment_key: str
+    policy_version: str
+    publication_state: Literal[
+        "canonical_published",
+        "audit_frozen",
+        "legacy_unverified",
+    ]
+    analysis_quality_state: Literal[
+        "ready",
+        "degraded",
+        "blocked",
+        "unassessed",
+    ]
+    assessed_at: str
+    reason_codes: list[str] = Field(default_factory=list)
+    tracks: list[OpportunityQualificationTrackSummary] = Field(
+        default_factory=list
+    )
+
+
 class OpportunitySnapshotItem(BaseModel):
     schema_version: str = "opportunity-snapshot/1.0"
     snapshot_key: str
@@ -152,13 +239,32 @@ class OpportunitySnapshotItem(BaseModel):
     eligible_candidate_count: int = Field(ge=0)
     validation_eligible: bool
     eligibility_reasons: list[str] = Field(default_factory=list)
+    analysis_quality_eligible: Optional[bool] = None
+    analysis_quality_reasons: list[str] = Field(default_factory=list)
+    qualification: Optional[OpportunityQualificationSummary] = None
     outcome_progress: list[OpportunityOutcomeProgress] = Field(default_factory=list)
+    underlying_path_candidate_count: int = Field(default=0, ge=0)
+    underlying_path_progress: list[OpportunityOutcomeProgress] = Field(
+        default_factory=list
+    )
+    full_research_candidate_count: int = Field(default=0, ge=0)
+    full_research_progress: list[OpportunityOutcomeProgress] = Field(
+        default_factory=list
+    )
     idempotent_replay: bool = False
 
 
 class OpportunitySnapshotListResponse(BaseModel):
     schema_version: str = "opportunity-snapshot-list/1.0"
     items: list[OpportunitySnapshotItem] = Field(default_factory=list)
+
+
+class OpportunitySnapshotDetailResponse(BaseModel):
+    """One immutable snapshot summary plus its frozen run payload, verbatim."""
+
+    schema_version: str = "opportunity-snapshot-detail/1.0"
+    snapshot: OpportunitySnapshotItem
+    run: dict[str, Any]
 
 
 class OpportunitySnapshotEnsureResponse(BaseModel):
@@ -169,16 +275,96 @@ class OpportunitySnapshotEnsureResponse(BaseModel):
     message: str
 
 
+class PremarketCycleStage(BaseModel):
+    name: str
+    state: Literal[
+        "pending",
+        "running",
+        "completed",
+        "degraded",
+        "blocked",
+        "failed",
+        "skipped",
+    ]
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    error_code: Optional[str] = None
+
+
+class PremarketCycleResponse(BaseModel):
+    schema_version: str = "canonical-premarket-cycle/1.0"
+    cycle_version: str
+    freeze_policy_version: str
+    scope_key: str
+    cycle_key: str
+    state: Literal[
+        "non_session",
+        "waiting_window",
+        "ready_to_run",
+        "research_pool_missing",
+        "running",
+        "published",
+        "blocked",
+        "window_closed",
+        "failed",
+    ]
+    quality: Literal["unknown", "ready", "degraded", "blocked"]
+    market_date_et: str
+    previous_session: Optional[str] = None
+    regular_open_at: Optional[str] = None
+    window_start_at: Optional[str] = None
+    window_end_at: Optional[str] = None
+    latest_start_at: Optional[str] = None
+    cycle_as_of: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    retry_after_seconds: Optional[int] = Field(default=None, ge=1)
+    universe: list[str] = Field(default_factory=list)
+    requested_limit: int
+    universe_source: Literal[
+        "persisted",
+        "stock_list_fallback",
+        "request_fallback",
+        "unavailable",
+    ] = "unavailable"
+    universe_version_key: Optional[str] = None
+    attempt_key: Optional[str] = None
+    attempt_trigger: Optional[Literal["manual", "scheduler"]] = None
+    attempt_started_at: Optional[str] = None
+    lease_expires_at: Optional[str] = None
+    recovered_from_attempt_key: Optional[str] = None
+    recoverable: bool = False
+    next_scheduled_at: Optional[str] = None
+    scheduler_enabled: bool = False
+    primary_scheduled_at: Optional[str] = None
+    retry_scheduled_at: Optional[str] = None
+    stages: list[PremarketCycleStage] = Field(default_factory=list)
+    regime_quality: dict[str, str] = Field(default_factory=dict)
+    quality_reasons: list[str] = Field(default_factory=list)
+    run: Optional[DailyOpportunityResponse] = None
+    snapshot: Optional[OpportunitySnapshotItem] = None
+    idempotent_replay: bool = False
+    error_code: Optional[str] = None
+    message: str
+
+
 class OpportunitySnapshotEvaluationResponse(BaseModel):
     schema_version: str = "opportunity-outcome-evaluation/1.0"
     snapshot_key: str
     evaluated_at: str
     candidate_count: int = Field(ge=0)
+    tracking_candidate_count: int = Field(default=0, ge=0)
     inserted_outcomes: int = Field(ge=0)
     already_recorded: int = Field(ge=0)
     pending_horizons: int = Field(ge=0)
     data_gap_horizons: int = Field(ge=0)
     outcome_progress: list[OpportunityOutcomeProgress] = Field(default_factory=list)
+    underlying_path_progress: list[OpportunityOutcomeProgress] = Field(
+        default_factory=list
+    )
+    full_research_progress: list[OpportunityOutcomeProgress] = Field(
+        default_factory=list
+    )
     message: str
 
 
@@ -186,16 +372,30 @@ class OpportunityLearningHorizon(BaseModel):
     horizon_sessions: Literal[5, 20]
     mature_count: int = Field(ge=0)
     distinct_signal_sessions: int = Field(ge=0)
-    context_hit_count: int = Field(ge=0)
-    context_miss_count: int = Field(ge=0)
-    neutral_count: int = Field(ge=0)
-    non_directional_count: int = Field(ge=0)
+    directional_sample_count: int = Field(default=0, ge=0)
+    context_hit_count: Optional[int] = Field(default=None, ge=0)
+    context_miss_count: Optional[int] = Field(default=None, ge=0)
+    neutral_count: Optional[int] = Field(default=None, ge=0)
+    non_directional_count: Optional[int] = Field(default=None, ge=0)
     context_hit_rate_percent: Optional[float] = Field(default=None, ge=0, le=100)
     summary_visible: bool
     investigation_ready: bool
     cohort_key: Optional[str] = None
     cohort_label: Optional[str] = None
     excluded_quality_count: int = Field(default=0, ge=0)
+
+
+class OpportunityOutcomeMaintenanceStatus(BaseModel):
+    session_date_et: str
+    policy_version: str
+    state: Literal["pending", "running", "completed", "degraded", "failed"]
+    attempt_count: int = Field(ge=0, le=2)
+    completed_at: Optional[str] = None
+    next_retry_at: Optional[str] = None
+    due_snapshot_count: int = Field(default=0, ge=0)
+    inserted_outcomes: int = Field(default=0, ge=0)
+    data_gap_horizons: int = Field(default=0, ge=0)
+    last_error_code: Optional[str] = None
 
 
 class OpportunityLearningSummaryResponse(BaseModel):
@@ -207,8 +407,11 @@ class OpportunityLearningSummaryResponse(BaseModel):
         "investigation_ready",
     ]
     auto_adjustment: Literal[False] = False
-    minimum_summary_samples: int = 10
+    minimum_summary_samples: int = 20
     minimum_investigation_samples: int = 20
+    automatic_maintenance_enabled: bool = False
+    maintenance_policy_version: Optional[str] = None
+    latest_maintenance: Optional[OpportunityOutcomeMaintenanceStatus] = None
     horizons: list[OpportunityLearningHorizon] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
 
@@ -383,6 +586,44 @@ class OptionWallCoverage(BaseModel):
     gamma_contracts: int = Field(ge=0)
 
 
+class OptionWallLevelExpiryQuote(BaseModel):
+    """Quote fields traced to the single snapshot row backing one expiry cell.
+
+    Fields absent from the observed snapshot stay ``None``; they are never
+    zero-filled.  当前 Moomoo 墙快照行只携带 IV 与 update_time，bid/ask/mark
+    结构性缺失，因此保持显式 null 并通过 ``quote_evidence`` 标缺。
+    """
+
+    iv_percent: Optional[float] = Field(default=None, gt=0)
+    bid: Optional[float] = Field(default=None, ge=0)
+    ask: Optional[float] = Field(default=None, ge=0)
+    mark: Optional[float] = Field(default=None, ge=0)
+    quote_as_of: Optional[str] = None
+
+
+class OptionWallLevelExpiry(BaseModel):
+    expiry: str
+    dte: Optional[int] = Field(default=None, ge=0)
+    metric_value: float = Field(gt=0)
+    share_of_level_percent: float = Field(ge=0, le=100)
+    contract_count: int = Field(ge=1)
+    quote: OptionWallLevelExpiryQuote = Field(
+        default_factory=OptionWallLevelExpiryQuote
+    )
+    quote_evidence: Literal["observed", "partial", "unavailable"] = "unavailable"
+
+
+class OptionWallLevelExpiryOther(BaseModel):
+    expiry_count: int = Field(ge=1)
+    metric_value: float = Field(ge=0)
+    share_of_level_percent: float = Field(ge=0, le=100)
+
+
+class OptionWallLevelExpiryBreakdown(BaseModel):
+    top_expiries: list[OptionWallLevelExpiry] = Field(default_factory=list)
+    other: Optional[OptionWallLevelExpiryOther] = None
+
+
 class OptionWallLevel(BaseModel):
     rank: int = Field(ge=1)
     strike: float = Field(gt=0)
@@ -395,6 +636,20 @@ class OptionWallLevel(BaseModel):
         "sum_session_volume",
         "gross_gamma_concentration_1pct",
     ]
+    # Additive per-level contract fields (option-wall/1.2); optional with
+    # defaults so pre-1.2 payloads and older clients remain valid.
+    side: Optional[Literal["call", "put", "call_put_aggregate"]] = None
+    metric_basis: Optional[
+        Literal[
+            "settled_open_interest_prior_session",
+            "current_session_cumulative_volume",
+            "model_from_settled_oi_and_snapshot_greeks",
+        ]
+    ] = None
+    quote_evidence: Optional[
+        Literal["observed", "partial", "unavailable"]
+    ] = None
+    expiry_breakdown: Optional[OptionWallLevelExpiryBreakdown] = None
 
 
 class OptionWallSet(BaseModel):
@@ -407,6 +662,16 @@ class OptionWallSet(BaseModel):
     gross_gamma_concentration: list[OptionWallLevel] = Field(default_factory=list)
 
 
+class OptionWallAtmCallIv(BaseModel):
+    state: Literal["ready", "not_configured", "unavailable"]
+    expiry: Optional[str] = None
+    strike: Optional[float] = Field(default=None, gt=0)
+    atm_call_iv_percent: Optional[float] = Field(default=None, gt=0)
+    selection_method: Literal[
+        "nearest_expiry_atm_call_from_same_wall_snapshot"
+    ]
+
+
 class OptionWallItem(BaseModel):
     ticker: str
     state: Literal["ready", "partial", "not_configured", "unavailable"]
@@ -415,6 +680,7 @@ class OptionWallItem(BaseModel):
     quote_as_of: Optional[str] = None
     formula_version: str
     spot: Optional[float] = Field(default=None, gt=0)
+    atm_call_iv: OptionWallAtmCallIv
     scope: OptionWallScope
     coverage: OptionWallCoverage
     walls: OptionWallSet

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -26,9 +27,17 @@ from src.journal.brokers.moomoo_statement import (
     StatementReconciliation,
 )
 from src.journal.ledger.models import (
+    BrokerExecutionGroupFeeObservation,
+    BrokerExecutionGroupFillLink,
+    BrokerExecutionGroupLegObservation,
+    BrokerExecutionGroupObservation,
     BrokerFillObservation,
     BrokerFeeObservation,
     BrokerOrderObservation,
+    CanonicalExecutionGroupFillLinkRecord,
+    CanonicalExecutionGroupLegRecord,
+    CanonicalExecutionGroupMemberRecord,
+    CanonicalExecutionGroupProvenanceRecord,
     CanonicalEvidenceIssueRecord,
     CanonicalEvidenceMemberRecord,
     CanonicalEvidenceProvenanceRecord,
@@ -42,8 +51,20 @@ from src.journal.ledger.models import (
 from src.options.occ_parser import parse_symbol
 from src.storage import Base, get_db
 
+# Register the append-only Playbook tables (contract slice C-2) on the shared
+# metadata so ``init_ledger_schema``'s ``create_all`` and the append-only deny
+# triggers always cover them.
+import src.journal.ledger.playbook_models as _playbook_models  # noqa: F401
+
+# Register the append-only artifact GC receipt table (contract F-2a) the same
+# way so its deny triggers install with ``init_ledger_schema``.
+import src.journal.ledger.artifact_gc_models as _artifact_gc_models  # noqa: F401
+
 __all__ = [
     "DEFAULT_LEDGER_ACCOUNT_KEY",
+    "LEDGER_APPEND_ONLY_GUARD_MESSAGE",
+    "ledger_guard_trigger_ddl",
+    "ledger_guard_trigger_name",
     "LedgerImportError",
     "LedgerImportResult",
     "LedgerOpenApiImportResult",
@@ -78,6 +99,10 @@ _APPEND_ONLY_TABLE_NAMES = (
     "journal_v2_broker_order_observations",
     "journal_v2_broker_fill_observations",
     "journal_v2_broker_fee_observations",
+    "journal_v2_broker_execution_group_observations",
+    "journal_v2_broker_execution_group_leg_observations",
+    "journal_v2_broker_execution_group_fill_links",
+    "journal_v2_broker_execution_group_fee_observations",
     "journal_v2_order_identity_links",
     "journal_v2_deal_identity_links",
     "journal_v2_order_fill_set_attestations",
@@ -85,12 +110,45 @@ _APPEND_ONLY_TABLE_NAMES = (
     "journal_v2_canonical_evidence_members",
     "journal_v2_canonical_evidence_issues",
     "journal_v2_canonical_evidence_provenance",
+    "journal_v2_canonical_execution_group_members",
+    "journal_v2_canonical_execution_group_legs",
+    "journal_v2_canonical_execution_group_fill_links",
+    "journal_v2_canonical_execution_group_provenance",
     "journal_v2_episode_builds",
     "journal_v2_episode_build_canonical_sources",
+    "journal_v2_episode_build_snapshot_fence_sources",
+    "journal_v2_episode_build_activations",
     "journal_v2_strategy_episodes",
     "journal_v2_position_episodes",
     "journal_v2_position_episode_evidence",
+    "journal_v2_review_annotations",
+    "journal_v2_playbook_candidates",
+    "journal_v2_playbook_rules",
+    "journal_v2_artifact_gc_receipts",
 )
+_LEDGER_SCHEMA_LOCK = threading.RLock()
+
+# Single authoritative deny-trigger DDL for ``_APPEND_ONLY_TABLE_NAMES``.
+# ``artifact_gc`` reuses it to install the GC receipt table's guards when the
+# CLI runs before ``init_ledger_schema`` has seen the new table; never
+# hand-copy the trigger body elsewhere.
+LEDGER_APPEND_ONLY_GUARD_MESSAGE = "journal v2 rows are append-only"
+
+
+def ledger_guard_trigger_name(table_name: str, operation: str) -> str:
+    """Deterministic UPDATE/DELETE deny-trigger name for one ledger table."""
+    return f"trg_{table_name}_{operation.lower()}_immutable"
+
+
+def ledger_guard_trigger_ddl(table_name: str, operation: str) -> str:
+    """Authoritative CREATE TRIGGER DDL guarding one append-only ledger table."""
+    trigger_name = ledger_guard_trigger_name(table_name, operation)
+    return (
+        f"CREATE TRIGGER IF NOT EXISTS {trigger_name} "
+        f"BEFORE {operation} ON {table_name} "
+        "BEGIN SELECT RAISE(ABORT, "
+        f"'{LEDGER_APPEND_ONLY_GUARD_MESSAGE}'); END"
+    )
 
 
 class LedgerImportError(ValueError):
@@ -117,6 +175,10 @@ class LedgerOpenApiImportResult:
     order_observations: int
     fill_observations: int
     fee_observations: int
+    execution_group_observations: int = 0
+    execution_group_leg_observations: int = 0
+    execution_group_fill_links: int = 0
+    execution_group_fee_observations: int = 0
     journal_legacy_written: bool = False
 
 
@@ -169,6 +231,7 @@ class CanonicalObservationInputs:
     fills: tuple[Any, ...]
     source_batch_ids: tuple[int, ...]
     csv_baseline_batch_id: Optional[int]
+    execution_groups: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -179,6 +242,8 @@ class CanonicalSetPersistenceResult:
     duplicate: bool
     analysis_ready: bool
     issue_count: int
+    execution_group_count: int = 0
+    execution_group_leg_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -314,21 +379,16 @@ def get_latest_data_health(
 
 def init_ledger_schema() -> None:
     """Create only missing tables; existing legacy Journal rows are untouched."""
-    db = get_db()
-    Base.metadata.create_all(db._engine)
-    if db._engine.dialect.name == "sqlite":
-        with db._engine.begin() as connection:
-            for table_name in _APPEND_ONLY_TABLE_NAMES:
-                for operation in ("UPDATE", "DELETE"):
-                    trigger_name = (
-                        f"trg_{table_name}_{operation.lower()}_immutable"
-                    )
-                    connection.exec_driver_sql(
-                        f"CREATE TRIGGER IF NOT EXISTS {trigger_name} "
-                        f"BEFORE {operation} ON {table_name} "
-                        "BEGIN SELECT RAISE(ABORT, "
-                        "'journal v2 rows are append-only'); END"
-                    )
+    with _LEDGER_SCHEMA_LOCK:
+        db = get_db()
+        Base.metadata.create_all(db._engine)
+        if db._engine.dialect.name == "sqlite":
+            with db._engine.begin() as connection:
+                for table_name in _APPEND_ONLY_TABLE_NAMES:
+                    for operation in ("UPDATE", "DELETE"):
+                        connection.exec_driver_sql(
+                            ledger_guard_trigger_ddl(table_name, operation)
+                        )
 
 
 @contextmanager
@@ -935,8 +995,153 @@ def _openapi_observation_key(kind: str, stable_id: str) -> str:
     )[:32]
 
 
+def _is_execution_group_order(value: Any) -> bool:
+    """Return whether an OpenAPI parent declares a complete combo shape."""
+    return bool(getattr(value, "combo_legs", ()))
+
+
+def _execution_group_leg_stable_id(
+    source_group_id: str,
+    raw_symbol: str,
+    side: str,
+    quantity_ratio: Decimal,
+) -> str:
+    return "|".join(
+        (
+            source_group_id,
+            raw_symbol.strip().upper(),
+            side.strip().upper(),
+            format(quantity_ratio, "f"),
+        )
+    )
+
+
+def _execution_group_leg_key(
+    source_group_id: str,
+    raw_symbol: str,
+    side: str,
+    quantity_ratio: Decimal,
+) -> str:
+    return _openapi_observation_key(
+        "execution_group_leg",
+        _execution_group_leg_stable_id(
+            source_group_id,
+            raw_symbol,
+            side,
+            quantity_ratio,
+        ),
+    )
+
+
+def _execution_group_fill_link_key(
+    source_group_id: str,
+    source_deal_id: str,
+    execution_group_leg_key: str,
+) -> str:
+    stable_id = "|".join(
+        (source_group_id, source_deal_id, execution_group_leg_key)
+    )
+    return _openapi_observation_key("execution_group_fill_link", stable_id)
+
+
+def _execution_group_fill_link_source_sha256(
+    source_group_id: str,
+    source_deal_id: str,
+    execution_group_leg_key: str,
+) -> str:
+    return _sha256_json(
+        {
+            "source_execution_group_id": source_group_id,
+            "source_deal_id": source_deal_id,
+            "execution_group_leg_key": execution_group_leg_key,
+            "link_method": "broker_parent_id_and_declared_leg_identity",
+        }
+    )
+
+
+def _execution_group_leg_source_sha256(
+    *,
+    source_group_id: str,
+    parent_source_record_sha256: str,
+    leg_key: str,
+    raw_symbol: str,
+    side: str,
+    quantity_ratio: Decimal,
+    contract_multiplier: Optional[Decimal],
+    contract_multiplier_basis: str,
+    contract_spec_source_record_sha256: Optional[str],
+) -> str:
+    return _sha256_json(
+        {
+            "source_execution_group_id": source_group_id,
+            "parent_source_record_sha256": parent_source_record_sha256,
+            "leg_key": leg_key,
+            "raw_symbol": raw_symbol.strip().upper(),
+            "side": side.strip().upper(),
+            "quantity_ratio": quantity_ratio,
+            "contract_multiplier": contract_multiplier,
+            "contract_multiplier_basis": contract_multiplier_basis,
+            "contract_spec_source_record_sha256": (
+                contract_spec_source_record_sha256
+            ),
+        }
+    )
+
+
+def _openapi_contract_specs_by_symbol(
+    preview: OpenApiExportPreview,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for spec in getattr(preview, "contract_specs", ()):
+        key = _normalized_broker_symbol(str(spec.raw_symbol))
+        existing = result.get(key)
+        if (
+            existing is not None
+            and Decimal(existing.resolved_multiplier)
+            != Decimal(spec.resolved_multiplier)
+        ):
+            raise LedgerImportError(
+                f"OpenAPI contract specs conflict for {spec.raw_symbol}"
+            )
+        result[key] = spec
+    return result
+
+
 def _as_decimal(value: Any) -> Optional[Decimal]:
     return None if value is None else Decimal(value)
+
+
+def _fee_components_tuple(value: Optional[str]) -> tuple[tuple[str, Decimal], ...]:
+    if value is None:
+        return ()
+    try:
+        payload = json.loads(value)
+        if isinstance(payload, dict):
+            items = payload.items()
+        elif isinstance(payload, list):
+            items = payload
+        else:
+            raise TypeError
+        result = tuple(
+            sorted(
+                (str(name), Decimal(str(amount)))
+                for name, amount in items
+            )
+        )
+    except (TypeError, ValueError, ArithmeticError, json.JSONDecodeError) as exc:
+        raise LedgerImportError(
+            "stored fee_components_json is not a decimal mapping"
+        ) from exc
+    return result
+
+
+def _batch_environment(batch: ImportBatch) -> str:
+    try:
+        payload = json.loads(str(batch.provenance_json))
+    except (TypeError, json.JSONDecodeError):
+        return "unknown"
+    environment = str(payload.get("environment") or "unknown").strip()
+    return environment or "unknown"
 
 
 def _multiplier_instrument_key(value: Any) -> tuple[Any, ...]:
@@ -1016,7 +1221,14 @@ def _validate_openapi_cross_batch_conflicts(
 ) -> None:
     """Block stable broker identities that disagree on economic facts."""
     incoming_orders = {
-        order.source_order_id: order for order in preview.orders
+        order.source_order_id: order
+        for order in preview.orders
+        if not _is_execution_group_order(order)
+    }
+    incoming_groups = {
+        order.source_order_id: order
+        for order in preview.orders
+        if _is_execution_group_order(order)
     }
     existing_orders = session.execute(
         select(BrokerOrderObservation)
@@ -1028,6 +1240,11 @@ def _validate_openapi_cross_batch_conflicts(
         )
     ).scalars().all()
     for existing in existing_orders:
+        if str(existing.source_order_id) in incoming_groups:
+            raise LedgerImportError(
+                "OpenAPI broker identity changed from an ordinary order "
+                f"to an execution group: {existing.source_order_id}"
+            )
         incoming = incoming_orders.get(str(existing.source_order_id))
         if incoming is None:
             continue
@@ -1046,6 +1263,71 @@ def _validate_openapi_cross_batch_conflicts(
             raise LedgerImportError(
                 "OpenAPI order identity conflicts with previously accepted evidence: "
                 f"{incoming.source_order_id}"
+            )
+
+    existing_groups = session.execute(
+        select(BrokerExecutionGroupObservation)
+        .join(
+            ImportBatch,
+            ImportBatch.id
+            == BrokerExecutionGroupObservation.import_batch_id,
+        )
+        .where(
+            BrokerExecutionGroupObservation.broker == "moomoo",
+            BrokerExecutionGroupObservation.account_key == account_key,
+            ImportBatch.source_kind == "openapi",
+        )
+    ).scalars().all()
+    for existing in existing_groups:
+        source_group_id = str(existing.source_execution_group_id)
+        if source_group_id in incoming_orders:
+            raise LedgerImportError(
+                "OpenAPI broker identity changed from an execution group "
+                f"to an ordinary order: {source_group_id}"
+            )
+        incoming = incoming_groups.get(source_group_id)
+        if incoming is None:
+            continue
+        existing_legs = session.execute(
+            select(BrokerExecutionGroupLegObservation).where(
+                BrokerExecutionGroupLegObservation.execution_group_observation_id
+                == existing.id
+            )
+        ).scalars().all()
+        existing_definition = {
+            (
+                _normalized_broker_symbol(str(leg.raw_symbol)),
+                str(leg.side).strip().upper(),
+                Decimal(leg.quantity_ratio),
+            )
+            for leg in existing_legs
+        }
+        incoming_definition = {
+            (
+                _normalized_broker_symbol(str(leg.raw_symbol)),
+                str(leg.side).strip().upper(),
+                Decimal(leg.quantity_ratio),
+            )
+            for leg in incoming.combo_legs
+        }
+        conflicts = (
+            _normalized_broker_symbol(str(existing.raw_parent_symbol))
+            != _normalized_broker_symbol(incoming.raw_symbol)
+            or str(existing.strategy_type).strip().upper()
+            != str(incoming.strategy_type).strip().upper()
+            or str(existing.parent_side).strip().upper()
+            != str(incoming.side).strip().upper()
+            or Decimal(existing.group_order_quantity)
+            != incoming.order_quantity
+            or str(existing.currency).strip().upper()
+            != incoming.currency.strip().upper()
+            or not _same_timestamp(existing.ordered_at, incoming.ordered_at)
+            or existing_definition != incoming_definition
+        )
+        if conflicts:
+            raise LedgerImportError(
+                "OpenAPI execution-group identity conflicts with previously "
+                f"accepted evidence: {source_group_id}"
             )
 
     incoming_fills = {
@@ -1073,7 +1355,9 @@ def _validate_openapi_cross_batch_conflicts(
             )
 
     incoming_fees = {
-        fee.source_order_id: fee for fee in preview.fees
+        fee.source_order_id: fee
+        for fee in preview.fees
+        if fee.source_order_id in incoming_orders
     }
     existing_fees = session.execute(
         select(BrokerFeeObservation)
@@ -1094,6 +1378,38 @@ def _validate_openapi_cross_batch_conflicts(
             raise LedgerImportError(
                 "OpenAPI fee evidence conflicts with a previously accepted order: "
                 f"{incoming.source_order_id}"
+            )
+
+    incoming_group_fees = {
+        fee.source_order_id: fee
+        for fee in preview.fees
+        if fee.source_order_id in incoming_groups
+    }
+    existing_group_fees = session.execute(
+        select(BrokerExecutionGroupFeeObservation)
+        .join(
+            ImportBatch,
+            ImportBatch.id
+            == BrokerExecutionGroupFeeObservation.import_batch_id,
+        )
+        .where(
+            BrokerExecutionGroupFeeObservation.broker == "moomoo",
+            BrokerExecutionGroupFeeObservation.account_key == account_key,
+            ImportBatch.source_kind == "openapi",
+        )
+    ).scalars().all()
+    for existing in existing_group_fees:
+        incoming = incoming_group_fees.get(
+            str(existing.source_execution_group_id)
+        )
+        if (
+            incoming is not None
+            and str(existing.source_record_sha256)
+            != incoming.source_record_sha256
+        ):
+            raise LedgerImportError(
+                "OpenAPI fee evidence conflicts with a previously accepted "
+                f"execution group: {incoming.source_order_id}"
             )
 
 
@@ -1133,6 +1449,22 @@ def append_openapi_batch(
     if any(fee.total_fee < 0 for fee in preview.fees):
         raise LedgerImportError("OpenAPI total fee cannot be negative")
 
+    execution_group_orders = tuple(
+        order for order in preview.orders if _is_execution_group_order(order)
+    )
+    ordinary_orders = tuple(
+        order for order in preview.orders if not _is_execution_group_order(order)
+    )
+    execution_group_ids = {
+        order.source_order_id for order in execution_group_orders
+    }
+    ordinary_order_ids = {order.source_order_id for order in ordinary_orders}
+    if execution_group_ids & ordinary_order_ids:
+        raise LedgerImportError(
+            "OpenAPI order identity cannot be both ordinary and execution-group"
+        )
+    contract_specs_by_symbol = _openapi_contract_specs_by_symbol(preview)
+
     if _session is None:
         init_ledger_schema()
     storage_key = _storage_openapi_batch_key(preview, account_key)
@@ -1147,6 +1479,34 @@ def append_openapi_batch(
                 or str(existing.source_schema) != metadata.source_schema
             ):
                 raise LedgerImportError("OpenAPI batch key collides with another source")
+            existing_group_rows = session.execute(
+                select(BrokerExecutionGroupObservation).where(
+                    BrokerExecutionGroupObservation.import_batch_id
+                    == existing.id
+                )
+            ).scalars().all()
+            existing_group_legs = session.execute(
+                select(BrokerExecutionGroupLegObservation).where(
+                    BrokerExecutionGroupLegObservation.import_batch_id
+                    == existing.id
+                )
+            ).scalars().all()
+            existing_group_links = session.execute(
+                select(BrokerExecutionGroupFillLink).where(
+                    BrokerExecutionGroupFillLink.import_batch_id == existing.id
+                )
+            ).scalars().all()
+            existing_group_fees = session.execute(
+                select(BrokerExecutionGroupFeeObservation).where(
+                    BrokerExecutionGroupFeeObservation.import_batch_id
+                    == existing.id
+                )
+            ).scalars().all()
+            existing_order_fees = session.execute(
+                select(BrokerFeeObservation).where(
+                    BrokerFeeObservation.import_batch_id == existing.id
+                )
+            ).scalars().all()
             return LedgerOpenApiImportResult(
                 batch_id=int(existing.id),
                 batch_key=storage_key,
@@ -1154,13 +1514,13 @@ def append_openapi_batch(
                 analysis_level=str(existing.analysis_level),
                 order_observations=int(existing.order_observation_count),
                 fill_observations=int(existing.fill_observation_count),
-                fee_observations=len(
-                    session.execute(
-                        select(BrokerFeeObservation).where(
-                            BrokerFeeObservation.import_batch_id == existing.id
-                        )
-                    ).scalars().all()
+                fee_observations=(
+                    len(existing_order_fees) + len(existing_group_fees)
                 ),
+                execution_group_observations=len(existing_group_rows),
+                execution_group_leg_observations=len(existing_group_legs),
+                execution_group_fill_links=len(existing_group_links),
+                execution_group_fee_observations=len(existing_group_fees),
             )
 
         _validate_openapi_cross_batch_conflicts(session, preview, account_key)
@@ -1189,6 +1549,12 @@ def append_openapi_batch(
             completeness_json=_canonical_json(
                 {
                     "orders": len(preview.orders),
+                    "ordinary_orders": len(ordinary_orders),
+                    "execution_groups": len(execution_group_orders),
+                    "execution_group_legs": sum(
+                        len(order.combo_legs)
+                        for order in execution_group_orders
+                    ),
                     "fills": len(preview.fills),
                     "fees": len(preview.fees),
                     "rejected": metadata.rejected_record_count,
@@ -1209,6 +1575,7 @@ def append_openapi_batch(
                     "environment": metadata.environment,
                     "market": metadata.market,
                     "account_selection": metadata.account_selection,
+                    "account_binding": metadata.account_binding,
                     "journal_database_write_confirmed": True,
                     "source_path_retained": False,
                 }
@@ -1221,8 +1588,15 @@ def append_openapi_batch(
             fee.source_order_id: fee for fee in preview.fees
         }
         order_rows: dict[str, BrokerOrderObservation] = {}
-        for order in preview.orders:
+        for order in ordinary_orders:
             instrument = _openapi_instrument_fields(order.raw_symbol)
+            order_spec = contract_specs_by_symbol.get(
+                _normalized_broker_symbol(order.raw_symbol)
+            )
+            if order_spec is not None:
+                instrument["contract_multiplier"] = Decimal(
+                    order_spec.resolved_multiplier
+                )
             fee = fee_by_order.get(order.source_order_id)
             has_fills = order.summary_filled_quantity > 0
             order_row = BrokerOrderObservation(
@@ -1246,8 +1620,8 @@ def append_openapi_batch(
                 ordered_at=_to_utc(order.ordered_at),
                 order_quantity=order.order_quantity,
                 order_price=order.order_price,
-                # The read-only API does not expose notional or contract
-                # multiplier.  Keep this NULL instead of inventing an amount.
+                # The read-only API does not expose order notional.  Keep it
+                # NULL instead of deriving an amount from multiplier evidence.
                 order_amount=None,
                 summary_filled_quantity=order.summary_filled_quantity,
                 summary_average_fill_price=order.summary_average_fill_price,
@@ -1299,80 +1673,399 @@ def append_openapi_batch(
             session.flush()
             order_rows[order.source_order_id] = order_row
 
-        for fill in preview.fills:
-            parent = order_rows[fill.source_order_id]
-            instrument = _openapi_instrument_fields(fill.raw_symbol)
-            session.add(
-                BrokerFillObservation(
-                    import_batch_id=batch.id,
-                    broker_order_observation_id=parent.id,
-                    observation_key=_openapi_observation_key(
-                        "fill", fill.source_deal_id
+        execution_group_rows: dict[str, BrokerExecutionGroupObservation] = {}
+        execution_group_leg_rows: dict[
+            tuple[str, str, str], BrokerExecutionGroupLegObservation
+        ] = {}
+        for order in execution_group_orders:
+            fee = fee_by_order.get(order.source_order_id)
+            has_fills = order.summary_filled_quantity > 0
+            group_row = BrokerExecutionGroupObservation(
+                import_batch_id=batch.id,
+                observation_key=_openapi_observation_key(
+                    "execution_group", order.source_order_id
+                ),
+                broker="moomoo",
+                account_key=account_key,
+                source_execution_group_id=order.source_order_id,
+                identity_strength="broker_stable",
+                source_row_number=None,
+                source_updated_at=_to_utc(order.source_updated_at),
+                raw_strategy_type=order.strategy_type,
+                strategy_type=order.strategy_type.strip().upper(),
+                raw_parent_symbol=order.raw_symbol,
+                parent_side=order.side,
+                status=order.status,
+                order_type=order.order_type or None,
+                time_in_force=order.time_in_force or None,
+                session=order.session or None,
+                fill_outside_rth=order.fill_outside_rth,
+                currency=order.currency,
+                ordered_at=_to_utc(order.ordered_at),
+                group_order_quantity=order.order_quantity,
+                broker_reported_dealt_quantity=(
+                    order.summary_filled_quantity
+                ),
+                broker_reported_order_price=order.order_price,
+                broker_reported_net_average_price=(
+                    order.summary_average_fill_price
+                ),
+                parent_quantity_semantics=(
+                    "broker_combo_package_units_audit_only"
+                ),
+                parent_price_semantics="broker_net_price_audit_only",
+                evidence_level=(
+                    "execution_group_fill_detail"
+                    if has_fills
+                    else "not_filled"
+                ),
+                fee_evidence_status=(
+                    "complete"
+                    if fee is not None
+                    else ("missing" if has_fills else "not_applicable")
+                ),
+                evidence_json=_canonical_json(
+                    {
+                        "market": order.market,
+                        "stock_name": order.stock_name,
+                        "fill_outside_rth": order.fill_outside_rth,
+                        "combo_definition_available": (
+                            order.combo_definition_available
+                        ),
+                        "declared_leg_count": len(order.combo_legs),
+                        "broker_reported_dealt_quantity": (
+                            order.summary_filled_quantity
+                        ),
+                        "broker_reported_net_average_price": (
+                            order.summary_average_fill_price
+                        ),
+                    }
+                ),
+                completeness_score=Decimal("1"),
+                completeness_json=_canonical_json(
+                    {
+                        "group_identity": "broker_stable",
+                        "parent_quantity": "broker_package_audit_only",
+                        "parent_price": "broker_net_audit_only",
+                        "leg_definition": "broker_declared",
+                        "fill_evidence": (
+                            "broker_deal_detail"
+                            if has_fills
+                            else "not_applicable"
+                        ),
+                        "fee_evidence": (
+                            "broker_execution_group_fee"
+                            if fee is not None
+                            else ("missing" if has_fills else "not_applicable")
+                        ),
+                    }
+                ),
+                provenance_json=_canonical_json(
+                    {
+                        "batch_key": storage_key,
+                        "parser_batch_key": metadata.batch_key,
+                        "source": "moomoo_openapi_readonly",
+                        "identity_basis": "broker_combo_order_id",
+                        "parent_economics_used_for_positions": False,
+                    }
+                ),
+                source_record_sha256=order.source_record_sha256,
+                raw_payload_json=None,
+            )
+            session.add(group_row)
+            session.flush()
+            execution_group_rows[order.source_order_id] = group_row
+
+            for leg_index, leg in enumerate(order.combo_legs):
+                instrument = _openapi_instrument_fields(leg.raw_symbol)
+                spec = contract_specs_by_symbol.get(
+                    _normalized_broker_symbol(leg.raw_symbol)
+                )
+                contract_multiplier = (
+                    None
+                    if spec is None
+                    else Decimal(spec.resolved_multiplier)
+                )
+                contract_multiplier_basis = (
+                    "unknown" if spec is None else "broker_stated"
+                )
+                instrument["contract_multiplier"] = contract_multiplier
+                leg_key = _execution_group_leg_key(
+                    order.source_order_id,
+                    leg.raw_symbol,
+                    leg.side,
+                    leg.quantity_ratio,
+                )
+                leg_source_sha256 = _execution_group_leg_source_sha256(
+                    source_group_id=order.source_order_id,
+                    parent_source_record_sha256=order.source_record_sha256,
+                    leg_key=leg_key,
+                    raw_symbol=leg.raw_symbol,
+                    side=leg.side,
+                    quantity_ratio=leg.quantity_ratio,
+                    contract_multiplier=contract_multiplier,
+                    contract_multiplier_basis=contract_multiplier_basis,
+                    contract_spec_source_record_sha256=(
+                        None
+                        if spec is None
+                        else str(spec.source_record_sha256)
                     ),
+                )
+                leg_row = BrokerExecutionGroupLegObservation(
+                    import_batch_id=batch.id,
+                    execution_group_observation_id=group_row.id,
+                    observation_key=leg_key,
+                    leg_key=leg_key,
                     broker="moomoo",
                     account_key=account_key,
-                    source_order_id=fill.source_order_id,
-                    source_deal_id=fill.source_deal_id,
-                    identity_strength="broker_stable",
-                    source_row_number=None,
+                    source_execution_group_id=order.source_order_id,
+                    leg_index=leg_index,
                     **instrument,
-                    side=fill.side,
-                    activity_kind="trade_fill",
-                    source_status=fill.source_status,
-                    filled_at=_to_utc(fill.filled_at),
-                    quantity=fill.quantity,
-                    price=fill.price,
-                    # The export does not provide an execution notional or a
-                    # contract multiplier; do not manufacture one here.
-                    amount=None,
-                    currency=fill.currency,
-                    total_fee=None,
-                    fee_components_json=None,
-                    fee_allocation_method=None,
-                    evidence_level="broker_fill_detail",
+                    contract_multiplier_basis=contract_multiplier_basis,
+                    side=leg.side,
+                    quantity_ratio=leg.quantity_ratio,
+                    currency=order.currency,
                     evidence_json=_canonical_json(
                         {
-                            "market": fill.market,
-                            "stock_name": fill.stock_name,
-                            "source_time_semantics": "broker_deal_create_time",
+                            "parent_source_record_sha256": (
+                                order.source_record_sha256
+                            ),
+                            "contract_spec_source_record_sha256": (
+                                None
+                                if spec is None
+                                else spec.source_record_sha256
+                            ),
                         }
                     ),
                     completeness_score=Decimal("1"),
                     completeness_json=_canonical_json(
                         {
-                            "identity": "broker_deal_id",
-                            "quantity": "exact",
-                            "price": "exact",
-                            "time": "broker_deal_create_time",
-                            "fee": "order_level_only",
+                            "leg_definition": "broker_declared",
+                            "contract_multiplier": contract_multiplier_basis,
                         }
                     ),
                     provenance_json=_canonical_json(
                         {
                             "batch_key": storage_key,
                             "parser_batch_key": metadata.batch_key,
-                            "source": "moomoo_openapi_readonly",
-                            "identity_basis": "broker_deal_id",
+                            "source": "moomoo_openapi_combo_leg",
+                            "identity_basis": (
+                                "parent_id_symbol_side_ratio"
+                            ),
                         }
                     ),
-                    source_record_sha256=fill.source_record_sha256,
-                    raw_payload_json=None,
+                    source_record_sha256=leg_source_sha256,
+                )
+                session.add(leg_row)
+                session.flush()
+                execution_group_leg_rows[
+                    (
+                        order.source_order_id,
+                        _normalized_broker_symbol(leg.raw_symbol),
+                        leg.side.strip().upper(),
+                    )
+                ] = leg_row
+
+        group_fill_link_count = 0
+        for fill in preview.fills:
+            ordinary_parent = order_rows.get(fill.source_order_id)
+            group_parent = execution_group_rows.get(fill.source_order_id)
+            if (ordinary_parent is None) == (group_parent is None):
+                raise LedgerImportError(
+                    "OpenAPI fill must resolve to exactly one ordinary order "
+                    f"or execution group: {fill.source_deal_id}"
+                )
+            instrument = _openapi_instrument_fields(fill.raw_symbol)
+            fill_spec = contract_specs_by_symbol.get(
+                _normalized_broker_symbol(fill.raw_symbol)
+            )
+            if fill_spec is not None:
+                instrument["contract_multiplier"] = Decimal(
+                    fill_spec.resolved_multiplier
+                )
+            fill_row = BrokerFillObservation(
+                import_batch_id=batch.id,
+                broker_order_observation_id=(
+                    None if ordinary_parent is None else ordinary_parent.id
+                ),
+                observation_key=_openapi_observation_key(
+                    "fill", fill.source_deal_id
+                ),
+                broker="moomoo",
+                account_key=account_key,
+                source_order_id=fill.source_order_id,
+                source_deal_id=fill.source_deal_id,
+                identity_strength="broker_stable",
+                source_row_number=None,
+                **instrument,
+                side=fill.side,
+                activity_kind="trade_fill",
+                source_status=fill.source_status,
+                filled_at=_to_utc(fill.filled_at),
+                quantity=fill.quantity,
+                price=fill.price,
+                # Group and order fee facts are never allocated onto a fill.
+                amount=None,
+                currency=fill.currency,
+                total_fee=None,
+                fee_components_json=None,
+                fee_allocation_method=None,
+                evidence_level="broker_fill_detail",
+                evidence_json=_canonical_json(
+                    {
+                        "market": fill.market,
+                        "stock_name": fill.stock_name,
+                        "source_time_semantics": "broker_deal_create_time",
+                        "execution_scope": (
+                            "execution_group"
+                            if group_parent is not None
+                            else "ordinary_order"
+                        ),
+                    }
+                ),
+                completeness_score=Decimal("1"),
+                completeness_json=_canonical_json(
+                    {
+                        "identity": "broker_deal_id",
+                        "quantity": "exact",
+                        "price": "exact",
+                        "time": "broker_deal_create_time",
+                        "fee": (
+                            "execution_group_only"
+                            if group_parent is not None
+                            else "order_level_only"
+                        ),
+                    }
+                ),
+                provenance_json=_canonical_json(
+                    {
+                        "batch_key": storage_key,
+                        "parser_batch_key": metadata.batch_key,
+                        "source": "moomoo_openapi_readonly",
+                        "identity_basis": "broker_deal_id",
+                    }
+                ),
+                source_record_sha256=fill.source_record_sha256,
+                raw_payload_json=None,
+            )
+            session.add(fill_row)
+            session.flush()
+
+            if group_parent is None:
+                continue
+            leg_row = execution_group_leg_rows.get(
+                (
+                    fill.source_order_id,
+                    _normalized_broker_symbol(fill.raw_symbol),
+                    fill.side.strip().upper(),
                 )
             )
+            if leg_row is None:
+                raise LedgerImportError(
+                    "OpenAPI execution-group fill does not match one declared "
+                    f"leg: {fill.source_deal_id}"
+                )
+            link_key = _execution_group_fill_link_key(
+                fill.source_order_id,
+                fill.source_deal_id,
+                str(leg_row.leg_key),
+            )
+            link_sha256 = _execution_group_fill_link_source_sha256(
+                fill.source_order_id,
+                fill.source_deal_id,
+                str(leg_row.leg_key),
+            )
+            session.add(
+                BrokerExecutionGroupFillLink(
+                    import_batch_id=batch.id,
+                    execution_group_observation_id=group_parent.id,
+                    execution_group_leg_observation_id=leg_row.id,
+                    broker_fill_observation_id=fill_row.id,
+                    link_key=link_key,
+                    broker="moomoo",
+                    account_key=account_key,
+                    source_execution_group_id=fill.source_order_id,
+                    source_deal_id=fill.source_deal_id,
+                    link_method=(
+                        "broker_parent_id_and_declared_leg_identity"
+                    ),
+                    identity_strength="broker_stable",
+                    evidence_json=_canonical_json(
+                        {
+                            "source_record_sha256": link_sha256,
+                            "fill_source_record_sha256": (
+                                fill.source_record_sha256
+                            ),
+                            "execution_group_leg_key": leg_row.leg_key,
+                        }
+                    ),
+                    provenance_json=_canonical_json(
+                        {
+                            "batch_key": storage_key,
+                            "parser_batch_key": metadata.batch_key,
+                            "source": "moomoo_openapi_combo_fill_binding",
+                            "link_is_fee_allocation": False,
+                        }
+                    ),
+                )
+            )
+            group_fill_link_count += 1
 
         for fee in preview.fees:
-            parent = order_rows[fee.source_order_id]
+            ordinary_parent = order_rows.get(fee.source_order_id)
+            group_parent = execution_group_rows.get(fee.source_order_id)
+            if (ordinary_parent is None) == (group_parent is None):
+                raise LedgerImportError(
+                    "OpenAPI fee must resolve to exactly one ordinary order "
+                    f"or execution group: {fee.source_order_id}"
+                )
+            if group_parent is not None:
+                session.add(
+                    BrokerExecutionGroupFeeObservation(
+                        import_batch_id=batch.id,
+                        execution_group_observation_id=group_parent.id,
+                        observation_key=_openapi_observation_key(
+                            "execution_group_fee", fee.source_order_id
+                        ),
+                        broker="moomoo",
+                        account_key=account_key,
+                        source_execution_group_id=fee.source_order_id,
+                        currency=str(group_parent.currency),
+                        total_fee=fee.total_fee,
+                        fee_components_json=_canonical_json(
+                            dict(fee.fee_components)
+                        ),
+                        evidence_json=_canonical_json(
+                            {
+                                "component_count": len(fee.fee_components),
+                                "fee_scope": "execution_group",
+                            }
+                        ),
+                        provenance_json=_canonical_json(
+                            {
+                                "batch_key": storage_key,
+                                "parser_batch_key": metadata.batch_key,
+                                "source": "moomoo_openapi_order_fee_query",
+                                "identity_basis": "broker_combo_order_id",
+                                "allocation_to_legs_or_fills": False,
+                            }
+                        ),
+                        source_record_sha256=fee.source_record_sha256,
+                    )
+                )
+                continue
+            assert ordinary_parent is not None
             session.add(
                 BrokerFeeObservation(
                     import_batch_id=batch.id,
-                    broker_order_observation_id=parent.id,
+                    broker_order_observation_id=ordinary_parent.id,
                     observation_key=_openapi_observation_key(
                         "fee", fee.source_order_id
                     ),
                     broker="moomoo",
                     account_key=account_key,
                     source_order_id=fee.source_order_id,
-                    currency=str(parent.currency),
+                    currency=str(ordinary_parent.currency),
                     total_fee=fee.total_fee,
                     fee_components_json=_canonical_json(
                         dict(fee.fee_components)
@@ -1400,6 +2093,15 @@ def append_openapi_batch(
             order_observations=len(preview.orders),
             fill_observations=len(preview.fills),
             fee_observations=len(preview.fees),
+            execution_group_observations=len(execution_group_orders),
+            execution_group_leg_observations=sum(
+                len(order.combo_legs) for order in execution_group_orders
+            ),
+            execution_group_fill_links=group_fill_link_count,
+            execution_group_fee_observations=sum(
+                fee.source_order_id in execution_group_ids
+                for fee in preview.fees
+            ),
         )
 
 
@@ -1958,6 +2660,8 @@ def load_canonical_observation_inputs(
     reader's alias and shadowing fields.
     """
     from src.journal.ledger.canonical import (
+        ExecutionGroupLegObservationInput,
+        ExecutionGroupObservationInput,
         FillObservationInput,
         OrderObservationInput,
     )
@@ -2036,6 +2740,44 @@ def load_canonical_observation_inputs(
             ).scalars().all()
             if int(row.import_batch_id) in batch_by_id
         ]
+        execution_group_rows = [
+            row
+            for row in session.execute(
+                select(BrokerExecutionGroupObservation).where(
+                    BrokerExecutionGroupObservation.account_key == account_key
+                )
+            ).scalars().all()
+            if int(row.import_batch_id) in batch_by_id
+        ]
+        execution_group_leg_rows = [
+            row
+            for row in session.execute(
+                select(BrokerExecutionGroupLegObservation).where(
+                    BrokerExecutionGroupLegObservation.account_key
+                    == account_key
+                )
+            ).scalars().all()
+            if int(row.import_batch_id) in batch_by_id
+        ]
+        execution_group_fee_rows = [
+            row
+            for row in session.execute(
+                select(BrokerExecutionGroupFeeObservation).where(
+                    BrokerExecutionGroupFeeObservation.account_key
+                    == account_key
+                )
+            ).scalars().all()
+            if int(row.import_batch_id) in batch_by_id
+        ]
+        execution_group_fill_links = [
+            row
+            for row in session.execute(
+                select(BrokerExecutionGroupFillLink).where(
+                    BrokerExecutionGroupFillLink.account_key == account_key
+                )
+            ).scalars().all()
+            if int(row.import_batch_id) in batch_by_id
+        ]
         multiplier_by_instrument = _evidence_multiplier_map(
             order_rows,
             fill_rows,
@@ -2044,7 +2786,8 @@ def load_canonical_observation_inputs(
         def _multiplier_fields(row: Any) -> tuple[Optional[Decimal], str]:
             broker_value = _as_decimal(row.contract_multiplier)
             if broker_value is not None:
-                return broker_value, "broker_stated"
+                basis = getattr(row, "contract_multiplier_basis", None)
+                return broker_value, str(basis or "broker_stated")
             derived = multiplier_by_instrument.get(
                 _multiplier_instrument_key(row)
             )
@@ -2054,6 +2797,79 @@ def load_canonical_observation_inputs(
 
         selected_fill_ids = {int(row.id) for row in fill_rows}
         selected_order_ids = {int(row.id) for row in order_rows}
+        fill_by_id = {int(row.id): row for row in fill_rows}
+        execution_group_by_id = {
+            int(row.id): row for row in execution_group_rows
+        }
+        execution_group_leg_by_id = {
+            int(row.id): row for row in execution_group_leg_rows
+        }
+        execution_group_legs_by_parent: dict[
+            int, list[BrokerExecutionGroupLegObservation]
+        ] = {}
+        for leg in execution_group_leg_rows:
+            parent = execution_group_by_id.get(
+                int(leg.execution_group_observation_id)
+            )
+            if (
+                parent is None
+                or int(parent.import_batch_id) != int(leg.import_batch_id)
+                or str(parent.source_execution_group_id)
+                != str(leg.source_execution_group_id)
+            ):
+                raise LedgerImportError(
+                    "stored execution-group leg does not bind to its parent"
+                )
+            execution_group_legs_by_parent.setdefault(
+                int(parent.id), []
+            ).append(leg)
+        execution_group_fee_by_parent: dict[
+            int, BrokerExecutionGroupFeeObservation
+        ] = {}
+        for fee in execution_group_fee_rows:
+            parent = execution_group_by_id.get(
+                int(fee.execution_group_observation_id)
+            )
+            if (
+                parent is None
+                or int(parent.import_batch_id) != int(fee.import_batch_id)
+                or str(parent.source_execution_group_id)
+                != str(fee.source_execution_group_id)
+            ):
+                raise LedgerImportError(
+                    "stored execution-group fee does not bind to its parent"
+                )
+            execution_group_fee_by_parent[int(parent.id)] = fee
+        execution_group_fill_link_by_fill: dict[
+            int, BrokerExecutionGroupFillLink
+        ] = {}
+        for group_link in execution_group_fill_links:
+            group = execution_group_by_id.get(
+                int(group_link.execution_group_observation_id)
+            )
+            leg = execution_group_leg_by_id.get(
+                int(group_link.execution_group_leg_observation_id)
+            )
+            linked_fill_id = int(group_link.broker_fill_observation_id)
+            linked_fill = fill_by_id.get(linked_fill_id)
+            if (
+                group is None
+                or leg is None
+                or linked_fill is None
+                or int(leg.execution_group_observation_id) != int(group.id)
+                or int(group_link.import_batch_id) != int(group.import_batch_id)
+                or int(group_link.import_batch_id) != int(leg.import_batch_id)
+                or int(group_link.import_batch_id)
+                != int(linked_fill.import_batch_id)
+                or str(group_link.source_execution_group_id)
+                != str(group.source_execution_group_id)
+                or str(group_link.source_deal_id)
+                != str(linked_fill.source_deal_id)
+            ):
+                raise LedgerImportError(
+                    "stored execution-group fill link is internally inconsistent"
+                )
+            execution_group_fill_link_by_fill[linked_fill_id] = group_link
         links = [
             row
             for row in session.execute(
@@ -2157,6 +2973,13 @@ def load_canonical_observation_inputs(
                 )
             )
 
+        execution_group_source_keys = {
+            (
+                int(group_row.import_batch_id),
+                str(group_row.source_execution_group_id),
+            )
+            for group_row in execution_group_rows
+        }
         fills = []
         for row in fill_rows:
             batch = batch_by_id[int(row.import_batch_id)]
@@ -2169,6 +2992,19 @@ def load_canonical_observation_inputs(
                 int(row.broker_order_observation_id or 0)
             )
             deal_link = deal_link_by_observation.get(int(row.id))
+            group_link = execution_group_fill_link_by_fill.get(int(row.id))
+            if (
+                group_link is None
+                and row.broker_order_observation_id is None
+                and (
+                    int(row.import_batch_id),
+                    str(row.source_order_id),
+                )
+                in execution_group_source_keys
+            ):
+                raise LedgerImportError(
+                    "execution-group fill is missing its immutable leg link"
+                )
             canonical_deal_id = (
                 None if deal_link is None else str(deal_link.canonical_deal_id)
             )
@@ -2180,6 +3016,40 @@ def load_canonical_observation_inputs(
             else:
                 role_name = "ordinary"
                 attestation_key = None
+            execution_group_id = None
+            execution_group_leg_key = None
+            execution_group_fill_link_id = None
+            execution_group_fill_link_key = None
+            execution_group_fill_link_sha256 = None
+            if group_link is not None:
+                if (
+                    deal_link is not None
+                    or role is not None
+                    or canonical_order_id is not None
+                    or row.total_fee is not None
+                    or row.fee_components_json is not None
+                    or row.fee_allocation_method is not None
+                ):
+                    raise LedgerImportError(
+                        "execution-group fill carries an ordinary order link "
+                        "or allocated fee"
+                    )
+                group_leg = execution_group_leg_by_id[
+                    int(group_link.execution_group_leg_observation_id)
+                ]
+                execution_group_id = str(
+                    group_link.source_execution_group_id
+                )
+                execution_group_leg_key = str(group_leg.leg_key)
+                execution_group_fill_link_id = int(group_link.id)
+                execution_group_fill_link_key = str(group_link.link_key)
+                execution_group_fill_link_sha256 = (
+                    _execution_group_fill_link_source_sha256(
+                        execution_group_id,
+                        str(group_link.source_deal_id),
+                        execution_group_leg_key,
+                    )
+                )
             identity_strength = str(row.identity_strength)
             if (
                 csv_baseline is not None
@@ -2234,6 +3104,147 @@ def load_canonical_observation_inputs(
                     canonical_deal_id=canonical_deal_id,
                     fill_set_role=role_name,
                     fill_set_attestation_key=attestation_key,
+                    execution_group_id=execution_group_id,
+                    execution_group_leg_key=execution_group_leg_key,
+                    execution_group_fill_link_id=(
+                        execution_group_fill_link_id
+                    ),
+                    execution_group_fill_link_key=(
+                        execution_group_fill_link_key
+                    ),
+                    execution_group_fill_link_sha256=(
+                        execution_group_fill_link_sha256
+                    ),
+                )
+            )
+
+        execution_groups = []
+        for group_row in execution_group_rows:
+            batch = batch_by_id[int(group_row.import_batch_id)]
+            ordered_at = _utc_from_database(group_row.ordered_at)
+            source_updated_at = _utc_from_database(
+                group_row.source_updated_at
+            )
+            recorded_at = _utc_from_database(group_row.recorded_at)
+            if (
+                ordered_at is None
+                or source_updated_at is None
+                or recorded_at is None
+            ):
+                raise LedgerImportError(
+                    "execution-group timestamps are incomplete"
+                )
+            leg_inputs = []
+            for leg_row in sorted(
+                execution_group_legs_by_parent.get(int(group_row.id), ()),
+                key=lambda item: (int(item.leg_index), str(item.leg_key)),
+            ):
+                leg_recorded_at = _utc_from_database(leg_row.recorded_at)
+                if leg_recorded_at is None:
+                    raise LedgerImportError(
+                        "execution-group leg recorded_at is missing"
+                    )
+                leg_inputs.append(
+                    ExecutionGroupLegObservationInput(
+                        observation_id=int(leg_row.id),
+                        import_batch_id=int(leg_row.import_batch_id),
+                        batch_key=str(batch.batch_key),
+                        source_kind=str(batch.source_kind),
+                        observation_key=str(leg_row.observation_key),
+                        source_record_sha256=str(
+                            leg_row.source_record_sha256
+                        ),
+                        broker=str(leg_row.broker),
+                        account_key=str(leg_row.account_key),
+                        group_observation_id=int(group_row.id),
+                        leg_key=str(leg_row.leg_key),
+                        raw_symbol=str(leg_row.raw_symbol),
+                        asset_type=str(leg_row.asset_type),
+                        underlying=str(leg_row.underlying),
+                        side=str(leg_row.side),
+                        currency=str(leg_row.currency),
+                        quantity_ratio=Decimal(leg_row.quantity_ratio),
+                        recorded_at=leg_recorded_at,
+                        expiry=leg_row.expiry,
+                        strike=_as_decimal(leg_row.strike),
+                        option_right=(
+                            None
+                            if leg_row.option_right is None
+                            else str(leg_row.option_right)
+                        ),
+                        contract_multiplier=_as_decimal(
+                            leg_row.contract_multiplier
+                        ),
+                        contract_multiplier_basis=str(
+                            leg_row.contract_multiplier_basis
+                        ),
+                        source_row_number=None,
+                        source_updated_at=source_updated_at,
+                    )
+                )
+            fee_row = execution_group_fee_by_parent.get(int(group_row.id))
+            total_fee = None if fee_row is None else Decimal(fee_row.total_fee)
+            fee_components = (
+                ()
+                if fee_row is None
+                else _fee_components_tuple(str(fee_row.fee_components_json))
+            )
+            execution_groups.append(
+                ExecutionGroupObservationInput(
+                    observation_id=int(group_row.id),
+                    import_batch_id=int(group_row.import_batch_id),
+                    batch_key=str(batch.batch_key),
+                    source_kind=str(batch.source_kind),
+                    observation_key=str(group_row.observation_key),
+                    source_record_sha256=str(
+                        group_row.source_record_sha256
+                    ),
+                    broker=str(group_row.broker),
+                    account_key=str(group_row.account_key),
+                    source_group_id=str(
+                        group_row.source_execution_group_id
+                    ),
+                    identity_strength=str(group_row.identity_strength),
+                    environment=_batch_environment(batch),
+                    raw_group_symbol=str(group_row.raw_parent_symbol),
+                    group_side=str(group_row.parent_side),
+                    strategy_type=str(group_row.strategy_type),
+                    status=str(group_row.status),
+                    currency=str(group_row.currency),
+                    ordered_at=ordered_at,
+                    source_updated_at=source_updated_at,
+                    package_quantity=Decimal(
+                        group_row.group_order_quantity
+                    ),
+                    filled_package_quantity=Decimal(
+                        group_row.broker_reported_dealt_quantity
+                    ),
+                    order_net_price=_as_decimal(
+                        group_row.broker_reported_order_price
+                    ),
+                    average_net_price=_as_decimal(
+                        group_row.broker_reported_net_average_price
+                    ),
+                    total_fee=total_fee,
+                    fee_evidence_status=str(
+                        group_row.fee_evidence_status
+                    ),
+                    recorded_at=recorded_at,
+                    legs=tuple(leg_inputs),
+                    fee_components=fee_components,
+                    fee_observation_id=(
+                        None if fee_row is None else int(fee_row.id)
+                    ),
+                    fee_observation_key=(
+                        None
+                        if fee_row is None
+                        else str(fee_row.observation_key)
+                    ),
+                    fee_source_record_sha256=(
+                        None
+                        if fee_row is None
+                        else str(fee_row.source_record_sha256)
+                    ),
                 )
             )
 
@@ -2244,6 +3255,7 @@ def load_canonical_observation_inputs(
             csv_baseline_batch_id=(
                 None if csv_baseline is None else int(csv_baseline.id)
             ),
+            execution_groups=tuple(execution_groups),
         )
 
 
@@ -2253,6 +3265,10 @@ def _canonical_set_payload(evidence_set: Any) -> dict[str, Any]:
         "provenance": evidence_set.provenance.canonical_payload(),
         "orders": [item.canonical_payload() for item in evidence_set.orders],
         "fills": [item.canonical_payload() for item in evidence_set.fills],
+        "execution_groups": [
+            item.canonical_payload()
+            for item in getattr(evidence_set, "execution_groups", ())
+        ],
         "issues": [item.canonical_payload() for item in evidence_set.issues],
     }
 
@@ -2311,6 +3327,18 @@ def append_canonical_evidence_set(
             )
         ).scalar_one_or_none()
         if existing is not None:
+            existing_groups = session.execute(
+                select(CanonicalExecutionGroupMemberRecord).where(
+                    CanonicalExecutionGroupMemberRecord.canonical_set_id
+                    == existing.id
+                )
+            ).scalars().all()
+            existing_group_legs = session.execute(
+                select(CanonicalExecutionGroupLegRecord).where(
+                    CanonicalExecutionGroupLegRecord.canonical_set_id
+                    == existing.id
+                )
+            ).scalars().all()
             return CanonicalSetPersistenceResult(
                 canonical_set_id=int(existing.id),
                 set_key=set_key,
@@ -2318,6 +3346,8 @@ def append_canonical_evidence_set(
                 duplicate=True,
                 analysis_ready=bool(existing.analysis_ready),
                 issue_count=int(existing.blocking_issue_count),
+                execution_group_count=len(existing_groups),
+                execution_group_leg_count=len(existing_group_legs),
             )
 
         batches = {
@@ -2340,22 +3370,80 @@ def append_canonical_evidence_set(
         observation_rows: dict[tuple[str, int], Any] = {}
         for ref in evidence_set.evidence_refs:
             if ref.evidence_kind == "order":
-                row = session.get(BrokerOrderObservation, ref.observation_id)
+                source_row = session.get(
+                    BrokerOrderObservation, ref.observation_id
+                )
             elif ref.evidence_kind == "fill":
-                row = session.get(BrokerFillObservation, ref.observation_id)
+                source_row = session.get(
+                    BrokerFillObservation, ref.observation_id
+                )
+            elif ref.evidence_kind == "execution_group":
+                source_row = session.get(
+                    BrokerExecutionGroupObservation,
+                    ref.observation_id,
+                )
+            elif ref.evidence_kind == "execution_group_leg":
+                source_row = session.get(
+                    BrokerExecutionGroupLegObservation,
+                    ref.observation_id,
+                )
+            elif ref.evidence_kind == "execution_group_fill_link":
+                source_row = session.get(
+                    BrokerExecutionGroupFillLink,
+                    ref.observation_id,
+                )
+            elif ref.evidence_kind == "execution_group_fee":
+                source_row = session.get(
+                    BrokerExecutionGroupFeeObservation,
+                    ref.observation_id,
+                )
             else:
                 raise LedgerImportError("canonical evidence kind is unsupported")
+            if ref.evidence_kind == "execution_group_fill_link":
+                source_leg = (
+                    None
+                    if source_row is None
+                    else session.get(
+                        BrokerExecutionGroupLegObservation,
+                        source_row.execution_group_leg_observation_id,
+                    )
+                )
+                source_observation_key = (
+                    None if source_row is None else str(source_row.link_key)
+                )
+                source_record_sha256 = (
+                    None
+                    if source_row is None or source_leg is None
+                    else _execution_group_fill_link_source_sha256(
+                        str(source_row.source_execution_group_id),
+                        str(source_row.source_deal_id),
+                        str(source_leg.leg_key),
+                    )
+                )
+            else:
+                source_observation_key = (
+                    None
+                    if source_row is None
+                    else str(source_row.observation_key)
+                )
+                source_record_sha256 = (
+                    None
+                    if source_row is None
+                    else str(source_row.source_record_sha256)
+                )
             if (
-                row is None
-                or int(row.import_batch_id) != int(ref.import_batch_id)
-                or str(row.observation_key) != ref.observation_key
-                or str(row.source_record_sha256) != ref.source_record_sha256
-                or str(row.account_key) != account_key
+                source_row is None
+                or int(source_row.import_batch_id) != int(ref.import_batch_id)
+                or source_observation_key != ref.observation_key
+                or source_record_sha256 != ref.source_record_sha256
+                or str(source_row.account_key) != account_key
             ):
                 raise LedgerImportError(
                     "canonical provenance does not bind to the stored observation"
                 )
-            observation_rows[(ref.evidence_kind, ref.observation_id)] = row
+            observation_rows[
+                (ref.evidence_kind, ref.observation_id)
+            ] = source_row
 
         payload = _canonical_set_payload(evidence_set)
         row = CanonicalEvidenceSetRecord(
@@ -2381,6 +3469,9 @@ def append_canonical_evidence_set(
         session.add(row)
         session.flush()
 
+        canonical_evidence_member_rows: dict[
+            tuple[str, tuple[Any, ...]], CanonicalEvidenceMemberRecord
+        ] = {}
         for entity_kind, members in (
             ("order", evidence_set.orders),
             ("fill", evidence_set.fills),
@@ -2403,30 +3494,359 @@ def append_canonical_evidence_set(
                         "canonical_payload": member_payload,
                     }
                 )
-                session.add(
-                    CanonicalEvidenceMemberRecord(
-                        canonical_set_id=row.id,
-                        member_key=member_key,
-                        entity_kind=entity_kind,
-                        identity_key=identity_key,
-                        selected_order_observation_id=(
-                            int(selected_row.id) if entity_kind == "order" else None
-                        ),
-                        selected_fill_observation_id=(
-                            int(selected_row.id) if entity_kind == "fill" else None
-                        ),
-                        canonical_payload_json=_canonical_json(member_payload),
-                        provenance_json=_canonical_json(
-                            {
-                                "selected_ref": selected.canonical_payload(),
-                                "evidence_refs": [
-                                    ref.canonical_payload()
-                                    for ref in member.evidence_refs
-                                ],
-                            }
-                        ),
+                member_row = CanonicalEvidenceMemberRecord(
+                    canonical_set_id=row.id,
+                    member_key=member_key,
+                    entity_kind=entity_kind,
+                    identity_key=identity_key,
+                    selected_order_observation_id=(
+                        int(selected_row.id)
+                        if entity_kind == "order"
+                        else None
+                    ),
+                    selected_fill_observation_id=(
+                        int(selected_row.id)
+                        if entity_kind == "fill"
+                        else None
+                    ),
+                    canonical_payload_json=_canonical_json(member_payload),
+                    provenance_json=_canonical_json(
+                        {
+                            "selected_ref": selected.canonical_payload(),
+                            "evidence_refs": [
+                                ref.canonical_payload()
+                                for ref in member.evidence_refs
+                            ],
+                        }
+                    ),
+                )
+                session.add(member_row)
+                canonical_evidence_member_rows[
+                    (entity_kind, tuple(member.identity))
+                ] = member_row
+        session.flush()
+
+        execution_groups = tuple(
+            getattr(evidence_set, "execution_groups", ())
+        )
+        canonical_group_member_rows: dict[
+            tuple[Any, ...], CanonicalExecutionGroupMemberRecord
+        ] = {}
+        canonical_group_leg_rows: dict[
+            tuple[tuple[Any, ...], str], CanonicalExecutionGroupLegRecord
+        ] = {}
+        for group in execution_groups:
+            selected = group.selected_ref
+            selected_row = observation_rows.get(
+                ("execution_group", selected.observation_id)
+            )
+            if not isinstance(selected_row, BrokerExecutionGroupObservation):
+                raise LedgerImportError(
+                    "canonical execution group has no selected raw parent"
+                )
+            group_payload = group.canonical_payload()
+            identity = tuple(group.identity)
+            identity_key = "/".join(str(value) for value in identity)
+            member_key = _sha256_json(
+                {
+                    "entity_kind": "execution_group",
+                    "identity": identity,
+                    "canonical_payload": group_payload,
+                }
+            )
+            proved_group_quantity = _as_decimal(
+                getattr(group, "proved_executed_group_quantity", None)
+            )
+            fee_components = tuple(
+                getattr(group, "fee_components", ())
+            )
+            if group.total_fee is None and fee_components:
+                raise LedgerImportError(
+                    "canonical group fee components require a group total"
+                )
+            group_member_row = CanonicalExecutionGroupMemberRecord(
+                canonical_set_id=row.id,
+                member_key=member_key,
+                identity_key=identity_key,
+                canonical_execution_group_id=str(group.source_group_id),
+                selected_execution_group_observation_id=int(
+                    selected_row.id
+                ),
+                strategy_type=str(group.strategy_type),
+                status=str(group.status),
+                currency=str(group.currency),
+                group_order_quantity=group.package_quantity,
+                broker_reported_dealt_quantity=(
+                    group.broker_reported_filled_package_quantity
+                ),
+                broker_reported_order_price=(
+                    group.broker_reported_order_net_price
+                ),
+                broker_reported_net_average_price=(
+                    group.broker_reported_average_net_price
+                ),
+                proved_executed_group_quantity=proved_group_quantity,
+                parent_quantity_semantics=str(
+                    selected_row.parent_quantity_semantics
+                ),
+                parent_price_semantics=str(
+                    selected_row.parent_price_semantics
+                ),
+                group_total_fee=group.total_fee,
+                group_fee_components_json=(
+                    None
+                    if group.total_fee is None
+                    else _canonical_json(dict(fee_components))
+                ),
+                fee_evidence_status=str(group.fee_evidence_status),
+                fee_scope_policy="execution_group_only_no_allocation",
+                canonical_payload_json=_canonical_json(group_payload),
+                provenance_json=_canonical_json(
+                    {
+                        "selected_ref": selected.canonical_payload(),
+                        "evidence_refs": [
+                            ref.canonical_payload()
+                            for ref in group.evidence_refs
+                        ],
+                        "parent_economics_used_for_positions": False,
+                        "fee_allocation_to_legs_or_fills": False,
+                    }
+                ),
+            )
+            session.add(group_member_row)
+            session.flush()
+            canonical_group_member_rows[identity] = group_member_row
+
+            for canonical_leg in group.legs:
+                selected_leg_ref = canonical_leg.selected_ref
+                selected_leg_row = observation_rows.get(
+                    (
+                        "execution_group_leg",
+                        selected_leg_ref.observation_id,
                     )
                 )
+                if not isinstance(
+                    selected_leg_row,
+                    BrokerExecutionGroupLegObservation,
+                ):
+                    raise LedgerImportError(
+                        "canonical execution-group leg has no selected raw leg"
+                    )
+                if (
+                    str(selected_leg_row.source_execution_group_id)
+                    != str(selected_row.source_execution_group_id)
+                    or str(selected_leg_row.broker) != str(selected_row.broker)
+                    or str(selected_leg_row.account_key)
+                    != str(selected_row.account_key)
+                ):
+                    raise LedgerImportError(
+                        "canonical execution-group leg selects another identity"
+                    )
+                instrument = canonical_leg.instrument
+                leg_payload = canonical_leg.canonical_payload()
+                leg_identity = tuple(canonical_leg.identity)
+                canonical_leg_row = CanonicalExecutionGroupLegRecord(
+                    canonical_set_id=row.id,
+                    canonical_execution_group_member_id=group_member_row.id,
+                    selected_execution_group_leg_observation_id=int(
+                        selected_leg_row.id
+                    ),
+                    leg_key=str(canonical_leg.leg_key),
+                    identity_key="/".join(
+                        str(value) for value in leg_identity
+                    ),
+                    leg_index=int(selected_leg_row.leg_index),
+                    raw_symbol=str(instrument.raw_symbol),
+                    asset_type=str(instrument.asset_type),
+                    underlying=str(instrument.underlying),
+                    expiry=instrument.expiry,
+                    strike=instrument.strike,
+                    option_right=instrument.option_right,
+                    contract_multiplier=instrument.contract_multiplier,
+                    contract_multiplier_basis=str(
+                        instrument.contract_multiplier_basis
+                    ),
+                    side=str(canonical_leg.side),
+                    quantity_ratio=canonical_leg.quantity_ratio,
+                    executed_quantity=canonical_leg.filled_quantity,
+                    proved_executed_group_quantity=proved_group_quantity,
+                    fill_count=len(canonical_leg.fill_identities),
+                    currency=str(instrument.currency),
+                    canonical_payload_json=_canonical_json(leg_payload),
+                    provenance_json=_canonical_json(
+                        {
+                            "selected_ref": (
+                                selected_leg_ref.canonical_payload()
+                            ),
+                            "evidence_refs": [
+                                ref.canonical_payload()
+                                for ref in canonical_leg.evidence_refs
+                            ],
+                            "fill_link_refs": [
+                                ref.canonical_payload()
+                                for ref in canonical_leg.fill_link_refs
+                            ],
+                            "fee_scope": "execution_group",
+                        }
+                    ),
+                )
+                session.add(canonical_leg_row)
+                session.flush()
+                canonical_group_leg_rows[
+                    (identity, str(canonical_leg.leg_key))
+                ] = canonical_leg_row
+
+        for canonical_fill in evidence_set.fills:
+            group_identity_value = canonical_fill.execution_group_identity
+            if group_identity_value is None:
+                continue
+            group_identity = tuple(group_identity_value)
+            group_member_row = canonical_group_member_rows.get(group_identity)
+            group_leg_row = canonical_group_leg_rows.get(
+                (
+                    group_identity,
+                    str(canonical_fill.execution_group_leg_key),
+                )
+            )
+            fill_member_row = canonical_evidence_member_rows.get(
+                ("fill", tuple(canonical_fill.identity))
+            )
+            fill_link_ref = canonical_fill.execution_group_fill_link_ref
+            selected_link_row = (
+                None
+                if fill_link_ref is None
+                else observation_rows.get(
+                    (
+                        "execution_group_fill_link",
+                        fill_link_ref.observation_id,
+                    )
+                )
+            )
+            if (
+                group_member_row is None
+                or group_leg_row is None
+                or fill_member_row is None
+                or not isinstance(
+                    selected_link_row,
+                    BrokerExecutionGroupFillLink,
+                )
+            ):
+                raise LedgerImportError(
+                    "canonical execution-group fill linkage is incomplete"
+                )
+            link_payload = {
+                "execution_group_identity": group_identity,
+                "execution_group_leg_key": (
+                    canonical_fill.execution_group_leg_key
+                ),
+                "fill_identity": canonical_fill.identity,
+                "selected_ref": fill_link_ref.canonical_payload(),
+                "fee_scope": "execution_group",
+            }
+            session.add(
+                CanonicalExecutionGroupFillLinkRecord(
+                    canonical_set_id=row.id,
+                    canonical_execution_group_member_id=group_member_row.id,
+                    canonical_execution_group_leg_id=group_leg_row.id,
+                    canonical_fill_member_id=fill_member_row.id,
+                    selected_execution_group_fill_link_id=int(
+                        selected_link_row.id
+                    ),
+                    link_key=_sha256_json(link_payload),
+                    canonical_deal_id=str(canonical_fill.source_deal_id),
+                    link_method=str(selected_link_row.link_method),
+                    fee_scope="execution_group",
+                    canonical_payload_json=_canonical_json(link_payload),
+                    provenance_json=_canonical_json(
+                        {
+                            "selected_ref": (
+                                fill_link_ref.canonical_payload()
+                            ),
+                            "fee_allocation": None,
+                        }
+                    ),
+                )
+            )
+
+        canonical_group_by_identity = {
+            tuple(group.identity): group for group in execution_groups
+        }
+        group_evidence_kinds = {
+            "execution_group",
+            "execution_group_leg",
+            "execution_group_fill_link",
+            "execution_group_fee",
+        }
+        for ref in evidence_set.evidence_refs:
+            if ref.evidence_kind not in group_evidence_kinds:
+                continue
+            source = observation_rows.get(
+                (ref.evidence_kind, ref.observation_id)
+            )
+            if source is None:
+                raise LedgerImportError(
+                    "canonical group provenance source is missing"
+                )
+            group_identity = (
+                str(source.broker).strip().lower(),
+                str(source.account_key).strip(),
+                str(source.source_execution_group_id).strip(),
+            )
+            group = canonical_group_by_identity.get(group_identity)
+            group_member_row = canonical_group_member_rows.get(
+                group_identity
+            )
+            if group is None or group_member_row is None:
+                raise LedgerImportError(
+                    "canonical group provenance has no canonical parent"
+                )
+            if ref == group.selected_ref:
+                evidence_role = "selected_group"
+            elif group.fee_ref is not None and ref == group.fee_ref:
+                evidence_role = "group_fee"
+            elif ref.evidence_kind == "execution_group_leg":
+                evidence_role = "declared_leg"
+            elif ref.evidence_kind == "execution_group_fill_link":
+                evidence_role = "fill_link"
+            else:
+                evidence_role = "supporting_group"
+            ref_payload = ref.canonical_payload()
+            provenance_payload = {
+                "execution_group_identity": group_identity,
+                "evidence_ref": ref_payload,
+                "evidence_role": evidence_role,
+            }
+            session.add(
+                CanonicalExecutionGroupProvenanceRecord(
+                    canonical_set_id=row.id,
+                    canonical_execution_group_member_id=group_member_row.id,
+                    provenance_key=_sha256_json(provenance_payload),
+                    import_batch_id=int(ref.import_batch_id),
+                    execution_group_observation_id=(
+                        int(source.id)
+                        if ref.evidence_kind == "execution_group"
+                        else None
+                    ),
+                    execution_group_leg_observation_id=(
+                        int(source.id)
+                        if ref.evidence_kind == "execution_group_leg"
+                        else None
+                    ),
+                    execution_group_fill_link_id=(
+                        int(source.id)
+                        if ref.evidence_kind == "execution_group_fill_link"
+                        else None
+                    ),
+                    execution_group_fee_observation_id=(
+                        int(source.id)
+                        if ref.evidence_kind == "execution_group_fee"
+                        else None
+                    ),
+                    evidence_kind=str(ref.evidence_kind),
+                    evidence_role=evidence_role,
+                    evidence_ref_json=_canonical_json(ref_payload),
+                )
+            )
 
         for issue in evidence_set.issues:
             issue_payload = issue.canonical_payload()
@@ -2451,6 +3871,8 @@ def append_canonical_evidence_set(
             )
 
         for ref in evidence_set.evidence_refs:
+            if ref.evidence_kind not in {"order", "fill"}:
+                continue
             source = observation_rows[(ref.evidence_kind, ref.observation_id)]
             ref_payload = ref.canonical_payload()
             provenance_key = _sha256_json(ref_payload)
@@ -2509,6 +3931,10 @@ def append_canonical_evidence_set(
             duplicate=False,
             analysis_ready=bool(evidence_set.analysis_ready),
             issue_count=len(evidence_set.issues),
+            execution_group_count=len(execution_groups),
+            execution_group_leg_count=sum(
+                len(group.legs) for group in execution_groups
+            ),
         )
 
 
@@ -2779,7 +4205,11 @@ def append_openapi_canonical_bundle(
             raise LedgerImportError(
                 "source_cutoff_at excludes the confirmed OpenAPI batch"
             )
-        canonical = canonicalize_observations(inputs.orders, inputs.fills)
+        canonical = canonicalize_observations(
+            inputs.orders,
+            inputs.fills,
+            execution_group_observations=inputs.execution_groups,
+        )
         try:
             canonical.require_analysis_ready()
         except CanonicalizationBlockedError as exc:

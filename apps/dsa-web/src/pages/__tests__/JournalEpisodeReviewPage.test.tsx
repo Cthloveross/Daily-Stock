@@ -2,19 +2,29 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import JournalEpisodeReviewPage from '../JournalEpisodeReviewPage';
-import { episodeReviewDraftStorageKey } from '../../components/journal/review/episodeReviewDraft';
+import {
+  emptyEpisodeReviewDraft,
+  episodeReviewDraftStorageKey,
+  saveEpisodeReviewDraft,
+} from '../../components/journal/review/episodeReviewDraft';
 import type { PositionEpisodeDetailResponse } from '../../types/journal';
 import type { StockHistory } from '../../types/stockHistory';
 
 const apiMocks = vi.hoisted(() => ({
   fetchDetail: vi.fn(),
   createAiReview: vi.fn(),
+  fetchLatestReview: vi.fn(),
+  fetchReviewHistory: vi.fn(),
+  saveReview: vi.fn(),
   getHistory: vi.fn(),
 }));
 
 vi.mock('../../api/journal', () => ({
   fetchPositionEpisodeDetail: apiMocks.fetchDetail,
   createPositionEpisodeAiReview: apiMocks.createAiReview,
+  fetchLatestPositionEpisodeReviewAnnotation: apiMocks.fetchLatestReview,
+  fetchPositionEpisodeReviewAnnotationHistory: apiMocks.fetchReviewHistory,
+  savePositionEpisodeReviewAnnotation: apiMocks.saveReview,
 }));
 
 vi.mock('../../api/stocks', () => ({
@@ -70,12 +80,18 @@ const detail: PositionEpisodeDetailResponse = {
     status: 'succeeded',
     sourceBatchIds: [2],
     sourceKind: 'canonical_set',
+    sourceWindowStart: '2026-03-04T00:00:00Z',
     sourceCutoffAt: '2026-07-21T00:00:00Z',
     positionEpisodeCount: 1,
     unresolvedEvidenceCount: 0,
     completenessScore: '0.8000',
     openingBoundaryPolicy: 'assumed_flat_unverified',
     assumedFlatUnverified: true,
+    executionGroupCount: 0,
+    groupFeeAffectedEpisodeCount: 0,
+    retainedExecutionGroupFeeTotal: '0.0000000000',
+    feeConservationByCurrency: {},
+    legFeeAttributionComplete: true,
     partialReasons: ['opening_boundary_unverified'],
     recordedAt: '2026-07-21T01:00:00Z',
   },
@@ -127,6 +143,7 @@ const detail: PositionEpisodeDetailResponse = {
       isLeftCensored: true,
       isRightCensored: false,
       pnlSummaryEligible: false,
+      groupFeeUnallocated: false,
       pnlExclusionReasons: ['boundary_unverified'],
     },
   },
@@ -246,6 +263,25 @@ const unavailableModelReviewResponse = {
   warnings: ['模型增强暂不可用；已根据成交与行情事实生成本地证据复盘。'],
 };
 
+const savedReviewAnnotation = {
+  id: 71,
+  episodeBuildId: 9,
+  positionEpisodeId: 41,
+  revision: 2,
+  reviewStatus: 'in_progress' as const,
+  setupThesis: '服务器保存的趋势延续假设',
+  entryTrigger: '收回前高',
+  invalidationPlan: '跌破结构低点',
+  positionRationale: '半仓',
+  exitReason: '达到目标',
+  postTradeReflection: '加仓需要新触发',
+  tags: ['趋势延续', '早盘'],
+  errorTypes: ['追高'],
+  contentSha256: 'a'.repeat(64),
+  previousAnnotationId: 70,
+  createdAt: '2026-07-22T09:30:00Z',
+};
+
 function LocationProbe() {
   const location = useLocation();
   return <output data-testid="location">{location.pathname}{location.search}</output>;
@@ -272,6 +308,14 @@ describe('JournalEpisodeReviewPage', () => {
     apiMocks.fetchDetail.mockResolvedValue(detail);
     apiMocks.getHistory.mockResolvedValue(intraday);
     apiMocks.createAiReview.mockResolvedValue(aiReviewResponse);
+    apiMocks.fetchLatestReview.mockResolvedValue({ dataState: 'not_started', annotation: null });
+    apiMocks.fetchReviewHistory.mockResolvedValue({ dataState: 'not_started', items: [] });
+    apiMocks.saveReview.mockResolvedValue({
+      dataState: 'ready',
+      created: true,
+      idempotentReplay: false,
+      annotation: savedReviewAnnotation,
+    });
   });
 
   afterEach(() => {
@@ -283,6 +327,12 @@ describe('JournalEpisodeReviewPage', () => {
 
     expect(await screen.findByText('NVDA260731C00150000')).toBeInTheDocument();
     expect(apiMocks.fetchDetail).toHaveBeenCalledWith(41, 9);
+    expect(screen.getByText('证据窗口内已归零')).toBeInTheDocument();
+    const replayBasis = screen.getByRole('region', { name: '复盘口径' });
+    expect(within(replayBasis).getByText('证据窗口（ET）起—止')).toBeInTheDocument();
+    expect(within(replayBasis).getByText('窗口末投影 as-of（ET）')).toBeInTheDocument();
+    expect(within(replayBasis).getByText(/不等于券商当前持仓/)).toBeInTheDocument();
+    expect(screen.getByText(/当前时点的券商持仓快照，也不能倒推这个历史证据窗口的期初持仓/)).toBeInTheDocument();
     await waitFor(() => expect(apiMocks.getHistory).toHaveBeenCalledWith('NVDA', '5m', expect.any(Number)));
     expect(await screen.findByText('5 分钟 · YFinanceFetcher')).toBeInTheDocument();
     expect(screen.getAllByText('真实逐笔成交')).not.toHaveLength(0);
@@ -481,14 +531,15 @@ describe('JournalEpisodeReviewPage', () => {
     expect(screen.getByRole('button', { name: '打开模型设置' })).toBeInTheDocument();
   });
 
-  it('keeps trade logic as a build-scoped local draft and attaches only non-empty context', async () => {
+  it('keeps unsaved trade logic as a build-scoped local draft and attaches only non-empty context', async () => {
     apiMocks.createAiReview.mockResolvedValueOnce(evidenceReviewResponse);
     renderPage();
 
     expect(await screen.findByRole('heading', { name: '交易逻辑草稿' })).toBeInTheDocument();
     expect(screen.getByText('事后回忆的进场前计划 · 只写当时可知信息')).toBeInTheDocument();
     expect(screen.getByText('交易后记录 · 结果已知后的观察')).toBeInTheDocument();
-    expect(screen.getByText(/只在本机持久化，不写 Moomoo\/证据账本/)).toBeInTheDocument();
+    expect(screen.getByText(/服务器版本 \+ 本机未提交草稿/)).toBeInTheDocument();
+    expect(screen.getByText(/不修改 Moomoo 或 execution evidence/)).toBeInTheDocument();
     expect(screen.getByText(/发送给本机服务，不会调用外部模型/)).toBeInTheDocument();
     expect(screen.getByText(/发送给你配置的第三方模型供应商/)).toBeInTheDocument();
 
@@ -498,12 +549,20 @@ describe('JournalEpisodeReviewPage', () => {
     fireEvent.change(screen.getByLabelText('实际出场原因 / Exit reason'), {
       target: { value: '跌破失效点' },
     });
+    fireEvent.change(screen.getByLabelText('复盘标签'), {
+      target: { value: '趋势延续,' },
+    });
+    expect(screen.getByLabelText('复盘标签')).toHaveValue('趋势延续,');
+    fireEvent.change(screen.getByLabelText('复盘标签'), {
+      target: { value: '趋势延续, 早盘' },
+    });
 
-    expect(screen.getByRole('status')).toHaveTextContent('已自动保存到本机');
-    expect(screen.getByText('本机草稿 · 2/6 项')).toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent('未提交更改已保存在本机');
+    expect(screen.getByText('用户自述 · 2/6 项')).toBeInTheDocument();
     const stored = window.localStorage.getItem(episodeReviewDraftStorageKey(9, 41));
     expect(stored).toContain('回踩 8 EMA 后延续');
     expect(stored).toContain('跌破失效点');
+    expect(stored).toContain('早盘');
 
     fireEvent.click(screen.getByRole('button', { name: '生成证据复盘' }));
     expect(apiMocks.createAiReview).toHaveBeenCalledWith(41, 9, false, {
@@ -512,10 +571,118 @@ describe('JournalEpisodeReviewPage', () => {
     });
     expect(await screen.findByText('一句话事实结论')).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: '清空草稿' }));
-    expect(screen.getByRole('status')).toHaveTextContent('已清空这个回合的本机草稿');
+    fireEvent.click(screen.getByRole('button', { name: '清空当前编辑' }));
+    expect(screen.getByRole('status')).toHaveTextContent('服务器版本与历史未删除');
     expect(window.localStorage.getItem(episodeReviewDraftStorageKey(9, 41))).toBeNull();
     expect(screen.getByText(/草稿已更新，重新生成后才会进入复盘/)).toBeInTheDocument();
+  });
+
+  it('restores the latest server review when no unsaved local draft exists', async () => {
+    apiMocks.fetchLatestReview.mockResolvedValueOnce({
+      dataState: 'ready',
+      annotation: savedReviewAnnotation,
+    });
+    renderPage();
+
+    expect(await screen.findByDisplayValue('服务器保存的趋势延续假设')).toBeInTheDocument();
+    expect(screen.getByLabelText('进场触发 / Entry trigger')).toHaveValue('收回前高');
+    expect(screen.getByLabelText('复盘标签')).toHaveValue('趋势延续, 早盘');
+    expect(screen.getByText('复盘 · 进行中')).toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent('已从服务器恢复复盘版本 #2');
+  });
+
+  it('keeps a non-empty local draft ahead of the latest server review', async () => {
+    saveEpisodeReviewDraft(9, 41, {
+      ...emptyEpisodeReviewDraft(),
+      setupThesis: '本机尚未提交的假设',
+      tags: ['本机标签'],
+    });
+    apiMocks.fetchLatestReview.mockResolvedValueOnce({
+      dataState: 'ready',
+      annotation: savedReviewAnnotation,
+    });
+    renderPage();
+
+    expect(await screen.findByDisplayValue('本机尚未提交的假设')).toBeInTheDocument();
+    expect(screen.queryByDisplayValue('服务器保存的趋势延续假设')).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByRole('status')).toHaveTextContent('本机未提交草稿，已优先保留');
+    });
+    expect(screen.getByLabelText('复盘标签')).toHaveValue('本机标签');
+  });
+
+  it('saves in-progress and completed revisions, clears only local persistence, and reports idempotent replay', async () => {
+    const completedAnnotation = {
+      ...savedReviewAnnotation,
+      id: 72,
+      revision: 3,
+      reviewStatus: 'completed' as const,
+      previousAnnotationId: 71,
+      createdAt: '2026-07-22T10:00:00Z',
+    };
+    apiMocks.saveReview
+      .mockResolvedValueOnce({
+        dataState: 'ready',
+        created: true,
+        idempotentReplay: false,
+        annotation: savedReviewAnnotation,
+      })
+      .mockResolvedValueOnce({
+        dataState: 'ready',
+        created: false,
+        idempotentReplay: true,
+        annotation: completedAnnotation,
+      });
+    renderPage();
+
+    await screen.findByRole('heading', { name: '交易逻辑草稿' });
+    expect(screen.getByRole('button', { name: '标记复盘完成' })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText('策略假设 / Setup thesis'), {
+      target: { value: '  回踩 8 EMA 后延续  ' },
+    });
+    fireEvent.change(screen.getByLabelText('复盘标签'), {
+      target: { value: '趋势延续, 早盘' },
+    });
+    fireEvent.change(screen.getByLabelText('错误类型'), {
+      target: { value: '追高, 仓位过大' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: '保存进行中' }));
+    await waitFor(() => expect(apiMocks.saveReview).toHaveBeenCalledWith(41, {
+      buildId: 9,
+      reviewStatus: 'in_progress',
+      setupThesis: '  回踩 8 EMA 后延续  ',
+      entryTrigger: '',
+      invalidationPlan: '',
+      positionRationale: '',
+      exitReason: '',
+      postTradeReflection: '',
+      tags: ['趋势延续', '早盘'],
+      errorTypes: ['追高', '仓位过大'],
+    }));
+    expect(await screen.findByText(/已保存服务器版本 #2/)).toBeInTheDocument();
+    expect(window.localStorage.getItem(episodeReviewDraftStorageKey(9, 41))).toBeNull();
+    expect(screen.getByLabelText('策略假设 / Setup thesis')).toHaveValue('  回踩 8 EMA 后延续  ');
+
+    fireEvent.click(screen.getByRole('button', { name: '标记复盘完成' }));
+    await waitFor(() => expect(apiMocks.saveReview).toHaveBeenLastCalledWith(
+      41,
+      expect.objectContaining({ buildId: 9, reviewStatus: 'completed' }),
+    ));
+    expect(await screen.findByText(/内容未变化，沿用服务器版本 #3/)).toBeInTheDocument();
+    expect(screen.getByText('复盘 · 已完成')).toBeInTheDocument();
+  });
+
+  it('does not allow tags alone to mark a review complete', async () => {
+    renderPage();
+    await screen.findByRole('heading', { name: '交易逻辑草稿' });
+    fireEvent.change(screen.getByLabelText('复盘标签'), {
+      target: { value: '待补充' },
+    });
+
+    expect(screen.getByRole('button', { name: '保存进行中' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '标记复盘完成' })).toBeDisabled();
+    expect(screen.getByText(/标签或错误分类不能替代复盘内容/)).toBeInTheDocument();
   });
 
   it('enforces the 6000-character aggregate context limit across fields', async () => {
