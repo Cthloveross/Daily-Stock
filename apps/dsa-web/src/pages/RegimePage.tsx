@@ -476,7 +476,7 @@ const RegimePage: React.FC = () => {
 
   if (todayLoading && !today) {
     return (
-      <div className="mx-auto max-w-7xl space-y-4 p-4">
+      <div className="mx-auto max-w-[1720px] space-y-4 p-4">
         <DailyOpportunityList symbols={userTickers} />
         <div aria-label="Regime 数据读取中" className="space-y-4">
           <div className="h-12 animate-pulse rounded-ds-md bg-bg-1" />
@@ -491,7 +491,7 @@ const RegimePage: React.FC = () => {
 
   if (!today) {
     return (
-      <div className="mx-auto max-w-7xl space-y-4 p-4">
+      <div className="mx-auto max-w-[1720px] space-y-4 p-4">
         <DailyOpportunityList symbols={userTickers} />
         <div className="mx-auto max-w-3xl py-4">
           <EmptyState
@@ -505,7 +505,7 @@ const RegimePage: React.FC = () => {
   }
 
   return (
-    <div className="mx-auto max-w-7xl space-y-4 p-4">
+    <div className="mx-auto max-w-[1720px] space-y-4 p-4">
       <DailyOpportunityList symbols={userTickers} />
 
       {quality && quality.state !== 'ready' && (

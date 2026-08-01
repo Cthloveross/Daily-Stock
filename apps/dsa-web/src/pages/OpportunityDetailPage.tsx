@@ -505,7 +505,7 @@ const OpportunityDetailPage: React.FC = () => {
   return (
     <div className="min-h-full bg-bg-0">
       <header className="border-b border-subtle bg-bg-1 px-4 py-4 sm:px-6">
-        <div className="mx-auto flex max-w-[1600px] flex-wrap items-start justify-between gap-4">
+        <div className="mx-auto flex max-w-[1720px] flex-wrap items-start justify-between gap-4">
           <div className="flex items-start gap-3">
             <button
               type="button"
@@ -553,7 +553,7 @@ const OpportunityDetailPage: React.FC = () => {
         </div>
       </header>
 
-      <main className="mx-auto max-w-[1600px] space-y-4 p-4 sm:p-6">
+      <main className="mx-auto max-w-[1720px] space-y-4 p-4 sm:p-6">
         <section
           className="flex flex-wrap items-center gap-x-5 gap-y-1 border border-subtle bg-bg-1 px-4 py-2 text-caption text-text-3"
           aria-label="数据时点"
