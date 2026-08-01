@@ -4,3 +4,4 @@
 # Test and lint tooling used by backend-gate.
 flake8
 pytest
+scipy>=1.11.0               # 科学计算（Black-Scholes 正态分布）
