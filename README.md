@@ -304,7 +304,8 @@ git clone https://github.com/ZhuLinsen/daily_stock_analysis.git && cd daily_stoc
 # 安装依赖
 pip install -r requirements.txt
 
-# 配置环境变量
+# 配置环境变量（可选：不配置也能启动 Web 界面并浏览；
+# 运行分析、通知与券商/行情集成需要相应 key）
 cp .env.example .env && vim .env
 
 # 运行分析
@@ -465,11 +466,13 @@ LITELLM_MODEL=openai/deepseek-chat
    python main.py --webui       # 启动 Web 界面 + 执行定时分析
    python main.py --webui-only  # 仅启动 Web 界面
    ```
-   启动时会在 `apps/dsa-web` 自动执行 `npm install && npm run build`。
+   启动时会在 `apps/dsa-web` 自动执行 `npm ci && npm run build`（无 lockfile 时
+   回退 `npm install`；要求本机已安装 Node，无 Node 环境请关闭自动构建并使用
+   预构建产物）。
    如需关闭自动构建，设置 `WEBUI_AUTO_BUILD=false`，并改为手动执行：
    ```bash
    cd ./apps/dsa-web
-   npm install && npm run build
+   npm ci && npm run build
    cd ../..
    ```
 

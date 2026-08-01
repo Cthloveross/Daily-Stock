@@ -52,7 +52,7 @@
 | F-1 | LaunchAgent 对齐 | sync/breakout 安装副本换新模板（含轮转 wrapper），或用户决定停用 breakout | 退出码/日志/OpenD 行为验证；**需用户确认 unload**（服务中断类操作） | ⛔ 等用户 |
 | F-2 | artifact GC | 合同：`New-docs/phase1/14_ARTIFACT_GC_CONTRACT.md`（核实结论：全部 artifact 表均在 deny-trigger 保护内，原“非保护范围”假设不成立；冻结删除谓词 + 单事务受控删除 + append-only 回执 + 备份前置） | 设计评审 → 实现 + 零误删测试（合同 T1-T10） | 🚧 F-2a 已实现 2026-08-01（`src/journal/ledger/artifact_gc.py` + `scripts/artifact_gc.py` CLI 默认只读 dry-run，T1-T10 全绿；正式库 apply 待用户确认 + 当日验证备份；F-2b 调度含 BLOCKED 决策，默认不做） |
 | F-3 | 日志 retention 启用 | 用户设 `LOG_RETENTION_DAYS=30`（机制已在） | 首次清理日志输出核对 | ⛔ 等用户一行配置 |
-| F-4 | clean-clone 演练 | 从 GitHub 干净克隆 → 按 README 启动成功 | 演练记录 + 修复发现的缺口 | ⬜ PR 合并后 |
+| F-4 | clean-clone 演练 | 从 GitHub 干净克隆 → 按 README 启动成功 | 演练记录 + 修复发现的缺口 | ✅ 2026-08-01 已演练（clone bc74bc6：pip install（含 scipy）→ ci_gate.sh 2636 passed → npm ci+build → `--serve-only` 隔离空库 health/health-layers 双 200，全程零依赖原工作树/.env/数据库；README 小缺口已记录在 CHANGELOG 待后续修正） |
 
 ## 横切 · 工程质量
 
