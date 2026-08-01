@@ -17,6 +17,22 @@ FORMULA_VERSION = "gross-gamma-concentration-1pct/v1"
 GAMMA_UNIT = "usd_delta_change_per_1pct_move"
 ATM_CALL_IV_METHOD = "nearest_expiry_atm_call_from_same_wall_snapshot"
 
+# Per-level expiry breakdown stays bounded so payloads remain small.
+LEVEL_TOP_EXPIRY_LIMIT = 3
+
+# Settlement/session semantics per metric.  Open interest is a cleared
+# prior-session total; volume is current-session cumulative activity; the
+# gamma metric is a model value derived from settled OI and snapshot greeks.
+METRIC_BASIS_SETTLED_OI = "settled_open_interest_prior_session"
+METRIC_BASIS_SESSION_VOLUME = "current_session_cumulative_volume"
+METRIC_BASIS_MODEL_GAMMA = "model_from_settled_oi_and_snapshot_greeks"
+
+# Quote fields a per-expiry entry may carry.  Every field must trace back to
+# the observed snapshot row backing that entry; a missing field stays ``None``
+# and is reported through an explicit ``quote_evidence`` marker instead of
+# being zero-filled.
+_QUOTE_FIELD_COUNT = 4  # iv_percent, bid, ask, mark
+
 
 def _finite_number(value: Any) -> Optional[float]:
     try:
@@ -26,12 +42,153 @@ def _finite_number(value: Any) -> Optional[float]:
     return number if math.isfinite(number) else None
 
 
+def _safe_dte(value: Any) -> Optional[int]:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+class _ExpiryCell:
+    """Per (metric, strike, expiry) contribution with its backing row."""
+
+    __slots__ = ("value", "dte", "contract_count", "contract")
+
+    def __init__(self) -> None:
+        self.value = 0.0
+        self.dte: Optional[int] = None
+        self.contract_count = 0
+        self.contract: Any = None
+
+    def add(self, value: float, contract: Any) -> None:
+        self.value += value
+        self.contract_count += 1
+        if self.dte is None:
+            self.dte = _safe_dte(getattr(contract, "dte", None))
+        # Quote context is only attributable when exactly one snapshot row
+        # backs the cell; otherwise per-contract quotes would be misassigned.
+        self.contract = contract if self.contract_count == 1 else None
+
+
+def _quote_context(cell: _ExpiryCell) -> tuple[dict[str, Any], str]:
+    """Extract quote fields from the single observed row backing a cell.
+
+    Fields absent from the snapshot row stay ``None``.  The current Moomoo
+    wall snapshot rows carry IV and ``update_time`` but no bid/ask/mark, so
+    those stay explicitly null until the adapter observes them.
+    """
+
+    iv_percent: Optional[float] = None
+    bid: Optional[float] = None
+    ask: Optional[float] = None
+    mark: Optional[float] = None
+    quote_as_of: Optional[str] = None
+
+    contract = cell.contract if cell.contract_count == 1 else None
+    if contract is not None:
+        iv_decimal = _finite_number(getattr(contract, "implied_volatility", None))
+        if iv_decimal is not None and iv_decimal > 0:
+            iv_percent = round(iv_decimal * 100.0, 6)
+        bid_value = _finite_number(getattr(contract, "bid", None))
+        if bid_value is not None and bid_value >= 0:
+            bid = round(bid_value, 6)
+        ask_value = _finite_number(getattr(contract, "ask", None))
+        if ask_value is not None and ask_value >= 0:
+            ask = round(ask_value, 6)
+        mark_value = _finite_number(getattr(contract, "mark", None))
+        if mark_value is not None and mark_value >= 0:
+            mark = round(mark_value, 6)
+        update_time = str(getattr(contract, "update_time", "") or "").strip()
+        quote_as_of = update_time or None
+
+    observed = sum(
+        1 for value in (iv_percent, bid, ask, mark) if value is not None
+    )
+    if observed == _QUOTE_FIELD_COUNT:
+        evidence = "observed"
+    elif observed > 0:
+        evidence = "partial"
+    else:
+        evidence = "unavailable"
+    quote = {
+        "iv_percent": iv_percent,
+        "bid": bid,
+        "ask": ask,
+        "mark": mark,
+        "quote_as_of": quote_as_of,
+    }
+    return quote, evidence
+
+
+def _expiry_breakdown(
+    cells: dict[str, _ExpiryCell],
+    *,
+    level_total: float,
+    limit: int = LEVEL_TOP_EXPIRY_LIMIT,
+) -> tuple[dict[str, Any], str]:
+    entries = sorted(
+        (
+            (expiry, cell)
+            for expiry, cell in cells.items()
+            if math.isfinite(cell.value) and cell.value > 0
+        ),
+        key=lambda item: (-item[1].value, item[0]),
+    )
+    top = entries[:limit]
+    rest = entries[limit:]
+
+    top_payload: list[dict[str, Any]] = []
+    evidences: list[str] = []
+    for expiry, cell in top:
+        quote, evidence = _quote_context(cell)
+        evidences.append(evidence)
+        top_payload.append(
+            {
+                "expiry": expiry,
+                "dte": cell.dte,
+                "metric_value": round(cell.value, 6),
+                "share_of_level_percent": round(
+                    (cell.value / level_total) * 100.0 if level_total > 0 else 0.0,
+                    6,
+                ),
+                "contract_count": cell.contract_count,
+                "quote": quote,
+                "quote_evidence": evidence,
+            }
+        )
+
+    other: Optional[dict[str, Any]] = None
+    if rest:
+        other_value = sum(cell.value for _, cell in rest)
+        other = {
+            "expiry_count": len(rest),
+            "metric_value": round(other_value, 6),
+            "share_of_level_percent": round(
+                (other_value / level_total) * 100.0 if level_total > 0 else 0.0,
+                6,
+            ),
+        }
+
+    if evidences and all(evidence == "observed" for evidence in evidences):
+        level_evidence = "observed"
+    elif any(evidence != "unavailable" for evidence in evidences):
+        level_evidence = "partial"
+    else:
+        level_evidence = "unavailable"
+
+    return {"top_expiries": top_payload, "other": other}, level_evidence
+
+
 def _top_levels(
     values: dict[float, float],
     *,
     spot: float,
     unit: str,
     method: str,
+    side: str,
+    metric_basis: str,
+    expiry_cells: dict[float, dict[str, _ExpiryCell]],
     limit: int = 3,
 ) -> list[dict[str, Any]]:
     positive = [
@@ -50,6 +207,10 @@ def _top_levels(
     prior_rank = 0
     for index, (strike, value) in enumerate(ordered, start=1):
         rank = prior_rank if prior_value == value else index
+        breakdown, quote_evidence = _expiry_breakdown(
+            expiry_cells.get(strike, {}),
+            level_total=value,
+        )
         levels.append(
             {
                 "rank": rank,
@@ -65,6 +226,10 @@ def _top_levels(
                 ),
                 "unit": unit,
                 "method": method,
+                "side": side,
+                "metric_basis": metric_basis,
+                "quote_evidence": quote_evidence,
+                "expiry_breakdown": breakdown,
             }
         )
         prior_value = value
@@ -156,24 +321,45 @@ def build_option_wall_payload(
     ``open_interest``, ``volume``, ``gamma``, ``contract_size`` and
     ``update_time`` attributes.  Invalid optional gamma fields are ignored
     without weakening the directly observed OI/volume walls.
+
+    Each level additionally carries a bounded per-expiry breakdown
+    (``expiry_breakdown``) built from ``expiry``/``dte`` on the same rows,
+    plus per-expiry quote context (``iv_percent``/``bid``/``ask``/``mark``)
+    taken only from the single observed row backing that expiry cell.  Fields
+    the snapshot does not carry stay ``None`` and are surfaced through
+    ``quote_evidence`` markers; nothing is zero-filled or estimated.
     """
 
     spot = _finite_number(getattr(snapshot, "spot", None))
     if spot is None or spot <= 0:
         raise ValueError("a finite positive underlying spot is required")
 
+    metric_keys = (
+        "call_oi",
+        "put_oi",
+        "call_volume",
+        "put_volume",
+        "call_gamma_concentration",
+        "put_gamma_concentration",
+        "gross_gamma_concentration",
+    )
     metrics: dict[str, dict[float, float]] = {
-        key: defaultdict(float)
-        for key in (
-            "call_oi",
-            "put_oi",
-            "call_volume",
-            "put_volume",
-            "call_gamma_concentration",
-            "put_gamma_concentration",
-            "gross_gamma_concentration",
-        )
+        key: defaultdict(float) for key in metric_keys
     }
+    expiry_cells: dict[str, dict[float, dict[str, _ExpiryCell]]] = {
+        key: {} for key in metric_keys
+    }
+
+    def _record(metric_key: str, strike: float, expiry: str, value: float, contract: Any) -> None:
+        metrics[metric_key][strike] += value
+        if value > 0 and expiry:
+            cell = (
+                expiry_cells[metric_key]
+                .setdefault(strike, {})
+                .setdefault(expiry, _ExpiryCell())
+            )
+            cell.add(value, contract)
+
     gamma_contract_count = 0
     quote_times: list[str] = []
 
@@ -191,16 +377,29 @@ def build_option_wall_payload(
             continue
 
         side = "call" if right == "C" else "put"
-        metrics[f"{side}_oi"][strike] += oi
-        metrics[f"{side}_volume"][strike] += volume
+        expiry = str(getattr(contract, "expiry", "") or "").strip()
+        _record(f"{side}_oi", strike, expiry, oi, contract)
+        _record(f"{side}_volume", strike, expiry, volume, contract)
 
         gamma = _finite_number(getattr(contract, "gamma", None))
         contract_size = _finite_number(getattr(contract, "contract_size", None))
         if gamma is not None and contract_size is not None and contract_size > 0:
             gross_gamma = abs(gamma) * oi * contract_size * spot * spot * 0.01
             if math.isfinite(gross_gamma):
-                metrics[f"{side}_gamma_concentration"][strike] += gross_gamma
-                metrics["gross_gamma_concentration"][strike] += gross_gamma
+                _record(
+                    f"{side}_gamma_concentration",
+                    strike,
+                    expiry,
+                    gross_gamma,
+                    contract,
+                )
+                _record(
+                    "gross_gamma_concentration",
+                    strike,
+                    expiry,
+                    gross_gamma,
+                    contract,
+                )
                 gamma_contract_count += 1
 
         update_time = str(getattr(contract, "update_time", "") or "").strip()
@@ -212,56 +411,52 @@ def build_option_wall_payload(
     valid = max(0, int(getattr(snapshot, "valid_contract_count", 0) or 0))
     coverage_percent = round((valid / requested) * 100.0, 4) if requested else 0.0
 
+    metric_specs = {
+        "call_oi": ("contracts", "sum_open_interest", "call", METRIC_BASIS_SETTLED_OI),
+        "put_oi": ("contracts", "sum_open_interest", "put", METRIC_BASIS_SETTLED_OI),
+        "call_volume": (
+            "contracts",
+            "sum_session_volume",
+            "call",
+            METRIC_BASIS_SESSION_VOLUME,
+        ),
+        "put_volume": (
+            "contracts",
+            "sum_session_volume",
+            "put",
+            METRIC_BASIS_SESSION_VOLUME,
+        ),
+        "call_gamma_concentration": (
+            GAMMA_UNIT,
+            "gross_gamma_concentration_1pct",
+            "call",
+            METRIC_BASIS_MODEL_GAMMA,
+        ),
+        "put_gamma_concentration": (
+            GAMMA_UNIT,
+            "gross_gamma_concentration_1pct",
+            "put",
+            METRIC_BASIS_MODEL_GAMMA,
+        ),
+        "gross_gamma_concentration": (
+            GAMMA_UNIT,
+            "gross_gamma_concentration_1pct",
+            "call_put_aggregate",
+            METRIC_BASIS_MODEL_GAMMA,
+        ),
+    }
     walls = {
-        "call_oi": _top_levels(
-            metrics["call_oi"],
+        key: _top_levels(
+            metrics[key],
             spot=spot,
-            unit="contracts",
-            method="sum_open_interest",
+            unit=unit,
+            method=method,
+            side=side,
+            metric_basis=metric_basis,
+            expiry_cells=expiry_cells[key],
             limit=top_n,
-        ),
-        "put_oi": _top_levels(
-            metrics["put_oi"],
-            spot=spot,
-            unit="contracts",
-            method="sum_open_interest",
-            limit=top_n,
-        ),
-        "call_volume": _top_levels(
-            metrics["call_volume"],
-            spot=spot,
-            unit="contracts",
-            method="sum_session_volume",
-            limit=top_n,
-        ),
-        "put_volume": _top_levels(
-            metrics["put_volume"],
-            spot=spot,
-            unit="contracts",
-            method="sum_session_volume",
-            limit=top_n,
-        ),
-        "call_gamma_concentration": _top_levels(
-            metrics["call_gamma_concentration"],
-            spot=spot,
-            unit=GAMMA_UNIT,
-            method="gross_gamma_concentration_1pct",
-            limit=top_n,
-        ),
-        "put_gamma_concentration": _top_levels(
-            metrics["put_gamma_concentration"],
-            spot=spot,
-            unit=GAMMA_UNIT,
-            method="gross_gamma_concentration_1pct",
-            limit=top_n,
-        ),
-        "gross_gamma_concentration": _top_levels(
-            metrics["gross_gamma_concentration"],
-            spot=spot,
-            unit=GAMMA_UNIT,
-            method="gross_gamma_concentration_1pct",
-            limit=top_n,
-        ),
+        )
+        for key, (unit, method, side, metric_basis) in metric_specs.items()
     }
 
     return {

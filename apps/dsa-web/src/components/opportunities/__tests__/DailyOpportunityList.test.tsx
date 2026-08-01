@@ -550,7 +550,40 @@ function readyOptionWallItem(
     },
     walls: {
       callOi: [
-        optionWallLevel(1, 135),
+        optionWallLevel(1, 135, {
+          side: 'call',
+          metricBasis: 'settled_open_interest_prior_session',
+          quoteEvidence: 'partial',
+          expiryBreakdown: {
+            topExpiries: [
+              {
+                expiry: '2026-07-24',
+                dte: 2,
+                metricValue: 900,
+                shareOfLevelPercent: 60,
+                contractCount: 1,
+                quote: {
+                  ivPercent: 41.2,
+                  bid: null,
+                  ask: null,
+                  mark: null,
+                  quoteAsOf: '2026-07-22 09:44:00',
+                },
+                quoteEvidence: 'partial',
+              },
+              {
+                expiry: '2026-07-31',
+                dte: 9,
+                metricValue: 600,
+                shareOfLevelPercent: 40,
+                contractCount: 1,
+                quote: { ivPercent: null, bid: null, ask: null, mark: null, quoteAsOf: null },
+                quoteEvidence: 'unavailable',
+              },
+            ],
+            other: null,
+          },
+        }),
         optionWallLevel(2, 140),
         optionWallLevel(3, 130),
       ],
@@ -579,7 +612,7 @@ function readyOptionWallItem(
 
 function optionWallResponse(items: OpportunityOptionWallItem[]): OpportunityOptionWallResponse {
   return {
-    schemaVersion: 'option-wall/1.1',
+    schemaVersion: 'option-wall/1.2',
     marketDateEt: '2026-07-22',
     generatedAt: '2026-07-22T12:00:04+00:00',
     items,
@@ -1868,6 +1901,23 @@ describe('DailyOpportunityList', () => {
     expect(screen.getByText('Put OI 墙（集中位）')).toBeInTheDocument();
     expect(screen.getByText('Gross Gamma 集中位')).toBeInTheDocument();
     expect(screen.getByText(/不是真实 Dealer GEX，也不计算 Gamma Flip/)).toBeInTheDocument();
+
+    expect(
+      screen.getByText('到期分布 · OI＝T-1 清算 · 报价证据部分缺失'),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        '2026-07-24 · DTE 2 · 占该位 60% · IV 41.2% · Bid/Ask/Mark 标缺（快照未含盘口报价） · 2026-07-22 09:44:00',
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        '2026-07-31 · DTE 9 · 占该位 40% · IV 标缺 · Bid/Ask/Mark 标缺（快照未含盘口报价）',
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText('标缺字段为快照未提供的数据，未用估算或旧值回填。'),
+    ).toBeInTheDocument();
 
     selectCandidateRow('AAPL');
     expect(await screen.findByLabelText('AAPL 期权墙，可用')).toBeInTheDocument();

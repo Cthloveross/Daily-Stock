@@ -586,6 +586,44 @@ class OptionWallCoverage(BaseModel):
     gamma_contracts: int = Field(ge=0)
 
 
+class OptionWallLevelExpiryQuote(BaseModel):
+    """Quote fields traced to the single snapshot row backing one expiry cell.
+
+    Fields absent from the observed snapshot stay ``None``; they are never
+    zero-filled.  当前 Moomoo 墙快照行只携带 IV 与 update_time，bid/ask/mark
+    结构性缺失，因此保持显式 null 并通过 ``quote_evidence`` 标缺。
+    """
+
+    iv_percent: Optional[float] = Field(default=None, gt=0)
+    bid: Optional[float] = Field(default=None, ge=0)
+    ask: Optional[float] = Field(default=None, ge=0)
+    mark: Optional[float] = Field(default=None, ge=0)
+    quote_as_of: Optional[str] = None
+
+
+class OptionWallLevelExpiry(BaseModel):
+    expiry: str
+    dte: Optional[int] = Field(default=None, ge=0)
+    metric_value: float = Field(gt=0)
+    share_of_level_percent: float = Field(ge=0, le=100)
+    contract_count: int = Field(ge=1)
+    quote: OptionWallLevelExpiryQuote = Field(
+        default_factory=OptionWallLevelExpiryQuote
+    )
+    quote_evidence: Literal["observed", "partial", "unavailable"] = "unavailable"
+
+
+class OptionWallLevelExpiryOther(BaseModel):
+    expiry_count: int = Field(ge=1)
+    metric_value: float = Field(ge=0)
+    share_of_level_percent: float = Field(ge=0, le=100)
+
+
+class OptionWallLevelExpiryBreakdown(BaseModel):
+    top_expiries: list[OptionWallLevelExpiry] = Field(default_factory=list)
+    other: Optional[OptionWallLevelExpiryOther] = None
+
+
 class OptionWallLevel(BaseModel):
     rank: int = Field(ge=1)
     strike: float = Field(gt=0)
@@ -598,6 +636,20 @@ class OptionWallLevel(BaseModel):
         "sum_session_volume",
         "gross_gamma_concentration_1pct",
     ]
+    # Additive per-level contract fields (option-wall/1.2); optional with
+    # defaults so pre-1.2 payloads and older clients remain valid.
+    side: Optional[Literal["call", "put", "call_put_aggregate"]] = None
+    metric_basis: Optional[
+        Literal[
+            "settled_open_interest_prior_session",
+            "current_session_cumulative_volume",
+            "model_from_settled_oi_and_snapshot_greeks",
+        ]
+    ] = None
+    quote_evidence: Optional[
+        Literal["observed", "partial", "unavailable"]
+    ] = None
+    expiry_breakdown: Optional[OptionWallLevelExpiryBreakdown] = None
 
 
 class OptionWallSet(BaseModel):

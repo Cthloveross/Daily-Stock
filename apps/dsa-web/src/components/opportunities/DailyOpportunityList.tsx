@@ -33,6 +33,7 @@ import type {
   PremarketCycleState,
 } from '../../types/opportunities';
 import { Button, EmptyState } from '../ui';
+import { WallLevelExpiryBreakdown } from './WallLevelExpiryBreakdown';
 import { parseApiTimestamp } from '../../utils/marketTime';
 
 const STATE_LABELS: Record<OpportunityResearchState, string> = {
@@ -814,6 +815,11 @@ function WallLevelList({
               <span className="col-span-3 text-right text-[11px] text-text-3">
                 该 DTE 桶占比 {level.shareOfBucketPercent.toLocaleString('en-US', { maximumFractionDigits: 1 })}%
               </span>
+              {level.expiryBreakdown && level.expiryBreakdown.topExpiries.length > 0 && (
+                <span className="col-span-3">
+                  <WallLevelExpiryBreakdown level={level} />
+                </span>
+              )}
             </li>
           ))}
         </ol>

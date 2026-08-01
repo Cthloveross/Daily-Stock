@@ -259,6 +259,43 @@ export type OpportunityOptionWallState =
   | 'not_configured'
   | 'unavailable';
 
+export type OpportunityOptionWallQuoteEvidence = 'observed' | 'partial' | 'unavailable';
+
+export type OpportunityOptionWallMetricBasis =
+  | 'settled_open_interest_prior_session'
+  | 'current_session_cumulative_volume'
+  | 'model_from_settled_oi_and_snapshot_greeks';
+
+/** Quote fields traced to the single snapshot row backing one expiry cell.
+ * 快照未携带的字段保持 null（当前 Moomoo 墙快照行没有 bid/ask/mark），
+ * 缺失通过 quoteEvidence 显式标缺，不做零值回填。 */
+export interface OpportunityOptionWallLevelExpiryQuote {
+  ivPercent: number | null;
+  bid: number | null;
+  ask: number | null;
+  mark: number | null;
+  quoteAsOf: string | null;
+}
+
+export interface OpportunityOptionWallLevelExpiry {
+  expiry: string;
+  dte: number | null;
+  metricValue: number;
+  shareOfLevelPercent: number;
+  contractCount: number;
+  quote: OpportunityOptionWallLevelExpiryQuote;
+  quoteEvidence: OpportunityOptionWallQuoteEvidence;
+}
+
+export interface OpportunityOptionWallLevelExpiryBreakdown {
+  topExpiries: OpportunityOptionWallLevelExpiry[];
+  other: {
+    expiryCount: number;
+    metricValue: number;
+    shareOfLevelPercent: number;
+  } | null;
+}
+
 export interface OpportunityOptionWallLevel {
   rank: number;
   strike: number;
@@ -267,6 +304,12 @@ export interface OpportunityOptionWallLevel {
   shareOfBucketPercent: number;
   unit: 'contracts' | 'usd_delta_change_per_1pct_move';
   method: 'sum_open_interest' | 'sum_session_volume' | 'gross_gamma_concentration_1pct';
+  // Additive per-level fields (option-wall/1.2); optional so pre-1.2 payloads
+  // remain valid without them.
+  side?: 'call' | 'put' | 'call_put_aggregate' | null;
+  metricBasis?: OpportunityOptionWallMetricBasis | null;
+  quoteEvidence?: OpportunityOptionWallQuoteEvidence | null;
+  expiryBreakdown?: OpportunityOptionWallLevelExpiryBreakdown | null;
 }
 
 export interface OpportunityOptionWallItem {

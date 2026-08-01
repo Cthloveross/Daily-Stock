@@ -126,7 +126,7 @@ describe('daily opportunity API', () => {
       })
       .mockResolvedValueOnce({
         data: {
-          schema_version: 'option-wall/1.1',
+          schema_version: 'option-wall/1.2',
           market_date_et: '2026-07-22',
           generated_at: '2026-07-22T12:00:00+00:00',
           items: [],

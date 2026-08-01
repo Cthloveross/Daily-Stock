@@ -1,5 +1,5 @@
 import type React from 'react';
-import { useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 import { ArrowLeft, Clock3, RefreshCw, ShieldCheck, TriangleAlert } from 'lucide-react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import {
@@ -12,6 +12,7 @@ import {
 } from '../api/opportunities';
 import { stocksApi } from '../api/stocks';
 import { CandlestickChart, type Candle, type MAOverlay } from '../components/charts/CandlestickChart';
+import { WallLevelExpiryBreakdown } from '../components/opportunities/WallLevelExpiryBreakdown';
 import { Tabs } from '../components/ui';
 import type {
   OpportunityCandidate,
@@ -218,15 +219,24 @@ function WallTable({ title, levels }: { title: string; levels: OpportunityOption
           </thead>
           <tbody className="divide-y divide-subtle">
             {levels.slice(0, 3).map((level) => (
-              <tr key={`${level.method}-${level.rank}-${level.strike}`} className="font-mono text-mono-xs tabular-nums text-text-2">
-                <td className="py-2 text-text-1">{formatNumber(level.strike)}</td>
-                <td className="py-2 text-right">{level.distanceFromSpotPercent > 0 ? '+' : ''}{formatPercent(level.distanceFromSpotPercent)}</td>
-                <td className="py-2 text-right">
-                  {level.unit === 'usd_delta_change_per_1pct_move'
-                    ? `${formatCompact(level.metricValue, true)} / 1%`
-                    : formatCompact(level.metricValue)}
-                </td>
-              </tr>
+              <Fragment key={`${level.method}-${level.rank}-${level.strike}`}>
+                <tr className="font-mono text-mono-xs tabular-nums text-text-2">
+                  <td className="py-2 text-text-1">{formatNumber(level.strike)}</td>
+                  <td className="py-2 text-right">{level.distanceFromSpotPercent > 0 ? '+' : ''}{formatPercent(level.distanceFromSpotPercent)}</td>
+                  <td className="py-2 text-right">
+                    {level.unit === 'usd_delta_change_per_1pct_move'
+                      ? `${formatCompact(level.metricValue, true)} / 1%`
+                      : formatCompact(level.metricValue)}
+                  </td>
+                </tr>
+                {level.expiryBreakdown && level.expiryBreakdown.topExpiries.length > 0 && (
+                  <tr>
+                    <td colSpan={3} className="pb-2">
+                      <WallLevelExpiryBreakdown level={level} />
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
             ))}
           </tbody>
         </table>

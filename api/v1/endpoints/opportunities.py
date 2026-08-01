@@ -72,7 +72,7 @@ _OPTION_CONTEXT_VERSION = "nearest_expiry_atm_call_iv_v1"
 _OPTION_CONTEXT_SOURCE = "moomoo_openapi"
 _OPTION_OVERVIEW_VERSION = "moomoo_option_underlying_overview_v1"
 _OPTION_OVERVIEW_SOURCE = "moomoo_openapi"
-_OPTION_WALL_VERSION = "observable_option_walls_v1_1"
+_OPTION_WALL_VERSION = "observable_option_walls_v1_2"
 _OPTION_WALL_SOURCE = "moomoo_openapi"
 _OPTION_EVENT_VERSION = "moomoo_unusual_option_events_v1"
 _OPTION_EVENT_SOURCE = "moomoo_openapi"
@@ -1132,7 +1132,7 @@ def _execute_option_walls(
         default=requested_at.isoformat(),
     )
     return {
-        "schema_version": "option-wall/1.1",
+        "schema_version": "option-wall/1.2",
         "generated_at": generated_at,
         "market_date_et": market_date_et,
         "items": ordered_items,

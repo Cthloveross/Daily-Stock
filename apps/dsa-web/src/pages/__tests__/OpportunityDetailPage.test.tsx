@@ -186,6 +186,38 @@ const callOiLevel: OpportunityOptionWallLevel = {
   shareOfBucketPercent: 12,
   unit: 'contracts',
   method: 'sum_open_interest',
+  side: 'call',
+  metricBasis: 'settled_open_interest_prior_session',
+  quoteEvidence: 'partial',
+  expiryBreakdown: {
+    topExpiries: [
+      {
+        expiry: '2026-08-21',
+        dte: 29,
+        metricValue: 12_000,
+        shareOfLevelPercent: 60,
+        contractCount: 1,
+        quote: {
+          ivPercent: 42.1,
+          bid: null,
+          ask: null,
+          mark: null,
+          quoteAsOf: '2026-07-23 09:59:00',
+        },
+        quoteEvidence: 'partial',
+      },
+      {
+        expiry: '2026-09-18',
+        dte: 57,
+        metricValue: 6_000,
+        shareOfLevelPercent: 30,
+        contractCount: 1,
+        quote: { ivPercent: null, bid: null, ask: null, mark: null, quoteAsOf: null },
+        quoteEvidence: 'unavailable',
+      },
+    ],
+    other: { expiryCount: 2, metricValue: 2_000, shareOfLevelPercent: 10 },
+  },
 };
 
 const putOiLevel: OpportunityOptionWallLevel = {
@@ -193,12 +225,18 @@ const putOiLevel: OpportunityOptionWallLevel = {
   strike: 90,
   distanceFromSpotPercent: -10,
   metricValue: 18_000,
+  side: 'put',
+  quoteEvidence: null,
+  expiryBreakdown: null,
 };
 
 const callVolumeLevel: OpportunityOptionWallLevel = {
   ...callOiLevel,
   metricValue: 4_000,
   method: 'sum_session_volume',
+  metricBasis: 'current_session_cumulative_volume',
+  quoteEvidence: null,
+  expiryBreakdown: null,
 };
 
 const gammaLevel: OpportunityOptionWallLevel = {
@@ -208,10 +246,14 @@ const gammaLevel: OpportunityOptionWallLevel = {
   metricValue: 250_000,
   unit: 'usd_delta_change_per_1pct_move',
   method: 'gross_gamma_concentration_1pct',
+  side: 'call_put_aggregate',
+  metricBasis: 'model_from_settled_oi_and_snapshot_greeks',
+  quoteEvidence: null,
+  expiryBreakdown: null,
 };
 
 const optionWalls: OpportunityOptionWallResponse = {
-  schemaVersion: 'option-wall/1.1',
+  schemaVersion: 'option-wall/1.2',
   marketDateEt: '2026-07-23',
   generatedAt: '2026-07-23T10:00:00-04:00',
   items: [{
@@ -499,6 +541,35 @@ describe('OpportunityDetailPage', () => {
     expect(screen.queryByText('查看各期限历史波动率')).not.toBeInTheDocument();
     expect(screen.queryByText('查看当日成交量集中位')).not.toBeInTheDocument();
     expect(screen.queryByText(/BUY \/ SELL、情绪与订单类型/)).not.toBeInTheDocument();
+  });
+
+  it('renders per-level expiry breakdown with explicit missing-quote markers in the walls tab', async () => {
+    renderPage();
+
+    await screen.findByText('查看各期限历史波动率');
+    fireEvent.click(screen.getByRole('button', { name: '期权墙' }));
+
+    expect(
+      screen.getByText('到期分布 · OI＝T-1 清算 · 报价证据部分缺失'),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        '2026-08-21 · DTE 29 · 占该位 60% · IV 42.1% · Bid/Ask/Mark 标缺（快照未含盘口报价） · 2026-07-23 09:59:00',
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        '2026-09-18 · DTE 57 · 占该位 30% · IV 标缺 · Bid/Ask/Mark 标缺（快照未含盘口报价）',
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText('其余 2 个到期日 · 占该位 10%')).toBeInTheDocument();
+    expect(
+      screen.getByText('标缺字段为快照未提供的数据，未用估算或旧值回填。'),
+    ).toBeInTheDocument();
+    // Honesty framing stays: concentration context, not dealer GEX.
+    expect(
+      screen.getByText(/总 Gamma 为绝对值集中度，不是 dealer GEX 或 gamma flip/),
+    ).toBeInTheDocument();
   });
 
   it('defaults intraday charts to regular hours and recomputes EMA from the selected visible bars', async () => {

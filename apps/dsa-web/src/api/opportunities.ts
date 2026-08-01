@@ -78,7 +78,7 @@ function optionOverviewCacheKey(symbols: string[]): string {
 }
 
 function optionWallCacheKey(symbols: string[], dteMin: number, dteMax: number): string {
-  return `opportunities:option-walls-v1.1:${normalizedOptionContextSymbols(symbols).sort().join(',')}:${dteMin}:${dteMax}`;
+  return `opportunities:option-walls-v1.2:${normalizedOptionContextSymbols(symbols).sort().join(',')}:${dteMin}:${dteMax}`;
 }
 
 function optionEventCacheKey(symbols: string[], limitPerSymbol: number): string {

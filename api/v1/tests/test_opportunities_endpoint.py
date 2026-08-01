@@ -830,6 +830,7 @@ def _wall_snapshot(*, complete: bool = True, include_gamma: bool = True):
         SimpleNamespace(
             code="US.TEST260724C105000",
             expiry="2026-07-24",
+            dte=2,
             right="C",
             strike=105.0,
             open_interest=1_000,
@@ -842,6 +843,7 @@ def _wall_snapshot(*, complete: bool = True, include_gamma: bool = True):
         SimpleNamespace(
             code="US.TEST260724P095000",
             expiry="2026-07-24",
+            dte=2,
             right="P",
             strike=95.0,
             open_interest=1_500,
@@ -918,6 +920,41 @@ def test_option_walls_return_ranked_observable_and_gamma_levels(monkeypatch):
     assert item["walls"]["gross_gamma_concentration"]
     assert item["coverage"]["coverage_percent"] == 100
     assert item["quote_as_of"] == "2026-07-22 10:00:01"
+
+    call_oi_level = item["walls"]["call_oi"][0]
+    assert call_oi_level["side"] == "call"
+    assert call_oi_level["metric_basis"] == "settled_open_interest_prior_session"
+    assert call_oi_level["quote_evidence"] == "partial"
+    assert call_oi_level["expiry_breakdown"] == {
+        "top_expiries": [
+            {
+                "expiry": "2026-07-24",
+                "dte": 2,
+                "metric_value": 1_000,
+                "share_of_level_percent": 100.0,
+                "contract_count": 1,
+                "quote": {
+                    "iv_percent": 42.5,
+                    "bid": None,
+                    "ask": None,
+                    "mark": None,
+                    "quote_as_of": "2026-07-22 10:00:00",
+                },
+                "quote_evidence": "partial",
+            }
+        ],
+        "other": None,
+    }
+    assert item["walls"]["call_volume"][0]["metric_basis"] == (
+        "current_session_cumulative_volume"
+    )
+    assert item["walls"]["gross_gamma_concentration"][0]["metric_basis"] == (
+        "model_from_settled_oi_and_snapshot_greeks"
+    )
+    assert item["walls"]["gross_gamma_concentration"][0]["side"] == (
+        "call_put_aggregate"
+    )
+
     assert item["atm_call_iv"] == {
         "state": "ready",
         "expiry": "2026-07-24",
@@ -927,7 +964,28 @@ def test_option_walls_return_ranked_observable_and_gamma_levels(monkeypatch):
             "nearest_expiry_atm_call_from_same_wall_snapshot"
         ),
     }
-    assert response.json()["schema_version"] == "option-wall/1.1"
+    assert response.json()["schema_version"] == "option-wall/1.2"
+
+
+def test_option_wall_level_schema_accepts_legacy_levels_without_breakdown():
+    from api.v1.schemas.opportunities import OptionWallLevel
+
+    level = OptionWallLevel.model_validate(
+        {
+            "rank": 1,
+            "strike": 105.0,
+            "distance_from_spot_percent": 5.0,
+            "metric_value": 1_000,
+            "share_of_bucket_percent": 40.0,
+            "unit": "contracts",
+            "method": "sum_open_interest",
+        }
+    )
+
+    assert level.side is None
+    assert level.metric_basis is None
+    assert level.quote_evidence is None
+    assert level.expiry_breakdown is None
 
 
 def test_option_walls_keep_oi_visible_when_gamma_or_snapshot_coverage_is_partial(
