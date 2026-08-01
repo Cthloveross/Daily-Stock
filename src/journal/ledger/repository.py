@@ -56,8 +56,15 @@ from src.storage import Base, get_db
 # triggers always cover them.
 import src.journal.ledger.playbook_models as _playbook_models  # noqa: F401
 
+# Register the append-only artifact GC receipt table (contract F-2a) the same
+# way so its deny triggers install with ``init_ledger_schema``.
+import src.journal.ledger.artifact_gc_models as _artifact_gc_models  # noqa: F401
+
 __all__ = [
     "DEFAULT_LEDGER_ACCOUNT_KEY",
+    "LEDGER_APPEND_ONLY_GUARD_MESSAGE",
+    "ledger_guard_trigger_ddl",
+    "ledger_guard_trigger_name",
     "LedgerImportError",
     "LedgerImportResult",
     "LedgerOpenApiImportResult",
@@ -117,8 +124,31 @@ _APPEND_ONLY_TABLE_NAMES = (
     "journal_v2_review_annotations",
     "journal_v2_playbook_candidates",
     "journal_v2_playbook_rules",
+    "journal_v2_artifact_gc_receipts",
 )
 _LEDGER_SCHEMA_LOCK = threading.RLock()
+
+# Single authoritative deny-trigger DDL for ``_APPEND_ONLY_TABLE_NAMES``.
+# ``artifact_gc`` reuses it to install the GC receipt table's guards when the
+# CLI runs before ``init_ledger_schema`` has seen the new table; never
+# hand-copy the trigger body elsewhere.
+LEDGER_APPEND_ONLY_GUARD_MESSAGE = "journal v2 rows are append-only"
+
+
+def ledger_guard_trigger_name(table_name: str, operation: str) -> str:
+    """Deterministic UPDATE/DELETE deny-trigger name for one ledger table."""
+    return f"trg_{table_name}_{operation.lower()}_immutable"
+
+
+def ledger_guard_trigger_ddl(table_name: str, operation: str) -> str:
+    """Authoritative CREATE TRIGGER DDL guarding one append-only ledger table."""
+    trigger_name = ledger_guard_trigger_name(table_name, operation)
+    return (
+        f"CREATE TRIGGER IF NOT EXISTS {trigger_name} "
+        f"BEFORE {operation} ON {table_name} "
+        "BEGIN SELECT RAISE(ABORT, "
+        f"'{LEDGER_APPEND_ONLY_GUARD_MESSAGE}'); END"
+    )
 
 
 class LedgerImportError(ValueError):
@@ -356,14 +386,8 @@ def init_ledger_schema() -> None:
             with db._engine.begin() as connection:
                 for table_name in _APPEND_ONLY_TABLE_NAMES:
                     for operation in ("UPDATE", "DELETE"):
-                        trigger_name = (
-                            f"trg_{table_name}_{operation.lower()}_immutable"
-                        )
                         connection.exec_driver_sql(
-                            f"CREATE TRIGGER IF NOT EXISTS {trigger_name} "
-                            f"BEFORE {operation} ON {table_name} "
-                            "BEGIN SELECT RAISE(ABORT, "
-                            "'journal v2 rows are append-only'); END"
+                            ledger_guard_trigger_ddl(table_name, operation)
                         )
 
 

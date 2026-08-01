@@ -1,6 +1,11 @@
 # 短期 Artifact GC 合同（阶段 F · F-2 · 设计冻结稿）
 
-> 状态：设计合同（2026-08-01 冻结）；F-2a / F-2b 均未实现
+> 状态：设计合同（2026-08-01 冻结）；**F-2a 已实现（2026-08-01）**：
+> `src/journal/ledger/artifact_gc.py`（谓词 + 单事务执行器）+
+> `artifact_gc_models.py`（回执表）+ `scripts/artifact_gc.py`（CLI，默认
+> dry-run 只读 `mode=ro`）+ T1-T10（`src/journal/tests/test_artifact_gc.py`）；
+> 正式库 apply 仍需用户明确确认 + 当日验证备份（§4）。F-2b 未实现
+> （默认不做，含 §8 两项 BLOCKED 决策）
 >
 > 真源顺序：可执行代码 > 本合同 > HANDOFF §5.2 / §15 P3.7 概述
 >

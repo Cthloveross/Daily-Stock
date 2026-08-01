@@ -49,6 +49,9 @@ from src.storage import Base, get_db
 __all__ = [
     "DEFAULT_REFRESH_ARTIFACT_TTL_MINUTES",
     "DEFAULT_REFRESH_OVERLAP_DAYS",
+    "REFRESH_APPEND_ONLY_GUARD_MESSAGE",
+    "refresh_guard_trigger_ddl",
+    "refresh_guard_trigger_name",
     "JournalRefreshArtifactSnapshot",
     "JournalRefreshConfirmation",
     "JournalRefreshError",
@@ -73,6 +76,28 @@ _IMMUTABLE_TABLES = (
     JournalRefreshArtifact.__tablename__,
     JournalRefreshPublication.__tablename__,
 )
+
+# Single authoritative deny-trigger DDL for the refresh artifact tables.
+# ``artifact_gc`` recreates the DELETE trigger from this exact text after a
+# controlled in-transaction delete; never hand-copy the trigger body elsewhere
+# (New-docs/phase1/14_ARTIFACT_GC_CONTRACT.md §3 step 7).
+REFRESH_APPEND_ONLY_GUARD_MESSAGE = "journal refresh rows are append-only"
+
+
+def refresh_guard_trigger_name(table_name: str, operation: str) -> str:
+    """Deterministic UPDATE/DELETE deny-trigger name for one refresh table."""
+    return f"trg_{table_name}_{operation.lower()}_immutable"
+
+
+def refresh_guard_trigger_ddl(table_name: str, operation: str) -> str:
+    """Authoritative CREATE TRIGGER DDL guarding one refresh table."""
+    trigger = refresh_guard_trigger_name(table_name, operation)
+    return (
+        f"CREATE TRIGGER IF NOT EXISTS {trigger} "
+        f"BEFORE {operation} ON {table_name} "
+        "BEGIN SELECT RAISE(ABORT, "
+        f"'{REFRESH_APPEND_ONLY_GUARD_MESSAGE}'); END"
+    )
 
 
 class JournalRefreshError(ValueError):
@@ -189,12 +214,8 @@ def init_refresh_schema() -> None:
             with db._engine.begin() as connection:
                 for table_name in _IMMUTABLE_TABLES:
                     for operation in ("UPDATE", "DELETE"):
-                        trigger = f"trg_{table_name}_{operation.lower()}_immutable"
                         connection.exec_driver_sql(
-                            f"CREATE TRIGGER IF NOT EXISTS {trigger} "
-                            f"BEFORE {operation} ON {table_name} "
-                            "BEGIN SELECT RAISE(ABORT, "
-                            "'journal refresh rows are append-only'); END"
+                            refresh_guard_trigger_ddl(table_name, operation)
                         )
 
 

@@ -23,6 +23,7 @@ from src.journal.ledger.position_snapshot_models import (
     ConfirmedPositionSnapshot,
     PositionSnapshotArtifact,
     PositionSnapshotMember,
+    position_snapshot_guard_trigger_ddl,
 )
 from src.journal.ledger.refresh_models import JournalRefreshPublication
 from src.options.occ_parser import parse_symbol
@@ -1323,12 +1324,11 @@ def init_position_snapshot_schema() -> None:
                             )
                 for table_name in _IMMUTABLE_TABLES:
                     for operation in ("UPDATE", "DELETE"):
-                        trigger = f"trg_{table_name}_{operation.lower()}_immutable"
                         connection.exec_driver_sql(
-                            f"CREATE TRIGGER IF NOT EXISTS {trigger} "
-                            f"BEFORE {operation} ON {table_name} "
-                            "BEGIN SELECT RAISE(ABORT, "
-                            "'position snapshot rows are append-only'); END"
+                            position_snapshot_guard_trigger_ddl(
+                                table_name,
+                                operation,
+                            )
                         )
                 connection.exec_driver_sql(
                     "CREATE INDEX IF NOT EXISTS "

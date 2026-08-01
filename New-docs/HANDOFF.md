@@ -381,7 +381,7 @@ Web：
 - overlap 不一致、账户 binding 不一致、窗口缺口、费用/规格证据不完整或 stale plan 时 fail closed；
 - blocked canonical 可供诊断，但 `analysis_ready=false` 时不能生成 Episode build；
 - 当前正式 broker/canonical execution-group 相关 rows 均为 0；组合增量 tail 的主要保证来自测试，pre-baseline/overlap 组合 merge 仍保持阻断；
-- 短期 refresh/snapshot artifact 的过期清理、可恢复异步 job 和持久化 last failure 仍是运维技术债。
+- 短期 refresh/snapshot artifact 的过期清理已实现（F-2a：`scripts/artifact_gc.py` 显式 CLI，默认只读 dry-run，apply 需当日验证备份，合同见 `New-docs/phase1/14_ARTIFACT_GC_CONTRACT.md`）；可恢复异步 job 和持久化 last failure 仍是运维技术债。
 
 ### 5.3 当前持仓与未来 Episode
 
@@ -1178,7 +1178,7 @@ ReportMarkdown 于当前 UI 有稳定入口前不得作为验收证据。
 4. 健康状态还没有统一分层面板；
 5. 旧 Phase 0/overview 文档需要标 stale 或更新。
 6. ~~基础相对量是 T-1，但当前页面总括提示写成“Volume＝本交易日累计”~~ 已解决（2026-07-31）：提示已区分 T-1 相对量能与当日期权成交量，并有测试断言。
-7. 过期 refresh/snapshot artifact 清理、refresh preview 的可恢复异步 job 与持久化 last failure 尚未实现。
+7. ~~过期 refresh/snapshot artifact 清理尚未实现~~ 已实现（2026-08-01，F-2a：显式 CLI dry-run/apply + append-only 回执，见 `New-docs/phase1/14_ARTIFACT_GC_CONTRACT.md`）；refresh preview 的可恢复异步 job 与持久化 last failure 尚未实现。
 8. strict anchor replay 会重复构造 full builder objects；non-empty persisted canonical → future preview 仍需真实 DB E2E。
 
 ---

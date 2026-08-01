@@ -39,14 +39,42 @@ from src.storage import Base
 import src.journal.ledger.refresh_models as _refresh_models  # noqa: E402,F401
 
 __all__ = [
+    "POSITION_SNAPSHOT_APPEND_ONLY_GUARD_MESSAGE",
     "PositionSnapshotArtifact",
     "ConfirmedPositionSnapshot",
     "PositionSnapshotMember",
+    "position_snapshot_guard_trigger_ddl",
+    "position_snapshot_guard_trigger_name",
 ]
 
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# Single authoritative deny-trigger DDL for the snapshot tables.  The model
+# hooks, the repository repair path, and ``artifact_gc``'s in-transaction
+# trigger recreation must all use this exact text; never hand-copy the trigger
+# body elsewhere (New-docs/phase1/14_ARTIFACT_GC_CONTRACT.md §3 step 7).
+POSITION_SNAPSHOT_APPEND_ONLY_GUARD_MESSAGE = (
+    "position snapshot rows are append-only"
+)
+
+
+def position_snapshot_guard_trigger_name(table_name: str, operation: str) -> str:
+    """Deterministic UPDATE/DELETE deny-trigger name for one snapshot table."""
+    return f"trg_{table_name}_{operation.lower()}_immutable"
+
+
+def position_snapshot_guard_trigger_ddl(table_name: str, operation: str) -> str:
+    """Authoritative CREATE TRIGGER DDL guarding one snapshot table."""
+    trigger = position_snapshot_guard_trigger_name(table_name, operation)
+    return (
+        f"CREATE TRIGGER IF NOT EXISTS {trigger} "
+        f"BEFORE {operation} ON {table_name} "
+        "BEGIN SELECT RAISE(ABORT, "
+        f"'{POSITION_SNAPSHOT_APPEND_ONLY_GUARD_MESSAGE}'); END"
+    )
 
 
 class PositionSnapshotArtifact(Base):
@@ -403,17 +431,14 @@ for _snapshot_model in (
 ):
     _snapshot_table_name = _snapshot_model.__tablename__
     for _snapshot_operation in ("UPDATE", "DELETE"):
-        _snapshot_trigger_name = (
-            f"trg_{_snapshot_table_name}_{_snapshot_operation.lower()}_immutable"
-        )
         event.listen(
             _snapshot_model.__table__,
             "after_create",
             DDL(
-                f"CREATE TRIGGER IF NOT EXISTS {_snapshot_trigger_name} "
-                f"BEFORE {_snapshot_operation} ON {_snapshot_table_name} "
-                "BEGIN SELECT RAISE(ABORT, "
-                "'position snapshot rows are append-only'); END"
+                position_snapshot_guard_trigger_ddl(
+                    _snapshot_table_name,
+                    _snapshot_operation,
+                )
             ).execute_if(dialect="sqlite"),
         )
 
@@ -441,14 +466,8 @@ def _repair_snapshot_guards_after_create_all(
         if table_name not in existing_tables:
             continue
         for operation in ("UPDATE", "DELETE"):
-            trigger_name = (
-                f"trg_{table_name}_{operation.lower()}_immutable"
-            )
             connection.exec_driver_sql(
-                f"CREATE TRIGGER IF NOT EXISTS {trigger_name} "
-                f"BEFORE {operation} ON {table_name} "
-                "BEGIN SELECT RAISE(ABORT, "
-                "'position snapshot rows are append-only'); END"
+                position_snapshot_guard_trigger_ddl(table_name, operation)
             )
 
 
