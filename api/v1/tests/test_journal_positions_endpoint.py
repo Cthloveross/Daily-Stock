@@ -950,12 +950,18 @@ def test_preview_maps_configuration_to_409_and_opend_failure_to_503(monkeypatch)
 
 
 def test_main_v1_router_registers_position_snapshot_paths():
+    # Newer Starlette wraps included routers without a flat ``path``
+    # attribute; assert via the mounted app's openapi schema instead.
+    from fastapi import FastAPI
+
     from api.v1.router import router
 
+    app = FastAPI()
+    app.include_router(router)
     registered = {
-        (method, route.path)
-        for route in router.routes
-        for method in getattr(route, "methods", set())
+        (method.upper(), path)
+        for path, operations in app.openapi()["paths"].items()
+        for method in operations
     }
     assert (
         "GET",

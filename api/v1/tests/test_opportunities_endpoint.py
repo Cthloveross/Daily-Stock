@@ -1261,18 +1261,18 @@ def test_request_bounds_are_enforced():
 
 
 def test_main_v1_router_registers_opportunity_paths():
+    # Newer Starlette wraps included routers in objects without a flat
+    # ``path`` attribute; assert against the mounted FastAPI app's openapi
+    # paths so the check stays version-robust.
+    from fastapi import FastAPI
+
     from api.v1.router import router
 
-    assert any(route.path == "/api/v1/opportunities/daily" for route in router.routes)
-    assert any(
-        route.path == "/api/v1/opportunities/option-context"
-        for route in router.routes
-    )
-    assert any(
-        route.path == "/api/v1/opportunities/option-walls"
-        for route in router.routes
-    )
-    assert any(
-        route.path == "/api/v1/opportunities/option-events"
-        for route in router.routes
-    )
+    app = FastAPI()
+    app.include_router(router)
+    paths = set(app.openapi()["paths"])
+
+    assert "/api/v1/opportunities/daily" in paths
+    assert "/api/v1/opportunities/option-context" in paths
+    assert "/api/v1/opportunities/option-walls" in paths
+    assert "/api/v1/opportunities/option-events" in paths
