@@ -10,6 +10,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -223,6 +224,8 @@ def _openapi_export_payload() -> dict:
                     "fill_outside_rth": False,
                     "session": "REGULAR",
                     "currency": "USD",
+                    "strategy_type": "NONE",
+                    "combo_legs": [],
                 }
             ],
             "deals": [
@@ -291,6 +294,38 @@ def _second_openapi_export_payload() -> dict:
         }
     )
     payload["records"]["fees"][0]["order_id"] = "order-2"
+    return payload
+
+
+def _empty_openapi_export_payload() -> dict:
+    """A complete zero-activity query beginning at the prior broker watermark."""
+    payload = json.loads(json.dumps(_openapi_export_payload()))
+    window = {
+        "start": "2026-07-01T16:00:00-04:00",
+        "end": "2026-07-02T16:00:00-04:00",
+        "timezone": "America/New_York",
+        "chunks": 1,
+        "max_chunk_days": 7,
+    }
+    payload["generated_at"] = "2026-07-02T20:00:00+00:00"
+    payload["window"] = window
+    payload["summary"].update(
+        window=window,
+        warnings=["no_filled_orders_in_window"],
+        counts={
+            "orders": 0,
+            "filled_orders": 0,
+            "fills": 0,
+            "fees": 0,
+            "unique_instruments": 0,
+            "option_activity_rows": 0,
+        },
+        activity_sides={"buy": 0, "sell": 0, "other": 0},
+        fee_totals_by_currency={},
+        activity_time_range={"first": None, "last": None},
+        fee_batches=0,
+    )
+    payload["records"] = {"orders": [], "deals": [], "fees": []}
     return payload
 
 
@@ -625,8 +660,15 @@ def test_v2_openapi_preview_is_strict_and_read_only():
     assert body["analysis_ready"] is True
     assert body["reconciliation_status"] == "passed"
     assert body["order_observations"] == 1
+    assert body["ordinary_order_observations"] == 1
+    assert body["unclassified_parent_observations"] == 0
     assert body["fill_observations"] == 1
     assert body["fee_observations"] == 1
+    assert body["contract_spec_observations"] == 0
+    assert body["execution_group_observations"] == 0
+    assert body["execution_group_leg_observations"] == 0
+    assert body["execution_group_fill_links"] == 0
+    assert body["execution_group_fee_observations"] == 0
     assert body["fee_totals_by_currency"] == {"USD": "0.3002"}
     assert body["journal_database_written"] is False
     assert not db_path.exists()
@@ -668,6 +710,15 @@ def test_v2_openapi_plan_without_csv_baseline_is_read_only_and_blocked():
     assert body["confirm_allowed"] is False
     assert body["base_scope"] is None
     assert body["journal_database_written"] is False
+    assert body["source_scope"]["ordinary_order_observations"] == 1
+    assert body["source_scope"]["unclassified_parent_observations"] == 0
+    assert body["source_scope"]["contract_spec_observations"] == 0
+    assert body["source_scope"]["execution_group_observations"] == 0
+    assert body["write_plan"]["ordinary_order_observations"] == 0
+    assert body["write_plan"]["unclassified_parent_observations"] == 0
+    assert body["canonical_impact"][
+        "input_execution_group_observations"
+    ] == 0
     assert [item["code"] for item in body["issues"]] == [
         "no_accepted_csv_baseline"
     ]
@@ -680,6 +731,162 @@ def test_v2_openapi_plan_without_csv_baseline_is_read_only_and_blocked():
                 "SELECT COUNT(*) FROM journal_v2_import_batches"
             ).fetchone()[0]
         assert count == 0
+
+
+def test_v2_openapi_plan_and_confirm_preserve_execution_group_counts(
+    monkeypatch,
+):
+    from api.v1.endpoints import journal as journal_endpoint
+
+    preview_key = "a" * 64
+    canonical_sha256 = "b" * 64
+    plan_payload = {
+        "preview_key": preview_key,
+        "confirm_allowed": False,
+        "source_scope": {
+            "environment": "LIVE",
+            "market": "US",
+            "account_selection": "unique_auto",
+            "account_bound": True,
+            "window_start": "2026-07-01T09:00:00-04:00",
+            "window_end": "2026-07-01T16:00:00-04:00",
+            "source_timezone": "America/New_York",
+            "order_observations": 3,
+            "ordinary_order_observations": 1,
+            "unclassified_parent_observations": 1,
+            "fill_observations": 4,
+            "fee_observations": 2,
+            "contract_spec_observations": 2,
+            "execution_group_observations": 1,
+            "execution_group_leg_observations": 2,
+            "execution_group_fill_links": 3,
+            "execution_group_fee_observations": 1,
+            "fee_totals_by_currency": {"USD": "8.08"},
+        },
+        "base_scope": None,
+        "coverage": {
+            "scope": "unavailable",
+            "matched_orders": 0,
+            "csv_only_in_window": 0,
+            "api_only_orders": 3,
+            "ambiguous_identity_keys": 0,
+            "covered_base_orders": 0,
+            "base_orders": 0,
+            "coverage_ratio": "0",
+            "outside_unverified_orders": 0,
+        },
+        "write_plan": {
+            "already_imported": False,
+            "order_observations": 3,
+            "ordinary_order_observations": 1,
+            "unclassified_parent_observations": 1,
+            "fill_observations": 4,
+            "fee_observations": 2,
+            "execution_group_observations": 1,
+            "execution_group_leg_observations": 2,
+            "execution_group_fill_links": 3,
+            "execution_group_fee_observations": 1,
+            "order_identity_links": 0,
+            "deal_identity_links": 0,
+            "fill_set_attestations": 0,
+            "canonical_sets": 1,
+        },
+        "canonical_impact": {
+            "input_order_observations": 1,
+            "input_fill_observations": 4,
+            "canonical_orders": 1,
+            "canonical_fills": 4,
+            "duplicate_order_observations": 0,
+            "duplicate_fill_observations": 0,
+            "shadowed_csv_fills": 0,
+            "shadowed_aggregate_orders": 0,
+            "blocking_issues": 1,
+            "analysis_ready": False,
+            "canonical_set_sha256": canonical_sha256,
+            "input_execution_group_observations": 1,
+            "canonical_execution_groups": 1,
+            "canonical_execution_group_legs": 2,
+            "duplicate_execution_group_observations": 0,
+        },
+        "issues": [],
+        "warnings": [],
+        "scope_is_full_batch": False,
+        "journal_database_written": False,
+    }
+    monkeypatch.setattr(
+        journal_endpoint,
+        "plan_openapi_import",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            as_dict=lambda: plan_payload
+        ),
+    )
+
+    client = _client()
+    encoded_payload = json.dumps(_openapi_export_payload())
+    planned = client.post(
+        "/api/v1/journal/v2/openapi-imports/plan",
+        files={"file": ("readonly.json", encoded_payload, "application/json")},
+    )
+    assert planned.status_code == 200, planned.text
+    plan = planned.json()
+    assert plan["source_scope"]["contract_spec_observations"] == 2
+    assert plan["source_scope"]["execution_group_leg_observations"] == 2
+    assert plan["write_plan"]["unclassified_parent_observations"] == 1
+    assert plan["write_plan"]["execution_group_fill_links"] == 3
+    assert plan["canonical_impact"]["canonical_execution_groups"] == 1
+    assert plan["canonical_impact"]["canonical_execution_group_legs"] == 2
+
+    monkeypatch.setattr(
+        journal_endpoint,
+        "confirm_openapi_import_plan",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            status="appended",
+            duplicate=False,
+            import_batch_id=12,
+            canonical_set_id=34,
+            canonical_set_sha256=canonical_sha256,
+            scope="incremental_tail",
+            appended={
+                "orders": 2,
+                "ordinary_orders": 1,
+                "fills": 4,
+                "fees": 2,
+                "execution_groups": 1,
+                "execution_group_legs": 2,
+                "execution_group_fill_links": 3,
+                "execution_group_fees": 1,
+                "order_links": 0,
+                "deal_links": 0,
+                "fill_set_attestations": 0,
+                "canonical_sets": 1,
+            },
+            canonical={
+                "orders": 1,
+                "fills": 4,
+                "execution_groups": 1,
+                "execution_group_legs": 2,
+                "shadowed_csv_fills": 0,
+                "shadowed_aggregate_orders": 0,
+                "blocking_issues": 0,
+                "analysis_ready": True,
+            },
+            message="appended",
+        ),
+    )
+    confirmed = client.post(
+        "/api/v1/journal/v2/openapi-imports/confirm",
+        params={"preview_key": preview_key},
+        files={"file": ("readonly.json", encoded_payload, "application/json")},
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    body = confirmed.json()
+    assert body["appended"]["ordinary_orders"] == 1
+    assert body["appended"]["execution_groups"] == 1
+    assert body["appended"]["execution_group_legs"] == 2
+    assert body["appended"]["execution_group_fill_links"] == 3
+    assert body["appended"]["execution_group_fees"] == 1
+    assert body["canonical"]["execution_groups"] == 1
+    assert body["canonical"]["execution_group_legs"] == 2
 
 
 def test_v2_openapi_plan_confirm_is_atomic_and_idempotent():
@@ -704,6 +911,8 @@ def test_v2_openapi_plan_confirm_is_atomic_and_idempotent():
         "matched_orders": 1,
         "csv_only_in_window": 0,
         "api_only_orders": 0,
+        "overlap_api_only_orders": 0,
+        "incremental_api_only_orders": 0,
         "ambiguous_identity_keys": 0,
         "covered_base_orders": 1,
         "base_orders": 1,
@@ -726,14 +935,21 @@ def test_v2_openapi_plan_confirm_is_atomic_and_idempotent():
     assert first["status"] == "appended"
     assert first["appended"] == {
         "orders": 1,
+        "ordinary_orders": 1,
         "fills": 1,
         "fees": 1,
+        "execution_groups": 0,
+        "execution_group_legs": 0,
+        "execution_group_fill_links": 0,
+        "execution_group_fees": 0,
         "order_links": 1,
         "deal_links": 1,
         "fill_set_attestations": 0,
         "canonical_sets": 1,
     }
     assert first["canonical"]["analysis_ready"] is True
+    assert first["canonical"]["execution_groups"] == 0
+    assert first["canonical"]["execution_group_legs"] == 0
     assert first["legacy_journal_written"] is False
     assert first["episode_build_triggered"] is False
     assert first["trading_action_performed"] is False
@@ -756,6 +972,379 @@ def test_v2_openapi_plan_confirm_is_atomic_and_idempotent():
     assert duplicate["duplicate"] is True
     assert all(value == 0 for value in duplicate["appended"].values())
     assert duplicate["canonical_set_sha256"] == first["canonical_set_sha256"]
+
+
+def test_v2_server_owned_refresh_preview_then_explicit_confirm(monkeypatch):
+    from api.v1.endpoints import journal as journal_endpoint
+    from src.journal.ledger.models import ImportBatch
+    from src.journal.ledger.refresh_models import (
+        JournalRefreshArtifact,
+        JournalRefreshPublication,
+    )
+    from src.journal.ledger.refresh_repository import get_journal_refresh_status
+    from src.storage import get_db
+
+    client = _client()
+    baseline = client.post(
+        "/api/v1/journal/v2/imports",
+        files={"file": ("history.csv", _matching_openapi_csv(), "text/csv")},
+    )
+    assert baseline.status_code == 200
+
+    payload = _openapi_export_payload()
+    payload["account"]["binding"] = "d" * 64
+    payload["summary"].update(
+        retrieval_complete=True,
+        coverage_complete=True,
+        has_activity=True,
+    )
+    monkeypatch.setenv("MOOMOO_OPEND_ENABLED", "true")
+    monkeypatch.setenv("MOOMOO_JOURNAL_REFRESH_ENABLED", "true")
+    monkeypatch.setenv("MOOMOO_JOURNAL_ENV", "LIVE")
+    monkeypatch.setenv(
+        "MOOMOO_JOURNAL_ACCOUNT_BINDING_SECRET",
+        "server-owned-refresh-test-secret-1234567890",
+    )
+    monkeypatch.setattr(
+        journal_endpoint,
+        "suggest_refresh_window",
+        lambda *_args, **_kwargs: (
+            datetime(
+                2026,
+                7,
+                1,
+                9,
+                tzinfo=ZoneInfo("America/New_York"),
+            ),
+            datetime(
+                2026,
+                7,
+                1,
+                16,
+                tzinfo=ZoneInfo("America/New_York"),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        journal_endpoint,
+        "run_readonly_probe",
+        lambda _config: SimpleNamespace(export_payload=payload),
+    )
+
+    preview_response = client.post(
+        "/api/v1/journal/v2/refreshes/preview",
+        json={"overlap_days": 7},
+    )
+    assert preview_response.status_code == 200, preview_response.text
+    preview = preview_response.json()
+    assert preview["evidence_written"] is False
+    assert preview["trading_action_performed"] is False
+    assert preview["source"] == {
+        "retrieval_complete": True,
+        "coverage_complete": True,
+        "has_activity": True,
+        "broker_queried_through": "2026-07-01T16:00:00-04:00",
+        "latest_fill_at": "2026-07-01T09:30:30-04:00",
+        "order_observations": 1,
+        "ordinary_order_observations": 1,
+        "unclassified_parent_observations": 0,
+        "fill_observations": 1,
+        "fee_observations": 1,
+        "contract_spec_observations": 0,
+        "execution_group_observations": 0,
+        "execution_group_leg_observations": 0,
+        "execution_group_fill_links": 0,
+        "execution_group_fee_observations": 0,
+    }
+    assert preview["plan"]["confirm_allowed"] is True, preview["plan"]["issues"]
+
+    db = get_db()
+    with db.session_scope() as session:
+        assert session.query(JournalRefreshArtifact).count() == 1
+        assert session.query(JournalRefreshPublication).count() == 0
+        assert session.query(ImportBatch).count() == 1
+
+    confirmed_response = client.post(
+        f"/api/v1/journal/v2/refreshes/{preview['artifact_id']}/confirm",
+        json={
+            "preview_key": preview["plan"]["preview_key"],
+            "acknowledge_partial_window": True,
+        },
+    )
+    assert confirmed_response.status_code == 200, confirmed_response.text
+    confirmed = confirmed_response.json()
+    assert confirmed["artifact_id"] == preview["artifact_id"]
+    assert confirmed["trading_action_performed"] is False
+    assert confirmed["publication"]["broker_queried_through"] == (
+        "2026-07-01T20:00:00Z"
+    )
+    assert confirmed["imported"]["canonical"]["analysis_ready"] is True
+
+    with db.session_scope() as session:
+        assert session.query(JournalRefreshPublication).count() == 1
+        assert session.query(ImportBatch).count() == 2
+
+    status = get_journal_refresh_status(
+        "default_moomoo_us",
+        now=datetime(
+            2026,
+            7,
+            1,
+            17,
+            tzinfo=ZoneInfo("America/New_York"),
+        ),
+    )
+    assert status.freshness_state == "evidence_current"
+    assert status.pending_stage == "build"
+    assert status.broker_queried_through == datetime(
+        2026,
+        7,
+        1,
+        20,
+        tzinfo=timezone.utc,
+    )
+    assert status.latest_fill_at == datetime(
+        2026,
+        7,
+        1,
+        13,
+        30,
+        30,
+        tzinfo=timezone.utc,
+    )
+
+    repeated = client.post(
+        f"/api/v1/journal/v2/refreshes/{preview['artifact_id']}/confirm",
+        json={
+            "preview_key": preview["plan"]["preview_key"],
+            "acknowledge_partial_window": True,
+        },
+    )
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["publication"]["publication_id"] == confirmed[
+        "publication"
+    ]["publication_id"]
+
+
+def test_v2_server_owned_refresh_rejects_a_gap_after_csv_baseline():
+    from dataclasses import replace
+
+    from src.journal.brokers.moomoo_openapi_export import parse_openapi_export
+    from src.journal.ledger.openapi_repository import plan_openapi_import
+    from src.journal.ledger.refresh_repository import (
+        JournalRefreshError,
+        save_refresh_artifact,
+    )
+
+    client = _client()
+    baseline = client.post(
+        "/api/v1/journal/v2/imports",
+        files={"file": ("history.csv", _matching_openapi_csv(), "text/csv")},
+    )
+    assert baseline.status_code == 200
+
+    payload = _openapi_export_payload()
+    payload["account"]["binding"] = "d" * 64
+    payload["summary"].update(
+        retrieval_complete=True,
+        coverage_complete=True,
+        has_activity=True,
+    )
+    preview = parse_openapi_export(payload)
+    discontinuous = replace(
+        preview,
+        metadata=replace(
+            preview.metadata,
+            window_start=datetime(
+                2026,
+                7,
+                1,
+                10,
+                0,
+                tzinfo=ZoneInfo("America/New_York"),
+            ),
+        ),
+    )
+    plan = plan_openapi_import(preview, payload)
+
+    with pytest.raises(JournalRefreshError, match="discontinuous"):
+        save_refresh_artifact(
+            discontinuous,
+            payload,
+            plan,
+            account_key="default_moomoo_us",
+        )
+
+
+def test_v2_server_owned_empty_refresh_advances_query_watermark(monkeypatch):
+    from api.v1.endpoints import journal as journal_endpoint
+
+    client = _client()
+    baseline = client.post(
+        "/api/v1/journal/v2/imports",
+        files={"file": ("history.csv", _matching_openapi_csv(), "text/csv")},
+    )
+    assert baseline.status_code == 200
+
+    activity_payload = _openapi_export_payload()
+    activity_payload["account"]["binding"] = "e" * 64
+    activity_payload["summary"].update(
+        retrieval_complete=True,
+        coverage_complete=True,
+        has_activity=True,
+    )
+    first_start = datetime(
+        2026,
+        7,
+        1,
+        9,
+        tzinfo=ZoneInfo("America/New_York"),
+    )
+    first_end = datetime(
+        2026,
+        7,
+        1,
+        16,
+        tzinfo=ZoneInfo("America/New_York"),
+    )
+    empty_start = first_end
+    empty_end = datetime(
+        2026,
+        7,
+        2,
+        16,
+        tzinfo=ZoneInfo("America/New_York"),
+    )
+    monkeypatch.setenv("MOOMOO_OPEND_ENABLED", "true")
+    monkeypatch.setenv("MOOMOO_JOURNAL_REFRESH_ENABLED", "true")
+    monkeypatch.setenv("MOOMOO_JOURNAL_ENV", "LIVE")
+    monkeypatch.setenv(
+        "MOOMOO_JOURNAL_ACCOUNT_BINDING_SECRET",
+        "server-owned-empty-refresh-test-secret-1234",
+    )
+    monkeypatch.setattr(
+        journal_endpoint,
+        "suggest_refresh_window",
+        lambda *_args, **_kwargs: (first_start, first_end),
+    )
+    monkeypatch.setattr(
+        journal_endpoint,
+        "run_readonly_probe",
+        lambda _config: SimpleNamespace(export_payload=activity_payload),
+    )
+
+    first_preview_response = client.post(
+        "/api/v1/journal/v2/refreshes/preview",
+        json={"overlap_days": 7},
+    )
+    assert first_preview_response.status_code == 200, first_preview_response.text
+    first_preview = first_preview_response.json()
+    first_confirm = client.post(
+        f"/api/v1/journal/v2/refreshes/{first_preview['artifact_id']}/confirm",
+        json={
+            "preview_key": first_preview["plan"]["preview_key"],
+            "acknowledge_partial_window": True,
+        },
+    )
+    assert first_confirm.status_code == 200, first_confirm.text
+
+    payload = _empty_openapi_export_payload()
+    payload["account"]["binding"] = "e" * 64
+    payload["summary"].update(
+        retrieval_complete=True,
+        coverage_complete=True,
+        has_activity=False,
+    )
+    monkeypatch.setattr(
+        journal_endpoint,
+        "suggest_refresh_window",
+        lambda *_args, **_kwargs: (empty_start, empty_end),
+    )
+    monkeypatch.setattr(
+        journal_endpoint,
+        "run_readonly_probe",
+        lambda _config: SimpleNamespace(export_payload=payload),
+    )
+    preview_response = client.post(
+        "/api/v1/journal/v2/refreshes/preview",
+        json={"overlap_days": 7},
+    )
+    assert preview_response.status_code == 200, preview_response.text
+    preview = preview_response.json()
+    assert preview["source"]["has_activity"] is False
+    assert preview["source"]["latest_fill_at"] is None
+    assert preview["source"]["order_observations"] == 0
+    assert preview["plan"]["confirm_allowed"] is True, preview["plan"]["issues"]
+
+    confirmed_response = client.post(
+        f"/api/v1/journal/v2/refreshes/{preview['artifact_id']}/confirm",
+        json={
+            "preview_key": preview["plan"]["preview_key"],
+            "acknowledge_partial_window": True,
+        },
+    )
+    assert confirmed_response.status_code == 200, confirmed_response.text
+    publication = confirmed_response.json()["publication"]
+    assert publication["broker_queried_through"] == "2026-07-02T20:00:00Z"
+    assert publication["latest_fill_at"] is None
+
+
+def test_v2_server_owned_refresh_rejects_probe_scope_drift(monkeypatch):
+    from api.v1.endpoints import journal as journal_endpoint
+
+    client = _client()
+    baseline = client.post(
+        "/api/v1/journal/v2/imports",
+        files={"file": ("history.csv", _matching_openapi_csv(), "text/csv")},
+    )
+    assert baseline.status_code == 200
+
+    payload = _openapi_export_payload()
+    payload["account"]["binding"] = "f" * 64
+    payload["summary"].update(
+        retrieval_complete=True,
+        coverage_complete=True,
+        has_activity=True,
+    )
+    monkeypatch.setenv("MOOMOO_OPEND_ENABLED", "true")
+    monkeypatch.setenv("MOOMOO_JOURNAL_REFRESH_ENABLED", "true")
+    monkeypatch.setenv("MOOMOO_JOURNAL_ENV", "LIVE")
+    monkeypatch.setenv(
+        "MOOMOO_JOURNAL_ACCOUNT_BINDING_SECRET",
+        "server-owned-scope-drift-test-secret-12345",
+    )
+    monkeypatch.setattr(
+        journal_endpoint,
+        "suggest_refresh_window",
+        lambda *_args, **_kwargs: (
+            datetime(
+                2026,
+                7,
+                1,
+                8,
+                tzinfo=ZoneInfo("America/New_York"),
+            ),
+            datetime(
+                2026,
+                7,
+                1,
+                16,
+                tzinfo=ZoneInfo("America/New_York"),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        journal_endpoint,
+        "run_readonly_probe",
+        lambda _config: SimpleNamespace(export_payload=payload),
+    )
+
+    response = client.post(
+        "/api/v1/journal/v2/refreshes/preview",
+        json={"overlap_days": 7},
+    )
+    assert response.status_code == 409
+    assert "server-owned query scope" in response.json()["detail"]
 
 
 def test_v2_openapi_plan_is_cumulative_across_disjoint_windows():
@@ -867,8 +1456,14 @@ def test_v2_openapi_overlapping_window_reuses_existing_identity_proofs():
     assert overlap_plan["write_plan"] == {
         "already_imported": False,
         "order_observations": 1,
+        "ordinary_order_observations": 1,
+        "unclassified_parent_observations": 0,
         "fill_observations": 1,
         "fee_observations": 1,
+        "execution_group_observations": 0,
+        "execution_group_leg_observations": 0,
+        "execution_group_fill_links": 0,
+        "execution_group_fee_observations": 0,
         "order_identity_links": 0,
         "deal_identity_links": 0,
         "fill_set_attestations": 0,
@@ -1123,6 +1718,12 @@ def test_v2_position_episodes_returns_explicit_not_built_state(monkeypatch):
         "total": 0,
         "page": 2,
         "per_page": 25,
+        "review_queue": {
+            "pending": 0,
+            "in_progress": 0,
+            "completed": 0,
+            "total": 0,
+        },
         "items": [],
     }
 
@@ -1185,6 +1786,12 @@ def test_v2_position_episodes_filters_and_preserves_decimal_strings(monkeypatch)
         "assumed_flat_unverified"
     )
     assert body["build"]["assumed_flat_unverified"] is True
+    assert body["build"]["source_window_start"] == (
+        "2026-03-04T00:00:00Z"
+    )
+    assert body["build"]["source_cutoff_at"] == (
+        "2026-07-19T00:00:00Z"
+    )
     assert body["reconciliation"]["scope"] == "partial_window"
     assert body["reconciliation"]["partial_window"] is True
     assert body["reconciliation"]["matched_order_count"] == 1089
@@ -1247,6 +1854,7 @@ def test_v2_position_episode_case_focus_openapi_contract():
         "top_loss",
         "largest_fee",
         "longest_hold",
+        "weakest_evidence",
     ]
 
 
@@ -1749,6 +2357,7 @@ def test_canonical_episode_build_confirm_reads_explicit_build_and_keeps_default(
         "expected_build_key": build_key,
         "account_key": "default_moomoo_us",
         "accept_assumed_flat": True,
+        "accept_group_fee_scope": False,
     }
     assert explicit_reads == [(12, "default_moomoo_us")]
     body = response.json()
@@ -2022,3 +2631,50 @@ def test_canonical_episode_api_round_trip_does_not_activate_default_build():
     )
     assert explicit_detail.status_code == 200, explicit_detail.text
     assert explicit_detail.json()["build"]["id"] == build_id
+
+    activation_before = c.get(
+        "/api/v1/journal/v2/episode-builds/activation"
+    )
+    assert activation_before.status_code == 200, activation_before.text
+    assert activation_before.json()["selection_source"] == "none"
+    assert activation_before.json()["current_build_id"] is None
+
+    activation_request = {
+        "expected_build_key": built_body["build"]["build_key"],
+        "expected_current_activation_id": None,
+        "expected_current_build_id": None,
+        "accept_assumed_flat": False,
+    }
+    missing_ack = c.post(
+        f"/api/v1/journal/v2/episode-builds/{build_id}/activate",
+        json=activation_request,
+    )
+    assert missing_ack.status_code == 409, missing_ack.text
+    assert "explicit acceptance" in missing_ack.json()["detail"]
+
+    activation_request["accept_assumed_flat"] = True
+    activated = c.post(
+        f"/api/v1/journal/v2/episode-builds/{build_id}/activate",
+        json=activation_request,
+    )
+    assert activated.status_code == 200, activated.text
+    activated_body = activated.json()
+    assert activated_body["duplicate"] is False
+    assert activated_body["trading_action_performed"] is False
+    assert activated_body["state"]["selection_source"] == "activation"
+    assert activated_body["state"]["current_build_id"] == build_id
+
+    activated_default_page = c.get("/api/v1/journal/v2/position-episodes")
+    assert activated_default_page.status_code == 200
+    assert activated_default_page.json()["data_state"] == "ready"
+    assert activated_default_page.json()["build"]["id"] == build_id
+
+    repeated_activation = c.post(
+        f"/api/v1/journal/v2/episode-builds/{build_id}/activate",
+        json=activation_request,
+    )
+    assert repeated_activation.status_code == 200, repeated_activation.text
+    assert repeated_activation.json()["duplicate"] is True
+    assert repeated_activation.json()["activation_id"] == activated_body[
+        "activation_id"
+    ]

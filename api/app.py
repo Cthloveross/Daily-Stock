@@ -17,6 +17,7 @@ FastAPI 应用工厂模块
 
 import mimetypes
 import os
+import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -33,14 +34,87 @@ from api.middlewares.error_handler import add_error_handlers
 from api.v1.schemas.common import HealthResponse
 from src.services.system_config_service import SystemConfigService
 
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def app_lifespan(app: FastAPI):
     """Initialize and release shared services for the app lifecycle."""
     app.state.system_config_service = SystemConfigService()
+    premarket_evidence_scheduler = None
+    premarket_scheduler = None
+    outcome_scheduler = None
     try:
+        from src.config import get_config
+
+        config = get_config()
+        if bool(
+            getattr(config, "moomoo_premarket_prefetch_enabled", False)
+        ):
+            from src.regime.premarket_repository import (
+                init_premarket_evidence_schema,
+            )
+            from src.services.premarket_evidence_scheduler import (
+                MoomooPremarketEvidenceScheduler,
+            )
+
+            init_premarket_evidence_schema()
+            premarket_evidence_scheduler = MoomooPremarketEvidenceScheduler()
+            premarket_evidence_scheduler.start()
+            app.state.moomoo_premarket_prefetch_scheduler = (
+                premarket_evidence_scheduler
+            )
+        if bool(
+            getattr(config, "premarket_research_scheduler_enabled", False)
+        ):
+            # Reuse the exact read-only scan path exposed by the API. The
+            # scheduler is only a wake-up host; DB leases decide the owner.
+            from api.v1.endpoints.opportunities import _execute_daily_scan
+            from src.services.premarket_scheduler import (
+                CanonicalPremarketScheduler,
+                execute_premarket_scheduler_tick,
+            )
+
+            premarket_scheduler = CanonicalPremarketScheduler(
+                lambda: execute_premarket_scheduler_tick(
+                    scan_runner=_execute_daily_scan,
+                )
+            )
+            premarket_scheduler.start()
+            app.state.premarket_research_scheduler = premarket_scheduler
+        if bool(
+            getattr(config, "opportunity_outcome_scheduler_enabled", False)
+        ):
+            from src.services.opportunity_outcome_scheduler import (
+                CanonicalOpportunityOutcomeScheduler,
+            )
+
+            outcome_scheduler = CanonicalOpportunityOutcomeScheduler()
+            outcome_scheduler.start()
+            app.state.opportunity_outcome_scheduler = outcome_scheduler
         yield
     finally:
+        for scheduler_name, scheduler in (
+            ("moomoo_premarket_prefetch", premarket_evidence_scheduler),
+            ("opportunity_outcome", outcome_scheduler),
+            ("premarket_research", premarket_scheduler),
+        ):
+            if scheduler is None:
+                continue
+            try:
+                scheduler.stop()
+            except Exception as exc:  # noqa: BLE001 - finish all cleanup paths
+                logger.error(
+                    "scheduler shutdown failed scheduler=%s error_type=%s",
+                    scheduler_name,
+                    type(exc).__name__,
+                )
+        if hasattr(app.state, "opportunity_outcome_scheduler"):
+            delattr(app.state, "opportunity_outcome_scheduler")
+        if hasattr(app.state, "premarket_research_scheduler"):
+            delattr(app.state, "premarket_research_scheduler")
+        if hasattr(app.state, "moomoo_premarket_prefetch_scheduler"):
+            delattr(app.state, "moomoo_premarket_prefetch_scheduler")
         if hasattr(app.state, "system_config_service"):
             delattr(app.state, "system_config_service")
 

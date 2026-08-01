@@ -14,17 +14,22 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date, datetime, timedelta
+import os
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from sqlalchemy import and_, func, select
+from starlette.concurrency import run_in_threadpool
 
 from api.v1.schemas.journal import (
     CanonicalEpisodeBuildConfirmRequest,
     CanonicalEpisodeBuildPlanResponse,
     EpisodeBuildMetadata,
+    EpisodeBuildActivationRequest,
+    EpisodeBuildActivationResponse,
+    EpisodeBuildActivationStateResponse,
     EpisodeBuildResponse,
     EpisodeConditionalPnl,
     EpisodeHeadlinePnl,
@@ -35,6 +40,7 @@ from api.v1.schemas.journal import (
     JournalQaResponse,
     JournalStatsByStyleResponse,
     JournalStatsResponse,
+    JournalRefreshStatusResponse,
     LedgerDataHealthResponse,
     LedgerImportResponse,
     MonthlyReviewGenerateRequest,
@@ -44,6 +50,12 @@ from api.v1.schemas.journal import (
     MoomooOpenApiPlanResponse,
     MoomooStatementPreviewResponse,
     MoomooOpenApiPreviewResponse,
+    MoomooJournalRefreshConfirmRequest,
+    MoomooJournalRefreshConfirmResponse,
+    MoomooJournalRefreshPreviewResponse,
+    MoomooJournalRefreshPublication,
+    MoomooJournalRefreshRequest,
+    MoomooJournalRefreshSource,
     MoomooSyncRequest,
     MoomooSyncResponse,
     PositionEpisodeDetailResponse,
@@ -53,6 +65,7 @@ from api.v1.schemas.journal import (
     PositionEpisodeItem,
     PositionEpisodeListResponse,
     PositionEpisodeQuality,
+    PositionEpisodeReviewQueue,
     PositionEpisodeSummaryResponse,
     RealityTestResponse,
     TradeItem,
@@ -73,6 +86,11 @@ from src.journal.brokers.moomoo_openapi_export import (
     MoomooOpenApiExportError,
     parse_openapi_export,
 )
+from src.journal.brokers.moomoo_readonly import (
+    MoomooReadonlyError,
+    ProbeConfig,
+    run_readonly_probe,
+)
 from src.journal.ledger.repository import (
     DEFAULT_LEDGER_ACCOUNT_KEY,
     LedgerImportError,
@@ -83,6 +101,13 @@ from src.journal.ledger.openapi_repository import (
     OpenApiPlanError,
     confirm_openapi_import_plan,
     plan_openapi_import,
+)
+from src.journal.ledger.refresh_repository import (
+    JournalRefreshError,
+    confirm_refresh_artifact,
+    get_journal_refresh_status,
+    save_refresh_artifact,
+    suggest_refresh_window,
 )
 from src.journal.ledger.episode_repository import (
     EpisodeBuildSummary,
@@ -98,6 +123,11 @@ from src.journal.ledger.episode_repository import (
     get_position_episode_page,
     preview_canonical_position_episodes,
     preview_latest_position_episodes,
+)
+from src.journal.ledger.activation_repository import (
+    EpisodeBuildActivationError,
+    activate_episode_build,
+    get_episode_build_activation_state,
 )
 from src.journal.models import (
     JournalHealthCheck,
@@ -143,6 +173,89 @@ async def _read_upload_limited(file: UploadFile, limit: int) -> bytes:
         await file.close()
 
 
+def _enabled_env(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _bounded_float_env(
+    name: str,
+    default: float,
+    *,
+    minimum: float,
+    maximum: float,
+) -> float:
+    raw = (os.environ.get(name) or str(default)).strip()
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise JournalRefreshError(f"{name} must be a number") from exc
+    if value < minimum or value > maximum:
+        raise JournalRefreshError(
+            f"{name} must be between {minimum:g} and {maximum:g}"
+        )
+    return value
+
+
+def _journal_refresh_probe_config(
+    *,
+    account_key: str,
+    overlap_days: int,
+) -> ProbeConfig:
+    if not _enabled_env("MOOMOO_OPEND_ENABLED"):
+        raise JournalRefreshError("MOOMOO_OPEND_ENABLED is not enabled")
+    if not _enabled_env("MOOMOO_JOURNAL_REFRESH_ENABLED"):
+        raise JournalRefreshError("MOOMOO_JOURNAL_REFRESH_ENABLED is not enabled")
+    environment = (os.environ.get("MOOMOO_JOURNAL_ENV") or "LIVE").strip().upper()
+    if environment != "LIVE":
+        raise JournalRefreshError("MOOMOO_JOURNAL_ENV must be LIVE for Journal refresh")
+    binding_secret = (
+        os.environ.get("MOOMOO_JOURNAL_ACCOUNT_BINDING_SECRET") or ""
+    ).strip()
+    if len(binding_secret) < 32:
+        raise JournalRefreshError(
+            "MOOMOO_JOURNAL_ACCOUNT_BINDING_SECRET must contain at least 32 characters"
+        )
+    account_id = (os.environ.get("MOOMOO_JOURNAL_ACCOUNT_ID") or "").strip() or None
+    try:
+        port = int((os.environ.get("MOOMOO_OPEND_PORT") or "11111").strip())
+    except ValueError as exc:
+        raise JournalRefreshError("MOOMOO_OPEND_PORT must be an integer") from exc
+    start, end = suggest_refresh_window(
+        account_key,
+        overlap_days=overlap_days,
+    )
+    try:
+        return ProbeConfig(
+            start=start,
+            end=end,
+            env="LIVE",
+            market="US",
+            host=(os.environ.get("MOOMOO_OPEND_HOST") or "127.0.0.1").strip(),
+            port=port,
+            acc_id=account_id,
+            account_binding_secret=binding_secret,
+            query_timeout=_bounded_float_env(
+                "MOOMOO_JOURNAL_QUERY_TIMEOUT_SECONDS",
+                15.0,
+                minimum=1.0,
+                maximum=60.0,
+            ),
+            overall_timeout=_bounded_float_env(
+                "MOOMOO_JOURNAL_REFRESH_TIMEOUT_SECONDS",
+                180.0,
+                minimum=10.0,
+                maximum=300.0,
+            ),
+        )
+    except ValueError as exc:
+        raise JournalRefreshError(str(exc)) from exc
+
+
 def _parse_openapi_content(content: bytes) -> tuple[dict, object]:
     if not content:
         raise HTTPException(status_code=400, detail="empty file")
@@ -158,6 +271,48 @@ def _parse_openapi_content(content: bytes) -> tuple[dict, object]:
     except MoomooOpenApiExportError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return payload, preview
+
+
+def _openapi_observation_counts(preview: object) -> dict[str, int]:
+    """Describe broker rows without collapsing multi-leg parent orders."""
+    orders = tuple(getattr(preview, "orders", ()) or ())
+    fills = tuple(getattr(preview, "fills", ()) or ())
+    fees = tuple(getattr(preview, "fees", ()) or ())
+    contract_specs = tuple(getattr(preview, "contract_specs", ()) or ())
+    group_orders = tuple(
+        item for item in orders if bool(getattr(item, "combo_legs", ()))
+    )
+    group_ids = {
+        getattr(item, "source_order_id", None) for item in group_orders
+    }
+    ordinary_orders = sum(
+        bool(getattr(item, "combo_definition_available", False))
+        and not bool(getattr(item, "combo_legs", ()))
+        for item in orders
+    )
+    return {
+        "order_observations": len(orders),
+        "ordinary_order_observations": ordinary_orders,
+        "unclassified_parent_observations": (
+            len(orders) - ordinary_orders - len(group_orders)
+        ),
+        "fill_observations": len(fills),
+        "fee_observations": len(fees),
+        "contract_spec_observations": len(contract_specs),
+        "execution_group_observations": len(group_orders),
+        "execution_group_leg_observations": sum(
+            len(getattr(item, "combo_legs", ()) or ())
+            for item in group_orders
+        ),
+        "execution_group_fill_links": sum(
+            getattr(item, "source_order_id", None) in group_ids
+            for item in fills
+        ),
+        "execution_group_fee_observations": sum(
+            getattr(item, "source_order_id", None) in group_ids
+            for item in fees
+        ),
+    }
 
 
 def _trade_row_to_dict(row: JournalTrade) -> dict:
@@ -251,6 +406,7 @@ def _episode_build_metadata(
             "canonical_set_sha256",
             None,
         ),
+        source_window_start=summary.source_window_start,
         source_cutoff_at=summary.source_cutoff_at,
         position_episode_count=summary.position_episode_count,
         unresolved_evidence_count=summary.unresolved_evidence_count,
@@ -260,6 +416,42 @@ def _episode_build_metadata(
             "assumed_flat_unverified",
             "mixed_explicit_and_assumed",
         },
+        execution_group_count=getattr(
+            summary,
+            "execution_group_count",
+            0,
+        ),
+        group_fee_affected_episode_count=getattr(
+            summary,
+            "group_fee_affected_episode_count",
+            0,
+        ),
+        retained_execution_group_fee_total=(
+            _decimal_text(
+                getattr(
+                    summary,
+                    "retained_execution_group_fee_total",
+                    Decimal("0"),
+                )
+            )
+            or "0"
+        ),
+        fee_conservation_by_currency={
+            str(currency): {
+                str(key): _decimal_text(value) or "0"
+                for key, value in values.items()
+            }
+            for currency, values in getattr(
+                summary,
+                "fee_conservation_by_currency",
+                {},
+            ).items()
+        },
+        leg_fee_attribution_complete=getattr(
+            summary,
+            "leg_fee_attribution_complete",
+            True,
+        ),
         partial_reasons=list(summary.partial_reasons),
         recorded_at=summary.recorded_at,
     )
@@ -330,6 +522,11 @@ def _episode_summary(
         left_censored_episode_count=summary.left_censored_episode_count,
         incomplete_episode_count=summary.incomplete_episode_count,
         aggregate_only_episode_count=summary.aggregate_only_episode_count,
+        group_fee_affected_episode_count=getattr(
+            summary,
+            "group_fee_affected_episode_count",
+            0,
+        ),
         headline_pnl=EpisodeHeadlinePnl(
             eligible_closed_count=summary.headline_episode_count,
             excluded_episode_count=summary.headline_excluded_episode_count,
@@ -377,6 +574,8 @@ def _episode_exclusion_reasons(
         reasons.append("incomplete")
     if item.realized_pnl_net is None:
         reasons.append("pnl_unavailable")
+    if getattr(item, "group_fee_unallocated", False):
+        reasons.append("group_fee_unallocated")
     return reasons
 
 
@@ -441,8 +640,16 @@ def _position_episode_item(
             is_left_censored=item.is_left_censored,
             is_right_censored=item.is_right_censored,
             pnl_summary_eligible=not exclusion_reasons,
+            group_fee_unallocated=getattr(
+                item,
+                "group_fee_unallocated",
+                False,
+            ),
             pnl_exclusion_reasons=exclusion_reasons,
         ),
+        review_status=getattr(item, "review_status", "not_started"),
+        review_revision=getattr(item, "review_revision", None),
+        review_updated_at=getattr(item, "review_updated_at", None),
     )
 
 
@@ -631,6 +838,40 @@ def get_ledger_data_health(
     )
 
 
+@router.get("/v2/refresh-status", response_model=JournalRefreshStatusResponse)
+def get_moomoo_journal_refresh_status(
+    account_key: str = Query(
+        DEFAULT_LEDGER_ACCOUNT_KEY,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    ),
+) -> JournalRefreshStatusResponse:
+    """Return separate broker, evidence, build, and active-view watermarks."""
+    try:
+        status = get_journal_refresh_status(account_key)
+    except JournalRefreshError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    refresh_enabled = _enabled_env("MOOMOO_JOURNAL_REFRESH_ENABLED")
+    refresh_configured = (
+        refresh_enabled
+        and _enabled_env("MOOMOO_OPEND_ENABLED")
+        and (os.environ.get("MOOMOO_JOURNAL_ENV") or "LIVE").strip().upper()
+        == "LIVE"
+        and len(
+            (
+                os.environ.get("MOOMOO_JOURNAL_ACCOUNT_BINDING_SECRET") or ""
+            ).strip()
+        )
+        >= 32
+    )
+    return JournalRefreshStatusResponse(
+        refresh_enabled=refresh_enabled,
+        refresh_configured=refresh_configured,
+        **status.__dict__,
+    )
+
+
 @router.get(
     "/v2/position-episodes",
     response_model=PositionEpisodeListResponse,
@@ -644,6 +885,10 @@ def list_position_episodes_v2(
     completeness_status: Optional[str] = Query(
         None,
         pattern=r"^(exact|complete|partial)$",
+    ),
+    review_status: Optional[str] = Query(
+        None,
+        pattern=r"^(not_started|in_progress|completed)$",
     ),
     case_focus: Optional[PositionEpisodeCaseFocus] = Query(None),
     page: int = Query(1, ge=1),
@@ -680,6 +925,8 @@ def list_position_episodes_v2(
         "page": page,
         "per_page": per_page,
     }
+    if review_status is not None:
+        page_kwargs["review_status"] = review_status
     if build_id is None:
         result_page = get_latest_position_episode_page(
             account_key,
@@ -705,6 +952,7 @@ def list_position_episodes_v2(
             detail="episode build changed during read; retry",
         )
 
+    review_queue = getattr(result_page, "review_queue", None)
     return PositionEpisodeListResponse(
         data_state="ready",
         build=_episode_build_metadata(summary),
@@ -713,6 +961,12 @@ def list_position_episodes_v2(
         total=result_page.total,
         page=result_page.page,
         per_page=result_page.per_page,
+        review_queue=PositionEpisodeReviewQueue(
+            pending=getattr(review_queue, "pending", result_page.total),
+            in_progress=getattr(review_queue, "in_progress", 0),
+            completed=getattr(review_queue, "completed", 0),
+            total=getattr(review_queue, "total", result_page.total),
+        ),
         items=[
             _position_episode_item(
                 item,
@@ -824,6 +1078,7 @@ def create_canonical_position_episode_build(
             expected_build_key=request.build_key,
             account_key=account_key,
             accept_assumed_flat=request.accept_assumed_flat,
+            accept_group_fee_scope=request.accept_group_fee_scope,
         )
     except EpisodeRepositoryError as exc:
         status_code = (
@@ -852,6 +1107,70 @@ def create_canonical_position_episode_build(
             "The default position review remains unchanged; use the explicit "
             "build ID to inspect this result."
         ),
+    )
+
+
+@router.get(
+    "/v2/episode-builds/activation",
+    response_model=EpisodeBuildActivationStateResponse,
+)
+def get_position_episode_build_activation(
+    account_key: str = Query(
+        DEFAULT_LEDGER_ACCOUNT_KEY,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    ),
+) -> EpisodeBuildActivationStateResponse:
+    """Return the append-only selection used by default Episode reads."""
+    try:
+        state = get_episode_build_activation_state(account_key)
+    except EpisodeBuildActivationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return EpisodeBuildActivationStateResponse(**state.__dict__)
+
+
+@router.post(
+    "/v2/episode-builds/{build_id}/activate",
+    response_model=EpisodeBuildActivationResponse,
+)
+def activate_position_episode_build(
+    build_id: int,
+    request: EpisodeBuildActivationRequest,
+    account_key: str = Query(
+        DEFAULT_LEDGER_ACCOUNT_KEY,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    ),
+) -> EpisodeBuildActivationResponse:
+    """Explicitly select one immutable canonical build as the default view."""
+    try:
+        result = activate_episode_build(
+            build_id,
+            request.expected_build_key,
+            expected_current_activation_id=(
+                request.expected_current_activation_id
+            ),
+            expected_current_build_id=request.expected_current_build_id,
+            accept_assumed_flat=request.accept_assumed_flat,
+            accept_group_fee_scope=request.accept_group_fee_scope,
+            account_key=account_key,
+        )
+    except EpisodeBuildActivationError as exc:
+        status_code = 404 if "does not exist" in str(exc) else 409
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    action = "already active" if result.duplicate else "activated"
+    return EpisodeBuildActivationResponse(
+        activation_id=result.activation_id,
+        activation_key=result.activation_key,
+        duplicate=result.duplicate,
+        state=EpisodeBuildActivationStateResponse(**result.state.__dict__),
+        message=(
+            f"canonical Episode build {result.state.current_build_id} {action}; "
+            "default review reads now resolve through the append-only activation."
+        ),
+        trading_action_performed=False,
     )
 
 
@@ -894,6 +1213,34 @@ def preview_canonical_position_episode_build(
     warnings = list(preview.partial_reasons)
     if assumption_required:
         warnings.append("explicit assumed-flat acceptance is required")
+    execution_group_count = int(
+        getattr(preview, "execution_group_count", 0)
+    )
+    group_fee_affected_episode_count = int(
+        getattr(preview, "group_fee_affected_episode_count", 0)
+    )
+    leg_fee_attribution_complete = bool(
+        getattr(preview, "leg_fee_attribution_complete", True)
+    )
+    retained_execution_group_fee_total = getattr(
+        preview,
+        "retained_execution_group_fee_total",
+        Decimal("0"),
+    )
+    fee_conservation_by_currency = getattr(
+        preview,
+        "fee_conservation_by_currency",
+        {},
+    )
+    group_fee_acceptance_required = (
+        group_fee_affected_episode_count > 0
+        and not leg_fee_attribution_complete
+    )
+    if group_fee_acceptance_required:
+        warnings.append(
+            "execution-group fee remains exact only at group scope; affected "
+            "leg episodes have no fee/net P&L and require explicit acceptance"
+        )
     warnings.append(
         "confirming this plan will not replace the default position review"
     )
@@ -923,9 +1270,31 @@ def preview_canonical_position_episode_build(
         allocated_known_fee_total=(
             _decimal_text(preview.allocated_known_fee_total) or "0"
         ),
+        retained_execution_group_fee_total=(
+            _decimal_text(retained_execution_group_fee_total) or "0"
+        ),
+        fee_conservation_by_currency={
+            str(currency): {
+                str(key): _decimal_text(value) or "0"
+                for key, value in values.items()
+            }
+            for currency, values in (
+                fee_conservation_by_currency.items()
+            )
+        },
         fee_conserved=preview.fee_conserved,
+        execution_group_count=execution_group_count,
+        group_fee_affected_episode_count=(
+            group_fee_affected_episode_count
+        ),
+        leg_fee_attribution_complete=(
+            leg_fee_attribution_complete
+        ),
         opening_boundary_policy=preview.opening_boundary_policy,
         requires_assumed_flat_acceptance=assumption_required,
+        requires_group_fee_scope_acceptance=(
+            group_fee_acceptance_required
+        ),
         default_build_id=(
             default_summary.build_id if default_summary is not None else None
         ),
@@ -1042,6 +1411,118 @@ async def preview_moomoo_statement(
 
 
 @router.post(
+    "/v2/refreshes/preview",
+    response_model=MoomooJournalRefreshPreviewResponse,
+)
+async def preview_moomoo_journal_refresh(
+    request: MoomooJournalRefreshRequest,
+    account_key: str = Query(
+        DEFAULT_LEDGER_ACCOUNT_KEY,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    ),
+) -> MoomooJournalRefreshPreviewResponse:
+    """Query OpenD read-only and freeze the exact server-owned import plan."""
+    try:
+        config = _journal_refresh_probe_config(
+            account_key=account_key,
+            overlap_days=request.overlap_days,
+        )
+        result = await run_in_threadpool(run_readonly_probe, config)
+        payload = result.export_payload
+        preview = parse_openapi_export(payload)
+        expected_selection = "explicit" if config.acc_id is not None else "unique_auto"
+        if (
+            preview.metadata.window_start.astimezone(timezone.utc)
+            != config.start.astimezone(timezone.utc)
+            or preview.metadata.window_end.astimezone(timezone.utc)
+            != config.end.astimezone(timezone.utc)
+            or preview.metadata.account_selection != expected_selection
+        ):
+            raise JournalRefreshError(
+                "OpenD refresh result does not match the server-owned query scope"
+            )
+        plan = plan_openapi_import(preview, payload, account_key=account_key)
+        artifact = save_refresh_artifact(
+            preview,
+            payload,
+            plan,
+            account_key=account_key,
+        )
+    except JournalRefreshError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except MoomooReadonlyError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (MoomooOpenApiExportError, OpenApiPlanError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    latest_fill_at = max(
+        (item.filled_at for item in preview.fills),
+        default=None,
+    )
+    observation_counts = _openapi_observation_counts(preview)
+    return MoomooJournalRefreshPreviewResponse(
+        artifact_id=artifact.artifact_id,
+        artifact_key=artifact.artifact_key,
+        expires_at=artifact.expires_at,
+        source=MoomooJournalRefreshSource(
+            retrieval_complete=preview.metadata.retrieval_complete,
+            coverage_complete=preview.metadata.coverage_complete,
+            has_activity=preview.metadata.has_activity,
+            broker_queried_through=preview.metadata.window_end,
+            latest_fill_at=latest_fill_at,
+            **observation_counts,
+        ),
+        plan=MoomooOpenApiPlanResponse(**plan.as_dict()),
+        evidence_written=False,
+        trading_action_performed=False,
+    )
+
+
+@router.post(
+    "/v2/refreshes/{artifact_id}/confirm",
+    response_model=MoomooJournalRefreshConfirmResponse,
+)
+def confirm_moomoo_journal_refresh(
+    artifact_id: int,
+    request: MoomooJournalRefreshConfirmRequest,
+    account_key: str = Query(
+        DEFAULT_LEDGER_ACCOUNT_KEY,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    ),
+) -> MoomooJournalRefreshConfirmResponse:
+    """Publish the exact frozen artifact after an explicit user confirmation."""
+    try:
+        confirmation = confirm_refresh_artifact(
+            artifact_id,
+            preview_key=request.preview_key,
+            acknowledge_partial_window=request.acknowledge_partial_window,
+            account_key=account_key,
+        )
+    except JournalRefreshError as exc:
+        status_code = 404 if "does not exist" in str(exc) else 409
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    publication = confirmation.publication
+    return MoomooJournalRefreshConfirmResponse(
+        artifact_id=confirmation.artifact.artifact_id,
+        publication=MoomooJournalRefreshPublication(
+            publication_id=publication.publication_id,
+            broker_queried_through=publication.broker_queried_through,
+            latest_fill_at=publication.latest_fill_at,
+            evidence_published_through=publication.evidence_published_through,
+            recorded_at=publication.recorded_at,
+        ),
+        imported=MoomooOpenApiConfirmResponse(
+            **confirmation.import_result.__dict__
+        ),
+        trading_action_performed=False,
+    )
+
+
+@router.post(
     "/v2/openapi-imports/preview",
     response_model=MoomooOpenApiPreviewResponse,
 )
@@ -1053,6 +1534,7 @@ async def preview_moomoo_openapi_export(
     _, preview = _parse_openapi_content(content)
 
     metadata = preview.metadata
+    observation_counts = _openapi_observation_counts(preview)
     order_currency = {
         order.source_order_id: order.currency for order in preview.orders
     }
@@ -1079,9 +1561,7 @@ async def preview_moomoo_openapi_export(
         window_start=metadata.window_start,
         window_end=metadata.window_end,
         source_timezone=metadata.source_timezone,
-        order_observations=len(preview.orders),
-        fill_observations=len(preview.fills),
-        fee_observations=len(preview.fees),
+        **observation_counts,
         fee_totals_by_currency={
             currency: format(amount, "f")
             for currency, amount in sorted(fee_totals.items())

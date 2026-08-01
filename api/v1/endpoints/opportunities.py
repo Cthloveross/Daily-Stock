@@ -11,6 +11,7 @@ import copy
 import logging
 import math
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,6 +27,7 @@ from api.v1.schemas.opportunities import (
     DailyOpportunityRequest,
     DailyOpportunityResponse,
     OpportunityLearningSummaryResponse,
+    OpportunitySnapshotDetailResponse,
     OpportunitySnapshotEnsureResponse,
     OpportunitySnapshotEvaluationResponse,
     OpportunitySnapshotItem,
@@ -38,6 +40,10 @@ from api.v1.schemas.opportunities import (
     OptionEventResponse,
     OptionWallRequest,
     OptionWallResponse,
+    PremarketCycleRequest,
+    PremarketCycleResponse,
+    PremarketUniversePutRequest,
+    PremarketUniverseResponse,
 )
 from src.opportunities.repository import SnapshotConflictError
 from src.opportunities.engine import (
@@ -48,6 +54,7 @@ from src.opportunities.engine import (
     normalize_symbols,
 )
 from src.opportunities.option_walls import (
+    ATM_CALL_IV_METHOD as OPTION_WALL_ATM_CALL_IV_METHOD,
     FORMULA_VERSION as OPTION_WALL_FORMULA_VERSION,
     build_option_wall_payload,
 )
@@ -56,13 +63,16 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 _NEW_YORK = ZoneInfo("America/New_York")
 _MAX_FETCH_WORKERS = 4
+_MAX_OPTION_WALL_WORKERS = 5
 _SCAN_CACHE_TTL_SECONDS = 30.0
 _SCAN_CACHE_MAX_ENTRIES = 32
+_SCAN_FLIGHT_LEASE_SECONDS = 30.0
+_SCAN_FOLLOWER_WAIT_SECONDS = 30.0
 _OPTION_CONTEXT_VERSION = "nearest_expiry_atm_call_iv_v1"
 _OPTION_CONTEXT_SOURCE = "moomoo_openapi"
 _OPTION_OVERVIEW_VERSION = "moomoo_option_underlying_overview_v1"
 _OPTION_OVERVIEW_SOURCE = "moomoo_openapi"
-_OPTION_WALL_VERSION = "observable_option_walls_v1"
+_OPTION_WALL_VERSION = "observable_option_walls_v1_1"
 _OPTION_WALL_SOURCE = "moomoo_openapi"
 _OPTION_EVENT_VERSION = "moomoo_unusual_option_events_v1"
 _OPTION_EVENT_SOURCE = "moomoo_openapi"
@@ -130,22 +140,37 @@ class _ScanCacheEntry:
 
 @dataclass
 class _ScanFlight:
+    generation: int
+    started_at: float
+    deadline_at: float
     event: threading.Event = field(default_factory=threading.Event)
     result: Optional[dict[str, Any]] = None
     error: Optional[BaseException] = None
 
 
+class OpportunityScanTimeoutError(TimeoutError):
+    """Raised when a shared provider scan exceeds its bounded lease."""
+
+
 _scan_cache_lock = threading.RLock()
 _scan_cache: dict[tuple[Any, ...], _ScanCacheEntry] = {}
 _scan_flights: dict[tuple[Any, ...], _ScanFlight] = {}
+_scan_flight_generation = 0
 
 
 def _cache_now() -> float:
     return time.monotonic()
 
 
-def _scan_cache_key(symbols: list[str], limit: int) -> tuple[Any, ...]:
-    return (SIGNAL_VERSION, tuple(symbols), int(limit))
+def _scan_cache_key(
+    symbols: list[str],
+    limit: int,
+    market_date_et: Optional[date | str] = None,
+) -> tuple[Any, ...]:
+    market_date = market_date_et or datetime.now(timezone.utc).astimezone(
+        _NEW_YORK
+    ).date()
+    return (SIGNAL_VERSION, str(market_date), tuple(symbols), int(limit))
 
 
 def _option_context_cache_key(
@@ -215,12 +240,18 @@ def _option_event_cache_key(
 def _reset_scan_cache_for_tests() -> None:
     """Clear completed entries between deterministic tests.
 
-    Production code never calls this helper.  In-flight work is intentionally
-    left alone so a test cannot strand an already waiting thread.
+    Production code never calls this helper.
     """
 
     with _scan_cache_lock:
         _scan_cache.clear()
+        for flight in _scan_flights.values():
+            if flight.error is None:
+                flight.error = OpportunityScanTimeoutError(
+                    "opportunity scan reset during test"
+                )
+            flight.event.set()
+        _scan_flights.clear()
 
 
 def _prune_scan_cache(now: float) -> None:
@@ -237,6 +268,8 @@ def _get_or_compute_scan(
     factory: Callable[[], dict[str, Any]],
     *,
     bypass_cache: bool = False,
+    wait_timeout_seconds: float = _SCAN_FOLLOWER_WAIT_SECONDS,
+    lease_seconds: float = _SCAN_FLIGHT_LEASE_SECONDS,
 ) -> dict[str, Any]:
     """Return a cached scan or share one in-flight computation per key.
 
@@ -245,6 +278,10 @@ def _get_or_compute_scan(
     traffic.
     """
 
+    if wait_timeout_seconds <= 0 or lease_seconds <= 0:
+        raise ValueError("scan wait and lease must be positive")
+
+    global _scan_flight_generation
     now = _cache_now()
     with _scan_cache_lock:
         _prune_scan_cache(now)
@@ -253,13 +290,42 @@ def _get_or_compute_scan(
             return copy.deepcopy(cached.result)
 
         flight = _scan_flights.get(key)
+        if flight is not None and flight.deadline_at <= now:
+            flight.error = OpportunityScanTimeoutError(
+                "opportunity scan exceeded its lease"
+            )
+            _scan_flights.pop(key, None)
+            flight.event.set()
+            flight = None
         is_leader = flight is None
         if flight is None:
-            flight = _ScanFlight()
+            _scan_flight_generation += 1
+            flight = _ScanFlight(
+                generation=_scan_flight_generation,
+                started_at=now,
+                deadline_at=now + lease_seconds,
+            )
             _scan_flights[key] = flight
 
     if not is_leader:
-        flight.event.wait()
+        remaining = min(
+            wait_timeout_seconds,
+            max(0.0, flight.deadline_at - _cache_now()),
+        )
+        completed = flight.event.wait(timeout=remaining)
+        if not completed:
+            now = _cache_now()
+            with _scan_cache_lock:
+                current = _scan_flights.get(key)
+                if current is flight and now >= flight.deadline_at:
+                    flight.error = OpportunityScanTimeoutError(
+                        "opportunity scan exceeded its lease"
+                    )
+                    _scan_flights.pop(key, None)
+                    flight.event.set()
+            raise OpportunityScanTimeoutError(
+                "opportunity scan is still running; retry shortly"
+            )
         if flight.error is not None:
             raise flight.error
         if flight.result is None:
@@ -270,22 +336,47 @@ def _get_or_compute_scan(
         result = factory()
     except BaseException as exc:
         with _scan_cache_lock:
-            flight.error = exc
-            _scan_flights.pop(key, None)
+            if _scan_flights.get(key) is flight:
+                _scan_flights.pop(key, None)
+            if flight.error is None:
+                flight.error = exc
             flight.event.set()
         raise
 
     stored = copy.deepcopy(result)
+    completion_time = _cache_now()
     with _scan_cache_lock:
-        _prune_scan_cache(_cache_now())
+        current = _scan_flights.get(key)
+        if current is not flight or completion_time > flight.deadline_at:
+            if current is flight:
+                _scan_flights.pop(key, None)
+            if flight.error is None:
+                flight.error = OpportunityScanTimeoutError(
+                    "opportunity scan completed after its lease"
+                )
+            flight.event.set()
+            raise flight.error
+        _prune_scan_cache(completion_time)
         _scan_cache[key] = _ScanCacheEntry(
-            expires_at=_cache_now() + _SCAN_CACHE_TTL_SECONDS,
+            expires_at=completion_time + _SCAN_CACHE_TTL_SECONDS,
             result=stored,
         )
         flight.result = stored
         _scan_flights.pop(key, None)
         flight.event.set()
     return copy.deepcopy(stored)
+
+
+def _scan_timeout_response(exc: OpportunityScanTimeoutError) -> HTTPException:
+    return HTTPException(
+        status_code=504,
+        detail={
+            "error": "opportunity_scan_timeout",
+            "message": "行情研究仍在执行或已超时，请稍后重试。",
+            "retryable": True,
+            "retry_after_seconds": 2,
+        },
+    )
 
 
 def _configured_symbols() -> list[str]:
@@ -295,6 +386,26 @@ def _configured_symbols() -> list[str]:
     if isinstance(configured, str):
         configured = configured.split(",")
     return normalize_symbols([str(item) for item in configured])[:20]
+
+
+def _premarket_scheduler_enabled() -> bool:
+    """Expose the configured host state without making it a page-load trigger."""
+
+    from src.config import get_config
+
+    return bool(
+        getattr(get_config(), "premarket_research_scheduler_enabled", False)
+    )
+
+
+def _persisted_premarket_universe():
+    from src.services.premarket_research_service import (
+        resolve_premarket_research_universe,
+    )
+
+    return resolve_premarket_research_universe(
+        include_fallback_suggestion=False,
+    )
 
 
 def _create_data_fetcher_manager():
@@ -327,12 +438,16 @@ def _load_daily_history(
             error=None if rows else "daily history returned no rows",
         )
     except Exception as exc:  # noqa: BLE001 - per-symbol graceful degradation
-        logger.debug("[opportunities] daily history unavailable for %s: %s", symbol, exc)
+        logger.debug(
+            "[opportunities] daily history unavailable symbol=%s error_type=%s",
+            symbol,
+            type(exc).__name__,
+        )
         return DailyHistoryInput(
             bars=(),
             source=None,
             fetched_at=as_of,
-            error=f"{type(exc).__name__}: {exc}",
+            error=f"provider_error:{type(exc).__name__}",
         )
 
 
@@ -384,12 +499,16 @@ def _load_histories_gracefully(
         try:
             return _load_daily_history(symbol, as_of=as_of, manager=manager)
         except Exception as exc:  # noqa: BLE001 - injected loaders may also fail
-            logger.debug("[opportunities] injected daily loader failed for %s: %s", symbol, exc)
+            logger.debug(
+                "[opportunities] injected daily loader failed symbol=%s error_type=%s",
+                symbol,
+                type(exc).__name__,
+            )
             return DailyHistoryInput(
                 bars=(),
                 source=None,
                 fetched_at=as_of,
-                error=f"{type(exc).__name__}: {exc}",
+                error=f"provider_error:{type(exc).__name__}",
             )
 
     worker_count = min(_MAX_FETCH_WORKERS, len(supported))
@@ -400,18 +519,34 @@ def _load_histories_gracefully(
             try:
                 histories[symbol] = future.result()
             except Exception as exc:  # pragma: no cover - load itself is fail-open
-                logger.debug("[opportunities] worker failed for %s: %s", symbol, exc)
+                logger.debug(
+                    "[opportunities] worker failed symbol=%s error_type=%s",
+                    symbol,
+                    type(exc).__name__,
+                )
                 histories[symbol] = DailyHistoryInput(
                     bars=(),
                     source=None,
                     fetched_at=as_of,
-                    error=f"{type(exc).__name__}: {exc}",
+                    error=f"provider_error:{type(exc).__name__}",
                 )
     return histories
 
 
-def _execute_daily_scan(symbols: list[str], limit: int) -> dict[str, Any]:
-    as_of = datetime.now(timezone.utc)
+_AUTO_REGIME = object()
+
+
+def _execute_daily_scan(
+    symbols: list[str],
+    limit: int,
+    *,
+    as_of: Optional[datetime] = None,
+    regime: Any = _AUTO_REGIME,
+) -> dict[str, Any]:
+    as_of = as_of or datetime.now(timezone.utc)
+    if as_of.tzinfo is None or as_of.utcoffset() is None:
+        raise ValueError("as_of must be timezone-aware")
+    as_of = as_of.astimezone(timezone.utc)
     market_date = as_of.astimezone(_NEW_YORK).date()
     supported = any(is_supported_us_option_underlying(symbol) for symbol in symbols)
     manager = None
@@ -422,13 +557,16 @@ def _execute_daily_scan(symbols: list[str], limit: int) -> dict[str, Any]:
         else:
             histories = _load_histories_gracefully(symbols, as_of=as_of, manager=None)
     except Exception as exc:  # noqa: BLE001 - manager creation must not fail the batch
-        logger.info("[opportunities] daily data manager unavailable: %s", exc)
+        logger.info(
+            "[opportunities] daily data manager unavailable error_type=%s",
+            type(exc).__name__,
+        )
         histories = {
             symbol: DailyHistoryInput(
                 bars=(),
                 source=None,
                 fetched_at=as_of,
-                error=f"{type(exc).__name__}: {exc}",
+                error=f"provider_error:{type(exc).__name__}",
             )
             for symbol in symbols
         }
@@ -437,13 +575,18 @@ def _execute_daily_scan(symbols: list[str], limit: int) -> dict[str, Any]:
             try:
                 manager.close()
             except Exception as exc:  # noqa: BLE001 - best-effort read-only cleanup
-                logger.debug("[opportunities] data manager close failed: %s", exc)
+                logger.debug(
+                    "[opportunities] data manager close failed error_type=%s",
+                    type(exc).__name__,
+                )
 
-    regime = _load_current_regime(market_date)
+    selected_regime = (
+        _load_current_regime(market_date) if regime is _AUTO_REGIME else regime
+    )
     return build_daily_opportunity_run(
         symbols=symbols,
         histories=histories,
-        regime=regime,
+        regime=selected_regime,
         as_of=as_of,
         limit=limit,
     )
@@ -809,6 +952,17 @@ def _empty_option_wall_payload(
         "quote_as_of": None,
         "formula_version": OPTION_WALL_FORMULA_VERSION,
         "spot": None,
+        "atm_call_iv": {
+            "state": (
+                "not_configured"
+                if state == "not_configured"
+                else "unavailable"
+            ),
+            "expiry": None,
+            "strike": None,
+            "atm_call_iv_percent": None,
+            "selection_method": OPTION_WALL_ATM_CALL_IV_METHOD,
+        },
         "scope": {
             "dte_min": dte_min,
             "dte_max": dte_max,
@@ -929,8 +1083,10 @@ def _execute_option_walls(
 ) -> dict[str, Any]:
     requested_at = datetime.now(timezone.utc)
     market_date_et = requested_at.astimezone(_NEW_YORK).date().isoformat()
-    items = [
-        _get_or_compute_scan(
+    started_at = time.monotonic()
+
+    def load_one(symbol: str) -> dict[str, Any]:
+        return _get_or_compute_scan(
             _option_wall_cache_key(
                 symbol,
                 enabled,
@@ -946,17 +1102,40 @@ def _execute_option_walls(
                 dte_max=dte_max,
             ),
         )
-        for symbol in symbols
-    ]
+
+    if enabled and len(symbols) > 1:
+        # One full 0–45 DTE scan usually needs several 400-contract provider
+        # batches.  Dedicated QuoteContext lanes make independent underlyings
+        # overlap; stable index placement preserves the request order.
+        items: list[Optional[dict[str, Any]]] = [None] * len(symbols)
+        with ThreadPoolExecutor(
+            max_workers=min(_MAX_OPTION_WALL_WORKERS, len(symbols)),
+            thread_name_prefix="option-wall",
+        ) as executor:
+            futures = {
+                executor.submit(load_one, symbol): index
+                for index, symbol in enumerate(symbols)
+            }
+            for future in as_completed(futures):
+                items[futures[future]] = future.result()
+        ordered_items = [item for item in items if item is not None]
+    else:
+        ordered_items = [load_one(symbol) for symbol in symbols]
+
+    logger.debug(
+        "[opportunities] option-wall batch completed symbols=%s duration_ms=%s",
+        len(symbols),
+        round((time.monotonic() - started_at) * 1000),
+    )
     generated_at = max(
-        (str(item["fetched_at"]) for item in items),
+        (str(item["fetched_at"]) for item in ordered_items),
         default=requested_at.isoformat(),
     )
     return {
-        "schema_version": "option-wall/1.0",
+        "schema_version": "option-wall/1.1",
         "generated_at": generated_at,
         "market_date_et": market_date_et,
-        "items": items,
+        "items": ordered_items,
     }
 
 
@@ -1111,12 +1290,191 @@ def daily_opportunities(payload: DailyOpportunityRequest) -> DailyOpportunityRes
         )
 
     key = _scan_cache_key(symbols, payload.limit)
-    result = _get_or_compute_scan(
-        key,
-        lambda: _execute_daily_scan(symbols, payload.limit),
-        bypass_cache=payload.refresh,
-    )
+    try:
+        result = _get_or_compute_scan(
+            key,
+            lambda: _execute_daily_scan(symbols, payload.limit),
+            bypass_cache=payload.refresh,
+        )
+    except OpportunityScanTimeoutError as exc:
+        raise _scan_timeout_response(exc) from exc
     return DailyOpportunityResponse.model_validate(result)
+
+
+@router.get("/premarket/universe", response_model=PremarketUniverseResponse)
+def get_premarket_research_universe() -> PremarketUniverseResponse:
+    """Read the persisted research pool or a non-active STOCK_LIST suggestion."""
+
+    from src.services.premarket_research_service import (
+        resolve_premarket_research_universe,
+    )
+
+    persisted = resolve_premarket_research_universe(
+        include_fallback_suggestion=False,
+    )
+    if persisted is not None:
+        return PremarketUniverseResponse(
+            configured=True,
+            universe_version_key=persisted.universe_version_key,
+            source="persisted",
+            symbols=list(persisted.symbols),
+            limit=persisted.requested_limit,
+            created_at=(
+                persisted.created_at.isoformat()
+                if persisted.created_at is not None
+                else None
+            ),
+            message="已读取服务端持久化研究池。",
+        )
+
+    suggestion = resolve_premarket_research_universe(
+        configured_symbols=_configured_symbols(),
+        include_fallback_suggestion=True,
+    )
+    if suggestion is None:
+        return PremarketUniverseResponse(
+            configured=False,
+            source="unavailable",
+            symbols=[],
+            limit=5,
+            message=(
+                "尚未配置正式研究池；当前也没有可展示的美股 STOCK_LIST 建议。"
+            ),
+        )
+    return PremarketUniverseResponse(
+        configured=False,
+        source=suggestion.source,
+        symbols=list(suggestion.symbols),
+        limit=suggestion.requested_limit,
+        message=(
+            "这是未启用的 STOCK_LIST 建议；必须显式保存后才会用于盘前研究。"
+        ),
+    )
+
+
+@router.put("/premarket/universe", response_model=PremarketUniverseResponse)
+def put_premarket_research_universe(
+    payload: PremarketUniversePutRequest,
+) -> PremarketUniverseResponse:
+    """Append one immutable, explicit server-side research-pool revision."""
+
+    from src.opportunities.cycle_repository import append_research_universe
+    from src.opportunities.premarket import CANONICAL_SCOPE_KEY
+
+    symbols = normalize_symbols(payload.symbols)
+    unsupported = [
+        symbol
+        for symbol in symbols
+        if not is_supported_us_option_underlying(symbol)
+    ]
+    if not symbols or unsupported:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_premarket_universe",
+                "message": "盘前研究池只接受受支持的美股期权标的。",
+                "unsupported_symbols": unsupported,
+            },
+        )
+    stored, duplicate = append_research_universe(
+        symbols,
+        payload.limit,
+        scope_key=CANONICAL_SCOPE_KEY,
+        source="api",
+    )
+    return PremarketUniverseResponse(
+        configured=True,
+        universe_version_key=stored.universe_version_key,
+        source="persisted",
+        symbols=list(stored.symbols),
+        limit=stored.requested_limit,
+        created_at=stored.created_at.isoformat(),
+        duplicate=duplicate,
+        message=(
+            "该研究池版本已存在，未重复写入。"
+            if duplicate
+            else "已保存新的正式研究池版本；后续周期会从该版本开始。"
+        ),
+    )
+
+
+@router.post("/premarket/status", response_model=PremarketCycleResponse)
+def premarket_research_status(
+    payload: PremarketCycleRequest,
+) -> PremarketCycleResponse:
+    """Read the exact canonical cycle state without starting provider work."""
+
+    from src.opportunities.premarket import PremarketCalendarError
+    from src.services.premarket_research_service import (
+        status_canonical_premarket_research,
+    )
+
+    universe = _persisted_premarket_universe()
+    symbols = list(universe.symbols) if universe is not None else []
+    limit = universe.requested_limit if universe is not None else payload.limit
+    universe_source = universe.source if universe is not None else "unavailable"
+    universe_version_key = (
+        universe.universe_version_key if universe is not None else None
+    )
+    try:
+        result = status_canonical_premarket_research(
+            symbols,
+            limit,
+            universe_source=universe_source,
+            universe_version_key=universe_version_key,
+            scheduler_enabled=_premarket_scheduler_enabled(),
+        )
+    except PremarketCalendarError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "xnys_calendar_unavailable",
+                "message": "XNYS 交易日历暂时不可用。",
+            },
+        ) from exc
+    return PremarketCycleResponse.model_validate(result)
+
+
+@router.post("/premarket/run", response_model=PremarketCycleResponse)
+def run_premarket_research(
+    payload: PremarketCycleRequest,
+) -> PremarketCycleResponse:
+    """Explicitly run, or otherwise only read, the canonical cycle."""
+
+    from src.opportunities.premarket import PremarketCalendarError
+    from src.services.premarket_research_service import (
+        run_canonical_premarket_research,
+    )
+
+    if not payload.manual:
+        return premarket_research_status(payload)
+
+    universe = _persisted_premarket_universe()
+    symbols = list(universe.symbols) if universe is not None else []
+    limit = universe.requested_limit if universe is not None else payload.limit
+    universe_source = universe.source if universe is not None else "unavailable"
+    universe_version_key = (
+        universe.universe_version_key if universe is not None else None
+    )
+    try:
+        result = run_canonical_premarket_research(
+            symbols,
+            limit,
+            scan_runner=_execute_daily_scan,
+            universe_source=universe_source,
+            universe_version_key=universe_version_key,
+            trigger="manual",
+            scheduler_enabled=_premarket_scheduler_enabled(),
+        )
+    except PremarketCalendarError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "xnys_calendar_unavailable",
+                "message": "XNYS 交易日历暂时不可用。",
+            },
+        ) from exc
+    return PremarketCycleResponse.model_validate(result)
 
 
 @router.post("/snapshots/freeze", response_model=OpportunitySnapshotItem)
@@ -1137,10 +1495,13 @@ def freeze_opportunity_snapshot(
             },
         )
     key = _scan_cache_key(symbols, payload.limit)
-    run = _get_or_compute_scan(
-        key,
-        lambda: _execute_daily_scan(symbols, payload.limit),
-    )
+    try:
+        run = _get_or_compute_scan(
+            key,
+            lambda: _execute_daily_scan(symbols, payload.limit),
+        )
+    except OpportunityScanTimeoutError as exc:
+        raise _scan_timeout_response(exc) from exc
     try:
         result = freeze_daily_snapshot(run)
     except SnapshotConflictError as exc:
@@ -1179,10 +1540,13 @@ def ensure_opportunity_snapshot(
             },
         )
     key = _scan_cache_key(symbols, payload.limit)
-    run = _get_or_compute_scan(
-        key,
-        lambda: _execute_daily_scan(symbols, payload.limit),
-    )
+    try:
+        run = _get_or_compute_scan(
+            key,
+            lambda: _execute_daily_scan(symbols, payload.limit),
+        )
+    except OpportunityScanTimeoutError as exc:
+        raise _scan_timeout_response(exc) from exc
     try:
         result = ensure_daily_snapshot(run)
     except SnapshotConflictError as exc:
@@ -1218,6 +1582,48 @@ def opportunity_snapshots(
     return OpportunitySnapshotListResponse.model_validate(
         list_snapshot_items(limit=limit)
     )
+
+
+@router.get(
+    "/snapshots/{snapshot_key}",
+    response_model=OpportunitySnapshotDetailResponse,
+)
+def opportunity_snapshot_detail(snapshot_key: str) -> OpportunitySnapshotDetailResponse:
+    """Return one immutable snapshot with its frozen run payload, read-only."""
+
+    from src.services.opportunity_snapshot_service import get_snapshot_detail
+
+    if not re.fullmatch(r"ops_[0-9a-f]{64}", snapshot_key):
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "snapshot_not_found",
+                "message": "snapshot_key 格式不合法或不存在。",
+            },
+        )
+    try:
+        result = get_snapshot_detail(snapshot_key)
+    except Exception as exc:  # noqa: BLE001 - bounded retryable API state
+        logger.error(
+            "[opportunity-snapshot] snapshot detail unavailable: %s",
+            exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "snapshot_detail_unavailable",
+                "message": "快照读取暂不可用；冻结证据未被修改，请稍后重试。",
+            },
+        ) from exc
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "snapshot_not_found",
+                "message": "指定 snapshot_key 不存在。",
+            },
+        )
+    return OpportunitySnapshotDetailResponse.model_validate(result)
 
 
 @router.post(
@@ -1268,9 +1674,53 @@ def evaluate_opportunity_snapshot(
 def opportunity_learning_summary() -> OpportunityLearningSummaryResponse:
     """Return guarded descriptive statistics; never change ranking weights."""
 
+    from src.config import get_config
+    from src.opportunities.maintenance_repository import (
+        OUTCOME_MAINTENANCE_POLICY_VERSION,
+        get_latest_outcome_maintenance,
+    )
     from src.services.opportunity_snapshot_service import learning_summary
 
-    return OpportunityLearningSummaryResponse.model_validate(learning_summary())
+    result = learning_summary()
+    result["automatic_maintenance_enabled"] = bool(
+        getattr(
+            get_config(),
+            "opportunity_outcome_scheduler_enabled",
+            False,
+        )
+    )
+    result["maintenance_policy_version"] = (
+        OUTCOME_MAINTENANCE_POLICY_VERSION
+    )
+    latest = get_latest_outcome_maintenance()
+    if latest is not None:
+        result["latest_maintenance"] = {
+            "session_date_et": latest.session_date_et.isoformat(),
+            "policy_version": latest.policy_version,
+            "state": latest.state,
+            "attempt_count": latest.attempt_count,
+            "completed_at": (
+                latest.completed_at.isoformat()
+                if latest.completed_at is not None
+                else None
+            ),
+            "next_retry_at": (
+                latest.next_retry_at.isoformat()
+                if latest.next_retry_at is not None
+                else None
+            ),
+            "due_snapshot_count": int(
+                latest.result.get("due_snapshot_count") or 0
+            ),
+            "inserted_outcomes": int(
+                latest.result.get("inserted_outcomes") or 0
+            ),
+            "data_gap_horizons": int(
+                latest.result.get("data_gap_horizons") or 0
+            ),
+            "last_error_code": latest.last_error_code,
+        }
+    return OpportunityLearningSummaryResponse.model_validate(result)
 
 
 @router.post("/option-overview", response_model=OptionOverviewResponse)
@@ -1310,11 +1760,13 @@ def option_context(payload: OptionContextRequest) -> OptionContextResponse:
 
 @router.post("/option-walls", response_model=OptionWallResponse)
 def option_walls(payload: OptionWallRequest) -> OptionWallResponse:
-    """Return observable OI/volume walls and unsigned gamma concentration.
+    """Return walls plus ATM Call IV derived from the same dynamic snapshot.
 
     Public open interest does not identify dealer positioning.  Consequently
     this endpoint never labels the unsigned concentration as true dealer GEX,
-    never calculates a fake gamma flip, and never invokes a trade API.
+    never calculates a fake gamma flip, and never invokes a trade API.  The ATM
+    field reuses already fetched contracts and does not issue another option
+    chain request.
     """
 
     result = _execute_option_walls(
