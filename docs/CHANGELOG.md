@@ -369,6 +369,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] Journal“仓位复盘”页「模式观察」每个分桶新增「保存为候选」内联表单（标题 + 规则描述，空内容禁用提交），并在其下方新增 Playbook 面板：候选可显式「晋升为规则」、规则显示版本/状态并支持显式「退役」，两者均带确认步骤与“规则不会影响系统评分或榜单，仅是你的决策清单”文案。
 - [测试] 新增 Playbook 仓储回归（快照冻结内容、幂等重放、桶缺失/无构建 fail-closed 零写、CAS 陈旧拒绝、退役复制快照、重晋升需显式意图、两表 deny trigger、列表排序）、API 合同（round-trip + 409/422）与 Web 组件测试（表单 gating、晋升/退役确认流、诚实文案断言）。
 - [文档] `New-docs/phase1/13_PLAYBOOK_PROMOTION_CONTRACT.md` 切片 C-2 标记为已实现并补实现锚点；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` 同步 C-2 状态。
+- [改进] `/regime/opportunity/:ticker` 摘要同证据束（D-4）：官方快照绑定时，「交易研究结论」摘要句中织入的增强数据数值（option-overview 的 IV Rank）强制带「（当前增强数据 as-of ET，非冻结榜单证据）」内联标注，模型终值区间的 IV 输入同步加注（价格基准 as-of 已由 modelBasisLabel 携带）；冻结 bundle 数值（20 日区间 / EMA / 量能比率）不加注，即时扫描视图不加注。
+- [测试] 详情页文案审计回归：官方绑定下增强数值必须带非冻结标注、冻结数值不得被标注、即时扫描无任何增强标注；审计按「指标名+数字」词面模式扫描结论侧栏段落，防止新增无标注增强数值（局限：不识别未命名裸数字）。
+- [文档] `New-docs/HANDOFF.md` §9.3 摘要同证据束项标记已完成并记录标注方式；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` D-4 状态更新为已验收。
+- [新功能] Journal Playbook 切片 C-3：新增零写反向链接端点 `GET /api/v1/journal/v2/position-episodes/{episode_id}/playbook-links?build_id=...`，返回冻结证据快照中引用该回合的候选与规则（每条 lineage 只取最新版本）；只匹配快照 `build_id` 与给定构建一致的引用，快照样本被截断（冻结时成员 >200）而无法确认成员关系时，仅在冻结桶回显与回合当前标签/方向/边界口径一致时以独立 `possible_truncated` 条目返回，绝不伪装为已确认；未知回合/构建与 review-annotation 读路径一致返回 404。
+- [新功能] 单笔复盘页（`/journal/review/:episodeId`）新增「Playbook 关联」面板：按已确认规则（`规则 v{n} · 生效中/已退役`）→ 已确认候选 → 「可能相关（无法确认）」排序展示，均带冻结桶回显（标签/错误类型 · 值 · 方向 · 边界口径）；截断条目标注「证据快照抽样截断，无法确认该回合是否在样本内」，空态为「该回合未被任何 Playbook 候选或规则引用」。
+- [测试] 新增 C-3 仓储回归（确认链接排序与桶回显、lineage 最新版本含退役状态、构建不匹配排除、截断样本 possible 标注与桶不匹配省略、零写断言、未知 scope fail-closed）、API 合同（链接契约 + 空链接 + 404/422）与 Web 组件测试（规则/候选标签、截断不确定性标注、空态与错误态渲染）。
+- [文档] `New-docs/phase1/13_PLAYBOOK_PROMOTION_CONTRACT.md` 切片 C-3 标记为已实现并补实现锚点；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` 同步 C-3 状态。
 
 ## [3.11.0] - 2026-03-27
 

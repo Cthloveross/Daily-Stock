@@ -16,6 +16,7 @@ import { parseApiError, type ParsedApiError } from '../api/error';
 import { ApiErrorAlert } from '../components/common/ApiErrorAlert';
 import { InlineAlert } from '../components/common/InlineAlert';
 import { CandlestickChart, type Candle } from '../components/charts/CandlestickChart';
+import { EpisodePlaybookLinksPanel } from '../components/journal/review/EpisodePlaybookLinksPanel';
 import { TradeLogicDraftPanel } from '../components/journal/review/TradeLogicDraftPanel';
 import {
   buildEmaOverlay,
@@ -1297,6 +1298,12 @@ const JournalEpisodeReviewPage: React.FC = () => {
           void saveReviewWorkspace(status);
         }}
         onLoadHistory={loadSavedReviewHistory}
+      />
+
+      <EpisodePlaybookLinksPanel
+        key={`playbook-links:${episodeId}:${detail.build.id}`}
+        episodeId={episodeId}
+        buildId={detail.build.id}
       />
 
       <AiReviewPanel

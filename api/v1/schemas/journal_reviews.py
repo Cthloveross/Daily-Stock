@@ -275,3 +275,43 @@ class PlaybookRuleRetireResponse(BaseModel):
     retired: bool
     idempotent_replay: bool
     rule: PlaybookRuleItem
+
+
+# --- playbook episode links (slice C-3, zero-write reverse lookup) -----------
+
+
+class PlaybookEpisodeLinkItem(BaseModel):
+    """One frozen-snapshot reference from a candidate/rule to this episode.
+
+    ``link_state`` is ``confirmed`` when the frozen ``episode_ids`` sample
+    contains the episode, and ``possible_truncated`` when the sample was
+    truncated so membership is honestly unknowable.  ``bucket`` echoes the
+    snapshot's frozen bucket, never a re-derived live one.
+    """
+
+    schema_version: str = "playbook-episode-link/1.0"
+    kind: Literal["rule", "candidate"]
+    link_state: Literal["confirmed", "possible_truncated"]
+    title: str
+    rule_text: str
+    bucket: Optional[PlaybookSourceBucketModel] = None
+    snapshot_build_id: int = Field(ge=1)
+    snapshot_generated_at: Optional[datetime] = None
+    lineage_key: Optional[str] = None
+    version: Optional[int] = Field(default=None, ge=1)
+    status: Optional[Literal["active", "retired"]] = None
+    candidate_key: Optional[str] = None
+    promoted: Optional[bool] = None
+    created_at: datetime
+
+
+class PlaybookEpisodeLinksResponse(BaseModel):
+    """Confirmed rules, confirmed candidates, then possible entries."""
+
+    schema_version: Literal["journal-playbook-episode-links/1.0"] = (
+        "journal-playbook-episode-links/1.0"
+    )
+    account_key: str
+    build_id: int = Field(ge=1)
+    episode_id: int = Field(ge=1)
+    links: list[PlaybookEpisodeLinkItem] = Field(default_factory=list)

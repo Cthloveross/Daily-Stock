@@ -462,13 +462,19 @@ const OpportunityDetailPage: React.FC = () => {
       ? `上一完整日收盘低于前 20 日低点 ${formatNumber(priorLow)}；EMA 结构为 ${emaContext}。这是破位背景，不等于自动做空条件。`
       : `价格仍在前 20 日区间 ${formatNumber(priorLow)}–${formatNumber(priorHigh)} 内；EMA 结构为 ${emaContext}。`;
   const ivRank = overview?.ivRankPercent;
+  const isOfficialBinding = officialBinding.state === 'official';
+  // D-4 摘要同证据束：官方绑定时，摘要句中织入的增强数据数值（非冻结 bundle）必须带 as-of 内联标注；
+  // 冻结 bundle 数值（20 日区间 / EMA / 量能比率）不加注，页头已声明冻结绑定。
+  const liveEnhancementNote = isOfficialBinding
+    ? `（当前增强数据 ${formatEtTime(overview?.fetchedAt)}，非冻结榜单证据）`
+    : '';
   const volatilityZone = typeof ivRank !== 'number'
     ? 'IV Rank 暂不可用，不能判断当前 IV 在自身历史区间的位置。'
     : ivRank >= 75
-      ? `IV Rank ${formatPercent(ivRank)}，处于数据商历史区间偏高位置；高 IV 仍可能继续上升，不自动等于卖出波动率。`
+      ? `IV Rank ${formatPercent(ivRank)}${liveEnhancementNote}，处于数据商历史区间偏高位置；高 IV 仍可能继续上升，不自动等于卖出波动率。`
       : ivRank <= 25
-        ? `IV Rank ${formatPercent(ivRank)}，处于数据商历史区间偏低位置；低 IV 不自动等于应买入期权。`
-        : `IV Rank ${formatPercent(ivRank)}，位于数据商历史区间中段。`;
+        ? `IV Rank ${formatPercent(ivRank)}${liveEnhancementNote}，处于数据商历史区间偏低位置；低 IV 不自动等于应买入期权。`
+        : `IV Rank ${formatPercent(ivRank)}${liveEnhancementNote}，位于数据商历史区间中段。`;
   const callOiWall = wall?.walls.callOi[0]?.strike;
   const putOiWall = wall?.walls.putOi[0]?.strike;
   const confirmationReadout = priorHigh === null || priorLow === null
@@ -644,6 +650,9 @@ const OpportunityDetailPage: React.FC = () => {
                     <div className="text-right text-caption text-text-3">
                       <div>IV {formatPercent(impliedMove.annualizedIvPercent)}</div>
                       <div className="mt-0.5">{modelBasisLabel}</div>
+                      {isOfficialBinding && (
+                        <div className="mt-0.5">IV 为当前增强数据（{formatEtTime(overview?.fetchedAt)}），非冻结榜单证据</div>
+                      )}
                     </div>
                   </div>
 

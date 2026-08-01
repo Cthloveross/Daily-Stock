@@ -473,6 +473,56 @@ describe('OpportunityDetailPage', () => {
     expect(screen.queryByLabelText('冻结与当前差异')).not.toBeInTheDocument();
   });
 
+  it('labels live enhancement values with as-of notes in the officially bound summary (D-4 copy audit)', async () => {
+    renderPage(`/regime/opportunity/COIN?snapshotKey=${officialSnapshotKey}`);
+
+    // 增强数据数值（option-overview 的 IV Rank）织入摘要句时必须带 as-of + 非冻结声明。
+    const aside = await screen.findByLabelText('专业解读');
+    const positioning = await within(aside).findByText(/IV Rank 80%/);
+    expect(positioning.textContent).toContain(
+      'IV Rank 80%（当前增强数据 07/23 10:00 ET，非冻结榜单证据）',
+    );
+
+    // 冻结 bundle 数值（前 20 日区间 / 日线 EMA13）不需要也不得被标成增强数据。
+    const confirmation = within(aside).getByText(/前 20 日高点 105/);
+    expect(confirmation.textContent).toContain('EMA13 97');
+    expect(confirmation.textContent).not.toContain('当前增强数据');
+    expect(confirmation.textContent).not.toContain('非冻结榜单证据');
+
+    // 模型终值区间的 IV 输入同为增强数据；价格基准 as-of 已由 modelBasisLabel（Moomoo spot · 时点）携带。
+    const summarySection = screen
+      .getByRole('heading', { name: '专业结论与波动情景' })
+      .closest('section') as HTMLElement;
+    expect(
+      await within(summarySection).findByText(/IV 为当前增强数据（07\/23 10:00 ET），非冻结榜单证据/),
+    ).toBeInTheDocument();
+
+    // 审计代理：结论侧栏任何「增强指标名 + 数字」的句子都必须带非冻结声明，
+    // 防止后续有人把新的增强数值织入摘要而不加标注。
+    // 局限：按词面模式（IV/IV Rank/Spot/现价 后跟数字）识别，无法捕捉未命名的裸数字。
+    const liveValuePattern = /(?:IV Rank|IV|Spot|spot|现价)\s*[$\d]/;
+    const paragraphs = Array.from(aside.querySelectorAll('p'));
+    expect(paragraphs.length).toBeGreaterThan(0);
+    for (const paragraph of paragraphs) {
+      const text = paragraph.textContent ?? '';
+      if (liveValuePattern.test(text)) {
+        expect(text, `摘要句含增强数值但缺少非冻结标注: ${text}`).toContain('非冻结榜单证据');
+      }
+    }
+  });
+
+  it('keeps the live-scan summary free of enhancement as-of labels', async () => {
+    renderPage();
+
+    expect(await screen.findByText('即时扫描 · 未绑定官方快照')).toBeInTheDocument();
+    const aside = await screen.findByLabelText('专业解读');
+    const positioning = await within(aside).findByText(/IV Rank 80%/);
+    // 即时扫描视图没有冻结证据束，增强数据即当前数据，不加「非冻结」标注。
+    expect(positioning.textContent).not.toContain('当前增强数据');
+    expect(screen.queryByText(/非冻结榜单证据/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/当前增强数据/)).not.toBeInTheDocument();
+  });
+
   it('falls back to a labelled live scan when the official snapshot is unavailable', async () => {
     apiMocks.fetchSnapshotDetail.mockRejectedValue(new Error('404'));
     renderPage(`/regime/opportunity/COIN?snapshotKey=${officialSnapshotKey}`);

@@ -776,6 +776,32 @@ export interface RetirePlaybookRuleResponse {
   rule: PlaybookRule;
 }
 
+/** Slice C-3: zero-write reverse links from one episode to frozen snapshots. */
+export interface EpisodePlaybookLink {
+  schemaVersion: 'playbook-episode-link/1.0' | string;
+  kind: 'rule' | 'candidate';
+  linkState: 'confirmed' | 'possible_truncated';
+  title: string;
+  ruleText: string;
+  bucket?: PlaybookSourceBucket | null;
+  snapshotBuildId: number;
+  snapshotGeneratedAt?: string | null;
+  lineageKey?: string | null;
+  version?: number | null;
+  status?: 'active' | 'retired' | null;
+  candidateKey?: string | null;
+  promoted?: boolean | null;
+  createdAt: string;
+}
+
+export interface EpisodePlaybookLinksResponse {
+  schemaVersion: 'journal-playbook-episode-links/1.0' | string;
+  accountKey: string;
+  buildId: number;
+  episodeId: number;
+  links: EpisodePlaybookLink[];
+}
+
 export interface PositionEpisodeAiReviewResponse {
   dataState: 'ready' | string;
   analysisMode: 'model_enhanced' | 'deterministic';

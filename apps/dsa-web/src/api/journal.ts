@@ -30,6 +30,7 @@ import type {
   PositionEpisodeListResponse,
   PositionEpisodeReviewAnnotationHistoryResponse,
   PositionEpisodeReviewAnnotationLatestResponse,
+  EpisodePlaybookLinksResponse,
   PlaybookListResponse,
   CreatePlaybookCandidateRequest,
   CreatePlaybookCandidateResponse,
@@ -320,6 +321,17 @@ export async function promotePlaybookCandidate(
     },
   );
   return toCamelCase<PromotePlaybookCandidateResponse>(data);
+}
+
+export async function fetchEpisodePlaybookLinks(
+  episodeId: number,
+  buildId: number,
+): Promise<EpisodePlaybookLinksResponse> {
+  const { data } = await apiClient.get(
+    `${BASE}/v2/position-episodes/${episodeId}/playbook-links`,
+    { params: { build_id: buildId } },
+  );
+  return toCamelCase<EpisodePlaybookLinksResponse>(data);
 }
 
 export async function retirePlaybookRule(

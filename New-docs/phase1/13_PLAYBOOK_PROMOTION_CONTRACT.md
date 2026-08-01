@@ -1,6 +1,6 @@
 # 个人 Playbook 晋升链路合同（阶段 C · 设计冻结稿）
 
-> 状态：设计合同（2026-08-01）；切片 C-1 / C-2 已实现（2026-08-01），C-3 未开始
+> 状态：设计合同（2026-08-01）；切片 C-1 / C-2 / C-3 均已实现（2026-08-01）
 >
 > 真源顺序：可执行代码 > 本合同 > HANDOFF §16 阶段 C 概述
 >
@@ -46,7 +46,7 @@
 |---|---|---|---|
 | C-1 | L1 聚合端点 `GET /journal/v2/review-insights`（按 tag/setup 分组，门槛 fail-closed）+ 复盘页「模式观察」面板 | 零写 | 已实现 |
 | C-2 | L2/L3 表 + append-only 仓储 + 晋升/退役端点 + Playbook 页面 | 新增 2 张 append-only 表 | 已实现 |
-| C-3 | 单笔复盘页反向链接（该 episode 命中的 rule/candidate） | 零写 | 未开始 |
+| C-3 | 单笔复盘页反向链接（该 episode 命中的 rule/candidate） | 零写 | 已实现 |
 
 ### C-1 实现锚点（2026-08-01）
 
@@ -120,6 +120,39 @@
   （round-trip + 409/422）、
   `apps/dsa-web/src/components/journal/__tests__/PlaybookPanel.test.tsx` 与
   `ReviewInsightsPanel.test.tsx`（表单 gating、确认流、诚实文案）。
+
+### C-3 实现锚点（2026-08-01）
+
+- 仓储：`src/journal/ledger/playbook_repository.py`
+  `list_playbook_links_for_episode(episode_id, build_id, account_key)`——纯
+  SELECT 反向查询：扫描该账户全部候选与每条规则 lineage 的最新版本，将冻结
+  的 `evidence_snapshot_json` 与给定回合 + 构建身份比对。匹配语义：
+  free_form 快照不绑定任何回合证据，永不成链；快照 `build_id` ≠ 给定
+  build 一律不显示；回合 id 在冻结 `episode_ids` 样本内 → `confirmed`；
+  样本被截断（冻结时成员 >200）且回合不在样本内 → 成员关系诚实不可知，
+  仅当冻结桶回显（group_kind/group_value/direction/boundary_policy）与该
+  回合当前标签、方向与边界口径一致时以独立 `possible_truncated` 条目返回，
+  否则整体省略；未截断样本不含该回合即证明非成员，不返回。方向/边界的派生
+  与 C-1 聚合共用 `_position_item` + latest-revision 标注，避免口径漂移。
+  回合不在给定构建/账户内 → `ReviewAnnotationScopeNotFoundError`。零写。
+- 端点：`GET /api/v1/journal/v2/position-episodes/{episode_id}/playbook-links
+  ?build_id=...`（`api/v1/endpoints/journal_reviews.py`；schema
+  `journal-playbook-episode-links/1.0` + `playbook-episode-link/1.0` 于
+  `api/v1/schemas/journal_reviews.py`；排序固定为已确认规则 → 已确认候选 →
+  possible 条目，各组 newest first；未知回合/构建与 review-annotation 读
+  路径一致返回 404）。
+- 页面：`apps/dsa-web/src/components/journal/review/EpisodePlaybookLinksPanel.tsx`
+  （「Playbook 关联」面板，挂载于 `/journal/review/:episodeId` 交易逻辑草稿
+  面板下方；规则显示 `规则 v{n} · 生效中/已退役`、候选显示 `候选（· 已晋
+  升）`，均带冻结桶回显 chip；possible 条目单列「可能相关（无法确认）」组
+  并标注「证据快照抽样截断，无法确认该回合是否在样本内」；空态「该回合未被
+  任何 Playbook 候选或规则引用」；API client `fetchEpisodePlaybookLinks`
+  见 `apps/dsa-web/src/api/journal.ts`）。
+- 回归：`src/journal/tests/test_playbook_repository.py`（确认链接排序与桶
+  回显、lineage 只显示最新版本（含退役状态）、构建不匹配排除、截断样本
+  possible/桶不匹配省略、零写断言 + 未知 scope fail-closed）、
+  `api/v1/tests/test_journal_playbook_endpoint.py`（合同 + 空链接 + 404/
+  422）、`apps/dsa-web/src/components/journal/review/__tests__/EpisodePlaybookLinksPanel.test.tsx`。
 
 ## 4. 验收（对照 HANDOFF §16 阶段 C）
 

@@ -8,6 +8,8 @@ from api.v1.schemas.journal_reviews import (
     PlaybookCandidateCreateRequest,
     PlaybookCandidateCreateResponse,
     PlaybookCandidateItem,
+    PlaybookEpisodeLinkItem,
+    PlaybookEpisodeLinksResponse,
     PlaybookListResponse,
     PlaybookRuleItem,
     PlaybookRulePromoteRequest,
@@ -30,12 +32,14 @@ from api.v1.schemas.journal_reviews import (
 from src.journal.ledger.episode_repository import EpisodeRepositoryError
 from src.journal.ledger.playbook_repository import (
     PlaybookConflictError,
+    PlaybookEpisodeLink,
     PlaybookRepositoryError,
     PlaybookSourceBucket,
     StoredPlaybookCandidate,
     StoredPlaybookRule,
     create_playbook_candidate,
     list_playbook_candidates,
+    list_playbook_links_for_episode,
     list_playbook_rules,
     promote_candidate_to_rule,
     retire_playbook_rule,
@@ -454,4 +458,59 @@ def retire_rule(
         retired=not result.duplicate,
         idempotent_replay=result.duplicate,
         rule=_rule_item(result.rule),
+    )
+
+
+# --- playbook episode links (slice C-3): zero-write reverse lookup -----------
+
+
+def _episode_link_item(value: PlaybookEpisodeLink) -> PlaybookEpisodeLinkItem:
+    return PlaybookEpisodeLinkItem(
+        kind=value.kind,  # type: ignore[arg-type]
+        link_state=value.link_state,  # type: ignore[arg-type]
+        title=value.title,
+        rule_text=value.rule_text,
+        bucket=_bucket_model(value.bucket),
+        snapshot_build_id=value.snapshot_build_id,
+        snapshot_generated_at=value.snapshot_generated_at,
+        lineage_key=value.lineage_key,
+        version=value.version,
+        status=value.status,  # type: ignore[arg-type]
+        candidate_key=value.candidate_key,
+        promoted=value.promoted,
+        created_at=value.created_at,
+    )
+
+
+@router.get(
+    "/v2/position-episodes/{episode_id}/playbook-links",
+    response_model=PlaybookEpisodeLinksResponse,
+)
+def get_position_episode_playbook_links(
+    episode_id: int,
+    build_id: int = Query(..., ge=1),
+    account_key: str = _ACCOUNT_KEY_QUERY,
+) -> PlaybookEpisodeLinksResponse:
+    """Which candidates/rules reference this episode in their frozen snapshot.
+
+    Zero writes.  Only snapshots frozen against the same build identity are
+    considered; truncated-sample snapshots that cannot prove membership are
+    returned as separate ``possible_truncated`` entries (bucket echo must
+    match the episode) instead of being passed off as confirmed links.
+    """
+    try:
+        result = list_playbook_links_for_episode(
+            episode_id=episode_id,
+            build_id=build_id,
+            account_key=account_key,
+        )
+    except ReviewAnnotationRepositoryError as exc:
+        raise _scope_error(exc) from exc
+    except PlaybookRepositoryError as exc:
+        raise _playbook_error(exc) from exc
+    return PlaybookEpisodeLinksResponse(
+        account_key=result.account_key,
+        build_id=result.build_id,
+        episode_id=result.episode_id,
+        links=[_episode_link_item(link) for link in result.links],
     )

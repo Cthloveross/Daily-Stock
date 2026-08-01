@@ -47,12 +47,16 @@ BASE = "/api/v1/journal/v2/playbook"
 
 def _seed_annotated_bucket() -> int:
     """Statement build with one momentum-tagged annotation."""
+    build_id, _episodes = _seed_annotated_bucket_with_episodes()
+    return build_id
+
+
+def _seed_annotated_bucket_with_episodes() -> tuple[int, dict[str, int]]:
+    """Statement build plus its episode ids keyed by underlying."""
     import_statement_batch(_case_focus_statement())
     build = append_latest_position_episode_build(accept_assumed_flat=True)
     page = get_latest_position_episode_page(per_page=10)
-    episode_id = next(
-        item.episode_id for item in page.items if item.underlying == "WIN"
-    )
+    by_underlying = {item.underlying: item.episode_id for item in page.items}
     append_review_annotation(
         ReviewAnnotationInput(
             review_status="completed",
@@ -60,9 +64,9 @@ def _seed_annotated_bucket() -> int:
             tags=("momentum",),
         ),
         episode_build_id=build.build_id,
-        position_episode_id=episode_id,
+        position_episode_id=by_underlying["WIN"],
     )
-    return build.build_id
+    return build.build_id, by_underlying
 
 
 _BUCKET = {
@@ -242,3 +246,72 @@ def test_conflicts_map_to_409():
     assert reactivated.status_code == 200
     assert reactivated.json()["rule"]["version"] == 3
     assert reactivated.json()["rule"]["status"] == "active"
+
+
+def _links_url(episode_id: int, build_id: int) -> str:
+    return (
+        "/api/v1/journal/v2/position-episodes/"
+        f"{episode_id}/playbook-links?build_id={build_id}"
+    )
+
+
+def test_episode_playbook_links_contract():
+    build_id, by_underlying = _seed_annotated_bucket_with_episodes()
+    client = _client()
+    candidate = _create_candidate(client).json()["candidate"]
+    rule = client.post(
+        f"{BASE}/candidates/{candidate['candidate_key']}/promote",
+        json={},
+    ).json()["rule"]
+
+    response = client.get(_links_url(by_underlying["WIN"], build_id))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["schema_version"] == "journal-playbook-episode-links/1.0"
+    assert body["account_key"] == "default_moomoo_us"
+    assert body["build_id"] == build_id
+    assert body["episode_id"] == by_underlying["WIN"]
+    assert [
+        (item["kind"], item["link_state"]) for item in body["links"]
+    ] == [("rule", "confirmed"), ("candidate", "confirmed")]
+    rule_link, candidate_link = body["links"]
+    assert rule_link["schema_version"] == "playbook-episode-link/1.0"
+    assert rule_link["title"] == "动量候选"
+    assert rule_link["lineage_key"] == rule["lineage_key"]
+    assert rule_link["version"] == 1
+    assert rule_link["status"] == "active"
+    assert rule_link["candidate_key"] is None
+    assert rule_link["promoted"] is None
+    assert rule_link["snapshot_build_id"] == build_id
+    assert rule_link["snapshot_generated_at"] is not None
+    # The bucket echo is the frozen snapshot's bucket.
+    assert rule_link["bucket"] == _BUCKET
+    assert candidate_link["candidate_key"] == candidate["candidate_key"]
+    assert candidate_link["promoted"] is True
+    assert candidate_link["lineage_key"] is None
+    assert candidate_link["bucket"] == _BUCKET
+
+    # An episode referenced by no frozen snapshot returns an empty list.
+    unreferenced = client.get(_links_url(by_underlying["LOSS"], build_id))
+    assert unreferenced.status_code == 200
+    assert unreferenced.json()["links"] == []
+
+
+def test_episode_playbook_links_unknown_scope_maps_to_404():
+    build_id, by_underlying = _seed_annotated_bucket_with_episodes()
+    client = _client()
+
+    # Mirrors the review-annotation reads: unknown episode/build scope → 404.
+    unknown_episode = client.get(_links_url(999_999, build_id))
+    assert unknown_episode.status_code == 404
+
+    unknown_build = client.get(
+        _links_url(by_underlying["WIN"], build_id + 99)
+    )
+    assert unknown_build.status_code == 404
+
+    missing_build_id = client.get(
+        f"/api/v1/journal/v2/position-episodes/"
+        f"{by_underlying['WIN']}/playbook-links"
+    )
+    assert missing_build_id.status_code == 422

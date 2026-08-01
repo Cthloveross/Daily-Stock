@@ -24,6 +24,12 @@ from typing import Any, Optional
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from src.journal.ledger.episode_repository import _position_item
+from src.journal.ledger.models import (
+    PositionEpisode,
+    ReviewAnnotation,
+    StrategyEpisode,
+)
 from src.journal.ledger.playbook_models import PlaybookCandidate, PlaybookRule
 from src.journal.ledger.repository import (
     DEFAULT_LEDGER_ACCOUNT_KEY,
@@ -37,12 +43,20 @@ from src.journal.ledger.review_insights import (
     ReviewInsightBucketEvidence,
     collect_review_insight_bucket_evidence,
 )
+from src.journal.ledger.review_repository import (
+    _parse_labels,
+    _validate_scope as _validate_review_scope,
+)
 from src.storage import get_db
 
 __all__ = [
+    "EPISODE_LINK_STATE_CONFIRMED",
+    "EPISODE_LINK_STATE_POSSIBLE_TRUNCATED",
     "PLAYBOOK_EVIDENCE_SNAPSHOT_SCHEMA_VERSION",
     "PlaybookCandidateCreateResult",
     "PlaybookConflictError",
+    "PlaybookEpisodeLink",
+    "PlaybookEpisodeLinksResult",
     "PlaybookRepositoryError",
     "PlaybookRulePromotionResult",
     "PlaybookRuleRetireResult",
@@ -51,6 +65,7 @@ __all__ = [
     "StoredPlaybookRule",
     "create_playbook_candidate",
     "list_playbook_candidates",
+    "list_playbook_links_for_episode",
     "list_playbook_rules",
     "promote_candidate_to_rule",
     "retire_playbook_rule",
@@ -75,6 +90,11 @@ _MAX_GROUP_VALUE_CHARACTERS = 64
 
 RULE_STATUS_ACTIVE = "active"
 RULE_STATUS_RETIRED = "retired"
+
+# Slice C-3 reverse-link states: a snapshot either proves membership, or —
+# when its bounded episode-id sample was truncated — honestly cannot.
+EPISODE_LINK_STATE_CONFIRMED = "confirmed"
+EPISODE_LINK_STATE_POSSIBLE_TRUNCATED = "possible_truncated"
 
 
 class PlaybookRepositoryError(ValueError):
@@ -148,6 +168,40 @@ class PlaybookRulePromotionResult:
 class PlaybookRuleRetireResult:
     rule: StoredPlaybookRule
     duplicate: bool
+
+
+@dataclass(frozen=True)
+class PlaybookEpisodeLink:
+    """One frozen-snapshot reference from a candidate/rule to an episode.
+
+    ``bucket`` echoes the snapshot's frozen bucket (never the live one) and
+    ``snapshot_generated_at`` is the frozen as-of moment; rule identity or
+    candidate identity is populated depending on ``kind``.
+    """
+
+    kind: str  # "rule" | "candidate"
+    link_state: str  # EPISODE_LINK_STATE_* value
+    title: str
+    rule_text: str
+    bucket: Optional[PlaybookSourceBucket]
+    snapshot_build_id: int
+    snapshot_generated_at: Optional[datetime]
+    created_at: datetime
+    lineage_key: Optional[str] = None
+    version: Optional[int] = None
+    status: Optional[str] = None
+    candidate_key: Optional[str] = None
+    promoted: Optional[bool] = None
+
+
+@dataclass(frozen=True)
+class PlaybookEpisodeLinksResult:
+    """Zero-write reverse lookup result for one episode in one build."""
+
+    account_key: str
+    build_id: int
+    episode_id: int
+    links: tuple[PlaybookEpisodeLink, ...]
 
 
 def _canonical_json(value: Any) -> str:
@@ -832,4 +886,261 @@ def list_playbook_rules(
                 ),
             )
             for row, candidate_key_value in rows
+        )
+
+
+# --- slice C-3: zero-write reverse links from one episode --------------------
+
+
+def _snapshot_bucket(
+    snapshot: dict[str, Any],
+) -> Optional[PlaybookSourceBucket]:
+    """Echo the snapshot's frozen bucket without re-deriving anything."""
+    bucket = snapshot.get("bucket")
+    if not isinstance(bucket, dict):
+        return None
+    return PlaybookSourceBucket(
+        group_kind=str(bucket.get("group_kind", "")),
+        group_value=str(bucket.get("group_value", "")),
+        direction=str(bucket.get("direction", "")),
+        boundary_policy=str(bucket.get("boundary_policy", "")),
+    )
+
+
+def _snapshot_generated_at(snapshot: dict[str, Any]) -> Optional[datetime]:
+    raw = snapshot.get("generated_at")
+    if not isinstance(raw, str):
+        return None
+    try:
+        return _utc(datetime.fromisoformat(raw))
+    except ValueError:
+        return None
+
+
+def _snapshot_link_state(
+    snapshot: dict[str, Any],
+    *,
+    episode_id: int,
+    build_id: int,
+    episode_direction: str,
+    episode_boundary_policy: str,
+    episode_labels: set[tuple[str, str]],
+) -> Optional[str]:
+    """Classify one frozen snapshot against one episode, or return ``None``.
+
+    * free-form snapshots bind no episode evidence — never a link;
+    * a snapshot frozen against another build identity is never shown here;
+    * membership in the frozen ``episode_ids`` sample is a confirmed link;
+    * a truncated sample (>200 members at freeze time) that does not contain
+      the episode is honestly unknowable: it is surfaced as a *possible* link
+      only when the frozen bucket echo matches the episode's own current
+      labels, direction and boundary policy — otherwise it is omitted;
+    * a complete (untruncated) sample without the episode proves the episode
+      was not a member, so nothing is shown.
+    """
+    if snapshot.get("snapshot_kind") != "insights_bucket":
+        return None
+    if snapshot.get("build_id") != build_id:
+        return None
+    raw_ids = snapshot.get("episode_ids")
+    sampled_ids = (
+        {
+            value
+            for value in raw_ids
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+        if isinstance(raw_ids, list)
+        else set()
+    )
+    if episode_id in sampled_ids:
+        return EPISODE_LINK_STATE_CONFIRMED
+    if snapshot.get("episode_id_sample_truncated") is not True:
+        return None
+    bucket = _snapshot_bucket(snapshot)
+    if bucket is None:
+        return None
+    if bucket.direction != episode_direction:
+        return None
+    if bucket.boundary_policy != episode_boundary_policy:
+        return None
+    if (bucket.group_kind, bucket.group_value) not in episode_labels:
+        return None
+    return EPISODE_LINK_STATE_POSSIBLE_TRUNCATED
+
+
+def list_playbook_links_for_episode(
+    *,
+    episode_id: int,
+    build_id: int,
+    account_key: str = DEFAULT_LEDGER_ACCOUNT_KEY,
+) -> PlaybookEpisodeLinksResult:
+    """Which candidates/rules reference this episode in their frozen snapshot.
+
+    Pure SELECT (slice C-3): scans the account's candidates and the latest
+    version of every rule lineage, matching the frozen
+    ``evidence_snapshot_json`` against the given episode and build identity.
+    Ordering: confirmed rules, confirmed candidates, then possible
+    (truncation-unknowable) rules and candidates — each newest first.
+    Raises ``ReviewAnnotationScopeNotFoundError`` when the episode does not
+    exist in the given build and account.
+    """
+    account_key = _normalized_account_key(account_key)
+    if episode_id < 1 or build_id < 1:
+        raise PlaybookRepositoryError(
+            "episode_id and build_id must be positive"
+        )
+
+    init_ledger_schema()
+    db = get_db()
+    with db.session_scope() as session:
+        _validate_review_scope(
+            session,
+            account_key=account_key,
+            episode_build_id=build_id,
+            position_episode_id=episode_id,
+        )
+        position, strategy = session.execute(
+            select(PositionEpisode, StrategyEpisode)
+            .join(
+                StrategyEpisode,
+                StrategyEpisode.id == PositionEpisode.strategy_episode_id,
+            )
+            .where(
+                PositionEpisode.id == episode_id,
+                PositionEpisode.episode_build_id == build_id,
+                PositionEpisode.account_key == account_key,
+            )
+        ).one()
+        annotation = session.execute(
+            select(ReviewAnnotation)
+            .where(
+                ReviewAnnotation.account_key == account_key,
+                ReviewAnnotation.episode_build_id == build_id,
+                ReviewAnnotation.position_episode_id == episode_id,
+            )
+            .order_by(
+                ReviewAnnotation.revision.desc(),
+                ReviewAnnotation.id.desc(),
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        # Same identity derivation as the C-1 aggregation, so the truncation
+        # bucket-echo check can never drift from the bucketing itself.
+        item = _position_item(position, strategy, annotation)
+        episode_direction = str(item.direction).upper()
+        episode_boundary_policy = (
+            BOUNDARY_POLICY_VERIFIED
+            if item.left_boundary_verified and not item.is_left_censored
+            else BOUNDARY_POLICY_ASSUMED_OR_CENSORED
+        )
+        episode_labels: set[tuple[str, str]] = set()
+        if annotation is not None:
+            episode_labels.update(
+                ("tag", value)
+                for value in _parse_labels(str(annotation.tags_json))
+            )
+            episode_labels.update(
+                ("error_type", value)
+                for value in _parse_labels(str(annotation.error_types_json))
+            )
+
+        rule_rows = session.execute(
+            select(PlaybookRule)
+            .where(PlaybookRule.account_key == account_key)
+            .order_by(
+                PlaybookRule.created_at.desc(),
+                PlaybookRule.id.desc(),
+            )
+        ).scalars().all()
+        latest_versions: dict[str, int] = {}
+        for rule in rule_rows:
+            lineage = str(rule.lineage_key)
+            latest_versions[lineage] = max(
+                latest_versions.get(lineage, 0), int(rule.version)
+            )
+        promoted_ids = {
+            int(rule.promoted_from_candidate_id) for rule in rule_rows
+        }
+        candidate_rows = session.execute(
+            select(PlaybookCandidate)
+            .where(PlaybookCandidate.account_key == account_key)
+            .order_by(
+                PlaybookCandidate.created_at.desc(),
+                PlaybookCandidate.id.desc(),
+            )
+        ).scalars().all()
+
+        def _state(snapshot: dict[str, Any]) -> Optional[str]:
+            return _snapshot_link_state(
+                snapshot,
+                episode_id=episode_id,
+                build_id=build_id,
+                episode_direction=episode_direction,
+                episode_boundary_policy=episode_boundary_policy,
+                episode_labels=episode_labels,
+            )
+
+        confirmed_rules: list[PlaybookEpisodeLink] = []
+        possible_rules: list[PlaybookEpisodeLink] = []
+        for rule in rule_rows:
+            # One entry per lineage: its latest version carries the rule's
+            # current status and (after any re-promotion) current snapshot.
+            if int(rule.version) != latest_versions[str(rule.lineage_key)]:
+                continue
+            snapshot = _parse_snapshot(str(rule.evidence_snapshot_json))
+            state = _state(snapshot)
+            if state is None:
+                continue
+            link = PlaybookEpisodeLink(
+                kind="rule",
+                link_state=state,
+                title=str(rule.title),
+                rule_text=str(rule.rule_text),
+                bucket=_snapshot_bucket(snapshot),
+                snapshot_build_id=build_id,
+                snapshot_generated_at=_snapshot_generated_at(snapshot),
+                created_at=_utc(rule.created_at),
+                lineage_key=str(rule.lineage_key),
+                version=int(rule.version),
+                status=str(rule.status),
+            )
+            if state == EPISODE_LINK_STATE_CONFIRMED:
+                confirmed_rules.append(link)
+            else:
+                possible_rules.append(link)
+
+        confirmed_candidates: list[PlaybookEpisodeLink] = []
+        possible_candidates: list[PlaybookEpisodeLink] = []
+        for candidate in candidate_rows:
+            snapshot = _parse_snapshot(str(candidate.evidence_snapshot_json))
+            state = _state(snapshot)
+            if state is None:
+                continue
+            link = PlaybookEpisodeLink(
+                kind="candidate",
+                link_state=state,
+                title=str(candidate.title),
+                rule_text=str(candidate.rule_text),
+                bucket=_snapshot_bucket(snapshot),
+                snapshot_build_id=build_id,
+                snapshot_generated_at=_snapshot_generated_at(snapshot),
+                created_at=_utc(candidate.created_at),
+                candidate_key=str(candidate.candidate_key),
+                promoted=int(candidate.id) in promoted_ids,
+            )
+            if state == EPISODE_LINK_STATE_CONFIRMED:
+                confirmed_candidates.append(link)
+            else:
+                possible_candidates.append(link)
+
+        return PlaybookEpisodeLinksResult(
+            account_key=account_key,
+            build_id=build_id,
+            episode_id=episode_id,
+            links=tuple(
+                confirmed_rules
+                + confirmed_candidates
+                + possible_rules
+                + possible_candidates
+            ),
         )

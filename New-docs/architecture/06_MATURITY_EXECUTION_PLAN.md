@@ -14,7 +14,7 @@
 | B-3 | 前端 confirm UI | preview→确认块+acceptance 勾选+409 引导 | 组件回归 + 真实页面 | ✅ 2026-08-01 |
 | B-4 | 真实小样本演练 | 用户完成一次 snapshot confirm → 次日 refresh → fence ready → 正式 build → 激活 | 正式库真实链路走通 + 回滚演练（激活回旧 build） | ⛔ 等用户交易日操作 |
 
-## 阶段 C · 复盘 → Playbook（设计已冻结，C-1 已实现）
+## 阶段 C · 复盘 → Playbook（设计已冻结，C-1/C-2/C-3 已实现）
 
 合同：`New-docs/phase1/13_PLAYBOOK_PROMOTION_CONTRACT.md`
 
@@ -22,7 +22,7 @@
 |---|---|---|---|---|
 | C-1 | 模式观察聚合（零写） | `GET /journal/v2/review-insights`：按 tag/error_type × 方向 × boundary policy 分桶；verified 样本 <10 笔或独立交易日 <5 只显示计数不显示比率；条件性 P&L 单独计数永不入统计（`src/journal/ledger/review_insights.py` + `ReviewInsightsPanel.tsx`，锚点见合同 §3） | 门槛 fail-closed 测试 + 分桶不混轨测试 + 零写断言 + 「模式观察」面板渲染回归 | ✅ 2026-08-01 |
 | C-2 | Playbook 表与晋升 | 2 张 append-only 表（candidate/rule 版本链）+ 晋升冻结证据快照（episode ids+build+revisions+聚合数字+as-of）+ CAS 晋升/退役端点（`src/journal/ledger/playbook_models.py` + `playbook_repository.py` + `/journal/v2/playbook*` + `PlaybookPanel.tsx`，锚点见合同 §3） | 晋升快照可重放、deny triggers、不反写任何权重：仓储/端点/组件回归全绿（桶缺失 fail-closed 409、幂等重放、退役快照逐字复制） | ✅ 2026-08-01 |
-| C-3 | 复盘页反向链接 | 单笔页显示命中的 candidate/rule | 零写、真实页面 | ⬜ |
+| C-3 | 复盘页反向链接 | 单笔页显示命中的 candidate/rule：`GET /journal/v2/position-episodes/{id}/playbook-links` 只匹配同构建冻结快照的 `episode_ids`；截断样本无法确认时以独立「可能相关」条目诚实标注（`list_playbook_links_for_episode` + `EpisodePlaybookLinksPanel.tsx`，锚点见合同 §3） | 零写断言 + 构建不匹配排除 + 截断 possible/省略 + 404 scope + 面板确认/截断/空态渲染回归 | ✅ 2026-08-01 |
 | C-4 | 复盘工作流打磨 | Review Queue 逐项引导（未复盘案例队列化）、annotation 字段辅助文案 | 用户实际完成 ≥10 笔结构化复盘（用户行为，系统只降低摩擦） | ⬜ |
 
 ## 阶段 D · 可解释研究台（大部分完成，收尾三项）
@@ -32,7 +32,7 @@
 | D-1 | 官方快照绑定 | 深链 snapshotKey + 冻结证据优先 + 回退标注 | 已验收 | ✅ 2026-07-31 |
 | D-2 | 冻结 vs 当前差异 | 差异条 | 已验收 | ✅ 2026-07-31 |
 | D-3 | 期权墙逐层合同 | level 级 expiry 分解 + 可观察报价/IV + 显式标缺（`option-wall/1.2`）；bid/ask/mark 需 adapter 扩展仍标缺 | 4 项 builder 回归（含无 dealer-sign 键递归断言）+ 真实页面逐层标注验证 | ✅ 2026-08-01 |
-| D-4 | 摘要同证据束 | 详情页专业摘要只引用冻结 bundle 内数值，增强数据引用必须带 as-of 标注 | 文案审计测试（摘要不得出现无来源数值） | ⬜ |
+| D-4 | 摘要同证据束 | 官方绑定时摘要句中的增强数据数值（IV Rank / 模型区间 IV 输入）带「当前增强数据 as-of，非冻结榜单证据」内联标注；冻结 bundle 数值不加注；即时扫描不加注（`OpportunityDetailPage.tsx`） | 文案审计测试：增强数值必须带标注、冻结数值不得被标注、即时扫描无标注；审计按「指标名+数字」词面模式扫描结论段落（局限：不识别未命名裸数字） | ✅ 2026-08-01 |
 | D-5 | 概率展示校准边界 | IV 终值区间明确标注模型假设；hit-rate 仅在 track 样本达门槛后出现 | 已有护栏，补自动化断言 | ⬜ |
 
 ## 阶段 E · 结果学习闭环（框架已在，等数据+两项工程）

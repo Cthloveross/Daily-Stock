@@ -711,7 +711,7 @@ AI 必须区分：
 
 仍未完成（后续轮次）：
 
-- ~~增强数据与冻结证据的差异仅靠 as-of 标签区分，尚无 diff 展示~~ 第一项 diff 已做（2026-07-31）：官方绑定时数据时点栏下方显示「冻结基准 close（信号日收盘）→ 当前 spot（Moomoo 时点）：±x.xx%」差异条，双值任一缺失时整条隐藏 fail closed；摘要文案强制同一 evidence bundle 仍未做；
+- ~~增强数据与冻结证据的差异仅靠 as-of 标签区分，尚无 diff 展示~~ 第一项 diff 已做（2026-07-31）：官方绑定时数据时点栏下方显示「冻结基准 close（信号日收盘）→ 当前 spot（Moomoo 时点）：±x.xx%」差异条，双值任一缺失时整条隐藏 fail closed；~~摘要文案强制同一 evidence bundle 仍未做~~ 摘要同证据束已做（2026-08-01，D-4）：官方绑定时「交易研究结论」摘要句中织入的增强数据数值（option-overview 的 IV Rank）强制带「（当前增强数据 as-of ET，非冻结榜单证据）」内联标注，模型终值区间的 IV 输入同步加注（价格基准 as-of 已由 modelBasisLabel 携带）；冻结 bundle 数值（20 日区间、EMA、量能比率）不加注，页头已声明冻结绑定；即时扫描视图无标注；由文案审计测试守护——结论侧栏任何「增强指标名 + 数字」句必须含非冻结声明（词面模式审计，无法捕捉未命名裸数字，新增增强数值须同步扩审计词表）；
 - cycle id / candidate id 未随 URL 传递（当前以 snapshot_key + ticker 定位候选已足够唯一）；
 - 不把 T-1 structure/T-1 underlying volume、current-session option volume、settled OI 和 current IV 合并成无来源概率（该红线继续有效）。
 

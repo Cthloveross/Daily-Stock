@@ -10,21 +10,27 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+import src.journal.ledger.playbook_repository as playbook_repository
 from src.journal.ledger.playbook_repository import (
     PlaybookConflictError,
     PlaybookRepositoryError,
     PlaybookSourceBucket,
     create_playbook_candidate,
     list_playbook_candidates,
+    list_playbook_links_for_episode,
     list_playbook_rules,
     promote_candidate_to_rule,
     retire_playbook_rule,
 )
 from src.journal.ledger.repository import init_ledger_schema
+from src.journal.ledger.review_repository import (
+    ReviewAnnotationScopeNotFoundError,
+)
 from src.journal.tests.test_review_insights import (
     _annotate,
     _seed_statement_build,
     _seed_synthetic_build,
+    _verified_spec,
 )
 from src.storage import get_db
 
@@ -552,3 +558,203 @@ def test_list_candidates_and_rules_return_newest_first():
     assert len(rules) == 1
     assert rules[0].promoted_from_candidate_key == first.candidate_key
     assert rules[0].is_latest_version is True
+
+
+# --- slice C-3: zero-write reverse links from one episode --------------------
+
+
+def test_episode_links_confirmed_rules_before_candidates():
+    build_id, by_underlying = _seed_annotated_statement_build()
+    candidate = create_playbook_candidate(
+        title="动量候选",
+        rule_text="规则文本。",
+        source_bucket=_bucket(),
+    ).candidate
+    promoted = promote_candidate_to_rule(
+        candidate_key=candidate.candidate_key
+    ).rule
+
+    result = list_playbook_links_for_episode(
+        episode_id=by_underlying["WIN"],
+        build_id=build_id,
+    )
+
+    assert result.build_id == build_id
+    assert result.episode_id == by_underlying["WIN"]
+    assert [
+        (link.kind, link.link_state) for link in result.links
+    ] == [("rule", "confirmed"), ("candidate", "confirmed")]
+    rule_link, candidate_link = result.links
+    assert rule_link.title == "动量候选"
+    assert rule_link.lineage_key == promoted.lineage_key
+    assert rule_link.version == 1
+    assert rule_link.status == "active"
+    assert rule_link.candidate_key is None
+    assert rule_link.snapshot_build_id == build_id
+    assert rule_link.snapshot_generated_at is not None
+    # The bucket echo comes from the frozen snapshot, not a live re-derive.
+    assert rule_link.bucket == _bucket()
+    assert candidate_link.candidate_key == candidate.candidate_key
+    assert candidate_link.promoted is True
+    assert candidate_link.lineage_key is None
+    assert candidate_link.bucket == _bucket()
+
+    # An episode outside every frozen sample has no links at all.
+    unreferenced = list_playbook_links_for_episode(
+        episode_id=by_underlying["LOSS"],
+        build_id=build_id,
+    )
+    assert unreferenced.links == ()
+
+
+def test_episode_links_show_only_latest_rule_version_with_retired_status():
+    build_id, by_underlying = _seed_annotated_statement_build()
+    candidate = create_playbook_candidate(
+        title="动量候选",
+        rule_text="规则文本。",
+        source_bucket=_bucket(),
+    ).candidate
+    promoted = promote_candidate_to_rule(
+        candidate_key=candidate.candidate_key
+    ).rule
+    retire_playbook_rule(
+        lineage_key=promoted.lineage_key,
+        expected_current_version=1,
+    )
+
+    result = list_playbook_links_for_episode(
+        episode_id=by_underlying["WIN"],
+        build_id=build_id,
+    )
+
+    rule_links = [link for link in result.links if link.kind == "rule"]
+    assert len(rule_links) == 1
+    assert rule_links[0].version == 2
+    assert rule_links[0].status == "retired"
+    assert rule_links[0].link_state == "confirmed"
+
+
+def test_episode_links_exclude_snapshots_frozen_for_another_build():
+    build_a, by_underlying = _seed_annotated_statement_build()
+    create_playbook_candidate(
+        title="动量候选",
+        rule_text="规则文本。",
+        source_bucket=_bucket(),
+    )
+    # A newer default build gains an episode whose identity matches the
+    # frozen bucket echo exactly — the build identity check must still win.
+    build_b, episode_ids = _seed_synthetic_build(
+        [
+            {
+                "underlying": "SYN",
+                "direction": "long",
+                "opened_at": datetime(2026, 7, 27, 10, 0, tzinfo=ET),
+                "realized_pnl_net": None,
+                "verified": False,
+            }
+        ]
+    )
+    _annotate(build_b, episode_ids[0], tags=("momentum",))
+
+    mismatched = list_playbook_links_for_episode(
+        episode_id=episode_ids[0],
+        build_id=build_b,
+    )
+    assert mismatched.links == ()
+
+    # The episode of the snapshot's own build keeps its confirmed link even
+    # though that build is no longer the default one.
+    original = list_playbook_links_for_episode(
+        episode_id=by_underlying["WIN"],
+        build_id=build_a,
+    )
+    assert [link.link_state for link in original.links] == ["confirmed"]
+
+
+def test_episode_links_truncated_sample_is_possible_only_on_bucket_match(
+    monkeypatch,
+):
+    # Freeze with a tiny sample bound so the snapshot truncates honestly.
+    monkeypatch.setattr(playbook_repository, "_MAX_EVIDENCE_EPISODE_IDS", 2)
+    specs = [
+        _verified_spec(day=6, pnl="10"),
+        _verified_spec(day=7, pnl="10"),
+        _verified_spec(day=8, pnl="10"),
+        _verified_spec(day=9, pnl="10"),  # tagged "other"
+        _verified_spec(day=10, pnl="10", direction="short"),
+    ]
+    build_id, episode_ids = _seed_synthetic_build(specs)
+    for episode_id in episode_ids[:3]:
+        _annotate(build_id, episode_id, tags=("breakout",))
+    _annotate(build_id, episode_ids[3], tags=("other",))
+    _annotate(build_id, episode_ids[4], tags=("breakout",))
+    candidate = create_playbook_candidate(
+        title="突破候选",
+        rule_text="规则文本。",
+        source_bucket=_bucket(
+            group_value="breakout", boundary_policy="verified"
+        ),
+    ).candidate
+    snapshot = candidate.evidence_snapshot
+    assert snapshot["episode_id_sample_truncated"] is True
+    assert snapshot["episode_ids"] == sorted(episode_ids[:3])[:2]
+
+    # Sampled member: confirmed.
+    sampled = list_playbook_links_for_episode(
+        episode_id=episode_ids[0],
+        build_id=build_id,
+    )
+    assert [link.link_state for link in sampled.links] == ["confirmed"]
+
+    # Outside the truncated sample with a matching bucket echo: unknowable,
+    # surfaced as a separate possible entry — never as a confirmed link.
+    truncated_member = list_playbook_links_for_episode(
+        episode_id=episode_ids[2],
+        build_id=build_id,
+    )
+    assert [
+        (link.kind, link.link_state) for link in truncated_member.links
+    ] == [("candidate", "possible_truncated")]
+
+    # Outside the sample with a different tag: omitted entirely.
+    other_tag = list_playbook_links_for_episode(
+        episode_id=episode_ids[3],
+        build_id=build_id,
+    )
+    assert other_tag.links == ()
+
+    # Same tag but the opposite direction: omitted entirely.
+    other_direction = list_playbook_links_for_episode(
+        episode_id=episode_ids[4],
+        build_id=build_id,
+    )
+    assert other_direction.links == ()
+
+
+def test_episode_links_are_zero_write_and_fail_closed_on_unknown_scope(
+    isolated_sqlite: Path,
+):
+    build_id, by_underlying = _seed_annotated_statement_build()
+    candidate = create_playbook_candidate(
+        title="动量候选",
+        rule_text="规则文本。",
+        source_bucket=_bucket(),
+    ).candidate
+    promote_candidate_to_rule(candidate_key=candidate.candidate_key)
+    digest_before = _business_table_digest(isolated_sqlite)
+
+    list_playbook_links_for_episode(
+        episode_id=by_underlying["WIN"],
+        build_id=build_id,
+    )
+    with pytest.raises(
+        ReviewAnnotationScopeNotFoundError, match="not found"
+    ):
+        list_playbook_links_for_episode(
+            episode_id=999_999,
+            build_id=build_id,
+        )
+    with pytest.raises(PlaybookRepositoryError, match="must be positive"):
+        list_playbook_links_for_episode(episode_id=0, build_id=build_id)
+
+    assert _business_table_digest(isolated_sqlite) == digest_before
