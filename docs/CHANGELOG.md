@@ -299,6 +299,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [测试] 前端补 future build confirm 客户端与卡片回归：POST 请求体与三个 64-hex key 的本地校验（畸形 key 不发请求）、回显 build/fence 身份漂移与 activation 越权 fail-closed、无预览时确认块隐藏、acceptance 勾选门禁、写入中禁用、成功 / duplicate / 409 清空预览路径。
 - [修复] Playwright E2E 后端改为隔离启动：独立端口 8765、独立 `ENV_FILE` 与一次性空白 SQLite（`apps/dsa-web/e2e/.artifacts/`，已 gitignore），认证与全部 Moomoo / 盘前 / 回填调度器显式关闭，绝不复用本机常驻正式后端或真实 `.env` / `data/stock_analysis.db`；vite dev 代理目标支持 `DSA_WEB_API_PROXY_TARGET` 覆盖，chromium 项目改用本机 Chrome（`channel: 'chrome'`）以避免依赖 bundled 浏览器下载。
 - [测试] 重写 `apps/dsa-web/e2e/smoke.spec.ts` 为当前 UI 语义（HANDOFF §14.3）：断言 `/` 与 `/login` 在无认证时落到 `/regime`、官方盘前研究未发布空态与“数据时点”口径行、分层健康弹层 OpenD / Journal / 盘前发布 / 结果回填全为“未启用”、`/journal` 仓位复盘与交易证据空态无未预期 console/page error、`/regime/opportunity/AAPL` 深链呈现“即时扫描 · 未绑定官方快照”；旧 `report-markdown.spec.ts` 因依赖已下线 UI 显式 `test.describe.skip` 并标注 TODO。
+- [新功能] Regime 宏观事件域改用零成本官方年度日程（`src/regime/official_schedule.py` + `src/regime/data/official_economic_schedule_2026.json`）：FOMC 决议日（两日会议第二天）、CPI、非农发布日直接取自 federalreserve.gov / bls.gov 官方页面并随仓库版本化，含 per-series `source_url` / `retrieved_at` / coverage；`target_date + 7 天`窗口超出 coverage 时 fail closed 为 `unavailable`，过期日程不会伪装成“今天没有事件”。
+- [改进] `get_macro_events` 不再调用 Finnhub 付费 `/calendar/economic`（免费档每日 403 导致 events 域恒为 degraded）：经济序列以官方日程为主源，Finnhub 只保留 earnings 日历；官方日程覆盖窗口内经济序列 readiness=ready，events 域在 earnings 同时可用时恢复 ready，消除每日 `regime_supporting_events_degraded`。`_readiness`/`_status` 合同与 scorer 字段名保持不变，仅追加 `_economic_calendar` 可观测元数据。
+- [测试] 新增官方日程 provider 单测（决议日/发布日标志、两日会议第一天不标记、非事件日、7 天 agenda 窗口、coverage 边界 fail-closed、缺 series/坏文件 fail-closed、多年度文件合并）与 `get_macro_events` 集成回归（无 Finnhub 时经济序列仍 ready、earnings 正常时 events 整域 ready、超出 coverage 降级、不再调用经济日历端点）。
+- [文档] HANDOFF「官方发布每天 degraded」排障条目更新：events 侧已由官方年度日程解决，premarket 侧仍需 Alpaca key；补充年度运维步骤——来年官方日程发布后需刷新 `src/regime/data/official_economic_schedule_*.json`，否则 coverage 到期前一周起 events 会诚实地重新降级。
 
 ## [3.12.0] - 2026-04-01
 

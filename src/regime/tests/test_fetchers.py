@@ -98,51 +98,94 @@ class TestVix:
 
 
 class TestMacroEvents:
-    def test_no_finnhub_returns_empty_defaults(self):
+    def test_no_finnhub_still_serves_official_economic_series(self):
+        """Zero-config path: FOMC/CPI/NFP need no API key at all."""
         f = RegimeDataFetcher(finnhub=None, manager=None)
         ev = f.get_macro_events(date(2026, 4, 17), watchlist=["NVDA"])
         assert ev["fomc_today"] is False
         assert ev["cpi_today"] is False
         assert ev["earnings_count_watchlist"] == 0
-        assert ev["_status"] == "unavailable"
+        # Economic series is ready from the official schedule; only the
+        # earnings calendar is missing without Finnhub.
+        assert ev["_status"] == "degraded"
+        assert ev["_readiness"] == {
+            "economic_calendar": "ready",
+            "earnings_calendar": "unavailable",
+        }
+        assert ev["_economic_calendar"]["source"] == "official_schedule"
 
-    def test_fomc_detected(self):
+    def test_fomc_decision_day_flagged_and_events_ready(self):
         finnhub = MagicMock()
         finnhub.configured = True
-        finnhub.get_economic_calendar.return_value = [
-            {"event": "Federal Funds Rate", "country": "US"},
-        ]
+        finnhub.request_succeeded.return_value = True
         finnhub.get_earnings_calendar.return_value = [
             {"symbol": "NVDA"},
             {"symbol": "AAPL"},
         ]
         f = RegimeDataFetcher(finnhub=finnhub, manager=None)
-        ev = f.get_macro_events(date(2026, 4, 17), watchlist=["NVDA"])
+        # 2026-04-29 is the decision day of the April 28-29 FOMC meeting.
+        ev = f.get_macro_events(date(2026, 4, 29), watchlist=["NVDA"])
         assert ev["fomc_today"] is True
+        assert ev["cpi_today"] is False
+        assert ev["nfp_today"] is False
         assert ev["earnings_count_watchlist"] == 1
-        finnhub.get_economic_calendar.assert_called_once_with(
-            date(2026, 4, 17), date(2026, 4, 24)
-        )
+        assert ev["_status"] == "ready"
+        assert ev["_readiness"] == {
+            "economic_calendar": "ready",
+            "earnings_calendar": "ready",
+        }
+        # The paid Finnhub economic endpoint must not be called any more.
+        finnhub.get_economic_calendar.assert_not_called()
         finnhub.get_earnings_calendar.assert_called_once_with(
-            date(2026, 4, 17), date(2026, 4, 24)
+            date(2026, 4, 29), date(2026, 5, 6)
         )
 
-    def test_non_us_cpi_ignored(self):
-        """Regression: Canadian CPI release must NOT trigger d3 penalty for US regime."""
-        finnhub = MagicMock()
-        finnhub.configured = True
-        finnhub.get_economic_calendar.return_value = [
-            {"event": "CPI Common YoY", "country": "CA"},
-            {"event": "CPI Median YoY", "country": "CA"},
-            {"event": "BoC Interest Rate Decision", "country": "CA"},
-        ]
-        finnhub.get_earnings_calendar.return_value = []
-        f = RegimeDataFetcher(finnhub=finnhub, manager=None)
-        ev = f.get_macro_events(date(2026, 4, 17), watchlist=["NVDA"])
-        assert ev["cpi_today"] is False
+    def test_first_day_of_fomc_meeting_is_not_flagged(self):
+        f = RegimeDataFetcher(finnhub=None, manager=None)
+        ev = f.get_macro_events(date(2026, 4, 28), watchlist=["NVDA"])
         assert ev["fomc_today"] is False
 
-    def test_permission_failure_is_unavailable_not_a_clean_calendar(self):
+    def test_cpi_and_nfp_release_days_flagged(self):
+        f = RegimeDataFetcher(finnhub=None, manager=None)
+        cpi_day = f.get_macro_events(date(2026, 5, 12), watchlist=[])
+        nfp_day = f.get_macro_events(date(2026, 6, 5), watchlist=[])
+        assert cpi_day["cpi_today"] is True
+        assert cpi_day["fomc_today"] is False
+        assert nfp_day["nfp_today"] is True
+        assert nfp_day["cpi_today"] is False
+
+    def test_us_agenda_lists_official_events_in_window(self):
+        f = RegimeDataFetcher(finnhub=None, manager=None)
+        # 2026-09-10 .. 09-17 window: CPI on 09-11, FOMC decision on 09-16.
+        ev = f.get_macro_events(date(2026, 9, 10), watchlist=[])
+        assert [(row["date"], row["impact"]) for row in ev["us_agenda"]] == [
+            ("2026-09-11", "high"),
+            ("2026-09-16", "high"),
+        ]
+
+    def test_beyond_schedule_coverage_fails_closed_to_degraded(self):
+        """A stale schedule must not silently report a clean calendar."""
+        finnhub = MagicMock()
+        finnhub.configured = True
+        finnhub.request_succeeded.return_value = True
+        finnhub.get_earnings_calendar.return_value = []
+        f = RegimeDataFetcher(finnhub=finnhub, manager=None)
+        # 2027-03-17 IS a known FOMC decision day, but BLS coverage ends in
+        # 2026, so the economic series must fail closed rather than flag.
+        ev = f.get_macro_events(date(2027, 3, 17), watchlist=["NVDA"])
+        assert ev["_status"] == "degraded"
+        assert ev["_readiness"] == {
+            "economic_calendar": "unavailable",
+            "earnings_calendar": "ready",
+        }
+        assert ev["fomc_today"] is False
+        assert ev["us_agenda"] == []
+        assert (
+            ev["_economic_calendar"]["reason"]
+            == "target_window_outside_coverage"
+        )
+
+    def test_earnings_permission_failure_keeps_official_economic_ready(self):
         class ForbiddenFinnhub:
             configured = True
 
@@ -167,62 +210,22 @@ class TestMacroEvents:
             request_budget_seconds=5,
         )
         ev = f.get_macro_events(date(2026, 4, 17), watchlist=["NVDA"])
-        assert ev["_status"] == "unavailable"
-        assert ev["fomc_today"] is False
-        assert [call[0] for call in finnhub.calls] == ["economic", "earnings"]
-
-    def test_economic_failure_keeps_successful_watchlist_earnings(self):
-        class PartialFinnhub:
-            configured = True
-
-            def get_economic_calendar(self, from_, to):
-                # A failed response must never make this apparent FOMC row
-                # actionable.
-                return [{"event": "FOMC", "country": "US"}]
-
-            def get_earnings_calendar(self, from_, to):
-                return [
-                    {"date": "2026-04-17", "symbol": "NVDA"},
-                    {"date": "2026-04-17", "symbol": "AAPL"},
-                ]
-
-            def request_succeeded(self, operation):
-                return operation == "earnings_calendar"
-
-        f = RegimeDataFetcher(
-            finnhub=PartialFinnhub(),
-            manager=None,
-            request_budget_seconds=5,
-        )
-        ev = f.get_macro_events(date(2026, 4, 17), watchlist=["NVDA"])
-
         assert ev["_status"] == "degraded"
         assert ev["_readiness"] == {
-            "economic_calendar": "unavailable",
-            "earnings_calendar": "ready",
+            "economic_calendar": "ready",
+            "earnings_calendar": "unavailable",
         }
         assert ev["fomc_today"] is False
-        assert ev["earnings_count_watchlist"] == 1
-        assert ev["watchlist_earnings"] == [
-            {
-                "date": "2026-04-17",
-                "symbol": "NVDA",
-                "hour": None,
-                "eps_estimate": None,
-            }
-        ]
+        assert [call[0] for call in finnhub.calls] == ["earnings"]
 
     def test_earnings_failure_does_not_treat_returned_rows_as_observed(self):
         class PartialFinnhub:
             configured = True
 
-            def get_economic_calendar(self, from_, to):
-                return [{"event": "FOMC", "country": "US"}]
-
             def get_earnings_calendar(self, from_, to):
                 # Defensive regression: a provider may return a partial body
                 # while still reporting the request as failed.
-                return [{"date": "2026-04-17", "symbol": "NVDA"}]
+                return [{"date": "2026-04-29", "symbol": "NVDA"}]
 
             def request_succeeded(self, operation):
                 return operation == "economic_calendar"
@@ -232,7 +235,7 @@ class TestMacroEvents:
             manager=None,
             request_budget_seconds=5,
         )
-        ev = f.get_macro_events(date(2026, 4, 17), watchlist=["NVDA"])
+        ev = f.get_macro_events(date(2026, 4, 29), watchlist=["NVDA"])
 
         assert ev["_status"] == "degraded"
         assert ev["_readiness"] == {

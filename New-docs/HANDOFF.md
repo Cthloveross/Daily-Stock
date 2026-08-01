@@ -1282,14 +1282,15 @@ ReportMarkdown 于当前 UI 有稳定入口前不得作为验收证据。
 6. 不要用无限重试；
 7. 不要让 Regime 或单一 option enhancement 阻塞 Top 5。
 
-### 官方发布每天都是 degraded（events 降级 + premarket 不可用）
+### 官方发布每天都是 degraded（events 已解决 + premarket 不可用）
 
-2026-08-01 已定位根因，两者都是配置/权限缺口而非代码缺陷：
+2026-08-01 已定位根因并解决 events 侧；premarket 侧仍是配置缺口：
 
-1. `regime_supporting_events_degraded`：Finnhub `/calendar/economic` 对免费档 key 返回 403 Forbidden（付费端点）；earnings 日历正常，所以 events 域是 degraded 而非 unavailable。当天日志可见 `Finnhub economic_calendar failed: 403`。解决选项：升级 Finnhub 计划、更换免费可用的经济日历源、或接受 FOMC/CPI/NFP 标志缺失。
-2. `regime_supporting_premarket_unavailable`：盘前活动域唯一接线的数据源是 Alpaca，本机 `.env` 未配置 ALPACA key。`MoomooFetcher.get_premarket` 适配器已存在但未接线（`src/regime/fetchers.py` 注释：同步 SDK 冷历史调用可能超预算且无法安全取消）。解决选项：配置 Alpaca key（有免费档）、或评审 Moomoo 接线的预算隔离方案。
+1. `regime_supporting_events_degraded`（**已解决，2026-08-01**）：原因是 Finnhub `/calendar/economic` 对免费档 key 返回 403 Forbidden（付费端点）。现在 FOMC/CPI/NFP 经济序列改由零成本官方年度日程提供（`src/regime/official_schedule.py` + `src/regime/data/official_economic_schedule_2026.json`，来源 federalreserve.gov FOMC 日历与 bls.gov CPI / Employment Situation 发布日程页，文件内记录 per-series source_url + retrieved_at + coverage），`get_macro_events` 不再调用 Finnhub 经济日历端点，403 日志噪音随之消失；Finnhub 只保留 earnings 日历。官方日程覆盖窗口内 economic_calendar readiness=ready，earnings 同时可用时 events 域整体 ready。
+   - **年度运维步骤**：日程 fail closed——`target_date + 7 天`窗口超出 coverage 即回到 `unavailable`，不会伪装“今天没有事件”。当前 coverage_through 由 BLS 序列决定（NFP 到 2026-12-04，即 2026-11-27 之后 events 会诚实地重新降级）；BLS/美联储发布来年日程后，需从官方页面刷新 `src/regime/data/official_economic_schedule_*.json`（新增年度文件或扩展现有文件均可，loader 会合并）。
+2. `regime_supporting_premarket_unavailable`（**仍未解决**）：盘前活动域唯一接线的数据源是 Alpaca，本机 `.env` 未配置 ALPACA key。`MoomooFetcher.get_premarket` 适配器已存在但未接线（`src/regime/fetchers.py` 注释：同步 SDK 冷历史调用可能超预算且无法安全取消）。解决选项：配置 Alpaca key（有免费档）、或评审 Moomoo 接线的预算隔离方案。
 
-在上述任一项解决前，quality=degraded 是诚实且预期的状态；基础 Top 5 不受影响，但候选被排除出严格完整研究统计（full_research track 持续为 0 的原因之一）。
+在 premarket 解决前，quality=degraded（premarket 单域）仍是诚实且预期的状态；基础 Top 5 不受影响，但候选被排除出严格完整研究统计（full_research track 持续为 0 的原因之一）。
 
 ### 所有候选都“证据不足”
 

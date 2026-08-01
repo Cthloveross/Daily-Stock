@@ -2,8 +2,10 @@
 """Bounded Regime market-data aggregator.
 
 Daily market structure is Moomoo-first, with the official Cboe VIX history and
-one bounded SPY yfinance call as narrow fallbacks.  Alpaca premarket and
-Finnhub calendars are optional supporting domains.  Every getter preserves
+one bounded SPY yfinance call as narrow fallbacks.  Alpaca premarket and the
+Finnhub earnings calendar are optional supporting domains; the FOMC/CPI/NFP
+economic series come from the locally versioned official annual schedule
+(:mod:`src.regime.official_schedule`).  Every getter preserves
 missing/partial inputs through ``_status`` metadata; the classifier's quality
 contract decides whether a score is ready, provisional, or unavailable rather
 than turning missing data into an authoritative number.
@@ -372,7 +374,15 @@ class RegimeDataFetcher:
         }
 
     def get_macro_events(self, target_date: date, watchlist: list[str]) -> dict:
-        """Today's macro flags for scoring AND a 7-day US agenda for display."""
+        """Today's macro flags for scoring AND a 7-day US agenda for display.
+
+        The economic series (FOMC / CPI / NFP flags + their agenda rows) come
+        from the locally versioned official annual schedule (Federal Reserve +
+        BLS pages, see :mod:`src.regime.official_schedule`) — zero network
+        cost and no paid calendar API.  Finnhub's ``/calendar/economic`` is a
+        paid endpoint that 403s on the free tier, so it is no longer called;
+        Finnhub remains the earnings-calendar source only.
+        """
         events = {
             "_status": "unavailable",
             "_readiness": {
@@ -388,112 +398,90 @@ class RegimeDataFetcher:
             "us_agenda": [],           # list of {date, time, event, impact}
             "watchlist_earnings": [],  # list of {date, symbol}
         }
+
+        economic_ok = False
+        try:
+            from src.regime.official_schedule import get_official_macro_snapshot
+
+            official = get_official_macro_snapshot(target_date)
+            economic_ok = official.get("readiness") == "ready"
+            # Additive metadata for observability; scorers ignore it.
+            events["_economic_calendar"] = {
+                "source": official.get("source"),
+                "readiness": official.get("readiness"),
+                "reason": official.get("reason"),
+                "schedule_version": official.get("schedule_version"),
+                "retrieved_at": official.get("retrieved_at"),
+                "source_urls": official.get("source_urls"),
+                "coverage_through": official.get("coverage_through"),
+            }
+            if economic_ok:
+                events["fomc_today"] = bool(official.get("fomc_today"))
+                events["cpi_today"] = bool(official.get("cpi_today"))
+                events["nfp_today"] = bool(official.get("nfp_today"))
+                events["us_agenda"] = list(official.get("us_agenda") or [])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("official economic schedule failed: %s", exc)
+
+        earnings_ok = False
         if self.finnhub and getattr(self.finnhub, "configured", False):
             try:
-                if self._remaining_budget() <= 0:
-                    return events
-                window_end = target_date + timedelta(days=7)
-                # Finnhub accepts date ranges.  Two bounded range requests
-                # replace the previous 16 per-day calls.
-                economic_rows = self.finnhub.get_economic_calendar(
-                    target_date, window_end
-                )
-                economic_ok = self._finnhub_request_succeeded(
-                    "economic_calendar"
-                )
-                earnings_attempted = self._remaining_budget() > 0
-                earnings_rows = []
-                if earnings_attempted:
+                if self._remaining_budget() > 0:
+                    window_end = target_date + timedelta(days=7)
                     earnings_rows = self.finnhub.get_earnings_calendar(
                         target_date, window_end
                     )
-                earnings_ok = (
-                    self._finnhub_request_succeeded("earnings_calendar")
-                    if earnings_attempted
-                    else False
-                )
-                events["_readiness"] = {
-                    "economic_calendar": (
-                        "ready" if economic_ok else "unavailable"
-                    ),
-                    "earnings_calendar": (
-                        "ready" if earnings_ok else "unavailable"
-                    ),
-                }
-
-                def row_date(row: dict) -> Optional[date]:
-                    raw = row.get("date") or row.get("time")
-                    if raw is None:
-                        return None
-                    try:
-                        return date.fromisoformat(str(raw)[:10])
-                    except (TypeError, ValueError):
-                        return None
-
-                # Today's flags drive the score.  Rows without a date are kept
-                # compatible with older mocks/providers and treated as today's.
-                for ev in economic_rows if economic_ok else []:
-                    event_date = row_date(ev)
-                    if event_date is not None and event_date != target_date:
-                        continue
-                    country = (ev.get("country") or "").upper()
-                    if country not in ("US", "USA", ""):
-                        continue
-                    label = (ev.get("event") or "").lower()
-                    if "federal funds rate" in label or "fomc" in label:
-                        events["fomc_today"] = True
-                    if "cpi" in label or "consumer price" in label:
-                        events["cpi_today"] = True
-                    if "nonfarm" in label or "nfp" in label:
-                        events["nfp_today"] = True
-
-                agenda: list[dict] = []
-                for ev in economic_rows if economic_ok else []:
-                    if (ev.get("country") or "").upper() not in ("US", "USA"):
-                        continue
-                    impact = (ev.get("impact") or "").lower()
-                    if impact not in ("medium", "high"):
-                        continue
-                    event_date = row_date(ev) or target_date
-                    agenda.append({
-                        "date": event_date.isoformat(),
-                        "time": ev.get("time"),
-                        "event": ev.get("event"),
-                        "impact": impact,
-                        "estimate": ev.get("estimate"),
-                        "prev": ev.get("prev"),
-                    })
-                events["us_agenda"] = agenda
-
-                watchlist_upper = {s.upper() for s in watchlist}
-                count = sum(
-                    1
-                    for row in earnings_rows if earnings_ok
-                    if (
-                        (row_date(row) in {None, target_date})
-                        and (row.get("symbol") or "").upper() in watchlist_upper
+                    earnings_ok = self._finnhub_request_succeeded(
+                        "earnings_calendar"
                     )
-                )
-                events["earnings_count_watchlist"] = count
-                events["watchlist_earnings"] = [
-                    {
-                        "date": (row_date(row) or target_date).isoformat(),
-                        "symbol": (row.get("symbol") or "").upper(),
-                        "hour": row.get("hour"),
-                        "eps_estimate": row.get("epsEstimate"),
-                    }
-                    for row in earnings_rows if earnings_ok
-                    if (row.get("symbol") or "").upper() in watchlist_upper
-                ]
-                events["_status"] = (
-                    "ready"
-                    if economic_ok and earnings_ok
-                    else "degraded"
-                    if economic_ok or earnings_ok
-                    else "unavailable"
-                )
+
+                    def row_date(row: dict) -> Optional[date]:
+                        raw = row.get("date") or row.get("time")
+                        if raw is None:
+                            return None
+                        try:
+                            return date.fromisoformat(str(raw)[:10])
+                        except (TypeError, ValueError):
+                            return None
+
+                    # Rows without a date are kept compatible with older
+                    # mocks/providers and treated as today's.
+                    watchlist_upper = {s.upper() for s in watchlist}
+                    count = sum(
+                        1
+                        for row in earnings_rows if earnings_ok
+                        if (
+                            (row_date(row) in {None, target_date})
+                            and (row.get("symbol") or "").upper()
+                            in watchlist_upper
+                        )
+                    )
+                    events["earnings_count_watchlist"] = count
+                    events["watchlist_earnings"] = [
+                        {
+                            "date": (row_date(row) or target_date).isoformat(),
+                            "symbol": (row.get("symbol") or "").upper(),
+                            "hour": row.get("hour"),
+                            "eps_estimate": row.get("epsEstimate"),
+                        }
+                        for row in earnings_rows if earnings_ok
+                        if (row.get("symbol") or "").upper() in watchlist_upper
+                    ]
             except Exception as exc:  # noqa: BLE001
-                logger.warning("finnhub macro events failed: %s", exc)
+                logger.warning("finnhub earnings calendar failed: %s", exc)
+                earnings_ok = False
+
+        events["_readiness"] = {
+            "economic_calendar": "ready" if economic_ok else "unavailable",
+            "earnings_calendar": "ready" if earnings_ok else "unavailable",
+        }
+        events["_status"] = (
+            "ready"
+            if economic_ok and earnings_ok
+            else "degraded"
+            if economic_ok or earnings_ok
+            else "unavailable"
+        )
         return events
 
     def _finnhub_request_succeeded(self, operation: str) -> bool:
