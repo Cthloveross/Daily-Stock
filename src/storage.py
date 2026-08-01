@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import re
+import threading
 import time
 from datetime import datetime, date, timedelta
 from typing import Optional, List, Dict, Any, TYPE_CHECKING, Tuple, Callable, TypeVar
@@ -636,13 +637,15 @@ class DatabaseManager:
     
     _instance: Optional['DatabaseManager'] = None
     _initialized: bool = False
+    _instance_lock = threading.RLock()
     
     def __new__(cls, *args, **kwargs):
         """单例模式实现"""
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._initialized = False
+            return cls._instance
     
     def __init__(self, db_url: Optional[str] = None):
         """
@@ -651,6 +654,11 @@ class DatabaseManager:
         Args:
             db_url: 数据库连接 URL（可选，默认从配置读取）
         """
+        with type(self)._instance_lock:
+            self._initialize(db_url)
+
+    def _initialize(self, db_url: Optional[str] = None) -> None:
+        """Initialize the singleton while its re-entrant lock is held."""
         if getattr(self, '_initialized', False):
             return
 
@@ -701,18 +709,24 @@ class DatabaseManager:
     @classmethod
     def get_instance(cls) -> 'DatabaseManager':
         """获取单例实例"""
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
+        with cls._instance_lock:
+            # Always invoke the constructor.  If another thread published the
+            # singleton from ``__new__`` but is still inside ``__init__``, the
+            # shared RLock waits for that initialization to finish.
+            return cls()
     
     @classmethod
     def reset_instance(cls) -> None:
         """重置单例（用于测试）"""
-        if cls._instance is not None:
-            if hasattr(cls._instance, '_engine') and cls._instance._engine is not None:
-                cls._instance._engine.dispose()
-            cls._instance._initialized = False
-            cls._instance = None
+        with cls._instance_lock:
+            if cls._instance is not None:
+                if (
+                    hasattr(cls._instance, '_engine')
+                    and cls._instance._engine is not None
+                ):
+                    cls._instance._engine.dispose()
+                cls._instance._initialized = False
+                cls._instance = None
 
     @classmethod
     def _cleanup_engine(cls, engine) -> None:

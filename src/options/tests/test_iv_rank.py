@@ -10,6 +10,17 @@ import pytest
 from src.options.iv_rank import compute_atm_iv, compute_iv_rank
 
 
+@pytest.fixture(autouse=True)
+def _disable_moomoo_iv_path(monkeypatch):
+    # compute_atm_iv prefers Moomoo OpenD before the yfinance fallback under
+    # test.  When the host .env enables OpenD and the suite has loaded it into
+    # os.environ, that path would hit live option quotes and return real IV.
+    monkeypatch.setattr(
+        "data_provider.moomoo_options.compute_atm_iv_moomoo",
+        lambda symbol, ref_date=None: (None, ""),
+    )
+
+
 class FakeChain:
     def __init__(self, calls_df):
         self.calls = calls_df

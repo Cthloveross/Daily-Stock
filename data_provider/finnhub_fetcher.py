@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 from datetime import date
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
@@ -24,6 +26,10 @@ __all__ = ["FinnhubFetcher"]
 
 
 BASE = "https://finnhub.io/api/v1"
+_HTTP_URL_RE = re.compile(r"https?://[^\s\"']+")
+_SECRET_QUERY_RE = re.compile(
+    r"(?i)([?&](?:token|api[_-]?key|apikey|key)=)[^&\s]+"
+)
 
 
 class FinnhubFetcher:
@@ -63,9 +69,29 @@ class FinnhubFetcher:
             if error is None:
                 self._request_errors.pop(operation, None)
             else:
-                self._request_errors[operation] = (
-                    f"{type(error).__name__}: {error}"
-                )
+                self._request_errors[operation] = self._safe_error_text(error)
+
+    def _safe_error_text(self, error: BaseException) -> str:
+        """Keep useful provider diagnostics without persisting query secrets."""
+
+        text = f"{type(error).__name__}: {error}"
+        if self.api_key:
+            text = text.replace(str(self.api_key), "<redacted>")
+        text = _SECRET_QUERY_RE.sub(r"\1<redacted>", text)
+
+        def strip_query(match: re.Match[str]) -> str:
+            raw = match.group(0)
+            trailing = ""
+            while raw and raw[-1] in ".,);]":
+                trailing = raw[-1] + trailing
+                raw = raw[:-1]
+            parsed = urlsplit(raw)
+            safe_url = urlunsplit(
+                (parsed.scheme, parsed.netloc, parsed.path, "", "")
+            )
+            return safe_url + trailing
+
+        return _HTTP_URL_RE.sub(strip_query, text)[:500]
 
     def get_economic_calendar(
         self, from_: Optional[date] = None, to: Optional[date] = None
@@ -91,7 +117,10 @@ class FinnhubFetcher:
             self._record_request(
                 "economic_calendar", succeeded=False, error=exc
             )
-            logger.warning("Finnhub economic_calendar failed: %s", exc)
+            logger.warning(
+                "Finnhub economic_calendar failed: %s",
+                self._safe_error_text(exc),
+            )
             return []
 
     def get_earnings_calendar(
@@ -123,7 +152,10 @@ class FinnhubFetcher:
             self._record_request(
                 "earnings_calendar", succeeded=False, error=exc
             )
-            logger.warning("Finnhub earnings_calendar failed: %s", exc)
+            logger.warning(
+                "Finnhub earnings_calendar failed: %s",
+                self._safe_error_text(exc),
+            )
             return []
 
     def get_recommendation_trends(self, symbol: str) -> list[dict]:
@@ -145,5 +177,9 @@ class FinnhubFetcher:
             self._record_request(
                 "recommendation_trends", succeeded=False, error=exc
             )
-            logger.warning("Finnhub recommendation_trends(%s) failed: %s", symbol, exc)
+            logger.warning(
+                "Finnhub recommendation_trends(%s) failed: %s",
+                symbol,
+                self._safe_error_text(exc),
+            )
             return []

@@ -277,6 +277,58 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "validation": {},
         "display_order": 15,
     },
+    "APCA_API_KEY_ID": {
+        "title": "Alpaca API Key ID",
+        "description": (
+            "Optional Alpaca Market Data credential used for completed US "
+            "premarket 1-minute bars. APCA_API_SECRET_KEY is also required."
+        ),
+        "category": "data_source",
+        "data_type": "string",
+        "ui_control": "password",
+        "is_sensitive": True,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": None,
+        "options": [],
+        "validation": {},
+        "display_order": 16,
+    },
+    "APCA_API_SECRET_KEY": {
+        "title": "Alpaca API Secret Key",
+        "description": (
+            "Secret paired with APCA_API_KEY_ID for optional Alpaca Market "
+            "Data access."
+        ),
+        "category": "data_source",
+        "data_type": "string",
+        "ui_control": "password",
+        "is_sensitive": True,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": None,
+        "options": [],
+        "validation": {},
+        "display_order": 17,
+    },
+    "FINNHUB_API_KEY": {
+        "title": "Finnhub API Key",
+        "description": (
+            "Optional Finnhub credential for the economic and watchlist "
+            "earnings calendars. Unsupported or rate-limited subdomains "
+            "degrade independently."
+        ),
+        "category": "data_source",
+        "data_type": "string",
+        "ui_control": "password",
+        "is_sensitive": True,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": None,
+        "options": [],
+        "validation": {},
+        "display_order": 18,
+    },
     "REALTIME_SOURCE_PRIORITY": {
         "title": "Realtime Source Priority",
         "description": "Comma-separated priority for realtime quote providers.",
@@ -1415,6 +1467,62 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "validation": {},
         "display_order": 8,
     },
+    "PREMARKET_RESEARCH_SCHEDULER_ENABLED": {
+        "title": "Official Premarket Research Scheduler",
+        "description": (
+            "Run the read-only US options research cycle at XNYS-relative "
+            "times (09:12 ET primary, 09:17 ET recovery). A persisted "
+            "premarket research pool is required."
+        ),
+        "category": "system",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "false",
+        "options": [],
+        "validation": {},
+        "display_order": 10,
+    },
+    "MOOMOO_PREMARKET_PREFETCH_ENABLED": {
+        "title": "Moomoo Premarket Shadow Prefetch",
+        "description": (
+            "Experimental, read-only shadow producer that fetches a coherent "
+            "SPY + research-pool premarket bundle in a cancelable child "
+            "process and stores only an audit artifact. The official Regime "
+            "does not consume it yet. Requires MOOMOO_OPEND_ENABLED=true and "
+            "a process restart; it never unlocks or places orders."
+        ),
+        "category": "system",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "false",
+        "options": [],
+        "validation": {},
+        "display_order": 9,
+    },
+    "OPPORTUNITY_OUTCOME_SCHEDULER_ENABLED": {
+        "title": "Opportunity Outcome Scheduler",
+        "description": (
+            "Automatically mature due 5D/20D underlying-price outcomes after "
+            "the exact XNYS close. Uses DB leases, never places orders, and "
+            "never changes ranking weights."
+        ),
+        "category": "system",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "false",
+        "options": [],
+        "validation": {},
+        "display_order": 11,
+    },
     "SCHEDULE_RUN_IMMEDIATELY": {
         "title": "Schedule Run Immediately",
         "description": "Whether to run one analysis immediately on startup in schedule mode.",
@@ -1427,7 +1535,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "default_value": "true",
         "options": [],
         "validation": {},
-        "display_order": 11,
+        "display_order": 12,
     },
     "TRADING_DAY_CHECK_ENABLED": {
         "title": "Trading Day Check",

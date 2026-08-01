@@ -36,15 +36,17 @@ Caveats
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
 import logging
 import math
 import os
 import threading
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Any, Iterator, List, Optional
 from zoneinfo import ZoneInfo
 
 from src.services.moomoo_runtime import (
@@ -120,7 +122,26 @@ _event_ctx_lock = threading.RLock()
 _event_ctx_singleton = None
 
 _SNAPSHOT_BATCH_SIZE = 400
+_WALL_CONTEXT_MAX_LANES = 5
+_WALL_CONTEXT_LEASE_WAIT_SECONDS = 30.0
 _NEW_YORK = ZoneInfo("America/New_York")
+
+
+@dataclass
+class _WallContextLane:
+    """One reusable, exclusively leased QuoteContext for a wall scan."""
+
+    ctx: Any = None
+    lock: Any = None
+    in_use: bool = False
+
+    def __post_init__(self) -> None:
+        if self.lock is None:
+            self.lock = threading.RLock()
+
+
+_wall_ctx_condition = threading.Condition(threading.RLock())
+_wall_ctx_lanes: list[_WallContextLane] = []
 
 
 @dataclass(frozen=True)
@@ -151,8 +172,11 @@ class MoomooOptionWallContract:
     """One valid strike-level input for an option-wall model.
 
     ``volume`` and ``open_interest`` are required observed snapshot fields.
-    Gamma and contract size remain nullable because older OpenD builds or quote
-    permissions may omit them.  No dealer-position sign is inferred here.
+    IV, gamma and contract size remain nullable because older OpenD builds or
+    quote permissions may omit them.  ``implied_volatility`` is normalized to
+    decimal form (``0.20`` = 20%) so the same dynamic wall snapshot can also
+    provide ATM Call IV without another option-chain request.  No
+    dealer-position sign is inferred here.
     """
 
     code: str
@@ -165,6 +189,7 @@ class MoomooOptionWallContract:
     gamma: Optional[float]
     contract_size: Optional[int]
     update_time: Optional[str]
+    implied_volatility: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -338,6 +363,107 @@ def _get_event_ctx():
         return _event_ctx_singleton
 
 
+def _claim_wall_context_lane() -> Optional[_WallContextLane]:
+    """Reserve one bounded wall lane without serializing provider I/O."""
+
+    deadline = time.monotonic() + _WALL_CONTEXT_LEASE_WAIT_SECONDS
+    with _wall_ctx_condition:
+        while True:
+            for lane in _wall_ctx_lanes:
+                if not lane.in_use:
+                    lane.in_use = True
+                    return lane
+            if len(_wall_ctx_lanes) < _WALL_CONTEXT_MAX_LANES:
+                lane = _WallContextLane(in_use=True)
+                _wall_ctx_lanes.append(lane)
+                return lane
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    "[moomoo_options] option-wall context lanes remained busy "
+                    "for %.1fs",
+                    _WALL_CONTEXT_LEASE_WAIT_SECONDS,
+                )
+                return None
+            _wall_ctx_condition.wait(timeout=remaining)
+
+
+def _release_wall_context_lane(lane: _WallContextLane) -> None:
+    with _wall_ctx_condition:
+        lane.in_use = False
+        _wall_ctx_condition.notify()
+
+
+@contextmanager
+def _lease_wall_context() -> Iterator[Optional[tuple[Any, Any]]]:
+    """Lease a reusable QuoteContext dedicated to one full wall scan.
+
+    A Top-5 request can otherwise take roughly five times the slowest symbol:
+    each symbol needs several independent 400-code snapshot batches.  Dedicated
+    lanes let those read-only scans overlap while keeping every SDK context
+    exclusive to one worker.  Five lanes stay within the endpoint's five-symbol
+    contract; provider failures still return ``None`` and never synthesize data.
+    """
+
+    if not _enabled():
+        yield None
+        return
+    try:
+        from moomoo import OpenQuoteContext  # noqa: F401  (probe real symbol)
+    except ImportError:
+        logger.warning("[moomoo_options] SDK not installed; returning None")
+        yield None
+        return
+
+    lane = _claim_wall_context_lane()
+    if lane is None:
+        yield None
+        return
+
+    try:
+        with lane.lock:
+            host, port = _endpoint()
+            if lane.ctx is not None and (
+                not probe_opend_tcp(host, port) or not _is_alive(lane.ctx)
+            ):
+                logger.info("[moomoo_options] cached wall ctx dead, reconnecting")
+                try:
+                    lane.ctx.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                lane.ctx = None
+            if lane.ctx is None:
+                try:
+                    lane.ctx = create_ready_quote_context(host=host, port=port)
+                except MoomooRuntimeError as exc:
+                    logger.warning(
+                        "[moomoo_options] OpenD wall context connect failed: %s",
+                        exc,
+                    )
+                    yield None
+                    return
+            yield lane.ctx, lane.lock
+    finally:
+        _release_wall_context_lane(lane)
+
+
+def _reset_wall_context_pool_for_tests() -> None:
+    """Close idle wall contexts between deterministic pool tests."""
+
+    with _wall_ctx_condition:
+        if any(lane.in_use for lane in _wall_ctx_lanes):
+            raise RuntimeError("cannot reset wall context pool while lanes are in use")
+        lanes = list(_wall_ctx_lanes)
+        _wall_ctx_lanes.clear()
+    for lane in lanes:
+        if lane.ctx is None:
+            continue
+        try:
+            lane.ctx.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _to_moomoo_underlying(symbol: str) -> str:
     """``AAPL`` → ``US.AAPL`` (matches MoomooFetcher's convention)."""
     s = (symbol or "").strip().upper()
@@ -397,9 +523,16 @@ def _spot_for_classification(symbol: str) -> Optional[float]:
         return None
 
 
-def _spot_from_ctx(ctx, symbol: str, ret_ok) -> Optional[float]:
+def _spot_from_ctx(
+    ctx,
+    symbol: str,
+    ret_ok,
+    *,
+    context_lock=None,
+) -> Optional[float]:
     """Read a finite positive underlying spot from an already leased context."""
-    with _ctx_lock:
+    lock = context_lock or _ctx_lock
+    with lock:
         ret, data = ctx.get_market_snapshot([_to_moomoo_underlying(symbol)])
     if ret != ret_ok or data is None or data.empty:
         return None
@@ -435,13 +568,16 @@ def _get_static_chain_range_frame(
     start_date: date,
     end_date: date,
     ret_ok,
+    *,
+    context_lock=None,
 ):
     """Read one option-chain date range of at most 30 calendar days."""
 
     if end_date < start_date or (end_date - start_date).days >= 30:
         raise ValueError("option-chain range must contain at most 30 days")
     try:
-        with _ctx_lock:
+        lock = context_lock or _ctx_lock
+        with lock:
             ret, data = ctx.get_option_chain(
                 code=underlying,
                 start=start_date.isoformat(),
@@ -637,6 +773,8 @@ def _get_option_snapshots(
     ctx,
     codes: List[str],
     ret_ok,
+    *,
+    context_lock=None,
 ) -> _OptionSnapshotResult:
     """Fetch dynamic option fields in documented batches of at most 400.
 
@@ -648,7 +786,8 @@ def _get_option_snapshots(
     requested = set(clean_codes)
     snapshots: dict[str, dict] = {}
     failed_batch_count = 0
-    with _ctx_lock:
+    lock = context_lock or _ctx_lock
+    with lock:
         for start in range(0, len(clean_codes), _SNAPSHOT_BATCH_SIZE):
             batch = list(clean_codes[start : start + _SNAPSHOT_BATCH_SIZE])
             try:
@@ -939,10 +1078,10 @@ def fetch_option_wall_snapshot_moomoo(
     underlying = _to_moomoo_underlying(normalized_symbol)
 
     try:
-        with _ctx_lock:
-            ctx = _get_ctx()
-            if ctx is None:
+        with _lease_wall_context() as leased:
+            if leased is None:
                 return None
+            ctx, context_lock = leased
 
             available_expiries = _expiration_dates_from_ctx(
                 ctx,
@@ -961,7 +1100,12 @@ def fetch_option_wall_snapshot_moomoo(
                 if dte_min <= dte <= dte_max:
                     selected.append((expiry, dte))
 
-            spot = _spot_from_ctx(ctx, normalized_symbol, RET_OK)
+            spot = _spot_from_ctx(
+                ctx,
+                normalized_symbol,
+                RET_OK,
+                context_lock=context_lock,
+            )
             if spot is None or spot <= 0:
                 return None
 
@@ -983,6 +1127,7 @@ def fetch_option_wall_snapshot_moomoo(
                     window_start,
                     window_end,
                     RET_OK,
+                    context_lock=context_lock,
                 )
                 if frame is None:
                     failed_chain_range_count += 1
@@ -1000,7 +1145,12 @@ def fetch_option_wall_snapshot_moomoo(
                     requested_by_code.setdefault(contract["code"], contract)
 
             requested_codes = list(requested_by_code)
-            snapshot_result = _get_option_snapshots(ctx, requested_codes, RET_OK)
+            snapshot_result = _get_option_snapshots(
+                ctx,
+                requested_codes,
+                RET_OK,
+                context_lock=context_lock,
+            )
 
             contracts: list[MoomooOptionWallContract] = []
             for code, static in requested_by_code.items():
@@ -1028,6 +1178,18 @@ def fetch_option_wall_snapshot_moomoo(
                 )
                 if gamma is not None and gamma < 0:
                     gamma = None
+                iv_percent = _safe_float(
+                    _first_present(
+                        dynamic,
+                        "option_implied_volatility",
+                        "implied_volatility",
+                    )
+                )
+                implied_volatility = (
+                    iv_percent / 100.0
+                    if iv_percent is not None and iv_percent > 0
+                    else None
+                )
                 contract_size = _safe_int(
                     _first_present(
                         dynamic,
@@ -1051,6 +1213,7 @@ def fetch_option_wall_snapshot_moomoo(
                         gamma=gamma,
                         contract_size=contract_size,
                         update_time=update_time,
+                        implied_volatility=implied_volatility,
                     )
                 )
 

@@ -32,9 +32,16 @@ If the SDK is not installed or OPEND_ENABLED is false, this fetcher boots in
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
-from datetime import datetime, timedelta
+from datetime import (
+    date,
+    datetime,
+    time as datetime_time,
+    timedelta,
+    timezone,
+)
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -59,6 +66,73 @@ def _bool_env(name: str, default: bool = False) -> bool:
     if not raw:
         return default
     return raw in ("1", "true", "yes", "y", "on")
+
+
+def _aware_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _positive_float(value: object) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
+def _moomoo_market_timestamp(value: object) -> Optional[datetime]:
+    timestamp = pd.to_datetime(value, errors="coerce")
+    if pd.isna(timestamp):
+        return None
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize(_NEW_YORK)
+    else:
+        timestamp = timestamp.tz_convert(_NEW_YORK)
+    converted = timestamp.to_pydatetime()
+    return converted if isinstance(converted, datetime) else None
+
+
+def _previous_xnys_session(session_date: date) -> Optional[date]:
+    try:
+        import exchange_calendars as xcals
+
+        calendar = xcals.get_calendar("XNYS")
+        if not calendar.is_session(session_date):
+            return None
+        value = calendar.previous_session(session_date)
+        converted = value.to_pydatetime() if hasattr(value, "to_pydatetime") else value
+        if isinstance(converted, datetime):
+            return converted.date()
+        if isinstance(converted, date):
+            return converted
+        return date.fromisoformat(str(value)[:10])
+    except Exception as exc:  # noqa: BLE001 - reference dates must fail closed
+        logger.warning(
+            "Moomoo could not resolve previous XNYS session for %s: %s",
+            session_date,
+            exc,
+        )
+        return None
+
+
+def _premarket_unavailable(
+    base: dict,
+    reason: str,
+    *,
+    status: str = "unavailable",
+) -> dict:
+    return {
+        **base,
+        "price": None,
+        "previous_close": None,
+        "previous_close_date": None,
+        "pct_change": None,
+        "as_of": None,
+        "_status": status,
+        "_reason": reason,
+    }
 
 
 # Map our internal interval string → moomoo `KLType` attribute name.
@@ -87,6 +161,10 @@ _MARKET_TIMEZONES: dict[str, str] = {
     "SZ": "Asia/Shanghai",
     "BJ": "Asia/Shanghai",
 }
+_NEW_YORK = ZoneInfo("America/New_York")
+_PREMARKET_OPEN = datetime_time(hour=4)
+_REGULAR_OPEN = datetime_time(hour=9, minute=30)
+_MAX_PREMARKET_STALENESS = timedelta(minutes=5)
 
 
 class MoomooFetcher(BaseFetcher):
@@ -301,6 +379,218 @@ class MoomooFetcher(BaseFetcher):
         keep = ["code"] + STANDARD_COLUMNS
         df = df[[c for c in keep if c in df.columns]]
         return df.dropna(subset=["close"]).reset_index(drop=True)
+
+    # ------------------------------------------------------------------
+    # Evidence-aware US premarket snapshot
+    # ------------------------------------------------------------------
+    def get_premarket(
+        self,
+        symbol: str,
+        *,
+        target_date: Optional[date] = None,
+        as_of: Optional[datetime] = None,
+    ) -> dict:
+        """Return one proved US premarket move using unadjusted Moomoo bars.
+
+        The method deliberately does not reuse ``fetch_intraday``: Regime
+        evidence needs a fixed 04:00–09:30 ET window, one frozen ``as_of``,
+        exclusion of the in-progress minute, and Moomoo's unadjusted
+        ``last_close`` reference for the exact previous XNYS session.
+        """
+        observed_at = _aware_utc(as_of or datetime.now(timezone.utc))
+        observed_market_date = observed_at.astimezone(_NEW_YORK).date()
+        session_date = target_date or observed_market_date
+        session_start = datetime.combine(
+            session_date,
+            _PREMARKET_OPEN,
+            tzinfo=_NEW_YORK,
+        )
+        session_end = datetime.combine(
+            session_date,
+            _REGULAR_OPEN,
+            tzinfo=_NEW_YORK,
+        )
+        mcode = self._to_moomoo_code(symbol)
+        base = {
+            "symbol": symbol.upper(),
+            "market_date": session_date.isoformat(),
+            "session_start": session_start.isoformat(),
+            "session_end": session_end.isoformat(),
+            "requested_as_of": observed_at.isoformat(),
+            "_source": self.name,
+        }
+        if not mcode.startswith("US."):
+            return _premarket_unavailable(base, "unsupported_market")
+        if session_date > observed_market_date:
+            return _premarket_unavailable(base, "future_market_date")
+
+        effective_end = (
+            min(observed_at.astimezone(_NEW_YORK), session_end)
+            if session_date == observed_market_date
+            else session_end
+        )
+        completed_bar_cutoff = effective_end.replace(second=0, microsecond=0)
+        if completed_bar_cutoff <= session_start:
+            return _premarket_unavailable(
+                base,
+                "premarket_not_started_or_no_completed_bar",
+            )
+
+        expected_previous_session = _previous_xnys_session(session_date)
+        if expected_previous_session is None:
+            return _premarket_unavailable(
+                base,
+                "previous_xnys_session_unresolved",
+                status="degraded",
+            )
+
+        from moomoo import AuType, KLType, KL_FIELD, RET_OK
+
+        ctx = self._get_ctx()
+        common_request = {
+            "code": mcode,
+            "start": session_date.isoformat(),
+            "end": session_date.isoformat(),
+            "ktype": KLType.K_1M,
+            "autype": AuType.NONE,
+            "fields": [KL_FIELD.ALL],
+            "max_count": 1000,
+            "extended_time": True,
+        }
+        frames: list[pd.DataFrame] = []
+        page_req_key = None
+        seen_page_keys: set[tuple[str, str]] = set()
+
+        for page_number in range(1, _INTRADAY_MAX_PAGES + 1):
+            request = dict(common_request)
+            if page_req_key is not None:
+                request["page_req_key"] = page_req_key
+            try:
+                ret, data, next_page_key = ctx.request_history_kline(**request)
+            except Exception as exc:  # noqa: BLE001
+                raise DataFetchError(
+                    f"Moomoo premarket page {page_number} request raised: {exc}"
+                ) from exc
+            if ret != RET_OK:
+                raise DataFetchError(
+                    f"Moomoo premarket page {page_number} failed: {data}"
+                )
+            if data is not None and not data.empty:
+                frames.append(data.copy())
+            elif next_page_key is not None:
+                raise DataFetchError(
+                    "Moomoo premarket returned an empty page with a continuation key"
+                )
+            if next_page_key is None:
+                break
+            key_identity = (type(next_page_key).__name__, repr(next_page_key))
+            if key_identity in seen_page_keys:
+                raise DataFetchError(
+                    "Moomoo premarket returned a repeated continuation key"
+                )
+            seen_page_keys.add(key_identity)
+            page_req_key = next_page_key
+        else:
+            raise DataFetchError(
+                "Moomoo premarket exceeded the safe pagination limit "
+                f"({_INTRADAY_MAX_PAGES} pages)"
+            )
+
+        if not frames:
+            return _premarket_unavailable(base, "no_completed_premarket_bar")
+        combined = pd.concat(frames, ignore_index=True)
+        if "time_key" not in combined.columns:
+            return _premarket_unavailable(
+                base,
+                "premarket_timestamp_missing",
+                status="degraded",
+            )
+
+        eligible: list[tuple[datetime, dict]] = []
+        for row in combined.to_dict(orient="records"):
+            timestamp = _moomoo_market_timestamp(row.get("time_key"))
+            if (
+                timestamp is not None
+                and session_start <= timestamp < completed_bar_cutoff
+            ):
+                eligible.append((timestamp, row))
+        eligible.sort(key=lambda item: item[0])
+        if not eligible:
+            return _premarket_unavailable(base, "no_completed_premarket_bar")
+
+        latest_timestamp, latest_bar = eligible[-1]
+        latest_price = _positive_float(latest_bar.get("close"))
+        evidence_as_of = min(
+            latest_timestamp + timedelta(minutes=1),
+            completed_bar_cutoff,
+        )
+        evidence_as_of_utc = evidence_as_of.astimezone(timezone.utc).isoformat()
+        if latest_price is None:
+            return {
+                **_premarket_unavailable(
+                    base,
+                    "premarket_close_missing",
+                    status="degraded",
+                ),
+                "as_of": evidence_as_of_utc,
+            }
+
+        previous_close = None
+        previous_close_evidence_at = None
+        for timestamp, row in reversed(eligible):
+            candidate = _positive_float(row.get("last_close"))
+            if candidate is not None:
+                previous_close = candidate
+                previous_close_evidence_at = timestamp
+                break
+        if previous_close is None:
+            return {
+                **_premarket_unavailable(
+                    base,
+                    "previous_close_last_close_missing",
+                    status="degraded",
+                ),
+                "price": latest_price,
+                "previous_close_date": expected_previous_session.isoformat(),
+                "as_of": evidence_as_of_utc,
+            }
+
+        if completed_bar_cutoff - evidence_as_of > _MAX_PREMARKET_STALENESS:
+            return {
+                **base,
+                "price": latest_price,
+                "previous_close": previous_close,
+                "previous_close_date": expected_previous_session.isoformat(),
+                "previous_close_field": "last_close",
+                "previous_close_evidence_at": (
+                    previous_close_evidence_at.isoformat()
+                    if previous_close_evidence_at is not None
+                    else None
+                ),
+                "pct_change": None,
+                "as_of": evidence_as_of_utc,
+                "_status": "degraded",
+                "_reason": "premarket_bar_stale",
+            }
+
+        return {
+            **base,
+            "price": latest_price,
+            "previous_close": previous_close,
+            "previous_close_date": expected_previous_session.isoformat(),
+            "previous_close_field": "last_close",
+            "previous_close_evidence_at": (
+                previous_close_evidence_at.isoformat()
+                if previous_close_evidence_at is not None
+                else None
+            ),
+            "pct_change": (
+                (latest_price - previous_close) / previous_close * 100.0
+            ),
+            "as_of": evidence_as_of_utc,
+            "_status": "ready",
+            "_reason": None,
+        }
 
     # ------------------------------------------------------------------
     # Intraday K-line (mirrors YfinanceFetcher.fetch_intraday signature)

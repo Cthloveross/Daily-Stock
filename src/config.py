@@ -736,6 +736,12 @@ class Config:
     
     # === 定时任务配置 ===
     schedule_enabled: bool = False            # 是否启用定时任务
+    # 默认关闭的 Moomoo 盘前影子预取；仅写审计 artifact，正式 Regime 暂不消费。
+    moomoo_premarket_prefetch_enabled: bool = False
+    # 独立的美股期权盘前研究调度；按 XNYS 开盘相对时间运行，不复用本地墙钟任务。
+    premarket_research_scheduler_enabled: bool = False
+    # XNYS 收盘后自动成熟 5D/20D 结果；只写 append-only 研究结果，不影响排名。
+    opportunity_outcome_scheduler_enabled: bool = False
     schedule_time: str = "18:00"              # 每日推送时间（HH:MM 格式）
     schedule_run_immediately: bool = True     # 启动时是否立即执行一次
     run_immediately: bool = True              # 启动时是否立即执行一次（非定时模式）
@@ -849,6 +855,9 @@ class Config:
             "STOCK_LIST",
             "RUN_IMMEDIATELY",
             "SCHEDULE_ENABLED",
+            "MOOMOO_PREMARKET_PREFETCH_ENABLED",
+            "PREMARKET_RESEARCH_SCHEDULER_ENABLED",
+            "OPPORTUNITY_OUTCOME_SCHEDULER_ENABLED",
             "SCHEDULE_TIME",
             "SCHEDULE_RUN_IMMEDIATELY",
         }
@@ -1415,6 +1424,21 @@ class Config:
             https_proxy=os.getenv('HTTPS_PROXY'),
             schedule_enabled=cls._resolve_env_value(
                 'SCHEDULE_ENABLED',
+                default='false',
+                prefer_env_file=True,
+            ).lower() == 'true',
+            moomoo_premarket_prefetch_enabled=cls._resolve_env_value(
+                'MOOMOO_PREMARKET_PREFETCH_ENABLED',
+                default='false',
+                prefer_env_file=True,
+            ).lower() == 'true',
+            premarket_research_scheduler_enabled=cls._resolve_env_value(
+                'PREMARKET_RESEARCH_SCHEDULER_ENABLED',
+                default='false',
+                prefer_env_file=True,
+            ).lower() == 'true',
+            opportunity_outcome_scheduler_enabled=cls._resolve_env_value(
+                'OPPORTUNITY_OUTCOME_SCHEDULER_ENABLED',
                 default='false',
                 prefer_env_file=True,
             ).lower() == 'true',
