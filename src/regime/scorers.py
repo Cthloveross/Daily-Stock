@@ -18,6 +18,7 @@ References: New-docs/06_REGIME_CLASSIFIER.md §3-4.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from typing import Iterable
 
 __all__ = [
@@ -115,24 +116,40 @@ def score_macro_penalty(events: dict) -> int:
         earnings_count_watchlist (int)
         tariff_headline_today (bool)
     """
-    if not events or str(events.get("_status") or "").lower() in {
-        "degraded",
-        "unavailable",
-    }:
+    if not events:
         return 0
+
+    overall_state = str(events.get("_status") or "").strip().lower()
+    readiness = events.get("_readiness")
+
+    def subdomain_ready(name: str) -> bool:
+        """Use explicit source readiness, with conservative legacy fallback."""
+        if isinstance(readiness, Mapping):
+            return str(readiness.get(name) or "").strip().lower() == "ready"
+        return overall_state not in {"degraded", "unavailable"}
+
+    economic_ready = subdomain_ready("economic_calendar")
+    earnings_ready = subdomain_ready("earnings_calendar")
+
     penalty = 0
-    if events.get("fomc_today"):
-        penalty -= 30
-    if events.get("cpi_today"):
-        penalty -= 20
-    if events.get("nfp_today"):
-        penalty -= 15
-    earnings_n = int(events.get("earnings_count_watchlist") or 0)
-    if earnings_n >= 3:
-        penalty -= 15
-    elif earnings_n >= 1:
-        penalty -= 5
-    if events.get("tariff_headline_today"):
+    if economic_ready:
+        if events.get("fomc_today"):
+            penalty -= 30
+        if events.get("cpi_today"):
+            penalty -= 20
+        if events.get("nfp_today"):
+            penalty -= 15
+    if earnings_ready:
+        earnings_n = int(events.get("earnings_count_watchlist") or 0)
+        if earnings_n >= 3:
+            penalty -= 15
+        elif earnings_n >= 1:
+            penalty -= 5
+    # This flag has no independent readiness contract yet. Preserve its
+    # historical behavior only for complete/legacy event payloads.
+    if overall_state not in {"degraded", "unavailable"} and events.get(
+        "tariff_headline_today"
+    ):
         penalty -= 10
     return _clamp(penalty, -50, 0)
 

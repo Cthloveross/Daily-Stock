@@ -27,6 +27,7 @@ from typing import Any, Mapping, Optional, Sequence
 
 from sqlalchemy import case, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from src.opportunities.models import (
     OpportunityCandidateOutcome,
@@ -621,11 +622,19 @@ def append_snapshot(
     candidates: Sequence[SnapshotCandidateInput],
     *,
     db_manager: Optional[DatabaseManager] = None,
+    session: Optional[Session] = None,
 ) -> SnapshotAppendResult:
-    """Atomically append one run and all candidates, or return an exact retry."""
+    """Atomically append one run and all candidates, or return an exact retry.
+
+    When ``session`` is supplied, the caller owns the surrounding transaction
+    and must initialize the opportunity schema before calling.  This narrow
+    hook lets canonical publication commit its snapshot and terminal cycle
+    audit in one database transaction.
+    """
 
     db = db_manager or get_db()
-    init_opportunity_schema(db)
+    if session is None:
+        init_opportunity_schema(db)
     if not isinstance(run.market_date_et, date):
         raise OpportunityRepositoryError("market_date_et must be a date")
     requested_limit = int(run.requested_limit)
@@ -648,92 +657,113 @@ def append_snapshot(
         tuple(candidates),
     )
 
-    session = db.get_session()
-    try:
-        existing = session.execute(
+    def append_in_session(target: Session) -> SnapshotAppendResult:
+        existing = target.execute(
             select(OpportunitySnapshotRun).where(
                 OpportunitySnapshotRun.snapshot_key == snapshot_key
             )
         ).scalar_one_or_none()
         if existing is not None:
             return _resolve_existing_snapshot(
-                session,
+                target,
                 existing,
                 payload_sha256=payload_sha256,
                 candidates=prepared_candidates,
             )
 
-        row = OpportunitySnapshotRun(
-            snapshot_key=snapshot_key,
-            market_date_et=run.market_date_et,
-            run_type=_required_text(run.run_type, "run_type"),
-            signal_version=_required_text(run.signal_version, "signal_version"),
-            schema_version=_required_text(run.schema_version, "schema_version"),
-            freeze_policy_version=_required_text(
-                run.freeze_policy_version, "freeze_policy_version"
-            ),
-            playbook_version=_required_text(
-                run.playbook_version, "playbook_version"
-            ),
-            scope_key=_required_text(run.scope_key, "scope_key"),
-            universe_sha256=universe_sha256,
-            universe_json=universe_json,
-            requested_limit=requested_limit,
-            source_run_id=_required_text(run.source_run_id, "source_run_id"),
-            ranking_method=_required_text(run.ranking_method, "ranking_method"),
-            strategy_validation_state=_required_text(
-                run.strategy_validation_state,
-                "strategy_validation_state",
-            ),
-            as_of=as_of,
-            frozen_at=frozen_at,
-            validation_eligible=bool(run.validation_eligible),
-            eligibility_reasons_json=canonical_json(
-                list(run.eligibility_reasons)
-            ),
-            payload_sha256=payload_sha256,
-            payload_json=payload_json,
-        )
-        session.add(row)
-        session.flush()
-        session.add_all(
-            [
-                OpportunitySnapshotCandidate(
-                    snapshot_run_id=row.id,
-                    **candidate.__dict__,
+        try:
+            # The savepoint keeps an external canonical publication
+            # transaction usable when a concurrent writer wins the immutable
+            # snapshot key.
+            with target.begin_nested():
+                row = OpportunitySnapshotRun(
+                    snapshot_key=snapshot_key,
+                    market_date_et=run.market_date_et,
+                    run_type=_required_text(run.run_type, "run_type"),
+                    signal_version=_required_text(
+                        run.signal_version, "signal_version"
+                    ),
+                    schema_version=_required_text(
+                        run.schema_version, "schema_version"
+                    ),
+                    freeze_policy_version=_required_text(
+                        run.freeze_policy_version, "freeze_policy_version"
+                    ),
+                    playbook_version=_required_text(
+                        run.playbook_version, "playbook_version"
+                    ),
+                    scope_key=_required_text(run.scope_key, "scope_key"),
+                    universe_sha256=universe_sha256,
+                    universe_json=universe_json,
+                    requested_limit=requested_limit,
+                    source_run_id=_required_text(
+                        run.source_run_id, "source_run_id"
+                    ),
+                    ranking_method=_required_text(
+                        run.ranking_method, "ranking_method"
+                    ),
+                    strategy_validation_state=_required_text(
+                        run.strategy_validation_state,
+                        "strategy_validation_state",
+                    ),
+                    as_of=as_of,
+                    frozen_at=frozen_at,
+                    validation_eligible=bool(run.validation_eligible),
+                    eligibility_reasons_json=canonical_json(
+                        list(run.eligibility_reasons)
+                    ),
+                    payload_sha256=payload_sha256,
+                    payload_json=payload_json,
                 )
-                for candidate in prepared_candidates
-            ]
-        )
-        session.commit()
-        return SnapshotAppendResult(
-            snapshot_run_id=int(row.id),
-            snapshot_key=snapshot_key,
-            payload_sha256=payload_sha256,
-            candidate_count=len(prepared_candidates),
-            duplicate=False,
-        )
-    except IntegrityError:
-        # A concurrent first writer may have won the unique daily slot.
-        session.rollback()
-        existing = session.execute(
-            select(OpportunitySnapshotRun).where(
-                OpportunitySnapshotRun.snapshot_key == snapshot_key
+                target.add(row)
+                target.flush()
+                target.add_all(
+                    [
+                        OpportunitySnapshotCandidate(
+                            snapshot_run_id=row.id,
+                            **candidate.__dict__,
+                        )
+                        for candidate in prepared_candidates
+                    ]
+                )
+                target.flush()
+                result = SnapshotAppendResult(
+                    snapshot_run_id=int(row.id),
+                    snapshot_key=snapshot_key,
+                    payload_sha256=payload_sha256,
+                    candidate_count=len(prepared_candidates),
+                    duplicate=False,
+                )
+            return result
+        except IntegrityError:
+            # A concurrent first writer may have won the unique daily slot.
+            existing = target.execute(
+                select(OpportunitySnapshotRun).where(
+                    OpportunitySnapshotRun.snapshot_key == snapshot_key
+                )
+            ).scalar_one_or_none()
+            if existing is None:
+                raise
+            return _resolve_existing_snapshot(
+                target,
+                existing,
+                payload_sha256=payload_sha256,
+                candidates=prepared_candidates,
             )
-        ).scalar_one_or_none()
-        if existing is None:
-            raise
-        return _resolve_existing_snapshot(
-            session,
-            existing,
-            payload_sha256=payload_sha256,
-            candidates=prepared_candidates,
-        )
+
+    if session is not None:
+        return append_in_session(session)
+
+    owned_session = db.get_session()
+    try:
+        result = append_in_session(owned_session)
+        owned_session.commit()
+        return result
     except Exception:
-        session.rollback()
+        owned_session.rollback()
         raise
     finally:
-        session.close()
+        owned_session.close()
 
 
 def _prepare_outcome(
@@ -1088,12 +1118,15 @@ def get_snapshot(
     snapshot_key: str,
     *,
     db_manager: Optional[DatabaseManager] = None,
+    session: Optional[Session] = None,
 ) -> Optional[StoredSnapshot]:
     db = db_manager or get_db()
-    init_opportunity_schema(db)
-    session = db.get_session()
+    if session is None:
+        init_opportunity_schema(db)
+    target = session or db.get_session()
+    owns_session = session is None
     try:
-        run = session.execute(
+        run = target.execute(
             select(OpportunitySnapshotRun).where(
                 OpportunitySnapshotRun.snapshot_key == snapshot_key
             )
@@ -1101,7 +1134,7 @@ def get_snapshot(
         if run is None:
             return None
         candidates = (
-            session.execute(
+            target.execute(
                 select(OpportunitySnapshotCandidate)
                 .where(OpportunitySnapshotCandidate.snapshot_run_id == run.id)
                 .order_by(OpportunitySnapshotCandidate.rank)
@@ -1111,7 +1144,8 @@ def get_snapshot(
         )
         return _stored_snapshot(run, candidates)
     finally:
-        session.close()
+        if owns_session:
+            target.close()
 
 
 def list_snapshots(
@@ -1240,18 +1274,21 @@ def list_snapshot_outcomes(
     evaluator_version: Optional[str] = None,
     *,
     db_manager: Optional[DatabaseManager] = None,
+    session: Optional[Session] = None,
 ) -> tuple[StoredOutcome, ...]:
     """List preferred outcomes for every candidate in one frozen snapshot."""
 
     db = db_manager or get_db()
-    init_opportunity_schema(db)
-    session = db.get_session()
+    if session is None:
+        init_opportunity_schema(db)
+    target = session or db.get_session()
+    owns_session = session is None
     try:
         query = _outcome_join_query(evaluator_version=evaluator_version).where(
             OpportunitySnapshotRun.snapshot_key
             == _required_text(snapshot_key, "snapshot_key")
         )
-        rows = session.execute(
+        rows = target.execute(
             query.order_by(
                 OpportunitySnapshotCandidate.rank,
                 OpportunityCandidateOutcome.horizon_sessions,
@@ -1265,7 +1302,8 @@ def list_snapshot_outcomes(
         ).all()
         return _preferred_joined_outcomes(rows)
     finally:
-        session.close()
+        if owns_session:
+            target.close()
 
 
 def list_candidate_outcomes(

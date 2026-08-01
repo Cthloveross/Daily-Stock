@@ -2,7 +2,7 @@
 """Classifier + compute_regime_score tests with fetchers stubbed."""
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -36,6 +36,7 @@ class TestMarketDate:
 class StubFetcher:
     def __init__(self, snapshot):
         self._snap = snapshot
+        self.premarket_as_of = None
 
     def get_spy_snapshot(self, d):
         return self._snap["spy"]
@@ -52,7 +53,8 @@ class StubFetcher:
     def get_prev_day_structure(self, d):
         return self._snap["prev_day"]
 
-    def get_premarket_activity(self, wl, d):
+    def get_premarket_activity(self, wl, d, *, as_of=None):
+        self.premarket_as_of = as_of
         return self._snap["premarket"]
 
 
@@ -107,6 +109,53 @@ class TestComputeRegimeScore:
         ):
             res = compute_regime_score(save_to_db=False)
         assert res.date == target
+
+    def test_passes_one_timezone_aware_as_of_to_premarket(self):
+        fetcher = StubFetcher(_ready_snapshot())
+        frozen_as_of = datetime(
+            2026,
+            4,
+            17,
+            9,
+            12,
+            tzinfo=timezone(timedelta(hours=-4)),
+        )
+        with patch(
+            "src.regime.classifier.RegimeDataFetcher",
+            return_value=fetcher,
+        ):
+            result = compute_regime_score(
+                target_date=date(2026, 4, 17),
+                save_to_db=False,
+                as_of=frozen_as_of,
+            )
+
+        expected_utc = datetime(
+            2026,
+            4,
+            17,
+            13,
+            12,
+            tzinfo=timezone.utc,
+        )
+        assert result.date == date(2026, 4, 17)
+        assert fetcher.premarket_as_of == expected_utc
+        assert fetcher.premarket_as_of.tzinfo is timezone.utc
+
+    def test_naive_as_of_is_rejected_before_fetcher_construction(self):
+        with patch(
+            "src.regime.classifier.RegimeDataFetcher"
+        ) as fetcher_factory, pytest.raises(
+            ValueError,
+            match="timezone-aware",
+        ):
+            compute_regime_score(
+                target_date=date(2026, 4, 17),
+                save_to_db=False,
+                as_of=datetime(2026, 4, 17, 13, 12),
+            )
+
+        fetcher_factory.assert_not_called()
 
     def test_closes_fetcher_after_success(self):
         fetcher = StubFetcher(_ready_snapshot())
@@ -188,6 +237,33 @@ class TestComputeRegimeScore:
         assert res.snapshot["quality"]["state"] == "degraded"
         assert res.snapshot["quality"]["authoritative"] is False
         assert "premarket" in res.snapshot["quality"]["missing_domains"]
+
+    def test_partial_macro_sources_keep_observed_earnings_penalty(self):
+        snapshot = _ready_snapshot()
+        snapshot["events"] = {
+            "_status": "degraded",
+            "_readiness": {
+                "economic_calendar": "unavailable",
+                "earnings_calendar": "ready",
+            },
+            "fomc_today": False,
+            "cpi_today": False,
+            "nfp_today": False,
+            "earnings_count_watchlist": 1,
+            "tariff_headline_today": False,
+        }
+        with patch(
+            "src.regime.classifier.RegimeDataFetcher",
+            return_value=StubFetcher(snapshot),
+        ):
+            res = compute_regime_score(
+                target_date=date(2026, 4, 17), save_to_db=False
+            )
+
+        assert res.d3_macro_penalty == -5
+        assert res.snapshot["quality"]["state"] == "degraded"
+        assert res.snapshot["quality"]["domain_states"]["events"] == "degraded"
+        assert res.snapshot["quality"]["authoritative"] is False
 
     def test_complete_snapshot_is_ready_and_versioned(self):
         with patch(

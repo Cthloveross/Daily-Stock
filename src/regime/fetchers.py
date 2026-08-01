@@ -11,11 +11,12 @@ than turning missing data into an authoritative number.
 from __future__ import annotations
 
 import logging
+import math
 import queue
 import statistics
 import threading
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from io import StringIO
 from typing import Any, Callable, Optional
 
@@ -374,6 +375,10 @@ class RegimeDataFetcher:
         """Today's macro flags for scoring AND a 7-day US agenda for display."""
         events = {
             "_status": "unavailable",
+            "_readiness": {
+                "economic_calendar": "unavailable",
+                "earnings_calendar": "unavailable",
+            },
             "fomc_today": False,
             "cpi_today": False,
             "nfp_today": False,
@@ -396,14 +401,25 @@ class RegimeDataFetcher:
                 economic_ok = self._finnhub_request_succeeded(
                     "economic_calendar"
                 )
-                earnings_rows = (
-                    self.finnhub.get_earnings_calendar(target_date, window_end)
-                    if self._remaining_budget() > 0
-                    else []
+                earnings_attempted = self._remaining_budget() > 0
+                earnings_rows = []
+                if earnings_attempted:
+                    earnings_rows = self.finnhub.get_earnings_calendar(
+                        target_date, window_end
+                    )
+                earnings_ok = (
+                    self._finnhub_request_succeeded("earnings_calendar")
+                    if earnings_attempted
+                    else False
                 )
-                earnings_ok = self._finnhub_request_succeeded(
-                    "earnings_calendar"
-                )
+                events["_readiness"] = {
+                    "economic_calendar": (
+                        "ready" if economic_ok else "unavailable"
+                    ),
+                    "earnings_calendar": (
+                        "ready" if earnings_ok else "unavailable"
+                    ),
+                }
 
                 def row_date(row: dict) -> Optional[date]:
                     raw = row.get("date") or row.get("time")
@@ -452,7 +468,7 @@ class RegimeDataFetcher:
                 watchlist_upper = {s.upper() for s in watchlist}
                 count = sum(
                     1
-                    for row in earnings_rows
+                    for row in earnings_rows if earnings_ok
                     if (
                         (row_date(row) in {None, target_date})
                         and (row.get("symbol") or "").upper() in watchlist_upper
@@ -572,55 +588,116 @@ class RegimeDataFetcher:
             return {}
 
     def get_premarket_activity(
-        self, watchlist: list[str], target_date: date
+        self,
+        watchlist: list[str],
+        target_date: date,
+        *,
+        as_of: Optional[datetime] = None,
     ) -> dict:
-        """Premarket SPY + watchlist movers. Alpaca preferred; otherwise empty.
+        """Premarket SPY + watchlist movers relative to prior daily closes.
 
-        The ``movers`` field (new) holds a per-symbol pct move for UI heatmap;
-        scorers keep using the aggregated ``watchlist_up_5pct`` / ``..._down_5pct``
-        counts so their behaviour is unchanged.
+        The ``movers`` field holds a per-symbol pct move for the UI. Unknown
+        evidence remains ``None`` rather than becoming a synthetic 0% move.
+        All Alpaca calls in this request receive the same frozen ``as_of``.
+
+        ``MoomooFetcher.get_premarket`` exists as a proved adapter, but is not
+        wired here yet: the synchronous SDK's cold history call can exceed this
+        request's bounded work budget and cannot be cancelled safely.
         """
-        spy_pre_pct = 0.0
+        frozen_as_of = _aware_utc(as_of or datetime.now(timezone.utc))
+        spy_pre_pct: Optional[float] = None
         up = 0
         down = 0
         movers: list[dict] = []
         spy_observed = False
+        partial_observed = False
         observed_symbols = 0
+        spy_as_of: Optional[str] = None
+        spy_previous_close: Optional[float] = None
+        reasons: list[str] = []
+        attempted_sources: list[str] = []
         if (
             self.alpaca is not None
             and getattr(self.alpaca, "configured", False)
             and self._remaining_budget() > 0
         ):
+            attempted_sources.append("Alpaca")
             try:
                 premarket_deadline = min(
                     self._deadline,
                     time.monotonic() + 3.0,
                 )
-                spy_bar = self.alpaca.get_premarket("SPY")
+                spy_bar = self.alpaca.get_premarket(
+                    "SPY",
+                    target_date=target_date,
+                    as_of=frozen_as_of,
+                )
                 if spy_bar:
-                    open_ = float(spy_bar.get("o") or 0)
-                    close_ = float(spy_bar.get("c") or 0)
-                    if open_:
-                        spy_pre_pct = (close_ - open_) / open_ * 100.0
-                        spy_observed = True
-                # If the core SPY request failed, do not fan out the same
-                # failing credential/network path across the entire watchlist.
-                # The provider has no batch endpoint in this adapter yet.
+                    partial_observed = (
+                        partial_observed
+                        or _has_premarket_evidence(spy_bar)
+                    )
+                    spy_as_of = spy_bar.get("as_of")
+                    spy_previous_close = _optional_float(
+                        spy_bar.get("previous_close")
+                    )
+                    spy_pre_pct = _optional_float(spy_bar.get("pct_change"))
+                    spy_observed = (
+                        spy_bar.get("_status") == "ready"
+                        and spy_pre_pct is not None
+                        and spy_previous_close is not None
+                    )
+                    reason = spy_bar.get("_reason")
+                    if reason:
+                        reasons.append(f"SPY:{reason}")
                 mover_symbols = watchlist[:5] if spy_observed else []
                 for sym in mover_symbols:
                     if time.monotonic() >= premarket_deadline:
+                        reasons.append("watchlist:request_budget_exhausted")
                         break
-                    bar = self.alpaca.get_premarket(sym)
+                    bar = (
+                        spy_bar
+                        if sym.upper() == "SPY"
+                        else self.alpaca.get_premarket(
+                            sym,
+                            target_date=target_date,
+                            as_of=frozen_as_of,
+                        )
+                    )
                     if not bar:
-                        movers.append({"symbol": sym, "pct": None, "close": None})
+                        movers.append({
+                            "symbol": sym,
+                            "pct": None,
+                            "close": None,
+                            "as_of": None,
+                            "previous_close": None,
+                        })
+                        reasons.append(f"{sym}:source_unavailable")
                         continue
-                    o = float(bar.get("o") or 0)
-                    c = float(bar.get("c") or 0)
-                    if not o:
-                        movers.append({"symbol": sym, "pct": None, "close": c or None})
+                    partial_observed = (
+                        partial_observed
+                        or _has_premarket_evidence(bar)
+                    )
+                    move = _optional_float(bar.get("pct_change"))
+                    close = _optional_float(bar.get("price"))
+                    previous_close = _optional_float(bar.get("previous_close"))
+                    if (
+                        bar.get("_status") != "ready"
+                        or move is None
+                        or close is None
+                        or previous_close is None
+                    ):
+                        movers.append({
+                            "symbol": sym,
+                            "pct": None,
+                            "close": close,
+                            "as_of": bar.get("as_of"),
+                            "previous_close": previous_close,
+                        })
+                        reason = bar.get("_reason") or "incomplete_reference"
+                        reasons.append(f"{sym}:{reason}")
                         continue
                     observed_symbols += 1
-                    move = (c - o) / o * 100.0
                     if move >= 5.0:
                         up += 1
                     elif move <= -5.0:
@@ -628,29 +705,50 @@ class RegimeDataFetcher:
                     movers.append({
                         "symbol": sym,
                         "pct": round(move, 3),
-                        "close": round(c, 2),
+                        "close": round(close, 2),
+                        "as_of": bar.get("as_of"),
+                        "previous_close": round(previous_close, 4),
                     })
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Alpaca premarket failed: %s", exc)
+                reasons.append("alpaca_request_failed")
+        status = (
+            "ready"
+            if (
+                spy_observed
+                and len(watchlist) <= 5
+                and observed_symbols == len(mover_symbols)
+            )
+            else "degraded"
+            if spy_observed or observed_symbols > 0 or partial_observed
+            else "unavailable"
+        )
         return {
             "spy_pre_pct": spy_pre_pct,
             "watchlist_up_5pct": up,
             "watchlist_down_5pct": down,
             "movers": movers,
-            "_status": (
-                "ready"
-                if (
-                    spy_observed
-                    and len(watchlist) <= 5
-                    and observed_symbols == len(mover_symbols)
-                )
-                else "degraded"
-                if spy_observed or observed_symbols > 0
-                else "unavailable"
-            ),
+            "_status": status,
             "_observed_symbols": observed_symbols,
             "_requested_symbols": min(len(watchlist), 5) if spy_observed else 0,
             "_watchlist_size": len(watchlist),
+            "_source": "Alpaca" if partial_observed else None,
+            "_attempted_sources": attempted_sources,
+            "_as_of": spy_as_of,
+            "_requested_as_of": frozen_as_of.isoformat(),
+            "_spy_previous_close": spy_previous_close,
+            "_reason": (
+                None
+                if status == "ready"
+                else reasons[0]
+                if reasons
+                else "watchlist_coverage_capped"
+                if spy_observed and len(watchlist) > 5
+                else "alpaca_premarket_incomplete"
+                if attempted_sources
+                else "no_premarket_provider_available"
+            ),
+            "_reasons": list(dict.fromkeys(reasons)),
         }
 
     # --- helpers ------------------------------------------------------
@@ -661,11 +759,92 @@ class RegimeDataFetcher:
             hist, _source = self._daily_frame(symbol, target_date, lookback_days)
             if hist is None or hist.empty:
                 return []
-            hist = hist.sort_index()
-            # Keep only rows with date <= target_date.
+            hist = _daily_frame_through(hist, target_date)
+            if hist.empty:
+                return []
             close_col = "close" if "close" in hist.columns else "Close"
             closes = [float(v) for v in hist[close_col].dropna().tolist()]
             return closes[-lookback_days:] if len(closes) >= lookback_days else closes
         except Exception as exc:  # noqa: BLE001
             logger.warning("yfinance history(%s) failed: %s", symbol, exc)
             return []
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _has_premarket_evidence(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if any(
+        _optional_float(payload.get(key)) is not None
+        for key in ("price", "previous_close", "pct_change", "c", "o")
+    ):
+        return True
+    return bool(payload.get("as_of") or payload.get("t"))
+
+
+def _aware_utc(value: datetime) -> datetime:
+    if not isinstance(value, datetime):
+        raise ValueError("as_of must be a datetime")
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("as_of must be timezone-aware")
+    return value.astimezone(timezone.utc)
+
+
+def _daily_frame_through(frame: Any, target_date: date):
+    """Return only observations provably dated on or before ``target_date``.
+
+    Moomoo/Cboe frames carry a date column while yfinance normally uses a
+    ``DatetimeIndex``.  Undated legacy/test frames retain their historical
+    behavior because there is no timestamp with which to prove a future leak.
+    """
+    import pandas as pd
+
+    filtered = frame.copy()
+    date_column = next(
+        (column for column in ("date", "Date") if column in filtered.columns),
+        None,
+    )
+    if date_column is not None:
+        observation_dates = filtered[date_column].map(_daily_observation_date)
+        eligible = observation_dates.map(
+            lambda observed: observed is not None and observed <= target_date
+        )
+        filtered = filtered.loc[eligible].copy()
+        if filtered.empty:
+            return filtered
+        filtered["_regime_observation_date"] = observation_dates.loc[eligible]
+        filtered = filtered.sort_values("_regime_observation_date")
+        return filtered.drop(columns=["_regime_observation_date"])
+
+    if isinstance(filtered.index, pd.DatetimeIndex):
+        eligible = [
+            observed is not None and observed <= target_date
+            for observed in (
+                _daily_observation_date(value) for value in filtered.index
+            )
+        ]
+        filtered = filtered.loc[eligible]
+    return filtered.sort_index()
+
+
+def _daily_observation_date(value: Any) -> Optional[date]:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        import pandas as pd
+
+        timestamp = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(timestamp):
+        return None
+    return timestamp.date()

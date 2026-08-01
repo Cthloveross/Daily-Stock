@@ -14,6 +14,9 @@ class _Contract:
     gamma: float | None = None
     contract_size: float | None = None
     update_time: str | None = None
+    expiry: str = "2026-07-24"
+    implied_volatility: float | None = None
+    code: str = ""
 
 
 @dataclass(frozen=True)
@@ -91,6 +94,109 @@ def test_missing_gamma_does_not_manufacture_gamma_wall():
     assert payload["walls"]["put_oi"]
     assert payload["walls"]["gross_gamma_concentration"] == []
     assert payload["coverage"]["gamma_contracts"] == 0
+
+
+def test_atm_call_iv_is_selected_from_same_nearest_expiry_wall_snapshot():
+    snapshot = _Snapshot(
+        spot=100,
+        requested_contract_count=4,
+        snapshot_received_count=4,
+        valid_contract_count=4,
+        contracts=(
+            _Contract(
+                "C",
+                95,
+                100,
+                10,
+                expiry="2026-07-24",
+                implied_volatility=0.41,
+                code="call-95",
+            ),
+            _Contract(
+                "C",
+                101,
+                100,
+                10,
+                expiry="2026-07-24",
+                implied_volatility=0.425,
+                code="call-101",
+            ),
+            _Contract(
+                "C",
+                100,
+                100,
+                10,
+                expiry="2026-08-21",
+                implied_volatility=0.99,
+                code="later-call-100",
+            ),
+            _Contract(
+                "P",
+                100,
+                100,
+                10,
+                expiry="2026-07-24",
+                implied_volatility=0.88,
+                code="put-100",
+            ),
+        ),
+    )
+
+    context = build_option_wall_payload(
+        snapshot,
+        dte_min=0,
+        dte_max=45,
+    )["atm_call_iv"]
+
+    assert context == {
+        "state": "ready",
+        "expiry": "2026-07-24",
+        "strike": 101.0,
+        "atm_call_iv_percent": 42.5,
+        "selection_method": (
+            "nearest_expiry_atm_call_from_same_wall_snapshot"
+        ),
+    }
+
+
+def test_atm_call_iv_fails_closed_when_exact_atm_snapshot_lacks_iv():
+    snapshot = _Snapshot(
+        spot=100,
+        requested_contract_count=2,
+        snapshot_received_count=2,
+        valid_contract_count=2,
+        contracts=(
+            _Contract(
+                "C",
+                100,
+                100,
+                10,
+                expiry="2026-07-24",
+                implied_volatility=None,
+                code="atm-without-iv",
+            ),
+            _Contract(
+                "C",
+                105,
+                100,
+                10,
+                expiry="2026-07-24",
+                implied_volatility=0.55,
+                code="non-atm-with-iv",
+            ),
+        ),
+    )
+
+    context = build_option_wall_payload(
+        snapshot,
+        dte_min=0,
+        dte_max=45,
+    )["atm_call_iv"]
+
+    assert context["state"] == "unavailable"
+    assert context["expiry"] == "2026-07-24"
+    assert context["strike"] == 100
+    assert context["atm_call_iv_percent"] is None
 
 
 def test_invalid_spot_is_rejected():

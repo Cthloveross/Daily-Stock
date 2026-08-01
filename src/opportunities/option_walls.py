@@ -15,6 +15,7 @@ from typing import Any, Iterable, Optional
 
 FORMULA_VERSION = "gross-gamma-concentration-1pct/v1"
 GAMMA_UNIT = "usd_delta_change_per_1pct_move"
+ATM_CALL_IV_METHOD = "nearest_expiry_atm_call_from_same_wall_snapshot"
 
 
 def _finite_number(value: Any) -> Optional[float]:
@@ -69,6 +70,77 @@ def _top_levels(
         prior_value = value
         prior_rank = rank
     return levels
+
+
+def _atm_call_iv_context(
+    snapshot: Any,
+    *,
+    spot: float,
+) -> dict[str, Any]:
+    """Select ATM Call IV without issuing another provider request.
+
+    The wall snapshot already contains dynamic observations for every accepted
+    contract.  Match the standalone ATM-IV contract by first fixing the
+    snapshot's nearest expiry, then choosing the Call strike closest to spot.
+    If that exact contract lacks a valid IV, fail closed instead of silently
+    substituting another strike or expiry.
+    """
+
+    expiries = [
+        str(value).strip()
+        for value in (getattr(snapshot, "expiries", ()) or ())
+        if str(value).strip()
+    ]
+    expiry = min(expiries) if expiries else None
+    calls = [
+        contract
+        for contract in (getattr(snapshot, "contracts", ()) or ())
+        if expiry is not None
+        and str(getattr(contract, "expiry", "")).strip() == expiry
+        and str(getattr(contract, "right", "")).strip().upper() == "C"
+        and (strike := _finite_number(getattr(contract, "strike", None))) is not None
+        and strike > 0
+    ]
+    atm = min(
+        calls,
+        key=lambda contract: (
+            abs(float(getattr(contract, "strike")) - spot),
+            float(getattr(contract, "strike")),
+            str(getattr(contract, "code", "")),
+        ),
+        default=None,
+    )
+    strike = (
+        _finite_number(getattr(atm, "strike", None))
+        if atm is not None
+        else None
+    )
+    iv_decimal = (
+        _finite_number(getattr(atm, "implied_volatility", None))
+        if atm is not None
+        else None
+    )
+    if (
+        expiry is not None
+        and strike is not None
+        and strike > 0
+        and iv_decimal is not None
+        and iv_decimal > 0
+    ):
+        return {
+            "state": "ready",
+            "expiry": expiry,
+            "strike": round(strike, 6),
+            "atm_call_iv_percent": round(iv_decimal * 100.0, 6),
+            "selection_method": ATM_CALL_IV_METHOD,
+        }
+    return {
+        "state": "unavailable",
+        "expiry": expiry,
+        "strike": round(strike, 6) if strike is not None and strike > 0 else None,
+        "atm_call_iv_percent": None,
+        "selection_method": ATM_CALL_IV_METHOD,
+    }
 
 
 def build_option_wall_payload(
@@ -196,6 +268,7 @@ def build_option_wall_payload(
         "formula_version": FORMULA_VERSION,
         "spot": round(spot, 6),
         "quote_as_of": max(quote_times) if quote_times else None,
+        "atm_call_iv": _atm_call_iv_context(snapshot, spot=spot),
         "scope": {
             "dte_min": dte_min,
             "dte_max": dte_max,

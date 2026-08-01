@@ -35,6 +35,15 @@ def save_regime_score(result) -> None:
     """
     init_regime_schema()
     db = get_db()
+    generated_at = getattr(result, "generated_at", None)
+    if (
+        not isinstance(generated_at, datetime)
+        or generated_at.tzinfo is None
+        or generated_at.utcoffset() is None
+    ):
+        generated_at = datetime.now(timezone.utc)
+    else:
+        generated_at = generated_at.astimezone(timezone.utc)
     with db.session_scope() as session:
         existing = session.get(RegimeScore, result.date)
         payload = {
@@ -51,7 +60,7 @@ def save_regime_score(result) -> None:
             # Refreshing today's row must also refresh the evidence timestamp.
             # SQLite stores this as a naive wall clock, so persist UTC by
             # contract and restore the UTC offset on read.
-            "generated_at": datetime.now(timezone.utc).replace(tzinfo=None),
+            "generated_at": generated_at.replace(tzinfo=None),
         }
         if existing is None:
             session.add(RegimeScore(date=result.date, **payload))
