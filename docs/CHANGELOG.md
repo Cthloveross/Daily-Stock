@@ -376,6 +376,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] 单笔复盘页（`/journal/review/:episodeId`）新增「Playbook 关联」面板：按已确认规则（`规则 v{n} · 生效中/已退役`）→ 已确认候选 → 「可能相关（无法确认）」排序展示，均带冻结桶回显（标签/错误类型 · 值 · 方向 · 边界口径）；截断条目标注「证据快照抽样截断，无法确认该回合是否在样本内」，空态为「该回合未被任何 Playbook 候选或规则引用」。
 - [测试] 新增 C-3 仓储回归（确认链接排序与桶回显、lineage 最新版本含退役状态、构建不匹配排除、截断样本 possible 标注与桶不匹配省略、零写断言、未知 scope fail-closed）、API 合同（链接契约 + 空链接 + 404/422）与 Web 组件测试（规则/候选标签、截断不确定性标注、空态与错误态渲染）。
 - [文档] `New-docs/phase1/13_PLAYBOOK_PROMOTION_CONTRACT.md` 切片 C-3 标记为已实现并补实现锚点；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` 同步 C-3 状态。
+- [文档] 新增 `New-docs/phase1/14_ARTIFACT_GC_CONTRACT.md`（F-2 短期 artifact GC 设计冻结稿）：核实过期 refresh / position-snapshot preview artifact 表全部处于 SQLite deny-trigger 保护内（原“非 append-only 保护范围”假设不成立），冻结删除谓词（过期 ≥7 天且从未确认且无 publication/snapshot 引用且非账户最新）、单事务受控删除 + append-only 回执 + 备份前置的执行模型与 T1-T10 零误删测试合同；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` F-2 状态同步为设计已冻结。
+- [测试] 概率展示校准边界（D-5）自动化断言：`/regime/opportunity/:ticker` 详情页测试固定模型终值区间块必须携带「IV 模型终值分布 · 不是历史真实胜率、盘中触及概率或方向预测」声明与「方向概率尚未校准」提示，并对整页（含期限切换与各研究 tab）扫描禁止出现「上涨概率 / 胜率+数字」伪概率文案（校准提示中的否定引用为唯一豁免）。
+- [新功能] 分层健康端点 `GET /api/v1/system/health-layers` 新增第 7 层 `economic_schedule_coverage`（E-5 年度日程续期预警）：读取官方 Fed/BLS 日程数据文件的 coverage_through，余量 >30 天为 ok、≤30 天 degraded（提示在到期前放入下一年度数据文件）、超出覆盖或数据文件不可用为 down；`src/regime/official_schedule.py` 增加公共缓存访问器 `get_cached_official_schedule`，前端健康弹层补「经济日程覆盖」层名，三态与不可用态均有回归测试。
+- [测试] Moomoo env 测试隔离系统化（Q-2 / HANDOFF §15 P1.9）：新增仓库根 `conftest.py` autouse fixture，非 network 测试统一把 `MOOMOO_OPEND_ENABLED` 等 5 个 live-integration 开关强制为 false（network 标记与单测试 `monkeypatch.setenv` 仍可 opt-in），杜绝 `get_config()` 载入宿主 `.env` 后 `-m "not network"` 套件打到真实 OpenD/调度器；新增 `tests/test_env_isolation_conftest.py` 回归证明，`test_iv_rank.py` 局部隔离 fixture 保留作纵深防御。
 
 ## [3.11.0] - 2026-03-27
 

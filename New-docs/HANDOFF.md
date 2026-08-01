@@ -1155,9 +1155,11 @@ ReportMarkdown 于当前 UI 有稳定入口前不得作为验收证据。
 7. ~~EMA seed 不统一~~ 已解决（2026-07-31）：共享 `utils/ema.ts` + 手算/后端 parity 测试，见 7.3；
 8. 本地 Watchlist 与官方研究池容易被用户混淆。
 
-### P1.9（2026-07-31 新发现）：`-m "not network"` 套件不完全封闭
+### P1.9（2026-07-31 新发现）：`-m "not network"` 套件不完全封闭 —— 已系统性修复（2026-08-01）
 
-套件中任何一个测试触发 `get_config()` 都会 `load_dotenv` 把本机 `.env` 的 `MOOMOO_OPEND_ENABLED=true` 注入 `os.environ`，此后所有「Moomoo 优先、fallback 兜底」的代码路径在测试里都可能打到真实 OpenD。已修复 `test_iv_rank.py`（autouse fixture 隔离），但同类暴露可能存在于其他 provider-chain 测试；系统性做法应是在 `conftest.py` 统一为测试进程剥离 Moomoo/OpenD 环境开关（未做）。此前该失败只在盘中 OpenD 有实时报价时出现，离线运行会假性通过。
+原问题：套件中任何一个测试触发 `get_config()` 都会 `load_dotenv` 把本机 `.env` 的 `MOOMOO_OPEND_ENABLED=true` 注入 `os.environ`，此后所有「Moomoo 优先、fallback 兜底」的代码路径在测试里都可能打到真实 OpenD。此前该失败只在盘中 OpenD 有实时报价时出现，离线运行会假性通过。
+
+系统性修复（2026-08-01）：仓库根新增 `conftest.py`，autouse fixture 在每个**非 network** 测试开始前把 `MOOMOO_OPEND_ENABLED` / `MOOMOO_JOURNAL_REFRESH_ENABLED` / `MOOMOO_PREMARKET_PREFETCH_ENABLED` / `PREMARKET_RESEARCH_SCHEDULER_ENABLED` / `OPPORTUNITY_OUTCOME_SCHEDULER_ENABLED` 强制为 `"false"`（写 false 而非删除：`load_dotenv` 默认 `override=False`，已存在的值不会被 `.env` 中途覆盖）。带 `@pytest.mark.network` 的测试保持进程环境原样可继续 opt-in；单测试自身的 `monkeypatch.setenv(..., "true")` 在该 fixture 之后执行，仍可覆盖（`tests/test_moomoo_runtime.py` 等 opt-in 用法不受影响）。`test_iv_rank.py` 的局部 autouse fixture 保留作为纵深防御。回归证明：`tests/test_env_isolation_conftest.py` 在导出 `MOOMOO_OPEND_ENABLED=true` 的 shell 下断言未打补丁的测试看到的开关全为 false、`moomoo_options._enabled()` 为 False；验证命令 `MOOMOO_OPEND_ENABLED=true python -m pytest src/options/tests/test_iv_rank.py tests/test_env_isolation_conftest.py -q`。
 
 ### P2：研究质量
 

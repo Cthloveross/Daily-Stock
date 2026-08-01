@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "OfficialEconomicSchedule",
+    "get_cached_official_schedule",
     "get_official_macro_snapshot",
     "load_official_schedule",
 ]
@@ -267,6 +268,21 @@ def load_official_schedule(
     )
 
 
+def get_cached_official_schedule() -> Optional[OfficialEconomicSchedule]:
+    """Process-cached schedule for read-only consumers (e.g. ops health).
+
+    Shares the same cache as ``get_official_macro_snapshot``.  Returns
+    ``None`` when the schedule data files are missing or unusable, so
+    callers can report coverage honestly instead of guessing.
+    """
+    global _cached_schedule, _cached_dir
+    with _cache_lock:
+        if _cached_schedule is None or _cached_dir != _DATA_DIR:
+            _cached_schedule = load_official_schedule(_DATA_DIR)
+            _cached_dir = _DATA_DIR
+        return _cached_schedule
+
+
 def get_official_macro_snapshot(
     target_date: date,
     *,
@@ -281,12 +297,7 @@ def get_official_macro_snapshot(
     if data_dir is not None:
         schedule = load_official_schedule(data_dir)
     else:
-        global _cached_schedule, _cached_dir
-        with _cache_lock:
-            if _cached_schedule is None or _cached_dir != _DATA_DIR:
-                _cached_schedule = load_official_schedule(_DATA_DIR)
-                _cached_dir = _DATA_DIR
-            schedule = _cached_schedule
+        schedule = get_cached_official_schedule()
     if schedule is None:
         return _empty_snapshot()
     return schedule.snapshot(target_date, window_days=window_days)

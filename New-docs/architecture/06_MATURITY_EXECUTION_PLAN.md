@@ -33,7 +33,7 @@
 | D-2 | 冻结 vs 当前差异 | 差异条 | 已验收 | ✅ 2026-07-31 |
 | D-3 | 期权墙逐层合同 | level 级 expiry 分解 + 可观察报价/IV + 显式标缺（`option-wall/1.2`）；bid/ask/mark 需 adapter 扩展仍标缺 | 4 项 builder 回归（含无 dealer-sign 键递归断言）+ 真实页面逐层标注验证 | ✅ 2026-08-01 |
 | D-4 | 摘要同证据束 | 官方绑定时摘要句中的增强数据数值（IV Rank / 模型区间 IV 输入）带「当前增强数据 as-of，非冻结榜单证据」内联标注；冻结 bundle 数值不加注；即时扫描不加注（`OpportunityDetailPage.tsx`） | 文案审计测试：增强数值必须带标注、冻结数值不得被标注、即时扫描无标注；审计按「指标名+数字」词面模式扫描结论段落（局限：不识别未命名裸数字） | ✅ 2026-08-01 |
-| D-5 | 概率展示校准边界 | IV 终值区间明确标注模型假设；hit-rate 仅在 track 样本达门槛后出现 | 已有护栏，补自动化断言 | ⬜ |
+| D-5 | 概率展示校准边界 | IV 终值区间明确标注模型假设；hit-rate 仅在 track 样本达门槛后出现 | 自动化断言已补（`OpportunityDetailPage.test.tsx`）：模型区间块必须携带「不是历史真实胜率/触及概率/方向预测」声明、「方向概率尚未校准」提示必须存在、全页（含各研究 tab 与期限切换）扫描禁止出现「上涨概率 / 胜率+数字」伪概率文案（校准提示中的否定引用为唯一豁免） | ✅ 2026-08-01 |
 
 ## 阶段 E · 结果学习闭环（框架已在，等数据+两项工程）
 
@@ -43,14 +43,14 @@
 | E-2 | premarket 域修复 | Alpaca key 配置 | key 已配置+认证 200；周一盘前实战确认 | ✅ 2026-08-01（待实战） |
 | E-3 | 完整研究 track 积累 | E-1/E-2 后 quality=ready 的官方发布开始入样 | 首个 qualified full-research 样本出现 | ⏳ 自动积累 |
 | E-4 | 20D 成熟与展示 | 20D outcome 达门槛后学习面板解锁 | 门槛逻辑已有，等时间 | ⏳ |
-| E-5 | 年度日程续期机制 | 2027 BLS 日程发布后添加数据文件（现覆盖至 2026-11-27） | 提醒机制：HANDOFF ops + 健康层可加覆盖期预警 | ⬜ 小项 |
+| E-5 | 年度日程续期机制 | 2027 BLS 日程发布后添加数据文件（现数据文件 coverage_through 2026-12-04，7 天 agenda 窗口下 2026-11-27 后诚实降级） | 健康层预警已上线（2026-08-01）：`/api/v1/system/health-layers` 新增第 7 层 `economic_schedule_coverage`（余量 >30 天 ok / ≤30 天 degraded 提醒放入下一年度数据文件 / 超出覆盖 down），三态回归已测；剩余动作＝2027 官方日程发布后放入数据文件 | ⏳ 预警已上线，等 2027 日程发布 |
 
 ## 阶段 F · 生产稳态（剩余四项）
 
 | # | 项 | 交付物 | 验收 | 状态 |
 |---|---|---|---|---|
 | F-1 | LaunchAgent 对齐 | sync/breakout 安装副本换新模板（含轮转 wrapper），或用户决定停用 breakout | 退出码/日志/OpenD 行为验证；**需用户确认 unload**（服务中断类操作） | ⛔ 等用户 |
-| F-2 | artifact GC | 过期 refresh/snapshot artifact 的显式清理合同（短期表非 append-only 保护范围需先核实） | 设计评审 → 实现 + 零误删测试 | ⬜ |
+| F-2 | artifact GC | 合同：`New-docs/phase1/14_ARTIFACT_GC_CONTRACT.md`（核实结论：全部 artifact 表均在 deny-trigger 保护内，原“非保护范围”假设不成立；冻结删除谓词 + 单事务受控删除 + append-only 回执 + 备份前置） | 设计评审 → 实现 + 零误删测试（合同 T1-T10） | 🧊 设计已冻结 2026-08-01（F-2a 待实现；F-2b 调度含 BLOCKED 决策） |
 | F-3 | 日志 retention 启用 | 用户设 `LOG_RETENTION_DAYS=30`（机制已在） | 首次清理日志输出核对 | ⛔ 等用户一行配置 |
 | F-4 | clean-clone 演练 | 从 GitHub 干净克隆 → 按 README 启动成功 | 演练记录 + 修复发现的缺口 | ⬜ PR 合并后 |
 
@@ -59,7 +59,7 @@
 | # | 项 | 状态 |
 |---|---|---|
 | Q-1 | 后端 2,566 / 前端 551 / E2E 5 全绿 | ✅ 持续维持 |
-| Q-2 | Moomoo env 测试隔离（conftest 系统化） | ⬜ 胶囊待用户或纳入下波 |
+| Q-2 | Moomoo env 测试隔离（conftest 系统化）：根 `conftest.py` autouse fixture 为非 network 测试强制关闭 5 个 live-integration 开关；network 标记与单测试 setenv 仍可 opt-in；`tests/test_env_isolation_conftest.py` 回归证明（HANDOFF §15 P1.9） | ✅ 2026-08-01 |
 | Q-3 | Desktop Electron 链路验证 | ⛔ 需下载 Electron（等用户点头） |
 | Q-4 | PR 合并 + GitHub CI 恢复 | ⏳ 分支已推，等用户建 PR |
 

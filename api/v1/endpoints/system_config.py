@@ -499,14 +499,15 @@ def _health_layer(layer: str, state: str, detail: str, **extra) -> dict:
     description=(
         "Read-only, bounded probes for each health domain: API process, OpenD "
         "TCP, Moomoo SDK, Journal refresh configuration, premarket scheduler "
-        "last publication, and outcome maintenance last run. One layer failing "
-        "degrades only that layer; the endpoint itself never 500s on probe "
-        "errors. States: ok | degraded | down | disabled | unknown."
+        "last publication, outcome maintenance last run, and official economic "
+        "schedule coverage (annual data-file renewal early warning). One layer "
+        "failing degrades only that layer; the endpoint itself never 500s on "
+        "probe errors. States: ok | degraded | down | disabled | unknown."
     ),
 )
 def get_health_layers() -> dict:
     import os
-    from datetime import datetime, timezone
+    from datetime import date, datetime, timezone
 
     layers: list[dict] = []
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -642,6 +643,48 @@ def get_health_layers() -> dict:
     except Exception as exc:  # noqa: BLE001
         layers.append(_health_layer(
             "outcome_maintenance", "unknown",
+            f"读取失败: {type(exc).__name__}", as_of=now_iso,
+        ))
+
+    # E-5 年度日程续期预警：官方 Fed/BLS 日程按年发布，数据文件覆盖到期后
+    # events 域会 fail-closed 降级。这里提前 30 天在健康层给出运维提醒。
+    try:
+        from src.regime.official_schedule import get_cached_official_schedule
+
+        schedule = get_cached_official_schedule()
+        if schedule is None:
+            layers.append(_health_layer(
+                "economic_schedule_coverage", "down",
+                "官方经济日程数据文件缺失或不可用（events 域将按 fail-closed 降级）",
+                as_of=now_iso,
+            ))
+        else:
+            coverage_through = schedule.coverage_through
+            days_remaining = (coverage_through - date.today()).days
+            if days_remaining < 0:
+                state = "down"
+                detail = (
+                    f"官方经济日程已超出覆盖范围（覆盖至 {coverage_through.isoformat()}），"
+                    "请放入下一年度数据文件"
+                )
+            elif days_remaining <= 30:
+                state = "degraded"
+                detail = (
+                    f"官方经济日程覆盖至 {coverage_through.isoformat()}，"
+                    "请在到期前放入下一年度数据文件"
+                )
+            else:
+                state = "ok"
+                detail = f"官方经济日程覆盖至 {coverage_through.isoformat()}"
+            layers.append(_health_layer(
+                "economic_schedule_coverage", state, detail,
+                as_of=now_iso,
+                coverage_through=coverage_through.isoformat(),
+                days_remaining=days_remaining,
+            ))
+    except Exception as exc:  # noqa: BLE001 - schedule read failure is a health signal
+        layers.append(_health_layer(
+            "economic_schedule_coverage", "unknown",
             f"读取失败: {type(exc).__name__}", as_of=now_iso,
         ))
 

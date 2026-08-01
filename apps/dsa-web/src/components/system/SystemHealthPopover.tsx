@@ -25,6 +25,7 @@ const LAYER_LABELS: Record<string, string> = {
   journal_refresh_config: 'Journal 刷新配置',
   premarket_publication: '盘前官方发布',
   outcome_maintenance: '结果回填维护',
+  economic_schedule_coverage: '经济日程覆盖',
 };
 
 const STATE_STYLES: Record<HealthLayer['state'], string> = {

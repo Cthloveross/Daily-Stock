@@ -565,6 +565,49 @@ describe('OpportunityDetailPage', () => {
     expect(screen.getByRole('button', { name: '5D' })).toHaveAttribute('aria-pressed', 'true');
   });
 
+  it('pins the IV model-interval copy to calibration boundaries (D-5 概率展示校准边界)', async () => {
+    renderPage();
+
+    const summarySection = screen
+      .getByRole('heading', { name: '专业结论与波动情景' })
+      .closest('section') as HTMLElement;
+
+    // (a) 模型终值区间块必须始终携带「不是胜率/方向预测」声明。
+    await within(summarySection).findByText('约 68% 模型终值区间 · 1 个交易日');
+    expect(
+      within(summarySection).getByText('IV 模型终值分布 · 不是历史真实胜率、盘中触及概率或方向预测'),
+    ).toBeInTheDocument();
+
+    // (b) 方向概率未校准提示必须存在。
+    const calibrationNote = within(summarySection).getByText(/方向概率尚未校准/);
+    expect(calibrationNote.textContent).toContain(
+      '需要历史同类信号的样本外结果后才能显示真实统计',
+    );
+
+    // (c) 页面任何位置不得出现伪概率文案（「上涨概率」或「胜率 + 数字」）。
+    // 唯一允许出现「上涨概率」字样的是校准提示里的否定引用（“不能直接变成
+    // ‘上涨概率’”），因此先剔除该提示原文，再对整页文本做守卫扫描。
+    const fakeProbabilityPattern = /上涨概率|胜率\s*\d/;
+    const guardedPageText = () =>
+      (document.body.textContent ?? '').replace(calibrationNote.textContent ?? '', '');
+    expect(guardedPageText()).not.toMatch(fakeProbabilityPattern);
+
+    // 切换概率期限后声明仍在，且不得引入伪概率。
+    fireEvent.click(screen.getByRole('button', { name: '20D' }));
+    await within(summarySection).findByText('约 68% 模型终值区间 · 20 个交易日');
+    expect(
+      within(summarySection).getByText('IV 模型终值分布 · 不是历史真实胜率、盘中触及概率或方向预测'),
+    ).toBeInTheDocument();
+    expect(within(summarySection).getByText(/方向概率尚未校准/)).toBeInTheDocument();
+    expect(guardedPageText()).not.toMatch(fakeProbabilityPattern);
+
+    // 逐个研究 tab 扫描，防止未来在 tab 内容里引入未校准的伪概率展示。
+    for (const tabName of ['期权墙', /异常成交/, '数据说明', '波动与情景'] as const) {
+      fireEvent.click(screen.getByRole('button', { name: tabName }));
+      expect(guardedPageText()).not.toMatch(fakeProbabilityPattern);
+    }
+  });
+
   it('renders only the active research tab content', async () => {
     renderPage();
 
