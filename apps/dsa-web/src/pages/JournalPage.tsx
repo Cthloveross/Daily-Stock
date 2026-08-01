@@ -11,6 +11,7 @@ import PnLByDte from '../components/journal/PnLByDte';
 import FrameworkPanel from '../components/journal/FrameworkPanel';
 import AskJournalChat from '../components/journal/AskJournalChat';
 import PositionEpisodesPanel from '../components/journal/PositionEpisodesPanel';
+import ReviewInsightsPanel from '../components/journal/ReviewInsightsPanel';
 import CurrentPositionsSnapshotCard from '../components/journal/CurrentPositionsSnapshotCard';
 import { positionReviewPath } from '../components/journal/review/journalReviewRouting';
 import { useJournalStore } from '../stores/journalStore';
@@ -272,6 +273,7 @@ const JournalPage: React.FC = () => {
             onSelectBuild={selectPositionBuild}
             onOpenReview={openPositionReview}
           />
+          <ReviewInsightsPanel />
         </div>
       )}
 

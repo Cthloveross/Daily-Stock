@@ -31,6 +31,7 @@ import type {
   PositionEpisodeReviewAnnotationHistoryResponse,
   PositionEpisodeReviewAnnotationLatestResponse,
   RealityTestResponse,
+  ReviewInsightsResponse,
   SavePositionEpisodeReviewAnnotationRequest,
   SavePositionEpisodeReviewAnnotationResponse,
   TradeItem,
@@ -271,6 +272,11 @@ export async function fetchPositionEpisodeReviewAnnotationHistory(
     ...response,
     items: response.items ?? response.annotations ?? [],
   };
+}
+
+export async function fetchReviewInsights(): Promise<ReviewInsightsResponse> {
+  const { data } = await apiClient.get(`${BASE}/v2/review-insights`);
+  return toCamelCase<ReviewInsightsResponse>(data);
 }
 
 export async function savePositionEpisodeReviewAnnotation(

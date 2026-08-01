@@ -206,6 +206,85 @@ def test_post_validates_body_limits_scope_and_rejects_model_fields():
     assert wrong_account.status_code == 404
 
 
+def test_review_insights_not_built_state():
+    client = _client()
+
+    resp = client.get("/api/v1/journal/v2/review-insights")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["schema_version"] == "journal-review-insights/1.0"
+    assert body["data_state"] == "not_built"
+    assert body["build_id"] is None
+    assert body["build_key"] is None
+    assert body["source_kind"] is None
+    assert body["generated_at"] is None
+    assert body["thresholds"] == {
+        "min_episode_count": 10,
+        "min_distinct_trading_day_count": 5,
+    }
+    assert body["total_episode_count"] == 0
+    assert body["annotated_episode_count"] == 0
+    assert body["unreviewed"] is None
+    assert body["buckets"] == []
+
+
+def test_review_insights_counts_only_below_threshold_contract():
+    import_statement_batch(_case_focus_statement())
+    build = append_latest_position_episode_build(accept_assumed_flat=True)
+    page = get_latest_position_episode_page(per_page=10)
+    episode_ids = [item.episode_id for item in page.items]
+    client = _client()
+
+    saved = client.post(
+        _path(episode_ids[1]),
+        json={
+            "build_id": build.build_id,
+            "review_status": "completed",
+            "exit_reason": "按计划退出",
+            "tags": ["momentum"],
+            "error_types": ["late_entry"],
+        },
+    )
+    assert saved.status_code == 200
+
+    resp = client.get("/api/v1/journal/v2/review-insights")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["schema_version"] == "journal-review-insights/1.0"
+    assert body["data_state"] == "ready"
+    assert body["build_id"] == build.build_id
+    assert body["build_key"] == build.build_key
+    assert body["source_kind"] == "csv_batch"
+    assert body["generated_at"] is not None
+    assert body["total_episode_count"] == 4
+    assert body["annotated_episode_count"] == 1
+    assert body["unreviewed"] == {
+        "episode_count": 3,
+        "distinct_trading_day_count": 3,
+    }
+    assert len(body["buckets"]) == 2
+    for bucket in body["buckets"]:
+        assert bucket["direction"] == "LONG"
+        # Statement builds assume a flat opening, so the boundary bucket and
+        # the conditional split both fail closed: counts only, no ratios.
+        assert bucket["boundary_policy"] == "assumed_or_censored"
+        assert bucket["episode_count"] == 1
+        assert bucket["distinct_trading_day_count"] == 1
+        assert bucket["review_completed_count"] == 1
+        assert bucket["verified_episode_count"] == 0
+        assert bucket["conditional_episode_count"] == 1
+        assert bucket["stats"] is None
+        assert bucket["stats_gate"] == {
+            "eligible": False,
+            "reason": "no_verified_pnl_episodes",
+        }
+    assert {
+        (bucket["group_kind"], bucket["group_value"])
+        for bucket in body["buckets"]
+    } == {("tag", "momentum"), ("error_type", "late_entry")}
+
+
 def test_position_episode_list_projects_queue_and_filters_before_pagination():
     import_statement_batch(_case_focus_statement())
     build = append_latest_position_episode_build(accept_assumed_flat=True)

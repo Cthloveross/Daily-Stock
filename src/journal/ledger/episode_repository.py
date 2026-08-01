@@ -85,6 +85,7 @@ __all__ = [
     "get_latest_position_episode_page",
     "get_position_episode_detail",
     "list_latest_position_episodes",
+    "position_episode_pnl_exclusion_reasons",
     "load_verified_canonical_evidence_projection",
     "load_verified_canonical_episode_evidence_projection",
     "preview_latest_position_episodes",
@@ -4046,6 +4047,44 @@ def _position_item(
             == _EXECUTION_GROUP_FEE_POLICY
         ),
     )
+
+
+def position_episode_pnl_exclusion_reasons(
+    item: PositionEpisodeListItem,
+    opening_boundary_policy: Optional[str] = None,
+) -> tuple[str, ...]:
+    """Reasons this episode's P&L is conditional instead of verified.
+
+    An empty result means the episode is ``pnl_summary_eligible``: closed,
+    boundary-verified, not left-censored, evidence-complete, with a known
+    net P&L and no group-scope fee retention.  The API projection and the
+    review-insights aggregation both consume this single definition so the
+    verified/conditional split can never drift between surfaces.
+    """
+    policy = opening_boundary_policy or getattr(
+        item,
+        "opening_boundary_policy",
+        "unknown",
+    )
+    reasons: list[str] = []
+    if not item.left_boundary_verified:
+        reasons.append("boundary_unverified")
+        if policy in {
+            "assumed_flat_unverified",
+            "mixed_explicit_and_assumed",
+        }:
+            reasons.append("assumed_flat_unverified")
+    if item.lifecycle_status != "closed":
+        reasons.append("open")
+    if item.is_left_censored:
+        reasons.append("left_censored")
+    if item.completeness_status not in {"exact", "complete"}:
+        reasons.append("incomplete")
+    if item.realized_pnl_net is None:
+        reasons.append("pnl_unavailable")
+    if getattr(item, "group_fee_unallocated", False):
+        reasons.append("group_fee_unallocated")
+    return tuple(reasons)
 
 
 def _position_episode_page_for_build(

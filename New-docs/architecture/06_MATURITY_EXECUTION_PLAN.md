@@ -14,13 +14,13 @@
 | B-3 | 前端 confirm UI | preview→确认块+acceptance 勾选+409 引导 | 组件回归 + 真实页面 | ✅ 2026-08-01 |
 | B-4 | 真实小样本演练 | 用户完成一次 snapshot confirm → 次日 refresh → fence ready → 正式 build → 激活 | 正式库真实链路走通 + 回滚演练（激活回旧 build） | ⛔ 等用户交易日操作 |
 
-## 阶段 C · 复盘 → Playbook（设计已冻结，实现未开始）
+## 阶段 C · 复盘 → Playbook（设计已冻结，C-1 已实现）
 
 合同：`New-docs/phase1/13_PLAYBOOK_PROMOTION_CONTRACT.md`
 
 | # | 项 | 交付物 | 验收 | 状态 |
 |---|---|---|---|---|
-| C-1 | 模式观察聚合（零写） | `GET /journal/v2/review-insights`：按 tag/setup/方向/boundary policy 分桶；样本<10 笔或独立交易日<5 只显示计数不显示比率；条件性 P&L 单独分桶 | 门槛 fail-closed 测试 + 分桶不混轨测试 + 真实页面「模式观察」面板 | ⬜ 下一波 |
+| C-1 | 模式观察聚合（零写） | `GET /journal/v2/review-insights`：按 tag/error_type × 方向 × boundary policy 分桶；verified 样本 <10 笔或独立交易日 <5 只显示计数不显示比率；条件性 P&L 单独计数永不入统计（`src/journal/ledger/review_insights.py` + `ReviewInsightsPanel.tsx`，锚点见合同 §3） | 门槛 fail-closed 测试 + 分桶不混轨测试 + 零写断言 + 「模式观察」面板渲染回归 | ✅ 2026-08-01 |
 | C-2 | Playbook 表与晋升 | 2 张 append-only 表（candidate/rule 版本链）+ 晋升冻结证据快照（episode ids+build+revisions+聚合数字+as-of）+ CAS 晋升/退役端点 | 晋升快照可重放、deny triggers、不反写任何权重 | ⬜ |
 | C-3 | 复盘页反向链接 | 单笔页显示命中的 candidate/rule | 零写、真实页面 | ⬜ |
 | C-4 | 复盘工作流打磨 | Review Queue 逐项引导（未复盘案例队列化）、annotation 字段辅助文案 | 用户实际完成 ≥10 笔结构化复盘（用户行为，系统只降低摩擦） | ⬜ |

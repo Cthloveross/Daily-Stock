@@ -10,8 +10,21 @@ from api.v1.schemas.journal_reviews import (
     ReviewAnnotationHistoryResponse,
     ReviewAnnotationItem,
     ReviewAnnotationLatestResponse,
+    ReviewInsightBucketModel,
+    ReviewInsightStatsGate,
+    ReviewInsightStatsModel,
+    ReviewInsightThresholds,
+    ReviewInsightUnreviewed,
+    ReviewInsightsResponse,
 )
+from src.journal.ledger.episode_repository import EpisodeRepositoryError
 from src.journal.ledger.repository import DEFAULT_LEDGER_ACCOUNT_KEY
+from src.journal.ledger.review_insights import (
+    DEFAULT_MIN_DISTINCT_TRADING_DAY_COUNT,
+    DEFAULT_MIN_EPISODE_COUNT,
+    ReviewInsightBucket,
+    get_latest_review_insights,
+)
 from src.journal.ledger.review_repository import (
     ReviewAnnotationInput,
     ReviewAnnotationRepositoryError,
@@ -52,6 +65,96 @@ def _scope_error(exc: ReviewAnnotationRepositoryError) -> HTTPException:
     if isinstance(exc, ReviewAnnotationScopeNotFoundError):
         return HTTPException(status_code=404, detail=str(exc))
     return HTTPException(status_code=422, detail=str(exc))
+
+
+def _insight_bucket(bucket: ReviewInsightBucket) -> ReviewInsightBucketModel:
+    stats = None
+    if bucket.stats is not None:
+        stats = ReviewInsightStatsModel(
+            win_rate=format(bucket.stats.win_rate, "f"),
+            avg_pnl=format(bucket.stats.avg_pnl, "f"),
+            sum_pnl=format(bucket.stats.sum_pnl, "f"),
+            win_count=bucket.stats.win_count,
+            loss_count=bucket.stats.loss_count,
+            breakeven_count=bucket.stats.breakeven_count,
+        )
+    return ReviewInsightBucketModel(
+        group_kind=bucket.group_kind,
+        group_value=bucket.group_value,
+        direction=bucket.direction,
+        boundary_policy=bucket.boundary_policy,
+        episode_count=bucket.episode_count,
+        distinct_trading_day_count=bucket.distinct_trading_day_count,
+        review_completed_count=bucket.review_completed_count,
+        verified_episode_count=bucket.verified_episode_count,
+        verified_distinct_trading_day_count=(
+            bucket.verified_distinct_trading_day_count
+        ),
+        conditional_episode_count=bucket.conditional_episode_count,
+        stats=stats,
+        stats_gate=ReviewInsightStatsGate(
+            eligible=bucket.stats_gate_eligible,
+            reason=bucket.stats_gate_reason,
+        ),
+    )
+
+
+@router.get("/v2/review-insights", response_model=ReviewInsightsResponse)
+def get_review_insights(
+    account_key: str = Query(
+        DEFAULT_LEDGER_ACCOUNT_KEY,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    ),
+) -> ReviewInsightsResponse:
+    """Zero-write L1 pattern observation over the current default build.
+
+    Buckets join the default build's episodes with each episode's latest
+    review annotation.  Win-rate style ratios fail closed below the sample
+    threshold; conditional-P&L members never enter the stats.
+    """
+    thresholds = ReviewInsightThresholds(
+        min_episode_count=DEFAULT_MIN_EPISODE_COUNT,
+        min_distinct_trading_day_count=(
+            DEFAULT_MIN_DISTINCT_TRADING_DAY_COUNT
+        ),
+    )
+    try:
+        result = get_latest_review_insights(account_key)
+    except EpisodeRepositoryError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if result is None:
+        return ReviewInsightsResponse(
+            data_state="not_built",
+            account_key=account_key,
+            thresholds=thresholds,
+            total_episode_count=0,
+            annotated_episode_count=0,
+        )
+    return ReviewInsightsResponse(
+        data_state="ready",
+        build_id=result.build_id,
+        build_key=result.build_key,
+        source_kind=result.source_kind,
+        account_key=result.account_key,
+        generated_at=result.generated_at,
+        thresholds=ReviewInsightThresholds(
+            min_episode_count=result.min_episode_count,
+            min_distinct_trading_day_count=(
+                result.min_distinct_trading_day_count
+            ),
+        ),
+        total_episode_count=result.total_episode_count,
+        annotated_episode_count=result.annotated_episode_count,
+        unreviewed=ReviewInsightUnreviewed(
+            episode_count=result.unreviewed.episode_count,
+            distinct_trading_day_count=(
+                result.unreviewed.distinct_trading_day_count
+            ),
+        ),
+        buckets=[_insight_bucket(bucket) for bucket in result.buckets],
+    )
 
 
 @router.get(

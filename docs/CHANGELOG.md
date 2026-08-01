@@ -359,6 +359,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] 飞书群机器人通知现在支持 `FEISHU_WEBHOOK_SECRET` / `FEISHU_WEBHOOK_KEYWORD`，并在 Web 设置与文档中明确区分 Webhook 推送和 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` 应用模式，降低误配导致的推送失败。
 - [改进] 🤖 **普通分析链路支持 LiteLLM 流式生成与更细任务进度** — 常规股票分析在 LLM 阶段会优先尝试 `stream=True` 并在服务端累积 chunk，首页任务 SSE 新增 `task_progress` 事件与更细的 `message/progress` 更新；仅在最终 JSON 解析成功后才持久化历史报告，不支持流式的 provider 会在首个 chunk 前自动回退到原非流式调用。
 - [新功能] Web AI 模型配置支持按渠道调用 `/models` 获取可用模型，并在渠道编辑器中以多选方式写回 `LLM_{CHANNEL}_MODELS`，获取失败时仍保留手动输入作为降级路径。
+- [新功能] Journal 新增零写模式观察聚合 `GET /api/v1/journal/v2/review-insights`（Playbook 合同切片 C-1）：按最新复盘标注的标签/错误类型 × 方向 × 边界口径分桶；胜率/均值等比率仅在 ≥10 笔且 ≥5 个独立交易日的已验证 P&L 样本上显示，条件性 P&L（假设平仓/左截断/组费影响）单独计数且永不进入统计，未标注回合只汇总为单一未复盘计数。
+- [新功能] Journal“仓位复盘”页新增「模式观察」面板：展示分桶计数、样本不足与条件性 P&L 的 fail-closed 文案，并注明“观察到的模式 ≠ 已验证规则；晋升到 Playbook 需要显式操作（后续切片）”。
+- [改进] Episode P&L 可统计口径（`pnl_summary_eligible` 排除原因）收敛为仓储层单一实现 `position_episode_pnl_exclusion_reasons`，API 投影与模式观察聚合共用同一定义，避免口径漂移。
+- [测试] 新增 review-insights 仓储与 API 合同回归：分桶键不混轨、10 笔/5 交易日阈值边界、条件性 P&L 超阈值仍被排除、latest-revision 聚合、未复盘/未构建空态与零写断言；Web 端补「模式观察」面板计数/统计/条件标注/空态渲染测试。
+- [文档] `New-docs/phase1/13_PLAYBOOK_PROMOTION_CONTRACT.md` 切片 C-1 标记为已实现并补实现锚点；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` 同步 C-1 状态。
 
 ## [3.11.0] - 2026-03-27
 

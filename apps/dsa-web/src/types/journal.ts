@@ -645,6 +645,57 @@ export interface SavePositionEpisodeReviewAnnotationResponse {
   annotation: PositionEpisodeReviewAnnotation;
 }
 
+/** Slice C-1: zero-write pattern observation over the default build. */
+export interface ReviewInsightStats {
+  winRate: string;
+  avgPnl: string;
+  sumPnl: string;
+  winCount: number;
+  lossCount: number;
+  breakevenCount: number;
+}
+
+export interface ReviewInsightStatsGate {
+  eligible: boolean;
+  reason?: 'below_sample_threshold' | 'no_verified_pnl_episodes' | null;
+}
+
+export interface ReviewInsightBucket {
+  groupKind: 'tag' | 'error_type';
+  groupValue: string;
+  direction: string;
+  boundaryPolicy: 'verified' | 'assumed_or_censored';
+  episodeCount: number;
+  distinctTradingDayCount: number;
+  reviewCompletedCount: number;
+  verifiedEpisodeCount: number;
+  verifiedDistinctTradingDayCount: number;
+  conditionalEpisodeCount: number;
+  stats?: ReviewInsightStats | null;
+  statsGate: ReviewInsightStatsGate;
+}
+
+export interface ReviewInsightsResponse {
+  schemaVersion: 'journal-review-insights/1.0' | string;
+  dataState: 'not_built' | 'ready' | string;
+  buildId?: number | null;
+  buildKey?: string | null;
+  sourceKind?: string | null;
+  accountKey: string;
+  generatedAt?: string | null;
+  thresholds: {
+    minEpisodeCount: number;
+    minDistinctTradingDayCount: number;
+  };
+  totalEpisodeCount: number;
+  annotatedEpisodeCount: number;
+  unreviewed?: {
+    episodeCount: number;
+    distinctTradingDayCount: number;
+  } | null;
+  buckets: ReviewInsightBucket[];
+}
+
 export interface PositionEpisodeAiReviewResponse {
   dataState: 'ready' | string;
   analysisMode: 'model_enhanced' | 'deterministic';

@@ -43,6 +43,13 @@ from src.journal.ledger.episode_repository import (
     preview_canonical_position_episodes,
     preview_latest_position_episodes,
 )
+from src.journal.ledger.review_insights import (
+    ReviewInsightBucket,
+    ReviewInsightStats,
+    ReviewInsightsResult,
+    ReviewInsightsUnreviewed,
+    get_latest_review_insights,
+)
 from src.journal.ledger.review_repository import (
     ReviewAnnotationAppendResult,
     ReviewAnnotationInput,
@@ -83,6 +90,10 @@ __all__ = [
     "ReviewAnnotationInput",
     "ReviewAnnotationRepositoryError",
     "ReviewAnnotationScopeNotFoundError",
+    "ReviewInsightBucket",
+    "ReviewInsightStats",
+    "ReviewInsightsResult",
+    "ReviewInsightsUnreviewed",
     "StoredReviewAnnotation",
     "activate_episode_build",
     "append_canonical_position_episode_build",
@@ -99,5 +110,6 @@ __all__ = [
     "preview_latest_position_episodes",
     "append_review_annotation",
     "get_latest_review_annotation",
+    "get_latest_review_insights",
     "list_review_annotation_history",
 ]

@@ -121,6 +121,7 @@ from src.journal.ledger.episode_repository import (
     get_latest_position_episode_page,
     get_position_episode_detail,
     get_position_episode_page,
+    position_episode_pnl_exclusion_reasons,
     preview_canonical_position_episodes,
     preview_latest_position_episodes,
 )
@@ -559,25 +560,11 @@ def _episode_exclusion_reasons(
     item: PositionEpisodeListItem,
     opening_boundary_policy: str,
 ) -> list[str]:
-    reasons: list[str] = []
-    if not item.left_boundary_verified:
-        reasons.append("boundary_unverified")
-        if opening_boundary_policy in {
-            "assumed_flat_unverified",
-            "mixed_explicit_and_assumed",
-        }:
-            reasons.append("assumed_flat_unverified")
-    if item.lifecycle_status != "closed":
-        reasons.append("open")
-    if item.is_left_censored:
-        reasons.append("left_censored")
-    if item.completeness_status not in {"exact", "complete"}:
-        reasons.append("incomplete")
-    if item.realized_pnl_net is None:
-        reasons.append("pnl_unavailable")
-    if getattr(item, "group_fee_unallocated", False):
-        reasons.append("group_fee_unallocated")
-    return reasons
+    # Single source of truth in the repository so the review-insights
+    # aggregation and this projection can never disagree on eligibility.
+    return list(
+        position_episode_pnl_exclusion_reasons(item, opening_boundary_policy)
+    )
 
 
 def _position_episode_item(

@@ -96,3 +96,70 @@ class ReviewAnnotationCreateResponse(BaseModel):
     created: bool
     idempotent_replay: bool
     annotation: ReviewAnnotationItem
+
+
+# --- review insights (slice C-1, zero-write L1 aggregation) ------------------
+
+
+class ReviewInsightStatsModel(BaseModel):
+    """Ratios over verified-P&L members only; absent below the gate."""
+
+    win_rate: str
+    avg_pnl: str
+    sum_pnl: str
+    win_count: int = Field(ge=0)
+    loss_count: int = Field(ge=0)
+    breakeven_count: int = Field(ge=0)
+
+
+class ReviewInsightStatsGate(BaseModel):
+    eligible: bool
+    reason: Optional[
+        Literal["below_sample_threshold", "no_verified_pnl_episodes"]
+    ] = None
+
+
+class ReviewInsightBucketModel(BaseModel):
+    """One observed-pattern bucket; direction and boundary never mix."""
+
+    group_kind: Literal["tag", "error_type"]
+    group_value: str
+    direction: str
+    boundary_policy: Literal["verified", "assumed_or_censored"]
+    episode_count: int = Field(ge=0)
+    distinct_trading_day_count: int = Field(ge=0)
+    review_completed_count: int = Field(ge=0)
+    verified_episode_count: int = Field(ge=0)
+    verified_distinct_trading_day_count: int = Field(ge=0)
+    conditional_episode_count: int = Field(ge=0)
+    stats: Optional[ReviewInsightStatsModel] = None
+    stats_gate: ReviewInsightStatsGate
+
+
+class ReviewInsightThresholds(BaseModel):
+    min_episode_count: int = Field(ge=1)
+    min_distinct_trading_day_count: int = Field(ge=1)
+
+
+class ReviewInsightUnreviewed(BaseModel):
+    """Episodes without any annotation: counts only, never any stats."""
+
+    episode_count: int = Field(ge=0)
+    distinct_trading_day_count: int = Field(ge=0)
+
+
+class ReviewInsightsResponse(BaseModel):
+    schema_version: Literal["journal-review-insights/1.0"] = (
+        "journal-review-insights/1.0"
+    )
+    data_state: Literal["not_built", "ready"]
+    build_id: Optional[int] = None
+    build_key: Optional[str] = None
+    source_kind: Optional[str] = None
+    account_key: str
+    generated_at: Optional[datetime] = None
+    thresholds: ReviewInsightThresholds
+    total_episode_count: int = Field(ge=0)
+    annotated_episode_count: int = Field(ge=0)
+    unreviewed: Optional[ReviewInsightUnreviewed] = None
+    buckets: list[ReviewInsightBucketModel] = Field(default_factory=list)

@@ -1,6 +1,6 @@
 # 个人 Playbook 晋升链路合同（阶段 C · 设计冻结稿）
 
-> 状态：设计合同（2026-08-01）；实现未开始
+> 状态：设计合同（2026-08-01）；切片 C-1 已实现（2026-08-01），C-2 / C-3 未开始
 >
 > 真源顺序：可执行代码 > 本合同 > HANDOFF §16 阶段 C 概述
 >
@@ -42,11 +42,41 @@
 
 ## 3. 最小实现切片
 
-| 切片 | 内容 | 写面 |
-|---|---|---|
-| C-1 | L1 聚合端点 `GET /journal/v2/review-insights`（按 tag/setup 分组，门槛 fail-closed）+ 复盘页「模式观察」面板 | 零写 |
-| C-2 | L2/L3 表 + append-only 仓储 + 晋升/退役端点 + Playbook 页面 | 新增 2 张 append-only 表 |
-| C-3 | 单笔复盘页反向链接（该 episode 命中的 rule/candidate） | 零写 |
+| 切片 | 内容 | 写面 | 状态 |
+|---|---|---|---|
+| C-1 | L1 聚合端点 `GET /journal/v2/review-insights`（按 tag/setup 分组，门槛 fail-closed）+ 复盘页「模式观察」面板 | 零写 | 已实现 |
+| C-2 | L2/L3 表 + append-only 仓储 + 晋升/退役端点 + Playbook 页面 | 新增 2 张 append-only 表 | 未开始 |
+| C-3 | 单笔复盘页反向链接（该 episode 命中的 rule/candidate） | 零写 | 未开始 |
+
+### C-1 实现锚点（2026-08-01）
+
+- 聚合仓储：`src/journal/ledger/review_insights.py`
+  `get_latest_review_insights()`——单一只读会话内解析默认构建（activation 优先、
+  CSV fallback），复用 review 队列的 latest-revision-per-episode 子查询把回合
+  与最新标注 join 后按 `{group_kind ∈ tag|error_type, group_value, direction
+  (LONG/SHORT), boundary_policy ∈ verified|assumed_or_censored}` 分桶；纯
+  SELECT，不落任何新表。
+- 口径统一：`position_episode_pnl_exclusion_reasons()`
+  （`src/journal/ledger/episode_repository.py`）是 verified/conditional P&L 的
+  唯一定义，API 投影（`pnl_summary_eligible`）与聚合共用；条件性成员单独计
+  入 `conditional_episode_count`，超过阈值也不进入 stats。
+- 门槛 fail-closed：verified 样本 `≥10 笔且 ≥5 个独立 ET 交易日` 才返回
+  `stats`（win_rate/avg_pnl/sum_pnl/胜负计数）；否则仅计数并返回机器可读
+  `stats_gate.reason ∈ below_sample_threshold | no_verified_pnl_episodes`。
+  无任何标注的回合只汇总为单一 `unreviewed` 计数，永不出现盈亏统计。
+- 端点：`GET /api/v1/journal/v2/review-insights`
+  （`api/v1/endpoints/journal_reviews.py`；schema
+  `journal-review-insights/1.0`，含 build_id/build_key/source_kind、
+  generated_at、thresholds 回显、按成员数降序的 buckets，见
+  `api/v1/schemas/journal_reviews.py`）。
+- 页面：`apps/dsa-web/src/components/journal/ReviewInsightsPanel.tsx`
+  （「模式观察」面板，挂载于 `/journal` 仓位复盘 tab，`fetchReviewInsights`
+  见 `apps/dsa-web/src/api/journal.ts`），含「样本不足仅显示计数」「条件性
+  P&L 不参与统计」与「观察到的模式 ≠ 已验证规则」文案。
+- 回归：`src/journal/tests/test_review_insights.py`（分桶不混轨、10/5 阈值边
+  界、条件排除、latest-revision、零写断言）、
+  `api/v1/tests/test_journal_reviews_endpoint.py`（合同 + not_built 空态）、
+  `apps/dsa-web/src/components/journal/__tests__/ReviewInsightsPanel.test.tsx`。
 
 ## 4. 验收（对照 HANDOFF §16 阶段 C）
 
