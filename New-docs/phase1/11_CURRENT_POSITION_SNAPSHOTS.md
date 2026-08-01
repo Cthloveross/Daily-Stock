@@ -89,7 +89,7 @@ Preview 保存短期、server-owned artifact；浏览器只拿到规范化持仓
 
 ## 5. 页面口径
 
-“仓位复盘”页把三类信息分开：
+快照卡片自 G-3（2026-08-01）起挂在「数据与构建」tab 的「当前持仓快照与未来构建」分组（此前位于“仓位复盘”页顶部）；Journal 页面仍把三类信息分开：
 
 1. Episode 的历史成交证据窗口；
 2. 由该窗口内成交重放得到的“证据窗口末数量”；
@@ -128,7 +128,7 @@ anchor 与 target canonical set 都通过 Episode builder 共用的 frozen repla
 - snapshot 成员与后续 OCC semantic identity / contract multiplier 兼容，不因 strike 是否使用 8 位零填充而误判；
 - fence key 的 `position-snapshot-continuity-fence/1.1` 合同冻结 snapshot、publication chain、canonical ID/hash/source cutoff、时间 policy 与全部门禁计数；即使同步重算合法 canonical set key，cutoff 漂移也必须产生新的 fence。
 
-页面只展示必要状态、下一步和可折叠阻断依据：没有 snapshot 时提示完成当前持仓确认；已有 snapshot 但没有后续发布时提示下一完整交易日后确认交易证据刷新；存在竞争成交、跨界经济单元、来源缺口或身份冲突时保持 `blocked`；证据充分时显示“连续性已证明”，同时明确“尚未生成或激活 Episode”。
+页面只展示必要状态、下一步和可折叠阻断依据：没有 snapshot 时提示完成当前持仓确认；已有 snapshot 但没有后续发布时提示下一完整交易日后在「每日刷新」确认一次只读刷新；存在竞争成交、跨界经济单元、来源缺口或身份冲突时保持 `blocked`；证据充分时显示“连续性已证明”，同时明确“尚未生成或激活 Episode”。
 
 即便未来用非零 snapshot 验证了新窗口的期初数量，先于该 snapshot 的开仓成本、费用和现金流仍未知；相关生命周期继续是 left-censored，不能补造历史已实现收益。
 
@@ -182,7 +182,7 @@ trading_action_performed=false
 
 仍需完成：
 
-- 在交易证据页正式确认一笔 account-bound refresh publication 后，走通生产库 snapshot preview / confirm；
+- 在「数据与构建」的「每日刷新」正式确认一笔 account-bound refresh publication 后，走通生产库 snapshot preview / confirm；
 - 真实完整空仓、多账户歧义、持仓在双采样之间变化、OpenD 离线和合约规格权限缺失验收；
 - 在生产库形成“refresh A → snapshot → refresh B”后，以真实成交验证 continuity fence 的 `ready / blocked` 分类；
 - 在真实 `ready` fence 上验收零写 Episode 预览的计数、费用守恒、延迟和页面身份失效保护；

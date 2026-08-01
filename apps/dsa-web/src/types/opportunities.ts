@@ -551,3 +551,53 @@ export interface OpportunityLearningSummaryResponse {
   horizons: OpportunityLearningHorizon[];
   limitations: string[];
 }
+
+export type IntradaySessionState = 'premarket' | 'regular' | 'afterhours' | 'closed';
+
+export type IntradayTrackingItemState =
+  | 'ready'
+  | 'partial'
+  | 'not_configured'
+  | 'unavailable';
+
+/** 盘中跟踪单标的行：只对照冻结盘前计划，缺失字段显式标缺，不含买卖信号。 */
+export interface IntradayTrackingItem {
+  ticker: string;
+  state: IntradayTrackingItemState;
+  source: string;
+  fetchedAt: string;
+  quoteAsOf: string | null;
+  lastPrice: number | null;
+  sessionOpen: number | null;
+  sessionHigh: number | null;
+  sessionLow: number | null;
+  prevClose: number | null;
+  sessionVolume: number | null;
+  sessionTurnover: number | null;
+  vwap: number | null;
+  vwapBasis: 'session_turnover_over_volume';
+  vwapUnavailableReason: string | null;
+  atr14: number | null;
+  atr14Method: 'wilder_smoothing_14_daily_completed_bars';
+  atr14BarCount: number;
+  atr14LastBarDate: string | null;
+  atr14Source: string | null;
+  atr14UnavailableReason: string | null;
+  volumePaceRatio: number | null;
+  volumePaceBasis: 'session_cumulative_vs_prior_20_session_full_day_median';
+  prior20dMedianVolume: number | null;
+  volumePaceUnavailableReason: string | null;
+  message: string;
+  limitations: string[];
+}
+
+export interface IntradayTrackingResponse {
+  schemaVersion: string;
+  generatedAt: string;
+  marketDateEt: string;
+  sessionState: IntradaySessionState;
+  sessionStateBasis: 'america_new_york_clock_v1';
+  trackingBasis: 'frozen_premarket_plan_readonly';
+  items: IntradayTrackingItem[];
+  limitations: string[];
+}

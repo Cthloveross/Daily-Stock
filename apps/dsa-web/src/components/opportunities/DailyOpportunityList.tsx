@@ -33,6 +33,7 @@ import type {
   PremarketCycleState,
 } from '../../types/opportunities';
 import { Button, EmptyState } from '../ui';
+import { IntradayTrackingPanel } from './IntradayTrackingPanel';
 import { WallLevelExpiryBreakdown } from './WallLevelExpiryBreakdown';
 import { parseApiTimestamp } from '../../utils/marketTime';
 
@@ -3019,6 +3020,8 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
               />
             )}
           </div>
+
+          <IntradayTrackingPanel candidates={primaryCandidates} />
         </div>
       )}
     </section>

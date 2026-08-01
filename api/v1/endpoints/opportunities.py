@@ -26,6 +26,8 @@ from sqlalchemy import select
 from api.v1.schemas.opportunities import (
     DailyOpportunityRequest,
     DailyOpportunityResponse,
+    IntradayTrackingRequest,
+    IntradayTrackingResponse,
     OpportunityLearningSummaryResponse,
     OpportunitySnapshotDetailResponse,
     OpportunitySnapshotEnsureResponse,
@@ -50,8 +52,21 @@ from src.opportunities.engine import (
     SIGNAL_VERSION,
     DailyHistoryInput,
     build_daily_opportunity_run,
+    completed_daily_bars,
     is_supported_us_option_underlying,
     normalize_symbols,
+)
+from src.opportunities.intraday import (
+    ATR14_METHOD,
+    INTRADAY_TRACKING_VERSION,
+    SESSION_STATE_BASIS,
+    VOLUME_PACE_BASIS,
+    VWAP_BASIS_SESSION_TURNOVER_OVER_VOLUME,
+    compute_atr14,
+    compute_prior_full_day_median_volume,
+    compute_session_vwap,
+    compute_volume_pace,
+    market_session_state,
 )
 from src.opportunities.option_walls import (
     ATM_CALL_IV_METHOD as OPTION_WALL_ATM_CALL_IV_METHOD,
@@ -97,6 +112,21 @@ _OPTION_WALL_LIMITATIONS = (
 _OPTION_WALL_ASSUMPTIONS = (
     "Gamma concentration = abs(gamma) × OI × contract size × spot² × 1%。",
     "不从公开 OI 推断 dealer 净多或净空 Gamma。",
+)
+_INTRADAY_TRACKING_SOURCE = "moomoo_openapi"
+_INTRADAY_TRACKING_SCHEMA = "intraday-tracking/1.0"
+# Completed daily bars only change once per session; memoise the derived
+# ATR14 / 20-session median inputs so a 60s polling panel does not re-run the
+# daily-history providers on every tick.  Live quote fields are never cached
+# here — they go through the shared 30s scan cache only.
+_INTRADAY_DAILY_CACHE_TTL_SECONDS = 900.0
+_INTRADAY_DAILY_CACHE_MAX_ENTRIES = 64
+_INTRADAY_TRACKING_LIMITATIONS = (
+    "盘中跟踪只对照已冻结的盘前计划，不重新排序，不生成买卖信号。",
+    "VWAP 为当日累计成交额 ÷ 累计成交量的近似值，不是逐笔加权的官方 VWAP。",
+    "量能节奏对比 20 个交易日的全日成交量中位数，未按盘中时点折算；开盘初段比值偏低属正常。",
+    "ATR14 基于已完成日线的 Wilder 平滑，不包含当日未完成 K 线。",
+    "盘段状态由 America/New_York 时钟判断，未接入交易所假日日历。",
 )
 _OPTION_EVENT_LIMITATIONS = (
     "仅返回 Moomoo get_option_event 为该标的识别的最近一页异动成交，不是完整逐笔期权流。",
@@ -156,6 +186,7 @@ _scan_cache_lock = threading.RLock()
 _scan_cache: dict[tuple[Any, ...], _ScanCacheEntry] = {}
 _scan_flights: dict[tuple[Any, ...], _ScanFlight] = {}
 _scan_flight_generation = 0
+_intraday_daily_cache: dict[tuple[str, str], _ScanCacheEntry] = {}
 
 
 def _cache_now() -> float:
@@ -245,6 +276,7 @@ def _reset_scan_cache_for_tests() -> None:
 
     with _scan_cache_lock:
         _scan_cache.clear()
+        _intraday_daily_cache.clear()
         for flight in _scan_flights.values():
             if flight.error is None:
                 flight.error = OpportunityScanTimeoutError(
@@ -1274,6 +1306,267 @@ def _execute_option_events(
     }
 
 
+def _fetch_underlying_session_quotes(symbols: list[str]):
+    """Read live session quotes through the Quote-only Moomoo adapter."""
+
+    from data_provider.moomoo_options import (
+        fetch_underlying_session_quotes_moomoo,
+    )
+
+    return fetch_underlying_session_quotes_moomoo(symbols)
+
+
+def _intraday_now() -> datetime:
+    """Wall clock for the intraday panel; isolated so tests can pin it."""
+
+    return datetime.now(timezone.utc)
+
+
+def _prune_intraday_daily_cache(now: float) -> None:
+    expired = [
+        key
+        for key, entry in _intraday_daily_cache.items()
+        if entry.expires_at <= now
+    ]
+    for key in expired:
+        _intraday_daily_cache.pop(key, None)
+    while len(_intraday_daily_cache) >= _INTRADAY_DAILY_CACHE_MAX_ENTRIES:
+        oldest = min(
+            _intraday_daily_cache,
+            key=lambda item: _intraday_daily_cache[item].expires_at,
+        )
+        _intraday_daily_cache.pop(oldest, None)
+
+
+def _intraday_daily_inputs(
+    symbols: list[str],
+    *,
+    as_of: datetime,
+    market_date_et: str,
+) -> dict[str, dict[str, Any]]:
+    """Per-symbol ATR14 + 20-session median volume from completed daily bars.
+
+    Uses the same shared daily-history loader as the daily board.  Complete
+    derivations are memoised per (symbol, ET market date): completed bars only
+    change once per session, so a 60s polling panel must not re-run the daily
+    providers on every tick.  Failed or short derivations are never memoised —
+    they retry on the next (30s-cached) request instead of freezing a failure.
+    """
+
+    now = _cache_now()
+    results: dict[str, dict[str, Any]] = {}
+    missing: list[str] = []
+    with _scan_cache_lock:
+        _prune_intraday_daily_cache(now)
+        for symbol in symbols:
+            entry = _intraday_daily_cache.get((symbol, market_date_et))
+            if entry is not None and entry.expires_at > now:
+                results[symbol] = copy.deepcopy(entry.result)
+            else:
+                missing.append(symbol)
+    if not missing:
+        return results
+
+    manager = None
+    try:
+        manager = _create_data_fetcher_manager()
+    except Exception as exc:  # noqa: BLE001 - loader machinery must not 500 the panel
+        logger.info(
+            "[opportunities] intraday daily manager unavailable error_type=%s",
+            type(exc).__name__,
+        )
+    try:
+        histories = _load_histories_gracefully(missing, as_of=as_of, manager=manager)
+    finally:
+        if manager is not None:
+            try:
+                manager.close()
+            except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+                logger.debug(
+                    "[opportunities] intraday manager close failed error_type=%s",
+                    type(exc).__name__,
+                )
+
+    completion_time = _cache_now()
+    for symbol in missing:
+        history = histories.get(
+            symbol, DailyHistoryInput(bars=(), error="loader result missing")
+        )
+        bars = completed_daily_bars(history.bars, as_of=as_of)
+        atr = compute_atr14(bars)
+        median, median_reason = compute_prior_full_day_median_volume(bars)
+        atr_reason = atr.unavailable_reason
+        if not bars and history.error:
+            atr_reason = f"daily_history_unavailable:{history.error}"
+            median_reason = f"daily_history_unavailable:{history.error}"
+        payload = {
+            "atr14": atr.value,
+            "atr14_bar_count": atr.bar_count,
+            "atr14_last_bar_date": atr.last_bar_date,
+            "atr14_unavailable_reason": atr_reason,
+            "source": history.source,
+            "prior_20d_median_volume": median,
+            "median_unavailable_reason": median_reason,
+        }
+        results[symbol] = payload
+        if atr.value is not None and median is not None:
+            with _scan_cache_lock:
+                _prune_intraday_daily_cache(completion_time)
+                _intraday_daily_cache[(symbol, market_date_et)] = _ScanCacheEntry(
+                    expires_at=completion_time + _INTRADAY_DAILY_CACHE_TTL_SECONDS,
+                    result=copy.deepcopy(payload),
+                )
+    return results
+
+
+def _intraday_tracking_item(
+    ticker: str,
+    *,
+    enabled: bool,
+    quote: Any,
+    daily: dict[str, Any],
+    fetched_at: datetime,
+) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "ticker": ticker,
+        "source": _INTRADAY_TRACKING_SOURCE,
+        "fetched_at": fetched_at.isoformat(),
+        "quote_as_of": None,
+        "last_price": None,
+        "session_open": None,
+        "session_high": None,
+        "session_low": None,
+        "prev_close": None,
+        "session_volume": None,
+        "session_turnover": None,
+        "vwap": None,
+        "vwap_basis": VWAP_BASIS_SESSION_TURNOVER_OVER_VOLUME,
+        "vwap_unavailable_reason": None,
+        "atr14": daily.get("atr14"),
+        "atr14_method": ATR14_METHOD,
+        "atr14_bar_count": int(daily.get("atr14_bar_count") or 0),
+        "atr14_last_bar_date": daily.get("atr14_last_bar_date"),
+        "atr14_source": daily.get("source"),
+        "atr14_unavailable_reason": daily.get("atr14_unavailable_reason"),
+        "volume_pace_ratio": None,
+        "volume_pace_basis": VOLUME_PACE_BASIS,
+        "prior_20d_median_volume": daily.get("prior_20d_median_volume"),
+        "volume_pace_unavailable_reason": None,
+        "limitations": list(_INTRADAY_TRACKING_LIMITATIONS),
+    }
+    if not enabled:
+        item.update(
+            state="not_configured",
+            vwap_unavailable_reason="moomoo_not_configured",
+            volume_pace_unavailable_reason="moomoo_not_configured",
+            message=(
+                "MOOMOO_OPEND_ENABLED 未启用；未读取实时快照，"
+                "仅保留已完成日线派生的 ATR14 与量能基准。"
+            ),
+        )
+        return item
+    if quote is None:
+        item.update(
+            state="unavailable",
+            vwap_unavailable_reason="quote_unavailable",
+            volume_pace_unavailable_reason="quote_unavailable",
+            message="Moomoo 未返回该标的的实时快照；未以 0 或旧值冒充实时行情。",
+        )
+        return item
+
+    quote_fetched_at = getattr(quote, "fetched_at", None)
+    vwap = compute_session_vwap(
+        getattr(quote, "turnover", None),
+        getattr(quote, "volume", None),
+    )
+    pace = compute_volume_pace(
+        getattr(quote, "volume", None),
+        daily.get("prior_20d_median_volume"),
+        median_unavailable_reason=daily.get("median_unavailable_reason"),
+    )
+    item.update(
+        fetched_at=(
+            quote_fetched_at.isoformat()
+            if isinstance(quote_fetched_at, datetime)
+            else fetched_at.isoformat()
+        ),
+        quote_as_of=getattr(quote, "update_time", None),
+        last_price=getattr(quote, "last_price", None),
+        session_open=getattr(quote, "open_price", None),
+        session_high=getattr(quote, "high_price", None),
+        session_low=getattr(quote, "low_price", None),
+        prev_close=getattr(quote, "prev_close_price", None),
+        session_volume=getattr(quote, "volume", None),
+        session_turnover=getattr(quote, "turnover", None),
+        vwap=vwap.value,
+        vwap_unavailable_reason=vwap.unavailable_reason,
+        volume_pace_ratio=pace.ratio,
+        volume_pace_unavailable_reason=pace.unavailable_reason,
+    )
+    if pace.prior_median_volume is not None:
+        item["prior_20d_median_volume"] = pace.prior_median_volume
+    if item["last_price"] is None:
+        item.update(
+            state="unavailable",
+            message="Moomoo 快照缺少有效现价；该行不可用于对照冻结计划。",
+        )
+        return item
+    complete = (
+        vwap.value is not None
+        and pace.ratio is not None
+        and item["atr14"] is not None
+    )
+    item["state"] = "ready" if complete else "partial"
+    item["message"] = (
+        "实时行情、VWAP 近似、量能节奏与 ATR14 已就绪；仅对照冻结盘前计划。"
+        if complete
+        else "现价可用，但部分指标标缺；缺失字段附带明确 reason，未估算回填。"
+    )
+    return item
+
+
+def _execute_intraday_tracking(
+    symbols: list[str], *, enabled: bool
+) -> dict[str, Any]:
+    requested_at = _intraday_now()
+    market_date_et = requested_at.astimezone(_NEW_YORK).date().isoformat()
+    session_state = market_session_state(requested_at)
+    daily_inputs = _intraday_daily_inputs(
+        symbols,
+        as_of=requested_at,
+        market_date_et=market_date_et,
+    )
+    quotes: dict[str, Any] = {}
+    if enabled:
+        try:
+            quotes = _fetch_underlying_session_quotes(symbols) or {}
+        except Exception as exc:  # noqa: BLE001 - fail the batch closed per symbol
+            logger.debug(
+                "[opportunities] intraday session quotes unavailable: %s", exc
+            )
+            quotes = {}
+    items = [
+        _intraday_tracking_item(
+            symbol,
+            enabled=enabled,
+            quote=quotes.get(symbol),
+            daily=daily_inputs.get(symbol) or {},
+            fetched_at=requested_at,
+        )
+        for symbol in symbols
+    ]
+    return {
+        "schema_version": _INTRADAY_TRACKING_SCHEMA,
+        "generated_at": requested_at.isoformat(),
+        "market_date_et": market_date_et,
+        "session_state": session_state,
+        "session_state_basis": SESSION_STATE_BASIS,
+        "tracking_basis": "frozen_premarket_plan_readonly",
+        "items": items,
+        "limitations": list(_INTRADAY_TRACKING_LIMITATIONS),
+    }
+
+
 @router.post("/daily", response_model=DailyOpportunityResponse)
 def daily_opportunities(payload: DailyOpportunityRequest) -> DailyOpportunityResponse:
     """Return an evidence-first daily research list with no opaque total score."""
@@ -1792,3 +2085,34 @@ def option_events(payload: OptionEventRequest) -> OptionEventResponse:
         limit_per_symbol=payload.limit_per_symbol,
     )
     return OptionEventResponse.model_validate(result)
+
+
+@router.post("/intraday-tracking", response_model=IntradayTrackingResponse)
+def intraday_tracking(payload: IntradayTrackingRequest) -> IntradayTrackingResponse:
+    """Track the live session against the frozen premarket plan, read-only.
+
+    冻结的盘前 Top 5 是唯一对照基准：本接口不重新排序、不生成买卖信号。
+    实时字段来自 Moomoo Quote-only 快照；VWAP 是当日累计成交额/成交量近似；
+    ATR14 与量能中位数来自与每日榜相同的已完成日线加载器。Moomoo 未启用或
+    不可用时逐标的显式 not_configured/unavailable，绝不以 0 冒充实时数据。
+    """
+
+    enabled = _moomoo_opend_enabled()
+    requested_at = _intraday_now()
+    market_date_et = requested_at.astimezone(_NEW_YORK).date().isoformat()
+    key = (
+        "intraday_tracking",
+        INTRADAY_TRACKING_VERSION,
+        enabled,
+        tuple(payload.symbols),
+        market_date_et,
+    )
+    try:
+        result = _get_or_compute_scan(
+            key,
+            lambda: _execute_intraday_tracking(payload.symbols, enabled=enabled),
+            bypass_cache=payload.refresh,
+        )
+    except OpportunityScanTimeoutError as exc:
+        raise _scan_timeout_response(exc) from exc
+    return IntradayTrackingResponse.model_validate(result)

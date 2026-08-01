@@ -101,23 +101,31 @@ test.describe('web smoke (isolated empty-DB backend)', () => {
     await expect(dialog.locator('li', { hasText: '结果回填维护' })).toContainText('未启用');
   });
 
-  test('journal positions and import tabs render empty states without unexpected errors', async ({ page }) => {
+  test('journal review workspace and data tab render empty states without unexpected errors', async ({ page }) => {
     const captured = captureErrors(page);
 
     await page.goto('/journal?tab=positions');
     await expect(page.getByText('期权交易复盘')).toBeVisible({ timeout: 15_000 });
     await expect(page.getByRole('button', { name: '仓位复盘' })).toBeVisible();
-    await expect(page.getByRole('button', { name: '交易证据' })).toBeVisible();
-    // 当前仓位快照能力未启用时必须 fail-closed，而不是伪装成空仓。
-    await expect(page.getByText('当前仓位快照功能未启用')).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByRole('button', { name: '数据与构建', exact: true })).toBeVisible();
+    // G-3 IA：仓位复盘只保留复盘工作台；数据管线全部移到「数据与构建」。
+    await expect(page.getByRole('heading', { name: '复盘工作台' })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByRole('button', { name: '继续复盘下一笔' })).toBeVisible();
+    await expect(page.getByText('当前仓位快照功能未启用')).toHaveCount(0);
 
     await page.goto('/journal?tab=import');
+    await expect(page.getByRole('heading', { name: '每日刷新' })).toBeVisible({ timeout: 15_000 });
     await expect(page.getByText('OpenD 只读刷新', { exact: true }).first()).toBeVisible({ timeout: 15_000 });
     // MOOMOO_JOURNAL_REFRESH_ENABLED=false 的诚实降级文案 + 手动导入兜底仍在。
     await expect(
       page.getByText('服务器尚未启用 Journal 只读刷新；仍可在下方使用手动文件导入。'),
     ).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByRole('heading', { name: '历史导入' })).toBeVisible();
     await expect(page.getByText('高级 / 首次导入：CSV 账单或只读 JSON')).toBeVisible();
+    // 快照/未来构建与构建管理已迁入本 tab，且快照能力未启用时仍 fail-closed。
+    await expect(page.getByRole('heading', { name: '当前持仓快照与未来构建' })).toBeVisible();
+    await expect(page.getByText('当前仓位快照功能未启用')).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByRole('heading', { name: '构建与默认视图管理' })).toBeVisible();
 
     expect(captured.pageErrors).toEqual([]);
     expect(unexpectedConsoleErrors(captured)).toEqual([]);

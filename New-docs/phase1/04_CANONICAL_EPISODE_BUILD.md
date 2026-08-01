@@ -88,7 +88,7 @@ Canonical 投影因此不传递 aggregate order 的 submitted amount。对于只
 | `GET` | `/api/v1/journal/v2/episode-builds/activation` | 读取当前默认版本、选择来源与上一 activation；没有 activation 时显示 CSV fallback |
 | `POST` | `/api/v1/journal/v2/episode-builds/{build_id}/activate` | 以预期 build key 和当前 activation/build ID 做 compare-and-swap，显式切换默认复盘版本 |
 
-“仓位复盘”顶部的“可信事实集构建预览”会显示事实集、执行事件、计划回合、费用守恒以及相对默认构建的差异，并明确提示“不会替换当前默认视图”。需要期初为空假设时，构建和激活各自要求独立确认。构建完成后可以先“查看这个构建”；只有点击“启用为当前复盘”并通过 stale-state 校验，列表和详情的默认读取才会切换。
+G-3（2026-08-01）起，“可信事实集构建预览”挂在「数据与构建」tab 的「构建与默认视图管理」分组（此前位于“仓位复盘”顶部），会显示事实集、执行事件、计划回合、费用守恒以及相对默认构建的差异，并明确提示“不会替换当前默认视图”。需要期初为空假设时，构建和激活各自要求独立确认。构建完成后可以先“查看这个构建”；只有点击“启用为当前复盘”并通过 stale-state 校验，列表和详情的默认读取才会切换。
 
 Preview 可能初始化缺失的本地 schema/append-only trigger，但不会追加 canonical、Episode、allocation 或 source-binding 事实行。`confirm_allowed=true` 还要求 canonical set 可分析、无未解决证据且费用守恒。
 

@@ -767,3 +767,84 @@ class OptionEventResponse(BaseModel):
     generated_at: str
     market_date_et: str
     items: list[OptionEventItem] = Field(default_factory=list)
+
+
+class IntradayTrackingRequest(BaseModel):
+    symbols: list[str] = Field(
+        min_length=1,
+        max_length=5,
+        description=(
+            "冻结盘前计划中的 Top 5 美股期权 underlying；US. 前缀会被规范化移除。"
+        ),
+    )
+    refresh: bool = Field(
+        False,
+        description="显式刷新时绕过服务端短 TTL；仍复用同 key 的在途请求。",
+    )
+
+    @field_validator("symbols")
+    @classmethod
+    def normalize_us_option_underlyings(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in value:
+            symbol = str(raw or "").strip().upper()
+            if symbol.startswith("US."):
+                symbol = symbol[3:]
+            if not _US_OPTION_UNDERLYING_PATTERN.fullmatch(symbol):
+                raise ValueError(f"unsupported US option underlying: {raw!r}")
+            if symbol not in seen:
+                normalized.append(symbol)
+                seen.add(symbol)
+        if not normalized:
+            raise ValueError("at least one US option underlying is required")
+        return normalized
+
+
+class IntradayTrackingItem(BaseModel):
+    """One symbol's live tracking row against the frozen premarket plan.
+
+    每个指标要么可追溯（值 + 口径标签），要么显式标缺（reason）；
+    绝不以 0 或旧值冒充实时数据。该行不包含任何买卖信号字段。
+    """
+
+    ticker: str
+    state: Literal["ready", "partial", "not_configured", "unavailable"]
+    source: str
+    fetched_at: str
+    quote_as_of: Optional[str] = None
+    last_price: Optional[float] = Field(default=None, gt=0)
+    session_open: Optional[float] = Field(default=None, gt=0)
+    session_high: Optional[float] = Field(default=None, gt=0)
+    session_low: Optional[float] = Field(default=None, gt=0)
+    prev_close: Optional[float] = Field(default=None, gt=0)
+    session_volume: Optional[int] = Field(default=None, ge=0)
+    session_turnover: Optional[float] = Field(default=None, ge=0)
+    vwap: Optional[float] = Field(default=None, gt=0)
+    vwap_basis: Literal["session_turnover_over_volume"]
+    vwap_unavailable_reason: Optional[str] = None
+    atr14: Optional[float] = Field(default=None, gt=0)
+    atr14_method: Literal["wilder_smoothing_14_daily_completed_bars"]
+    atr14_bar_count: int = Field(default=0, ge=0)
+    atr14_last_bar_date: Optional[str] = None
+    atr14_source: Optional[str] = None
+    atr14_unavailable_reason: Optional[str] = None
+    volume_pace_ratio: Optional[float] = Field(default=None, ge=0)
+    volume_pace_basis: Literal[
+        "session_cumulative_vs_prior_20_session_full_day_median"
+    ]
+    prior_20d_median_volume: Optional[float] = Field(default=None, ge=0)
+    volume_pace_unavailable_reason: Optional[str] = None
+    message: str
+    limitations: list[str] = Field(default_factory=list)
+
+
+class IntradayTrackingResponse(BaseModel):
+    schema_version: str
+    generated_at: str
+    market_date_et: str
+    session_state: Literal["premarket", "regular", "afterhours", "closed"]
+    session_state_basis: Literal["america_new_york_clock_v1"]
+    tracking_basis: Literal["frozen_premarket_plan_readonly"]
+    items: list[IntradayTrackingItem] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)

@@ -159,6 +159,22 @@ TradingView 面向个人网站账户没有公开的自选列表 REST API；其�
 
 5D/20D 区块是前瞻结果跟踪，不是今日候选筛选门禁。UI 用“已回填 / 等待目标日 / 已到目标日但缺行情”描述结果生命周期；`mature_count` 只表示目标窗口已经到达并保存了结果，不表示策略“成熟”，`pending_count` 也不表示交易机会“待观察”。没有任何统计入样时只显示“尚无可统计样本”，完整样本门槛与 cohort 口径放在折叠区。
 
+### 2.7 盘中跟踪（G-2 / G-4 首批指标）
+
+盘前计划一旦生成即视为冻结基准；「盘中跟踪」区块（`IntradayTrackingPanel`，位于机会看板下方）只把当日实时行情对照这份冻结计划，**不重新排序、不生成买卖信号、不改变盘前排名**，页头明示「跟踪冻结的盘前计划 · 不是信号 · 不改变盘前排名」并全程带数据时点。
+
+数据由 `POST /api/v1/opportunities/intraday-tracking`（最多 5 个美股期权 underlying）返回，实时字段复用与期权墙相同的 Moomoo `get_market_snapshot` Quote-only 机制；服务端 30 秒 TTL + single-flight 与兄弟接口一致，日线派生输入（ATR14、20 日量能中位）按 (symbol, ET market date) 另行 15 分钟记忆，避免 60 秒轮询反复触发日线数据源。每标的列：现价（as-of）、距确认位、距失效位、VWAP 上/下方、量能节奏、盘段状态。
+
+指标定义与诚实边界（G-4 首批，相对强度 vs SPY 后续交付）：
+
+- **确认/失效价**：直接取冻结候选结构化证据的同一数值锚点（`prior_20d_range_position` 的前 20 日高/低，退化时用 `ema8_ema13_alignment` 的 EMA13），不解析展示字符串；方向混合的候选没有单一触发价，显式标缺而不是猜测。
+- **ATR 标准化距离**：美元距离 ÷ ATR14；ATR14 用与每日榜相同的已完成日线加载器，Wilder 平滑（TR 取 max(H−L, |H−C₋₁|, |L−C₋₁|)，前 14 根 TR 简单均值做种子，其后 `ATR = (ATR₋₁×13 + TR)/14`），不含当日未完成 K 线。符号约定：距确认位 > 0 表示尚未触发，距失效位 > 0 表示仍有缓冲。
+- **VWAP**：当日累计成交额 ÷ 累计成交量的近似值（basis 标签 `session_turnover_over_volume`），不是逐笔加权官方 VWAP；两个输入缺一即显式标缺原因，绝不回填。
+- **量能节奏**：当日累计成交量 ÷ 前 20 个交易日**全日**成交量中位数（basis 标签明示 full-day median），**未按盘中时点折算**——开盘初段比值偏低属正常，这是 v1 的诚实口径而不是 bug。
+- **盘段状态**：premarket/regular/afterhours/closed 由 America/New_York 时钟判定（basis `america_new_york_clock_v1`），未接入交易所假日日历。
+
+刷新策略：手动刷新按钮 + 可选 60 秒自动刷新；自动刷新只在页面可见（`document.visibilityState`）且盘段为盘前/盘中时运行，其余情况彻底停表。Moomoo 未启用或快照缺失时逐标的显式 `not_configured` / `unavailable`，实时字段保持 null，从不显示伪造的 0。
+
 ## 3. 数据语义修正
 
 Moomoo 官方明确说明 [`get_option_chain`](https://openapi.moomoo.com/moomoo-api-doc/en/quote/get-option-chain.html) 只返回静态合约资料。动态 bid/ask、成交量、OI、IV 和 Greeks 必须用合约 code 再调用 [`get_market_snapshot`](https://openapi.moomoo.com/moomoo-api-doc/en/quote/get-market-snapshot.html)。当前适配器已改为分批（每批最多 400 个 code）合并快照；严格检查 `option_valid` 和有限数，缺任一必要动态字段就省略该合约，不再把静态行或缺失值伪装成全 0 实时行情。最近到期 ATM Call IV 仍先用静态链与 spot 锁定单一合约再读取快照；它不是 IV Rank/Percentile，也不代表异常期权大单或买卖方向。

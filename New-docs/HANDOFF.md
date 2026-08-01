@@ -521,8 +521,8 @@ Future preview 的关键边界：
 |---|---|
 | `/` | 重定向到 `/regime` |
 | `/login` | 登录入口；受保护路由会保留原 path/query 后跳转 |
-| `/journal?tab=positions` | 仓位复盘、canonical build、当前持仓与 future preview |
-| `/journal?tab=import` | 交易证据、每日刷新和高级 CSV/OpenAPI 导入 |
+| `/journal?tab=positions` | 复盘工作台（G-3）：「复盘工作台」头部条（默认构建标识 + Review Queue + 继续复盘下一笔）+ 回合列表/筛选 + 模式观察 + Playbook |
+| `/journal?tab=import` | 「数据与构建」（原「交易证据」，深链不变）：每日刷新、历史导入（CSV/OpenAPI）、当前持仓快照与 future preview、canonical 构建与默认视图（激活）管理 |
 | `/journal/review/:episodeId` | 单一 PositionEpisode 专业复盘 |
 | `/regime` | 官方盘前研究、Top 5、状态与学习面板 |
 | `/regime/opportunity/:ticker` | 单票机会详情 |
@@ -548,14 +548,14 @@ Future preview 的关键边界：
 
 盘后：
 
-1. 打开 `/journal?tab=import`；
-2. 点击“检查上一完整交易日”；
+1. 打开 `/journal?tab=import`（「数据与构建」，G-3 起集中全部数据管线）；
+2. 在「每日刷新」点击“检查上一完整交易日”；
 3. 查看 overlap、incremental tail、费用与 blocker；
 4. 显式确认发布；
-5. 打开 `/journal?tab=positions`；
-6. 查看 canonical preview；
-7. 需要新版本时先 build，再单独 activate；
-8. 使用列表的案例精选选择大盈、大亏、长持仓、高费用或证据最不完整案例（`weakest_evidence` 按 completeness_score 升序，2026-08-01 新增）；Review Queue 状态统计仍为未开始/进行中/已完成；
+5. 仍在「数据与构建」的「构建与默认视图管理」查看 canonical preview；
+6. 需要新版本时先 build，再单独 activate（激活管理已随 G-3 移到本 tab；当前持仓快照/future preview 在「当前持仓快照与未来构建」分组）；
+7. 打开 `/journal?tab=positions`（复盘工作台），头部条显示默认构建标识与 Review Queue（未开始/进行中/已完成）；
+8. 点「继续复盘下一笔」直达最优先回合（优先续上进行中；否则 top_loss 案例精选取亏损最大的未复盘已平仓回合；无命中退回最近未开始），或用列表案例精选选择大盈、大亏、长持仓、高费用或证据最不完整案例（`weakest_evidence` 按 completeness_score 升序，2026-08-01 新增）；
 9. 在详情页填写事后复盘上下文、对进场逻辑的回忆、出场原因与反思；这些是用户自述，不是系统留存的事前计划证据；
 10. 先看确定性证据分析，再按需调用模型增强；
 11. 不因单笔结果改变系统权重。

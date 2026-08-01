@@ -2,6 +2,7 @@ import apiClient from './index';
 import { toCamelCase } from './utils';
 import type {
   DailyOpportunityRun,
+  IntradayTrackingResponse,
   OpportunityLearningSummaryResponse,
   OpportunityOptionContextResponse,
   OpportunityOptionEventResponse,
@@ -33,6 +34,8 @@ const optionContextInFlight = new Map<string, Promise<OpportunityOptionContextRe
 const optionEventInFlight = new Map<string, Promise<OpportunityOptionEventResponse>>();
 const optionOverviewInFlight = new Map<string, Promise<OpportunityOptionOverviewResponse>>();
 const optionWallInFlight = new Map<string, Promise<OpportunityOptionWallResponse>>();
+const intradayTrackingInFlight = new Map<string, Promise<IntradayTrackingResponse>>();
+const INTRADAY_TRACKING_TIMEOUT_MS = 30_000;
 const premarketStatusInFlight = new Map<string, Promise<PremarketCycleResponse>>();
 const premarketRunInFlight = new Map<string, Promise<PremarketCycleResponse>>();
 
@@ -299,6 +302,33 @@ export async function fetchOpportunityOptionEvents(
   });
 
   optionEventInFlight.set(key, request);
+  return request;
+}
+
+/**
+ * 盘中跟踪：对照冻结盘前计划读取实时行情与首批专业指标。
+ * 服务端已有 30 秒 TTL + single-flight，本函数只做在途去重，不写 sessionCache，
+ * 保证每次轮询拿到的都是服务端允许的最新数据时点。
+ */
+export async function fetchIntradayTracking(
+  symbols: string[],
+  options: { refresh?: boolean } = {},
+): Promise<IntradayTrackingResponse> {
+  const requestedSymbols = normalizedOptionContextSymbols(symbols).slice(0, 5);
+  const key = `opportunities:intraday-tracking:${requestedSymbols.join(',')}:${options.refresh ? 'refresh' : 'cached'}`;
+  const pending = intradayTrackingInFlight.get(key);
+  if (pending) return pending;
+
+  const request = apiClient.post<Record<string, unknown>>(
+    '/api/v1/opportunities/intraday-tracking',
+    { symbols: requestedSymbols, refresh: Boolean(options.refresh) },
+    { timeout: INTRADAY_TRACKING_TIMEOUT_MS },
+  ).then((response) => toCamelCase<IntradayTrackingResponse>(response.data))
+    .finally(() => {
+      intradayTrackingInFlight.delete(key);
+    });
+
+  intradayTrackingInFlight.set(key, request);
   return request;
 }
 

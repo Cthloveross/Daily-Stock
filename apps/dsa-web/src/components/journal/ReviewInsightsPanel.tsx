@@ -252,7 +252,7 @@ export const ReviewInsightsPanel: React.FC<{ onCandidateSaved?: () => void }> = 
 
         {!error && insights?.dataState === 'not_built' && (
           <p className="text-body-sm text-text-3">
-            还没有 Episode 构建。导入交易证据并生成构建后，这里会按复盘标签聚合可观察的模式。
+            还没有 Episode 构建。到「数据与构建」导入证据并生成构建后，这里会按复盘标签聚合可观察的模式。
           </p>
         )}
 

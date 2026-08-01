@@ -288,6 +288,107 @@ class MoomooOptionUnderlyingOverview:
     hv_365d_percentile: Optional[float]
 
 
+@dataclass(frozen=True)
+class MoomooUnderlyingSessionQuote:
+    """One quote-only equity snapshot row for intraday plan tracking.
+
+    ``volume`` and ``turnover`` are the provider's *current-session cumulative*
+    figures; ``high_price``/``low_price`` are session extremes and
+    ``update_time`` is the provider's own quote timestamp.  Fields the
+    snapshot omits or invalidates stay ``None`` — they are never zero-filled
+    so downstream indicators can fail closed per field.
+    """
+
+    symbol: str
+    fetched_at: datetime
+    last_price: Optional[float]
+    open_price: Optional[float]
+    high_price: Optional[float]
+    low_price: Optional[float]
+    prev_close_price: Optional[float]
+    volume: Optional[int]
+    turnover: Optional[float]
+    update_time: Optional[str]
+
+
+def fetch_underlying_session_quotes_moomoo(
+    symbols: list[str] | tuple[str, ...],
+) -> dict[str, MoomooUnderlyingSessionQuote]:
+    """Batch-read live US-underlying session quotes via one snapshot call.
+
+    Reuses the same ``get_market_snapshot`` machinery the option walls use for
+    their spot read, on the shared quote context under ``_ctx_lock`` (one
+    bounded call for at most a handful of codes — no wall lane is consumed).
+    Quote-only: never subscribes, unlocks trading, or places orders.  Disabled
+    integration, SDK/connection failures, or malformed rows fail closed by
+    returning an empty/partial mapping.
+    """
+
+    if not _enabled():
+        return {}
+
+    requested: list[str] = []
+    seen: set[str] = set()
+    for raw in symbols:
+        try:
+            code = _to_moomoo_underlying(str(raw))
+        except ValueError:
+            continue
+        if not code.startswith("US.") or code in seen:
+            continue
+        requested.append(code)
+        seen.add(code)
+    if not requested:
+        return {}
+
+    try:
+        from moomoo import RET_OK
+    except ImportError:
+        return {}
+
+    try:
+        with _ctx_lock:
+            ctx = _get_ctx()
+            if ctx is None:
+                return {}
+            ret, frame = ctx.get_market_snapshot(requested)
+        if ret != RET_OK or frame is None or not hasattr(frame, "iterrows"):
+            logger.warning(
+                "[moomoo_options] underlying session snapshot unavailable: %s",
+                _brief_detail((ret, frame)),
+            )
+            return {}
+    except Exception as exc:  # noqa: BLE001 - quote-only provider boundary
+        logger.warning(
+            "[moomoo_options] underlying session snapshot failed: %s",
+            exc,
+        )
+        return {}
+
+    fetched_at = datetime.now(timezone.utc)
+    requested_set = set(requested)
+    result: dict[str, MoomooUnderlyingSessionQuote] = {}
+    for _, row in frame.iterrows():
+        item = row.to_dict() if hasattr(row, "to_dict") else dict(row)
+        code = (_safe_text(item.get("code")) or "").upper()
+        if code not in requested_set:
+            continue
+        symbol = code[3:]
+        result[symbol] = MoomooUnderlyingSessionQuote(
+            symbol=symbol,
+            fetched_at=fetched_at,
+            last_price=_valid_positive_float(item.get("last_price")),
+            open_price=_valid_positive_float(item.get("open_price")),
+            high_price=_valid_positive_float(item.get("high_price")),
+            low_price=_valid_positive_float(item.get("low_price")),
+            prev_close_price=_valid_positive_float(item.get("prev_close_price")),
+            volume=_valid_nonnegative_int(item.get("volume")),
+            turnover=_valid_nonnegative_float(item.get("turnover")),
+            update_time=_safe_text(item.get("update_time")),
+        )
+    return result
+
+
 def _is_alive(ctx) -> bool:
     """Inspect connection state without issuing a blocking SDK query."""
     return quote_context_is_ready(ctx)

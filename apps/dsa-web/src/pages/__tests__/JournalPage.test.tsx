@@ -89,7 +89,7 @@ describe('JournalPage active journal routing and legacy isolation', () => {
     vi.clearAllMocks();
   });
 
-  it('opens position review by default without loading legacy endpoints', () => {
+  it('opens the review workspace by default without loading legacy endpoints', () => {
     render(
       <MemoryRouter initialEntries={['/journal']}>
         <JournalPage />
@@ -97,11 +97,33 @@ describe('JournalPage active journal routing and legacy isolation', () => {
     );
 
     expect(screen.getByText('仓位复盘')).toHaveClass('text-text-1');
-    expect(screen.getByTestId('current-positions-snapshot-card')).toBeInTheDocument();
+    // Workbench strip replaces the data plumbing at the top of the tab.
+    expect(screen.getByText('复盘工作台')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '继续复盘下一笔' })).toBeInTheDocument();
+    // Snapshot machinery has moved to the 数据与构建 tab.
+    expect(screen.queryByTestId('current-positions-snapshot-card')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('可信事实集构建预览')).not.toBeInTheDocument();
     expect(screen.getByText('没有符合当前筛选条件的仓位回合。')).toBeInTheDocument();
     expect(storeMocks.loadStats).not.toHaveBeenCalled();
     expect(storeMocks.loadTrades).not.toHaveBeenCalled();
     expect(storeMocks.loadRealityTest).not.toHaveBeenCalled();
+  });
+
+  it('groups all data plumbing on the 数据与构建 tab', () => {
+    render(
+      <MemoryRouter initialEntries={['/journal?tab=import']}>
+        <JournalPage />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('button', { name: '数据与构建' })).toHaveClass('text-text-1');
+    // Relocated snapshot card plus the grouped build management sections.
+    expect(screen.getByTestId('current-positions-snapshot-card')).toBeInTheDocument();
+    expect(screen.getByText('当前持仓快照与未来构建')).toBeInTheDocument();
+    expect(screen.getByText('构建与默认视图管理')).toBeInTheDocument();
+    expect(screen.getByLabelText('可信事实集构建预览')).toBeInTheDocument();
+    // No legacy warning banner: this is an active tab, not an archive.
+    expect(screen.queryByText(/Legacy \/ 存档视图/)).not.toBeInTheDocument();
   });
 
   it('presents win rate and 0DTE share as context-dependent metrics', () => {

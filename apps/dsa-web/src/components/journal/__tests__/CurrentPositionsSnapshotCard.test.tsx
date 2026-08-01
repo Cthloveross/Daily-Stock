@@ -417,7 +417,7 @@ describe('CurrentPositionsSnapshotCard', () => {
     expect(within(fence).getByText(/即使已经过 30 分钟/)).toBeInTheDocument();
     expect(within(fence).getByText(/证据写入 0 · 交易动作 0/)).toBeInTheDocument();
     expect(fetchFuturePreviewMock).not.toHaveBeenCalled();
-    fireEvent.click(within(fence).getByRole('button', { name: '前往交易证据' }));
+    fireEvent.click(within(fence).getByRole('button', { name: '前往每日刷新' }));
     expect(onOpenEvidence).toHaveBeenCalledTimes(1);
   });
 
@@ -794,7 +794,7 @@ describe('CurrentPositionsSnapshotCard', () => {
     expect(within(previewRegion).getByRole('button', {
       name: '确认并保存当前仓位证据',
     })).toBeDisabled();
-    fireEvent.click(within(previewRegion).getByRole('button', { name: '前往交易证据' }));
+    fireEvent.click(within(previewRegion).getByRole('button', { name: '前往每日刷新' }));
     expect(onOpenEvidence).toHaveBeenCalledTimes(1);
   });
 
