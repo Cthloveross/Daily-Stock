@@ -280,6 +280,8 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
                         "SCHEDULE_TIME=09:30",
                         "RUN_IMMEDIATELY=false",
                         "SCHEDULE_RUN_IMMEDIATELY=true",
+                        "MOOMOO_PREMARKET_PREFETCH_ENABLED=true",
+                        "OPPORTUNITY_OUTCOME_SCHEDULER_ENABLED=true",
                     ]
                 )
                 + "\n",
@@ -295,6 +297,8 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
                     "SCHEDULE_TIME": "18:00",
                     "RUN_IMMEDIATELY": "true",
                     "SCHEDULE_RUN_IMMEDIATELY": "false",
+                    "MOOMOO_PREMARKET_PREFETCH_ENABLED": "false",
+                    "OPPORTUNITY_OUTCOME_SCHEDULER_ENABLED": "false",
                 },
                 clear=True,
             ):
@@ -306,6 +310,8 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
         self.assertEqual(config.schedule_time, "18:00")
         self.assertTrue(config.run_immediately)
         self.assertFalse(config.schedule_run_immediately)
+        self.assertFalse(config.moomoo_premarket_prefetch_enabled)
+        self.assertFalse(config.opportunity_outcome_scheduler_enabled)
 
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
     def test_runtime_mutable_keys_use_process_env_when_absent_from_file(

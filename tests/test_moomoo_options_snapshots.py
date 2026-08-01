@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import date, timezone
-from threading import Event
+from threading import Event, Lock
 from types import SimpleNamespace
 
 import pandas as pd
@@ -105,11 +106,20 @@ def _snapshot_row(code: str = "US.NVDA260821C180000", **overrides):
 def _prepare_wall_context(monkeypatch, ctx, *, spot: float = 181.0):
     _install_fake_moomoo(monkeypatch)
     monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
-    monkeypatch.setattr(moomoo_options, "_get_ctx", lambda: ctx)
+
+    @contextmanager
+    def lease_test_context():
+        yield ctx, moomoo_options._ctx_lock
+
+    monkeypatch.setattr(
+        moomoo_options,
+        "_lease_wall_context",
+        lease_test_context,
+    )
     monkeypatch.setattr(
         moomoo_options,
         "_spot_from_ctx",
-        lambda _ctx, _symbol, _ret_ok: spot,
+        lambda _ctx, _symbol, _ret_ok, **_kwargs: spot,
     )
 
 
@@ -450,9 +460,13 @@ def test_option_wall_snapshot_filters_dte_and_nonstandard_and_keeps_coverage(
         gamma=0.0123,
         contract_size=100,
         update_time="2026-07-22 10:01:02",
+        implied_volatility=0.425,
     )
     assert by_code[nullable_greeks_code].dte == 14
     assert by_code[nullable_greeks_code].contract_size is None
+    assert by_code[nullable_greeks_code].implied_volatility == pytest.approx(
+        0.425
+    )
     assert invalid_oi_code not in by_code
 
 
@@ -771,3 +785,61 @@ def test_context_cannot_close_while_expiration_query_is_in_flight(monkeypatch):
         assert query_future.result(timeout=2) == ["2026-08-21"]
         assert reconnect_future.result(timeout=2) is replacement
         assert closed.is_set()
+
+
+def test_option_wall_context_pool_leases_five_exclusive_reusable_lanes(
+    monkeypatch,
+):
+    _install_fake_moomoo(monkeypatch)
+    moomoo_options._reset_wall_context_pool_for_tests()
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+    monkeypatch.setattr(moomoo_options, "probe_opend_tcp", lambda *_args: True)
+    monkeypatch.setattr(moomoo_options, "_is_alive", lambda _ctx: True)
+
+    created: list[SimpleNamespace] = []
+    created_lock = Lock()
+
+    def create_context(**_kwargs):
+        context = SimpleNamespace(close=lambda: None)
+        with created_lock:
+            created.append(context)
+        return context
+
+    monkeypatch.setattr(
+        moomoo_options,
+        "create_ready_quote_context",
+        create_context,
+    )
+    all_leased = Event()
+    release = Event()
+    leased_ids: list[int] = []
+    leased_lock = Lock()
+
+    def hold_lane():
+        with moomoo_options._lease_wall_context() as leased:
+            assert leased is not None
+            context, _lock = leased
+            with leased_lock:
+                leased_ids.append(id(context))
+                if len(leased_ids) == 5:
+                    all_leased.set()
+            assert release.wait(timeout=3)
+            return id(context)
+
+    try:
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures = [pool.submit(hold_lane) for _ in range(5)]
+            assert all_leased.wait(timeout=3)
+            assert len(created) == 5
+            assert len(set(leased_ids)) == 5
+            release.set()
+            first_ids = {future.result(timeout=3) for future in futures}
+
+        with moomoo_options._lease_wall_context() as reused:
+            assert reused is not None
+            reused_context, _lock = reused
+            assert id(reused_context) in first_ids
+        assert len(created) == 5
+    finally:
+        release.set()
+        moomoo_options._reset_wall_context_pool_for_tests()

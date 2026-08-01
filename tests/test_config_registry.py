@@ -123,6 +123,52 @@ class TestSensitiveFieldsUsePasswordControl(unittest.TestCase):
                          f"Sensitive fields with non-password ui_control: {violations}")
 
 
+class TestOptionsResearchDataFieldsRegistered(unittest.TestCase):
+    """Optional US research credentials must be explicit and masked."""
+
+    _DATA_KEYS = (
+        "APCA_API_KEY_ID",
+        "APCA_API_SECRET_KEY",
+        "FINNHUB_API_KEY",
+    )
+
+    def test_fields_are_registered_as_sensitive_data_sources(self):
+        for key in self._DATA_KEYS:
+            field = get_field_definition(key)
+            self.assertEqual(field["category"], "data_source")
+            self.assertTrue(field["is_sensitive"])
+            self.assertEqual(field["ui_control"], "password")
+            self.assertNotEqual(field["display_order"], 9000)
+
+    def test_schema_response_includes_research_credentials(self):
+        schema = build_schema_response()
+        data_source = next(
+            (
+                category
+                for category in schema["categories"]
+                if category["category"] == "data_source"
+            ),
+            None,
+        )
+        self.assertIsNotNone(data_source, "data_source category missing")
+        field_keys = {field["key"] for field in data_source["fields"]}
+        for key in self._DATA_KEYS:
+            self.assertIn(key, field_keys)
+
+
+class TestPremarketShadowPrefetchField(unittest.TestCase):
+    def test_field_is_default_off_and_explicitly_shadow_only(self):
+        field = get_field_definition("MOOMOO_PREMARKET_PREFETCH_ENABLED")
+
+        self.assertEqual(field["category"], "system")
+        self.assertEqual(field["data_type"], "boolean")
+        self.assertEqual(field["default_value"], "false")
+        self.assertFalse(field["is_sensitive"])
+        self.assertIn("shadow", field["description"].lower())
+        self.assertIn("does not consume", field["description"].lower())
+        self.assertIn("never", field["description"].lower())
+
+
 class TestDiscordInteractionPublicKeyField(unittest.TestCase):
     def test_field_definition_exists(self):
         field = get_field_definition("DISCORD_INTERACTIONS_PUBLIC_KEY")
