@@ -696,6 +696,86 @@ export interface ReviewInsightsResponse {
   buckets: ReviewInsightBucket[];
 }
 
+/** Slice C-2: append-only playbook candidates (L2) and rule versions (L3). */
+export interface PlaybookSourceBucket {
+  groupKind: 'tag' | 'error_type';
+  groupValue: string;
+  direction: string;
+  boundaryPolicy: 'verified' | 'assumed_or_censored';
+}
+
+export interface PlaybookCandidate {
+  schemaVersion: 'playbook-candidate/1.0' | string;
+  id: number;
+  candidateKey: string;
+  accountKey: string;
+  title: string;
+  ruleText: string;
+  sourceBucket?: PlaybookSourceBucket | null;
+  evidenceSnapshot: Record<string, unknown>;
+  evidenceSnapshotSha256: string;
+  promoted: boolean;
+  createdAt: string;
+}
+
+export interface PlaybookRule {
+  schemaVersion: 'playbook-rule/1.0' | string;
+  id: number;
+  ruleKey: string;
+  lineageKey: string;
+  accountKey: string;
+  version: number;
+  status: 'active' | 'retired';
+  promotedFromCandidateId: number;
+  promotedFromCandidateKey: string;
+  previousRuleId?: number | null;
+  title: string;
+  ruleText: string;
+  evidenceSnapshot: Record<string, unknown>;
+  evidenceSnapshotSha256: string;
+  isLatestVersion: boolean;
+  createdAt: string;
+}
+
+export interface PlaybookListResponse {
+  schemaVersion: 'journal-playbook/1.0' | string;
+  accountKey: string;
+  candidates: PlaybookCandidate[];
+  rules: PlaybookRule[];
+}
+
+export interface CreatePlaybookCandidateRequest {
+  title: string;
+  ruleText: string;
+  sourceBucket?: PlaybookSourceBucket | null;
+}
+
+export interface CreatePlaybookCandidateResponse {
+  dataState: 'ready' | string;
+  created: boolean;
+  idempotentReplay: boolean;
+  candidate: PlaybookCandidate;
+}
+
+export interface PromotePlaybookCandidateRequest {
+  allowNewVersion?: boolean;
+  expectedCurrentVersion?: number | null;
+}
+
+export interface PromotePlaybookCandidateResponse {
+  dataState: 'ready' | string;
+  created: boolean;
+  idempotentReplay: boolean;
+  rule: PlaybookRule;
+}
+
+export interface RetirePlaybookRuleResponse {
+  dataState: 'ready' | string;
+  retired: boolean;
+  idempotentReplay: boolean;
+  rule: PlaybookRule;
+}
+
 export interface PositionEpisodeAiReviewResponse {
   dataState: 'ready' | string;
   analysisMode: 'model_enhanced' | 'deterministic';

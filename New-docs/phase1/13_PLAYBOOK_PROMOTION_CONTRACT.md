@@ -1,6 +1,6 @@
 # 个人 Playbook 晋升链路合同（阶段 C · 设计冻结稿）
 
-> 状态：设计合同（2026-08-01）；切片 C-1 已实现（2026-08-01），C-2 / C-3 未开始
+> 状态：设计合同（2026-08-01）；切片 C-1 / C-2 已实现（2026-08-01），C-3 未开始
 >
 > 真源顺序：可执行代码 > 本合同 > HANDOFF §16 阶段 C 概述
 >
@@ -45,7 +45,7 @@
 | 切片 | 内容 | 写面 | 状态 |
 |---|---|---|---|
 | C-1 | L1 聚合端点 `GET /journal/v2/review-insights`（按 tag/setup 分组，门槛 fail-closed）+ 复盘页「模式观察」面板 | 零写 | 已实现 |
-| C-2 | L2/L3 表 + append-only 仓储 + 晋升/退役端点 + Playbook 页面 | 新增 2 张 append-only 表 | 未开始 |
+| C-2 | L2/L3 表 + append-only 仓储 + 晋升/退役端点 + Playbook 页面 | 新增 2 张 append-only 表 | 已实现 |
 | C-3 | 单笔复盘页反向链接（该 episode 命中的 rule/candidate） | 零写 | 未开始 |
 
 ### C-1 实现锚点（2026-08-01）
@@ -77,6 +77,49 @@
   界、条件排除、latest-revision、零写断言）、
   `api/v1/tests/test_journal_reviews_endpoint.py`（合同 + not_built 空态）、
   `apps/dsa-web/src/components/journal/__tests__/ReviewInsightsPanel.test.tsx`。
+
+### C-2 实现锚点（2026-08-01）
+
+- 表：`src/journal/ledger/playbook_models.py` ——
+  `journal_v2_playbook_candidates`（L2：`candidate_key` sha256 UNIQUE、
+  `source_bucket_json` 对自由候选可空、`evidence_snapshot_json` +
+  `evidence_snapshot_sha256` 创建时冻结）与 `journal_v2_playbook_rules`
+  （L3：`UNIQUE(lineage_key, version)`、`UNIQUE(previous_rule_id)`、chain
+  CHECK `version=1 无 previous 且 active / version>1 必有 previous`、
+  `status ∈ active|retired`）；两表均加入
+  `src/journal/ledger/repository.py` 的 `_APPEND_ONLY_TABLE_NAMES`，
+  SQLite UPDATE/DELETE 拒绝触发器随 `init_ledger_schema()` 安装。
+- 仓储：`src/journal/ledger/playbook_repository.py` ——
+  `create_playbook_candidate`（非空/限长校验；同一会话内经
+  `collect_review_insight_bucket_evidence`（`review_insights.py` 内与 C-1
+  聚合共用 `_aggregate`）重跑聚合冻结快照：build_id/build_key/source_kind、
+  成员 episode_ids（有序 ≤200 + 截断标记）、latest annotation revision ids、
+  含条件性分桶的计数、10/5 阈值、`generated_at`；桶或构建缺失 →
+  `PlaybookConflictError` 零写 fail closed）、`promote_candidate_to_rule`
+  （CAS：candidate_key 定位 + active 重放幂等 + retired lineage 需显式
+  `allow_new_version` + `expected_current_version`；晋升时重新冻结快照）、
+  `retire_playbook_rule`（CAS on 当前版本；追加 `retired` 新版本并逐字复制
+  晋升快照）、`list_playbook_candidates` / `list_playbook_rules`（只读，
+  newest first，附 `promoted` / `is_latest_version` 投影）。所有失败路径
+  零写；幂等以自然键（内容 hash）判定 `duplicate=True`。
+- 端点：`GET /api/v1/journal/v2/playbook`、
+  `POST /api/v1/journal/v2/playbook/candidates`、
+  `POST /api/v1/journal/v2/playbook/candidates/{candidate_key}/promote`、
+  `POST /api/v1/journal/v2/playbook/rules/{lineage_key}/retire`
+  （`api/v1/endpoints/journal_reviews.py`；schema `journal-playbook/1.0`
+  于 `api/v1/schemas/journal_reviews.py`；冲突/陈旧 CAS → 409，校验 →
+  422；响应回显冻结快照）。
+- 页面：`ReviewInsightsPanel.tsx` 每桶「保存为候选」内联表单（标题 + 规则
+  描述，空内容禁用提交）+ `apps/dsa-web/src/components/journal/PlaybookPanel.tsx`
+  （候选「晋升为规则」/ 规则版本链「退役」，均带确认步骤与「规则不会影响
+  系统评分或榜单，仅是你的决策清单」文案），挂载于 `/journal` 仓位复盘 tab
+  「模式观察」下方；API client 见 `apps/dsa-web/src/api/journal.ts`。
+- 回归：`src/journal/tests/test_playbook_repository.py`（快照冻结内容、
+  幂等重放、fail-closed 零写、CAS、deny triggers、退役快照复制、重晋升
+  意图门禁）、`api/v1/tests/test_journal_playbook_endpoint.py`
+  （round-trip + 409/422）、
+  `apps/dsa-web/src/components/journal/__tests__/PlaybookPanel.test.tsx` 与
+  `ReviewInsightsPanel.test.tsx`（表单 gating、确认流、诚实文案）。
 
 ## 4. 验收（对照 HANDOFF §16 阶段 C）
 

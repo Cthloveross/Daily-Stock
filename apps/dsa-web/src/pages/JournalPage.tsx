@@ -12,6 +12,7 @@ import FrameworkPanel from '../components/journal/FrameworkPanel';
 import AskJournalChat from '../components/journal/AskJournalChat';
 import PositionEpisodesPanel from '../components/journal/PositionEpisodesPanel';
 import ReviewInsightsPanel from '../components/journal/ReviewInsightsPanel';
+import PlaybookPanel from '../components/journal/PlaybookPanel';
 import CurrentPositionsSnapshotCard from '../components/journal/CurrentPositionsSnapshotCard';
 import { positionReviewPath } from '../components/journal/review/journalReviewRouting';
 import { useJournalStore } from '../stores/journalStore';
@@ -77,6 +78,8 @@ const JournalPage: React.FC = () => {
   const [statsByStyle, setStatsByStyle] = useState<JournalStatsByStyleResponse | null>(null);
   const [statsLoading, setStatsLoading] = useState(false);
   const [statsError, setStatsError] = useState<ParsedApiError | null>(null);
+  // Bump to reload the Playbook list after a bucket was saved as a candidate.
+  const [playbookRefreshToken, setPlaybookRefreshToken] = useState(0);
 
   const { loadStats, loadTrades, stats, trades, tradesLoading } =
     useJournalStore();
@@ -273,7 +276,10 @@ const JournalPage: React.FC = () => {
             onSelectBuild={selectPositionBuild}
             onOpenReview={openPositionReview}
           />
-          <ReviewInsightsPanel />
+          <ReviewInsightsPanel
+            onCandidateSaved={() => setPlaybookRefreshToken((token) => token + 1)}
+          />
+          <PlaybookPanel refreshToken={playbookRefreshToken} />
         </div>
       )}
 

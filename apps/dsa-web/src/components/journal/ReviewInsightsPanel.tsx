@@ -1,12 +1,14 @@
 import type React from 'react';
 import { useCallback, useEffect, useState } from 'react';
-import { fetchReviewInsights } from '../../api/journal';
+import { createPlaybookCandidate, fetchReviewInsights } from '../../api/journal';
 import { parseApiError, type ParsedApiError } from '../../api/error';
 import type { ReviewInsightBucket, ReviewInsightsResponse } from '../../types/journal';
 
 /**
  * 「模式观察」（Playbook 合同切片 C-1）：只读聚合当前默认构建的最新复盘标注。
  * 统计口径 fail-closed——样本不足只显示计数；条件性 P&L 永不进入比率。
+ * 切片 C-2：每个分桶提供「保存为候选」——显式提交后冻结当时的证据快照，
+ * 候选/规则永不反写任何系统评分或榜单。
  */
 
 const DIRECTION_LABEL: Record<string, string> = {
@@ -33,11 +35,48 @@ const BucketRow: React.FC<{
   bucket: ReviewInsightBucket;
   minEpisodeCount: number;
   minDistinctTradingDayCount: number;
-}> = ({ bucket, minEpisodeCount, minDistinctTradingDayCount }) => {
+  onCandidateSaved?: () => void;
+}> = ({ bucket, minEpisodeCount, minDistinctTradingDayCount, onCandidateSaved }) => {
   const kindLabel = bucket.groupKind === 'tag' ? '标签' : '错误类型';
   const directionLabel = DIRECTION_LABEL[bucket.direction] ?? bucket.direction;
   const boundaryVerified = bucket.boundaryPolicy === 'verified';
   const stats = bucket.stats ?? null;
+  const [formOpen, setFormOpen] = useState(false);
+  const [title, setTitle] = useState('');
+  const [ruleText, setRuleText] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<ParsedApiError | null>(null);
+  const [savedReplay, setSavedReplay] = useState<boolean | null>(null);
+
+  const canSubmit = title.trim().length > 0 && ruleText.trim().length > 0 && !saving;
+
+  const submit = async () => {
+    if (!canSubmit) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      const response = await createPlaybookCandidate({
+        title,
+        ruleText,
+        sourceBucket: {
+          groupKind: bucket.groupKind,
+          groupValue: bucket.groupValue,
+          direction: bucket.direction,
+          boundaryPolicy: bucket.boundaryPolicy,
+        },
+      });
+      setSavedReplay(response.idempotentReplay);
+      setFormOpen(false);
+      setTitle('');
+      setRuleText('');
+      onCandidateSaved?.();
+    } catch (e) {
+      setSaveError(parseApiError(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
   return (
     <li className="flex flex-col gap-1 py-2.5">
       <div className="flex flex-wrap items-center gap-2">
@@ -62,6 +101,17 @@ const BucketRow: React.FC<{
           {bucket.episodeCount} 笔 · {bucket.distinctTradingDayCount} 个交易日 · 已复盘{' '}
           {bucket.reviewCompletedCount}
         </span>
+        <button
+          type="button"
+          className="btn-ghost text-caption"
+          onClick={() => {
+            setFormOpen((open) => !open);
+            setSaveError(null);
+            setSavedReplay(null);
+          }}
+        >
+          保存为候选
+        </button>
       </div>
       <div className="flex flex-wrap items-center gap-3 text-caption">
         {stats ? (
@@ -82,11 +132,70 @@ const BucketRow: React.FC<{
           </span>
         )}
       </div>
+      {savedReplay !== null && !formOpen && (
+        <p className="text-caption text-up-strong" role="status">
+          {savedReplay ? '相同内容的候选已存在（幂等回放）。' : '已保存为候选，可在下方 Playbook 面板显式晋升。'}
+        </p>
+      )}
+      {formOpen && (
+        <form
+          className="mt-1 flex flex-col gap-2 rounded-ds-sm border border-subtle bg-bg-0 p-3"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submit();
+          }}
+        >
+          <label className="flex flex-col gap-1 text-caption text-text-2">
+            候选标题
+            <input
+              type="text"
+              className="input-base text-body-sm"
+              maxLength={120}
+              value={title}
+              onChange={(event) => setTitle(event.target.value)}
+              placeholder="一句话概括这个模式"
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-caption text-text-2">
+            规则描述
+            <textarea
+              className="input-base min-h-[72px] text-body-sm"
+              maxLength={2000}
+              value={ruleText}
+              onChange={(event) => setRuleText(event.target.value)}
+              placeholder="用自己的话写下可执行的规则"
+            />
+          </label>
+          <p className="text-caption text-text-3">
+            保存会冻结当前分桶的证据快照（构建、回合、标注修订与计数）；候选与规则不会影响系统评分或榜单。
+          </p>
+          {saveError && (
+            <p className="text-caption text-down-strong" role="alert">
+              {saveError.message}
+            </p>
+          )}
+          <div className="flex items-center gap-2">
+            <button type="submit" className="btn-primary text-body-sm" disabled={!canSubmit}>
+              保存候选
+            </button>
+            <button
+              type="button"
+              className="btn-ghost text-body-sm"
+              onClick={() => setFormOpen(false)}
+              disabled={saving}
+            >
+              取消
+            </button>
+          </div>
+        </form>
+      )}
     </li>
   );
 };
 
-export const ReviewInsightsPanel: React.FC = () => {
+export const ReviewInsightsPanel: React.FC<{ onCandidateSaved?: () => void }> = ({
+  onCandidateSaved,
+}) => {
   const [insights, setInsights] = useState<ReviewInsightsResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<ParsedApiError | null>(null);
@@ -179,13 +288,14 @@ export const ReviewInsightsPanel: React.FC = () => {
                     bucket={bucket}
                     minEpisodeCount={minEpisodeCount}
                     minDistinctTradingDayCount={minDistinctTradingDayCount}
+                    onCandidateSaved={onCandidateSaved}
                   />
                 ))}
               </ul>
             )}
 
             <p className="border-t border-subtle pt-2 text-caption text-text-3">
-              观察到的模式 ≠ 已验证规则；晋升到 Playbook 需要显式操作（后续切片）。
+              观察到的模式 ≠ 已验证规则；保存候选与晋升规则都是你的显式操作，系统永不自动晋升。
             </p>
           </div>
         )}

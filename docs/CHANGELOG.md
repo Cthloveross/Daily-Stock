@@ -364,6 +364,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] Episode P&L 可统计口径（`pnl_summary_eligible` 排除原因）收敛为仓储层单一实现 `position_episode_pnl_exclusion_reasons`，API 投影与模式观察聚合共用同一定义，避免口径漂移。
 - [测试] 新增 review-insights 仓储与 API 合同回归：分桶键不混轨、10 笔/5 交易日阈值边界、条件性 P&L 超阈值仍被排除、latest-revision 聚合、未复盘/未构建空态与零写断言；Web 端补「模式观察」面板计数/统计/条件标注/空态渲染测试。
 - [文档] `New-docs/phase1/13_PLAYBOOK_PROMOTION_CONTRACT.md` 切片 C-1 标记为已实现并补实现锚点；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` 同步 C-1 状态。
+- [新功能] Journal Playbook 切片 C-2：新增 append-only `journal_v2_playbook_candidates`（L2 候选）与 `journal_v2_playbook_rules`（L3 规则版本链）两张表，均纳入 SQLite UPDATE/DELETE 拒绝触发器；创建候选与晋升规则时在同一会话内重跑 C-1 聚合冻结证据快照（build 身份、成员回合 id ≤200、最新标注修订、含条件性分桶的计数、阈值与 as-of），桶或默认构建不存在时 fail closed 拒绝写入。
+- [新功能] 新增 Playbook 端点：`GET /api/v1/journal/v2/playbook`、`POST .../playbook/candidates`、`POST .../playbook/candidates/{candidate_key}/promote`、`POST .../playbook/rules/{lineage_key}/retire`；晋升/退役全部为显式用户动作 + CAS（重放幂等、陈旧期望与已退役 lineage 的再晋升缺显式 new-version 意图时返回 409），退役追加 `retired` 新版本并逐字复制晋升时冻结的快照，规则永不反写任何评分、榜单或 AI prompt。
+- [新功能] Journal“仓位复盘”页「模式观察」每个分桶新增「保存为候选」内联表单（标题 + 规则描述，空内容禁用提交），并在其下方新增 Playbook 面板：候选可显式「晋升为规则」、规则显示版本/状态并支持显式「退役」，两者均带确认步骤与“规则不会影响系统评分或榜单，仅是你的决策清单”文案。
+- [测试] 新增 Playbook 仓储回归（快照冻结内容、幂等重放、桶缺失/无构建 fail-closed 零写、CAS 陈旧拒绝、退役复制快照、重晋升需显式意图、两表 deny trigger、列表排序）、API 合同（round-trip + 409/422）与 Web 组件测试（表单 gating、晋升/退役确认流、诚实文案断言）。
+- [文档] `New-docs/phase1/13_PLAYBOOK_PROMOTION_CONTRACT.md` 切片 C-2 标记为已实现并补实现锚点；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` 同步 C-2 状态。
 
 ## [3.11.0] - 2026-03-27
 

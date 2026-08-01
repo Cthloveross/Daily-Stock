@@ -163,3 +163,115 @@ class ReviewInsightsResponse(BaseModel):
     annotated_episode_count: int = Field(ge=0)
     unreviewed: Optional[ReviewInsightUnreviewed] = None
     buckets: list[ReviewInsightBucketModel] = Field(default_factory=list)
+
+
+# --- playbook (slice C-2, append-only L2 candidates / L3 rule versions) ------
+
+
+class PlaybookSourceBucketModel(BaseModel):
+    """Echo of the insights bucket a candidate was saved from."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    group_kind: Literal["tag", "error_type"]
+    group_value: str = Field(min_length=1, max_length=64)
+    direction: str = Field(min_length=1, max_length=24)
+    boundary_policy: Literal["verified", "assumed_or_censored"]
+
+
+class PlaybookCandidateCreateRequest(BaseModel):
+    """Explicit user content only; nothing is created automatically."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1, max_length=120)
+    rule_text: str = Field(min_length=1, max_length=2000)
+    source_bucket: Optional[PlaybookSourceBucketModel] = None
+
+    @model_validator(mode="after")
+    def strip_and_require_content(self) -> "PlaybookCandidateCreateRequest":
+        title = self.title.strip()
+        rule_text = self.rule_text.strip()
+        if not title:
+            raise ValueError("title cannot be empty")
+        if not rule_text:
+            raise ValueError("rule_text cannot be empty")
+        self.title = title
+        self.rule_text = rule_text
+        return self
+
+
+class PlaybookCandidateItem(BaseModel):
+    schema_version: str = "playbook-candidate/1.0"
+    id: int
+    candidate_key: str
+    account_key: str
+    title: str
+    rule_text: str
+    source_bucket: Optional[PlaybookSourceBucketModel] = None
+    evidence_snapshot: dict
+    evidence_snapshot_sha256: str
+    promoted: bool
+    created_at: datetime
+
+
+class PlaybookRuleItem(BaseModel):
+    schema_version: str = "playbook-rule/1.0"
+    id: int
+    rule_key: str
+    lineage_key: str
+    account_key: str
+    version: int = Field(ge=1)
+    status: Literal["active", "retired"]
+    promoted_from_candidate_id: int
+    promoted_from_candidate_key: str
+    previous_rule_id: Optional[int] = None
+    title: str
+    rule_text: str
+    evidence_snapshot: dict
+    evidence_snapshot_sha256: str
+    is_latest_version: bool
+    created_at: datetime
+
+
+class PlaybookListResponse(BaseModel):
+    schema_version: Literal["journal-playbook/1.0"] = "journal-playbook/1.0"
+    account_key: str
+    candidates: list[PlaybookCandidateItem] = Field(default_factory=list)
+    rules: list[PlaybookRuleItem] = Field(default_factory=list)
+
+
+class PlaybookCandidateCreateResponse(BaseModel):
+    data_state: Literal["ready"] = "ready"
+    created: bool
+    idempotent_replay: bool
+    candidate: PlaybookCandidateItem
+
+
+class PlaybookRulePromoteRequest(BaseModel):
+    """Promotion is always an explicit user action; no auto-promotion."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    allow_new_version: bool = False
+    expected_current_version: Optional[int] = Field(default=None, ge=1)
+
+
+class PlaybookRulePromoteResponse(BaseModel):
+    data_state: Literal["ready"] = "ready"
+    created: bool
+    idempotent_replay: bool
+    rule: PlaybookRuleItem
+
+
+class PlaybookRuleRetireRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_current_version: int = Field(ge=1)
+
+
+class PlaybookRuleRetireResponse(BaseModel):
+    data_state: Literal["ready"] = "ready"
+    retired: bool
+    idempotent_replay: bool
+    rule: PlaybookRuleItem

@@ -1,14 +1,16 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import ReviewInsightsPanel from '../ReviewInsightsPanel';
-import { fetchReviewInsights } from '../../../api/journal';
+import { createPlaybookCandidate, fetchReviewInsights } from '../../../api/journal';
 import type { ReviewInsightBucket, ReviewInsightsResponse } from '../../../types/journal';
 
 vi.mock('../../../api/journal', () => ({
   fetchReviewInsights: vi.fn(),
+  createPlaybookCandidate: vi.fn(),
 }));
 
 const fetchInsightsMock = vi.mocked(fetchReviewInsights);
+const createCandidateMock = vi.mocked(createPlaybookCandidate);
 
 const baseResponse: ReviewInsightsResponse = {
   schemaVersion: 'journal-review-insights/1.0',
@@ -74,7 +76,7 @@ describe('ReviewInsightsPanel', () => {
     expect(screen.getByText(/仅计数，永不显示盈亏统计/)).toBeInTheDocument();
     expect(screen.getByText(/尚无带标签的复盘标注/)).toBeInTheDocument();
     expect(
-      screen.getByText(/观察到的模式 ≠ 已验证规则；晋升到 Playbook 需要显式操作（后续切片）/),
+      screen.getByText(/观察到的模式 ≠ 已验证规则；保存候选与晋升规则都是你的显式操作，系统永不自动晋升/),
     ).toBeInTheDocument();
   });
 
@@ -154,5 +156,90 @@ describe('ReviewInsightsPanel', () => {
     await waitFor(() => {
       expect(screen.getByRole('alert')).toBeInTheDocument();
     });
+  });
+
+  it('gates the save-as-candidate form until both title and rule text exist', async () => {
+    fetchInsightsMock.mockResolvedValue({ ...baseResponse, buckets: [bucket({})] });
+    render(<ReviewInsightsPanel />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '保存为候选' }));
+    const submit = screen.getByRole('button', { name: '保存候选' });
+    expect(submit).toBeDisabled();
+    expect(
+      screen.getByText(/候选与规则不会影响系统评分或榜单/),
+    ).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('候选标题'), { target: { value: '动量候选' } });
+    expect(submit).toBeDisabled();
+    fireEvent.change(screen.getByLabelText('规则描述'), { target: { value: '   ' } });
+    expect(submit).toBeDisabled();
+    fireEvent.change(screen.getByLabelText('规则描述'), { target: { value: '只做计划内触发。' } });
+    expect(submit).toBeEnabled();
+    expect(createCandidateMock).not.toHaveBeenCalled();
+  });
+
+  it('submits the bucket echo explicitly and reports the saved candidate', async () => {
+    fetchInsightsMock.mockResolvedValue({ ...baseResponse, buckets: [bucket({})] });
+    createCandidateMock.mockResolvedValue({
+      dataState: 'ready',
+      created: true,
+      idempotentReplay: false,
+      candidate: {
+        schemaVersion: 'playbook-candidate/1.0',
+        id: 1,
+        candidateKey: 'c'.repeat(64),
+        accountKey: 'default_moomoo_us',
+        title: '动量候选',
+        ruleText: '只做计划内触发。',
+        sourceBucket: {
+          groupKind: 'tag',
+          groupValue: 'momentum',
+          direction: 'LONG',
+          boundaryPolicy: 'assumed_or_censored',
+        },
+        evidenceSnapshot: {},
+        evidenceSnapshotSha256: 'e'.repeat(64),
+        promoted: false,
+        createdAt: '2026-08-01T12:00:00Z',
+      },
+    });
+    const onCandidateSaved = vi.fn();
+    render(<ReviewInsightsPanel onCandidateSaved={onCandidateSaved} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '保存为候选' }));
+    fireEvent.change(screen.getByLabelText('候选标题'), { target: { value: '动量候选' } });
+    fireEvent.change(screen.getByLabelText('规则描述'), { target: { value: '只做计划内触发。' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存候选' }));
+
+    await waitFor(() => {
+      expect(createCandidateMock).toHaveBeenCalledWith({
+        title: '动量候选',
+        ruleText: '只做计划内触发。',
+        sourceBucket: {
+          groupKind: 'tag',
+          groupValue: 'momentum',
+          direction: 'LONG',
+          boundaryPolicy: 'assumed_or_censored',
+        },
+      });
+    });
+    expect(await screen.findByText(/已保存为候选，可在下方 Playbook 面板显式晋升/)).toBeInTheDocument();
+    expect(onCandidateSaved).toHaveBeenCalledTimes(1);
+  });
+
+  it('surfaces a save conflict without hiding the form', async () => {
+    fetchInsightsMock.mockResolvedValue({ ...baseResponse, buckets: [bucket({})] });
+    createCandidateMock.mockRejectedValue(new Error('conflict'));
+    render(<ReviewInsightsPanel />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '保存为候选' }));
+    fireEvent.change(screen.getByLabelText('候选标题'), { target: { value: '动量候选' } });
+    fireEvent.change(screen.getByLabelText('规则描述'), { target: { value: '只做计划内触发。' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存候选' }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toBeInTheDocument();
+    });
+    expect(screen.getByRole('button', { name: '保存候选' })).toBeInTheDocument();
   });
 });

@@ -30,6 +30,12 @@ import type {
   PositionEpisodeListResponse,
   PositionEpisodeReviewAnnotationHistoryResponse,
   PositionEpisodeReviewAnnotationLatestResponse,
+  PlaybookListResponse,
+  CreatePlaybookCandidateRequest,
+  CreatePlaybookCandidateResponse,
+  PromotePlaybookCandidateRequest,
+  PromotePlaybookCandidateResponse,
+  RetirePlaybookRuleResponse,
   RealityTestResponse,
   ReviewInsightsResponse,
   SavePositionEpisodeReviewAnnotationRequest,
@@ -277,6 +283,54 @@ export async function fetchPositionEpisodeReviewAnnotationHistory(
 export async function fetchReviewInsights(): Promise<ReviewInsightsResponse> {
   const { data } = await apiClient.get(`${BASE}/v2/review-insights`);
   return toCamelCase<ReviewInsightsResponse>(data);
+}
+
+export async function fetchPlaybook(): Promise<PlaybookListResponse> {
+  const { data } = await apiClient.get(`${BASE}/v2/playbook`);
+  return toCamelCase<PlaybookListResponse>(data);
+}
+
+export async function createPlaybookCandidate(
+  request: CreatePlaybookCandidateRequest,
+): Promise<CreatePlaybookCandidateResponse> {
+  const { data } = await apiClient.post(`${BASE}/v2/playbook/candidates`, {
+    title: request.title.trim(),
+    rule_text: request.ruleText.trim(),
+    source_bucket: request.sourceBucket
+      ? {
+          group_kind: request.sourceBucket.groupKind,
+          group_value: request.sourceBucket.groupValue,
+          direction: request.sourceBucket.direction,
+          boundary_policy: request.sourceBucket.boundaryPolicy,
+        }
+      : null,
+  });
+  return toCamelCase<CreatePlaybookCandidateResponse>(data);
+}
+
+export async function promotePlaybookCandidate(
+  candidateKey: string,
+  request: PromotePlaybookCandidateRequest = {},
+): Promise<PromotePlaybookCandidateResponse> {
+  const { data } = await apiClient.post(
+    `${BASE}/v2/playbook/candidates/${candidateKey}/promote`,
+    {
+      allow_new_version: request.allowNewVersion ?? false,
+      expected_current_version: request.expectedCurrentVersion ?? null,
+    },
+  );
+  return toCamelCase<PromotePlaybookCandidateResponse>(data);
+}
+
+export async function retirePlaybookRule(
+  lineageKey: string,
+  expectedCurrentVersion: number,
+): Promise<RetirePlaybookRuleResponse> {
+  const { data } = await apiClient.post(
+    `${BASE}/v2/playbook/rules/${lineageKey}/retire`,
+    { expected_current_version: expectedCurrentVersion },
+  );
+  return toCamelCase<RetirePlaybookRuleResponse>(data);
 }
 
 export async function savePositionEpisodeReviewAnnotation(

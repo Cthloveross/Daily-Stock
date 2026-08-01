@@ -51,6 +51,11 @@ from src.journal.ledger.models import (
 from src.options.occ_parser import parse_symbol
 from src.storage import Base, get_db
 
+# Register the append-only Playbook tables (contract slice C-2) on the shared
+# metadata so ``init_ledger_schema``'s ``create_all`` and the append-only deny
+# triggers always cover them.
+import src.journal.ledger.playbook_models as _playbook_models  # noqa: F401
+
 __all__ = [
     "DEFAULT_LEDGER_ACCOUNT_KEY",
     "LedgerImportError",
@@ -110,6 +115,8 @@ _APPEND_ONLY_TABLE_NAMES = (
     "journal_v2_position_episodes",
     "journal_v2_position_episode_evidence",
     "journal_v2_review_annotations",
+    "journal_v2_playbook_candidates",
+    "journal_v2_playbook_rules",
 )
 _LEDGER_SCHEMA_LOCK = threading.RLock()
 
