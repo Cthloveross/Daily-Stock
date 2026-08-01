@@ -18,6 +18,8 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.orm import aliased
 
 from src.journal.ledger.activation_repository import (
+    CANONICAL_SOURCE_KIND,
+    SNAPSHOT_FENCE_SOURCE_KIND,
     EpisodeBuildActivationError,
     _resolve_effective_episode_build,
 )
@@ -97,10 +99,12 @@ _EXCHANGE_TIMEZONE = "America/New_York"
 _GROUPING_METHOD = "one_to_one_no_strategy_inference"
 _STRATEGY_TYPE = "single_position_unclassified"
 _CSV_SOURCE_KIND = "csv_batch"
-_CANONICAL_SOURCE_KIND = "canonical_set"
-# Shared with the fenced future preview/confirm modules; a formal future
-# build is linked by a snapshot-fence source row instead of a canonical link.
-SNAPSHOT_FENCE_SOURCE_KIND = "position_snapshot_fenced_canonical"
+# Canonical and snapshot-fence source kinds are defined once in the
+# activation repository (this module's import direction points there) and
+# re-exported here for the fenced future preview/confirm modules; a formal
+# future build is linked by a snapshot-fence source row instead of a
+# canonical link.
+_CANONICAL_SOURCE_KIND = CANONICAL_SOURCE_KIND
 _CANONICAL_PROJECTION_NAME = "persisted_canonical_member_projection"
 _CANONICAL_PROJECTION_VERSION = "1.1.0"
 _EXECUTION_GROUP_FEE_POLICY = "retained_at_group_scope_not_leg_allocated"

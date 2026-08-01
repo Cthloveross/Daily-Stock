@@ -383,6 +383,7 @@ export async function activateEpisodeBuild(
       expected_current_build_id: request.expectedCurrentBuildId ?? null,
       accept_assumed_flat: request.acceptAssumedFlat,
       accept_group_fee_scope: request.acceptGroupFeeScope,
+      accept_left_censored_openings: request.acceptLeftCensoredOpenings,
     },
   );
   return toCamelCase<EpisodeBuildActivationResponse>(data);

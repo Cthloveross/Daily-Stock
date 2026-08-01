@@ -286,6 +286,7 @@ describe('journal canonical episode API', () => {
       expectedCurrentBuildId: state.currentBuildId,
       acceptAssumedFlat: true,
       acceptGroupFeeScope: false,
+      acceptLeftCensoredOpenings: true,
     });
     expect(apiMocks.post).toHaveBeenCalledWith(
       '/api/v1/journal/v2/episode-builds/9/activate',
@@ -295,6 +296,7 @@ describe('journal canonical episode API', () => {
         expected_current_build_id: 7,
         accept_assumed_flat: true,
         accept_group_fee_scope: false,
+        accept_left_censored_openings: true,
       },
     );
     expect(response.activationId).toBe(12);

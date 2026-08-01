@@ -704,6 +704,9 @@ class EpisodeBuildActivationRequest(BaseModel):
     expected_current_build_id: Optional[int] = Field(default=None, ge=1)
     accept_assumed_flat: bool = False
     accept_group_fee_scope: bool = False
+    # Required whenever the target build has left-censored openings (a
+    # snapshot-fence future build inheriting positions with no broker cost).
+    accept_left_censored_openings: bool = False
 
 
 class EpisodeBuildActivationResponse(BaseModel):

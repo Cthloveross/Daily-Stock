@@ -7,9 +7,12 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from sqlalchemy import func, select
 
 from src.journal.ledger import position_snapshot_continuity as continuity
 from src.journal.ledger.activation_repository import (
+    EpisodeBuildActivationError,
+    activate_episode_build,
     get_episode_build_activation_state,
 )
 from src.journal.ledger.episode_repository import (
@@ -23,6 +26,7 @@ from src.journal.ledger.episode_repository import (
     append_latest_position_episode_build,
     get_episode_summary,
     get_latest_episode_summary,
+    get_latest_position_episode_page,
 )
 from src.journal.ledger.episodes import (
     CanonicalFillEvidence,
@@ -31,8 +35,12 @@ from src.journal.ledger.episodes import (
 from src.journal.ledger.models import (
     BrokerFillObservation,
     BrokerOrderObservation,
+    EpisodeBuild,
+    EpisodeBuildActivation,
+    EpisodeBuildCanonicalSource,
     ImportBatch,
 )
+from src.journal.ledger.refresh_repository import get_journal_refresh_status
 from src.journal.ledger.position_snapshot_continuity import (
     assess_latest_position_snapshot_continuity,
 )
@@ -781,3 +789,295 @@ def test_default_view_stays_on_csv_fallback_when_fence_build_is_newer(
     summary = get_latest_episode_summary(ACCOUNT_KEY)
     assert summary is not None
     assert summary.build_id == csv_result.build_id
+
+
+def _activation_row_count() -> int:
+    db = get_db()
+    with db.session_scope() as session:
+        return int(
+            session.execute(
+                select(func.count(EpisodeBuildActivation.id))
+            ).scalar_one()
+        )
+
+
+def test_fence_build_activation_switches_default_readers_and_is_idempotent(
+    isolated_sqlite: Path,
+):
+    """切片 2 happy path：显式激活 fence build 后默认读取切换到它。"""
+    scenario = _ready_scenario()
+    _install_csv_baseline_batch(
+        scenario.snapshot.operation_completed_at - timedelta(days=30)
+    )
+    csv_result = append_latest_position_episode_build(
+        ACCOUNT_KEY,
+        accept_assumed_flat=True,
+    )
+    readiness = assess_latest_position_snapshot_continuity(ACCOUNT_KEY)
+    assert readiness.fence_key is not None
+    preview = preview_fenced_position_episodes(ACCOUNT_KEY, readiness.fence_key)
+    fence = _confirm(preview)
+    initial = get_episode_build_activation_state(ACCOUNT_KEY)
+    assert initial.selection_source == "csv_fallback"
+    assert initial.current_build_id == csv_result.build_id
+
+    first = activate_episode_build(
+        fence.build_id,
+        fence.build_key,
+        account_key=ACCOUNT_KEY,
+        accept_left_censored_openings=True,
+        expected_current_activation_id=initial.current_activation_id,
+        expected_current_build_id=initial.current_build_id,
+    )
+    retry = activate_episode_build(
+        fence.build_id,
+        fence.build_key,
+        account_key=ACCOUNT_KEY,
+        accept_left_censored_openings=True,
+        expected_current_activation_id=initial.current_activation_id,
+        expected_current_build_id=initial.current_build_id,
+    )
+
+    assert first.duplicate is False
+    assert first.target_source_kind == SNAPSHOT_FENCE_SOURCE_KIND
+    assert retry.duplicate is True
+    assert retry.activation_id == first.activation_id
+    assert first.state.selection_source == "activation"
+    assert first.state.current_build_id == fence.build_id
+    assert first.state.previous_build_id == csv_result.build_id
+    # The persisted activation identity is the fence link's frozen TARGET
+    # canonical set: the fence build's episodes derive exactly from it.
+    assert first.state.canonical_set_id == preview.target_canonical_set_id
+    assert first.state.canonical_set_sha256 == (
+        preview.target_canonical_set_sha256
+    )
+
+    summary = get_latest_episode_summary(ACCOUNT_KEY)
+    page = get_latest_position_episode_page(ACCOUNT_KEY)
+    assert summary is not None
+    assert summary.build_id == fence.build_id
+    assert summary.source_kind == SNAPSHOT_FENCE_SOURCE_KIND
+    assert page.build_id == fence.build_id
+    assert _activation_row_count() == 1
+
+
+def test_fence_build_activation_requires_left_censored_acceptance(
+    isolated_sqlite: Path,
+):
+    """缺 left-censored acceptance 时激活被拒且零业务写。"""
+    _scenario, preview = _ready_preview()
+    fence = _confirm(preview)
+    assert preview.counts.left_censored_episode_count > 0
+    before_counts = _business_table_counts(isolated_sqlite)
+    before_digest = _business_table_digest(isolated_sqlite)
+
+    with pytest.raises(
+        EpisodeBuildActivationError,
+        match="explicit acceptance",
+    ):
+        activate_episode_build(
+            fence.build_id,
+            fence.build_key,
+            account_key=ACCOUNT_KEY,
+            expected_current_activation_id=None,
+            expected_current_build_id=None,
+        )
+
+    assert _business_table_counts(isolated_sqlite) == before_counts
+    assert _business_table_digest(isolated_sqlite) == before_digest
+    assert get_episode_build_activation_state(
+        ACCOUNT_KEY
+    ).selection_source == "none"
+
+
+def test_fence_build_activation_cas_rejects_stale_expectations(
+    isolated_sqlite: Path,
+):
+    """陈旧 CAS 期望不能悄悄替换更新的 fence build 选择。"""
+    _scenario, preview = _ready_preview()
+    fence = _confirm(preview)
+    first = activate_episode_build(
+        fence.build_id,
+        fence.build_key,
+        account_key=ACCOUNT_KEY,
+        accept_left_censored_openings=True,
+        expected_current_activation_id=None,
+        expected_current_build_id=None,
+    )
+
+    with pytest.raises(EpisodeBuildActivationError, match="state changed"):
+        activate_episode_build(
+            fence.build_id,
+            fence.build_key,
+            account_key=ACCOUNT_KEY,
+            accept_left_censored_openings=True,
+            expected_current_activation_id=None,
+            expected_current_build_id=1_000_000,
+        )
+
+    assert _activation_row_count() == 1
+    assert get_episode_build_activation_state(
+        ACCOUNT_KEY
+    ).current_activation_id == first.activation_id
+
+
+def test_fence_link_tamper_fails_closed_on_activation_and_default_reads(
+    isolated_sqlite: Path,
+):
+    """篡改 fence link 的目标事实集指纹时，激活与默认读取都 fail closed。"""
+    scenario, preview = _ready_preview()
+    fence = _confirm(preview)
+
+    _tamper(
+        isolated_sqlite,
+        table=_LINK_TABLE,
+        sql=(
+            f"UPDATE {_LINK_TABLE} SET target_canonical_set_sha256=? "
+            "WHERE episode_build_id=?"
+        ),
+        parameters=("0" * 64, fence.build_id),
+    )
+    with pytest.raises(
+        EpisodeBuildActivationError,
+        match="not activation-ready",
+    ):
+        activate_episode_build(
+            fence.build_id,
+            fence.build_key,
+            account_key=ACCOUNT_KEY,
+            accept_left_censored_openings=True,
+            expected_current_activation_id=None,
+            expected_current_build_id=None,
+        )
+    assert _activation_row_count() == 0
+
+    _tamper(
+        isolated_sqlite,
+        table=_LINK_TABLE,
+        sql=(
+            f"UPDATE {_LINK_TABLE} SET target_canonical_set_sha256=? "
+            "WHERE episode_build_id=?"
+        ),
+        parameters=(scenario.target.canonical_set_sha256, fence.build_id),
+    )
+    activated = activate_episode_build(
+        fence.build_id,
+        fence.build_key,
+        account_key=ACCOUNT_KEY,
+        accept_left_censored_openings=True,
+        expected_current_activation_id=None,
+        expected_current_build_id=None,
+    )
+    assert activated.state.current_build_id == fence.build_id
+
+    _tamper(
+        isolated_sqlite,
+        table=_LINK_TABLE,
+        sql=(
+            f"UPDATE {_LINK_TABLE} SET target_canonical_set_sha256=? "
+            "WHERE episode_build_id=?"
+        ),
+        parameters=("0" * 64, fence.build_id),
+    )
+    with pytest.raises(
+        EpisodeBuildActivationError,
+        match="not activation-ready",
+    ):
+        get_episode_build_activation_state(ACCOUNT_KEY)
+    # Default reads wrap the same fail-closed refusal in the repository error.
+    with pytest.raises(
+        EpisodeRepositoryError,
+        match="not activation-ready",
+    ):
+        get_latest_episode_summary(ACCOUNT_KEY)
+
+
+def _append_synthetic_canonical_build_for_target(scenario, fence_build_id: int):
+    """Clone the fence build into a canonical-linked build on the target set.
+
+    Data-health compares the latest canonical-linked build against the latest
+    canonical set; this synthetic row provides that comparison partner without
+    replaying a full canonical seed.
+    """
+    db = get_db()
+    with db.session_scope() as session:
+        source = session.get(EpisodeBuild, fence_build_id)
+        assert source is not None
+        clone = EpisodeBuild(
+            build_key="c" * 64,
+            broker=source.broker,
+            account_key=source.account_key,
+            builder_name=source.builder_name,
+            builder_version=source.builder_version,
+            builder_config_sha256=source.builder_config_sha256,
+            evidence_set_sha256=scenario.target.canonical_set_sha256,
+            source_batch_ids_json=source.source_batch_ids_json,
+            source_cutoff_at=source.source_cutoff_at,
+            status="succeeded",
+            strategy_episode_count=source.strategy_episode_count,
+            position_episode_count=source.position_episode_count,
+            unresolved_evidence_count=0,
+            reconciliation_status=source.reconciliation_status,
+            build_report_json=source.build_report_json,
+            completeness_score=source.completeness_score,
+            completeness_json=source.completeness_json,
+            provenance_json=source.provenance_json,
+        )
+        session.add(clone)
+        session.flush()
+        session.add(
+            EpisodeBuildCanonicalSource(
+                link_key="d" * 64,
+                episode_build_id=int(clone.id),
+                canonical_set_id=scenario.target.canonical_set_id,
+                canonical_set_sha256=scenario.target.canonical_set_sha256,
+                projection_name="persisted_canonical_member_projection",
+                projection_version="1.1.0",
+                canonical_source_cutoff_at=source.source_cutoff_at,
+                source_batch_ids_json=source.source_batch_ids_json,
+            )
+        )
+        session.flush()
+        return int(clone.id)
+
+
+def test_data_health_reports_active_fence_build_honestly(
+    isolated_sqlite: Path,
+):
+    """激活的 fence build 不破坏 data-health，且按目标事实集口径对齐。"""
+    scenario, preview = _ready_preview()
+    fence = _confirm(preview)
+
+    before = get_journal_refresh_status(ACCOUNT_KEY)
+    assert before.active_selection_source == "none"
+    assert before.active_build_id is None
+
+    activated = activate_episode_build(
+        fence.build_id,
+        fence.build_key,
+        account_key=ACCOUNT_KEY,
+        accept_left_censored_openings=True,
+        expected_current_activation_id=None,
+        expected_current_build_id=None,
+    )
+    assert activated.duplicate is False
+
+    active = get_journal_refresh_status(ACCOUNT_KEY)
+    assert active.active_selection_source == "activation"
+    assert active.active_build_id == fence.build_id
+    assert active.active_canonical_set_id == preview.target_canonical_set_id
+    assert active.active_source_through == preview.source_cutoff_at
+    # No full canonical build exists yet, so the honest pending stage is
+    # still "build" for the latest canonical set.
+    assert active.pending_stage == "build"
+
+    canonical_build_id = _append_synthetic_canonical_build_for_target(
+        scenario,
+        fence.build_id,
+    )
+    aligned = get_journal_refresh_status(ACCOUNT_KEY)
+    assert aligned.latest_canonical_build_id == canonical_build_id
+    # The active fence build targets exactly the latest canonical set, so
+    # data-health must not demand re-activation of the canonical build.
+    assert aligned.freshness_state == "current"
+    assert aligned.pending_stage == "none"

@@ -400,8 +400,8 @@ const FutureEpisodePreviewSummary: React.FC<FutureEpisodePreviewSummaryProps> = 
               message={`Build #${confirmedBuild.build.id} · ${compactHash(confirmedBuild.build.buildKey)} · ${confirmedBuild.build.positionEpisodeCount.toLocaleString()} 个回合。`}
             />
             <p className="rounded-ds-md border border-warn-strong/25 bg-warn-subtle px-3 py-2 text-body-sm text-text-2">
-              <strong className="text-text-1">已构建 ≠ 已生效：默认复盘视图不变（activation 尚未支持 future build）。</strong>
-              {' '}如需查看该结果，请使用上方 build 编号显式检索。
+              <strong className="text-text-1">已构建 ≠ 已生效：激活前默认复盘视图不变。</strong>
+              {' '}如需生效，请在“仓位回合”页用上方 build 编号显式打开该构建后单独激活；激活会切换默认视图，且之后无法回到「零激活」的 CSV 默认状态。
             </p>
           </div>
         )}

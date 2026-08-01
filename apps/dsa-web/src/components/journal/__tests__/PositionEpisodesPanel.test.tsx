@@ -226,7 +226,9 @@ const canonicalBuildResult: EpisodeBuildResponse = {
     positionEpisodeCount: 1441,
   },
   reconciliation: readyList.reconciliation!,
-  summary: readyList.summary!,
+  // A canonical build has no snapshot-inherited openings, so its report
+  // never counts left-censored episodes.
+  summary: { ...readyList.summary!, leftCensoredEpisodeCount: 0 },
   message: 'canonical episode build appended',
 };
 
@@ -636,6 +638,7 @@ describe('PositionEpisodesPanel', () => {
       expectedCurrentBuildId: 7,
       acceptAssumedFlat: true,
       acceptGroupFeeScope: false,
+      acceptLeftCensoredOpenings: false,
     }));
     expect(onSelectBuild).toHaveBeenCalledWith();
     expect(controlled.reload).toHaveBeenCalledTimes(1);
@@ -690,5 +693,129 @@ describe('PositionEpisodesPanel', () => {
     expect(controlled.reload).not.toHaveBeenCalled();
     expect(controlled.reloadCanonicalPreview).not.toHaveBeenCalled();
     expect(onImported).not.toHaveBeenCalled();
+  });
+
+  it('requires left-censored acknowledgement before activating a build with left-censored episodes', async () => {
+    const leftCensoredResult: EpisodeBuildResponse = {
+      ...canonicalBuildResult,
+      summary: { ...canonicalBuildResult.summary, leftCensoredEpisodeCount: 2 },
+    };
+    render(
+      <PositionEpisodesPanel
+        filters={{ buildId: 9, page: 1, perPage: 50 }}
+        controller={controller({ canonicalBuildResult: leftCensoredResult })}
+        onApplyFilters={vi.fn()}
+        onPageChange={vi.fn()}
+        onSelectBuild={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(fetchActivationMock).toHaveBeenCalledTimes(1));
+    const activate = screen.getByRole('button', { name: '设为默认复盘构建' });
+    fireEvent.click(screen.getByRole('checkbox', {
+      name: /设为默认时，我再次接受未验证的期初空仓假设/,
+    }));
+    expect(activate).toBeDisabled();
+    expect(screen.getByText(/无法回到「零激活」的 CSV 默认状态/)).toBeInTheDocument();
+    expect(screen.getByText(/确认 left-censored 回合口径后才能设为默认/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('checkbox', {
+      name: /我接受 left-censored 回合无券商成本/,
+    }));
+    expect(activate).toBeEnabled();
+    fireEvent.click(activate);
+
+    await waitFor(() => expect(activateBuildMock).toHaveBeenCalledWith(9, expect.objectContaining({
+      acceptAssumedFlat: true,
+      acceptLeftCensoredOpenings: true,
+    })));
+  });
+
+  it('activates a viewed snapshot-fence build only after the left-censored acknowledgement', async () => {
+    const fenceList: PositionEpisodeListResponse = {
+      ...readyList,
+      build: {
+        ...readyList.build!,
+        id: 31,
+        buildKey: 'e'.repeat(64),
+        sourceKind: 'position_snapshot_fenced_canonical',
+        canonicalSetId: 5,
+        canonicalSetSha256: 'f'.repeat(64),
+        openingBoundaryPolicy: 'complete_snapshot',
+        assumedFlatUnverified: false,
+      },
+      summary: { ...readyList.summary!, leftCensoredEpisodeCount: 1 },
+    };
+    const onSelectBuild = vi.fn();
+    const onImported = vi.fn();
+    const controlled = controller({ list: fenceList });
+    activateBuildMock.mockResolvedValue({
+      ...activationResponse,
+      state: {
+        ...activationResponse.state,
+        currentBuildId: 31,
+        currentBuildKey: 'e'.repeat(64),
+        canonicalSetId: 5,
+      },
+    });
+    render(
+      <PositionEpisodesPanel
+        filters={{ buildId: 31, page: 1, perPage: 50 }}
+        controller={controlled}
+        onApplyFilters={vi.fn()}
+        onPageChange={vi.fn()}
+        onSelectBuild={onSelectBuild}
+        onImported={onImported}
+      />,
+    );
+
+    const card = await screen.findByRole('region', {
+      name: '将当前查看的构建 #31 设为默认',
+    });
+    await within(card).findByText(/当前 #7/);
+    expect(within(card).getByText(/快照围栏 future build · 目标事实集 #5/)).toBeInTheDocument();
+    expect(within(card).getByText(/激活身份绑定其冻结的目标事实集/)).toBeInTheDocument();
+    expect(within(card).getByText(/无法回到「零激活」的 CSV 默认状态/)).toBeInTheDocument();
+    const activate = within(card).getByRole('button', { name: '设为默认复盘构建' });
+    expect(activate).toBeDisabled();
+    expect(within(card).queryByRole('checkbox', {
+      name: /设为默认时，我再次接受未验证的期初空仓假设/,
+    })).not.toBeInTheDocument();
+
+    fireEvent.click(within(card).getByRole('checkbox', {
+      name: /left-censored 回合无券商成本/,
+    }));
+    expect(activate).toBeEnabled();
+    fireEvent.click(activate);
+
+    await waitFor(() => expect(activateBuildMock).toHaveBeenCalledWith(31, {
+      expectedBuildKey: 'e'.repeat(64),
+      expectedCurrentActivationId: null,
+      expectedCurrentBuildId: 7,
+      acceptAssumedFlat: false,
+      acceptGroupFeeScope: false,
+      acceptLeftCensoredOpenings: true,
+    }));
+    expect(onSelectBuild).toHaveBeenCalledWith();
+    expect(controlled.reload).toHaveBeenCalledTimes(1);
+    expect(controlled.reloadCanonicalPreview).toHaveBeenCalledTimes(1);
+    expect(onImported).toHaveBeenCalledTimes(1);
+  });
+
+  it('offers no activation affordance for a viewed CSV fallback build', async () => {
+    render(
+      <PositionEpisodesPanel
+        filters={{ buildId: 7, page: 1, perPage: 50 }}
+        controller={controller()}
+        onApplyFilters={vi.fn()}
+        onPageChange={vi.fn()}
+        onSelectBuild={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('正在查看构建 #7')).toBeInTheDocument();
+    await waitFor(() => expect(fetchActivationMock).toHaveBeenCalled());
+    expect(screen.queryByRole('button', { name: '设为默认复盘构建' })).not.toBeInTheDocument();
+    expect(activateBuildMock).not.toHaveBeenCalled();
   });
 });

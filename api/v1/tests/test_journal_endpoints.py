@@ -2678,3 +2678,103 @@ def test_canonical_episode_api_round_trip_does_not_activate_default_build():
     assert repeated_activation.json()["activation_id"] == activated_body[
         "activation_id"
     ]
+
+
+def _activation_state_for_build(build_id: int):
+    from src.journal.ledger.activation_repository import (
+        EpisodeBuildActivationState,
+    )
+
+    return EpisodeBuildActivationState(
+        account_key="default_moomoo_us",
+        selection_source="activation",
+        current_activation_id=3,
+        current_activation_sequence=1,
+        current_build_id=build_id,
+        current_build_key="a" * 64,
+        canonical_set_id=9,
+        canonical_set_sha256="b" * 64,
+        previous_activation_id=None,
+        previous_build_id=None,
+        activated_at=datetime(2026, 7, 31, tzinfo=timezone.utc),
+    )
+
+
+def test_activation_endpoint_forwards_left_censored_acceptance(monkeypatch):
+    from api.v1.endpoints import journal
+    from src.journal.ledger.activation_repository import (
+        SNAPSHOT_FENCE_SOURCE_KIND,
+        EpisodeBuildActivationResult,
+    )
+
+    captured = {}
+
+    def _activate(build_id, expected_build_key, **kwargs):
+        captured["build_id"] = build_id
+        captured["expected_build_key"] = expected_build_key
+        captured.update(kwargs)
+        return EpisodeBuildActivationResult(
+            activation_id=3,
+            activation_key="c" * 64,
+            duplicate=False,
+            state=_activation_state_for_build(21),
+            target_source_kind=SNAPSHOT_FENCE_SOURCE_KIND,
+        )
+
+    monkeypatch.setattr(journal, "activate_episode_build", _activate)
+    c = _client()
+    response = c.post(
+        "/api/v1/journal/v2/episode-builds/21/activate",
+        json={
+            "expected_build_key": "a" * 64,
+            "expected_current_activation_id": None,
+            "expected_current_build_id": None,
+            "accept_left_censored_openings": True,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert captured["build_id"] == 21
+    assert captured["accept_left_censored_openings"] is True
+    assert captured["accept_assumed_flat"] is False
+    assert captured["accept_group_fee_scope"] is False
+    body = response.json()
+    assert body["message"].startswith(
+        "snapshot-fence future Episode build 21 activated"
+    )
+    assert body["trading_action_performed"] is False
+    assert body["state"]["selection_source"] == "activation"
+
+
+def test_activation_endpoint_defaults_and_maps_left_censored_409(monkeypatch):
+    from api.v1.endpoints import journal
+    from src.journal.ledger.activation_repository import (
+        EpisodeBuildActivationError,
+    )
+
+    captured = {}
+
+    def _activate(build_id, expected_build_key, **kwargs):
+        captured["build_id"] = build_id
+        captured.update(kwargs)
+        raise EpisodeBuildActivationError(
+            "left-censored openings have no broker cost basis; "
+            "explicit acceptance is required"
+        )
+
+    monkeypatch.setattr(journal, "activate_episode_build", _activate)
+    c = _client()
+    # A request that omits the additive flag keeps the old wire shape and
+    # defaults to no acceptance server-side.
+    response = c.post(
+        "/api/v1/journal/v2/episode-builds/21/activate",
+        json={
+            "expected_build_key": "a" * 64,
+            "expected_current_activation_id": None,
+            "expected_current_build_id": None,
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert captured["accept_left_censored_openings"] is False
+    assert "explicit acceptance" in response.json()["detail"]

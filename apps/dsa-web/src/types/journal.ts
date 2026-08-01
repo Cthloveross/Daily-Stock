@@ -735,6 +735,8 @@ export interface EpisodeBuildActivationRequest {
   expectedCurrentBuildId?: number | null;
   acceptAssumedFlat: boolean;
   acceptGroupFeeScope: boolean;
+  /** Required whenever the target build has left-censored openings (snapshot-fence future builds). */
+  acceptLeftCensoredOpenings: boolean;
 }
 
 export interface EpisodeBuildActivationResponse {

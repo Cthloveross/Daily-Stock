@@ -125,6 +125,7 @@ from src.journal.ledger.episode_repository import (
     preview_latest_position_episodes,
 )
 from src.journal.ledger.activation_repository import (
+    SNAPSHOT_FENCE_SOURCE_KIND,
     EpisodeBuildActivationError,
     activate_episode_build,
     get_episode_build_activation_state,
@@ -1144,7 +1145,7 @@ def activate_position_episode_build(
         pattern=r"^[A-Za-z0-9_.:-]+$",
     ),
 ) -> EpisodeBuildActivationResponse:
-    """Explicitly select one immutable canonical build as the default view."""
+    """Explicitly select one immutable source-linked build as the default view."""
     try:
         result = activate_episode_build(
             build_id,
@@ -1155,20 +1156,29 @@ def activate_position_episode_build(
             expected_current_build_id=request.expected_current_build_id,
             accept_assumed_flat=request.accept_assumed_flat,
             accept_group_fee_scope=request.accept_group_fee_scope,
+            accept_left_censored_openings=(
+                request.accept_left_censored_openings
+            ),
             account_key=account_key,
         )
     except EpisodeBuildActivationError as exc:
         status_code = 404 if "does not exist" in str(exc) else 409
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     action = "already active" if result.duplicate else "activated"
+    kind_label = (
+        "snapshot-fence future"
+        if result.target_source_kind == SNAPSHOT_FENCE_SOURCE_KIND
+        else "canonical"
+    )
     return EpisodeBuildActivationResponse(
         activation_id=result.activation_id,
         activation_key=result.activation_key,
         duplicate=result.duplicate,
         state=EpisodeBuildActivationStateResponse(**result.state.__dict__),
         message=(
-            f"canonical Episode build {result.state.current_build_id} {action}; "
-            "default review reads now resolve through the append-only activation."
+            f"{kind_label} Episode build {result.state.current_build_id} "
+            f"{action}; default review reads now resolve through the "
+            "append-only activation."
         ),
         trading_action_performed=False,
     )

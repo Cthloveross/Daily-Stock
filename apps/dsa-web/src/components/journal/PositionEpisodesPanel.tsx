@@ -14,13 +14,19 @@ import type {
   CanonicalEpisodeBuildPlanResponse,
   EpisodeBuildActivationResponse,
   EpisodeBuildActivationState,
+  EpisodeBuildMetadata,
   EpisodeBuildResponse,
   PositionEpisodeDetailResponse,
   PositionEpisodeEvidenceItem,
   PositionEpisodeFilters,
   PositionEpisodeItem,
   PositionEpisodeListResponse,
+  PositionEpisodeSummary,
 } from '../../types/journal';
+
+const CANONICAL_SOURCE_KIND = 'canonical_set';
+const SNAPSHOT_FENCE_SOURCE_KIND = 'position_snapshot_fenced_canonical';
+const ACTIVATION_IRREVERSIBLE_WARNING = '激活后默认复盘视图将切换到此构建；之后可以再激活其他构建切回，但无法回到「零激活」的 CSV 默认状态。';
 
 interface PositionEpisodeController {
   list: PositionEpisodeListResponse | null;
@@ -349,6 +355,7 @@ function CanonicalEpisodeBuildCard({
   const [acceptedGroupFeePreviewKey, setAcceptedGroupFeePreviewKey] = useState<string | null>(null);
   const [acceptedActivationBuildId, setAcceptedActivationBuildId] = useState<number | null>(null);
   const [acceptedGroupFeeActivationBuildId, setAcceptedGroupFeeActivationBuildId] = useState<number | null>(null);
+  const [acceptedLeftCensoredActivationBuildId, setAcceptedLeftCensoredActivationBuildId] = useState<number | null>(null);
   const [activationState, setActivationState] = useState<EpisodeBuildActivationState | null>(null);
   const [activationLoading, setActivationLoading] = useState(true);
   const [activationSubmitting, setActivationSubmitting] = useState(false);
@@ -383,6 +390,7 @@ function CanonicalEpisodeBuildCard({
   useEffect(() => {
     setAcceptedActivationBuildId(null);
     setAcceptedGroupFeeActivationBuildId(null);
+    setAcceptedLeftCensoredActivationBuildId(null);
     setActivationResult(null);
     setActivationError(null);
     setActivationConflict(false);
@@ -442,11 +450,17 @@ function CanonicalEpisodeBuildCard({
     && result.build.groupFeeAffectedEpisodeCount > 0
     && !result.build.legFeeAttributionComplete,
   );
+  const targetRequiresLeftCensored = Boolean(
+    result && result.summary.leftCensoredEpisodeCount > 0,
+  );
   const activationAssumptionAccepted = (
     result != null && acceptedActivationBuildId === result.build.id
   );
   const activationGroupFeeScopeAccepted = (
     result != null && acceptedGroupFeeActivationBuildId === result.build.id
+  );
+  const activationLeftCensoredAccepted = (
+    result != null && acceptedLeftCensoredActivationBuildId === result.build.id
   );
   const targetIsCurrent = (
     result != null
@@ -465,7 +479,8 @@ function CanonicalEpisodeBuildCard({
     && !activationSubmitting
     && !activationError
     && (!targetRequiresAssumedFlat || activationAssumptionAccepted)
-    && (!targetRequiresGroupFeeScope || activationGroupFeeScopeAccepted),
+    && (!targetRequiresGroupFeeScope || activationGroupFeeScopeAccepted)
+    && (!targetRequiresLeftCensored || activationLeftCensoredAccepted),
   );
 
   const handleActivate = async () => {
@@ -482,6 +497,9 @@ function CanonicalEpisodeBuildCard({
         acceptGroupFeeScope: (
           targetRequiresGroupFeeScope && activationGroupFeeScopeAccepted
         ),
+        acceptLeftCensoredOpenings: (
+          targetRequiresLeftCensored && activationLeftCensoredAccepted
+        ),
       });
       if (
         response.tradingActionPerformed !== false
@@ -494,6 +512,7 @@ function CanonicalEpisodeBuildCard({
       setActivationResult(response);
       setAcceptedActivationBuildId(null);
       setAcceptedGroupFeeActivationBuildId(null);
+      setAcceptedLeftCensoredActivationBuildId(null);
       onActivated(response);
     } catch (reason) {
       const parsed = parseApiError(reason);
@@ -511,6 +530,7 @@ function CanonicalEpisodeBuildCard({
         }
         setAcceptedActivationBuildId(null);
         setAcceptedGroupFeeActivationBuildId(null);
+        setAcceptedLeftCensoredActivationBuildId(null);
         setActivationConflict(true);
         setActivationError({
           ...parsed,
@@ -754,6 +774,23 @@ function CanonicalEpisodeBuildCard({
                 </label>
               )}
 
+              {targetRequiresLeftCensored && !targetIsCurrent && (
+                <label className="mt-3 flex cursor-pointer items-start gap-3 rounded-ds-md border border-warn-strong/30 bg-warn-subtle p-3 text-body-sm text-text-2">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5 h-4 w-4 shrink-0 accent-cyan"
+                    checked={activationLeftCensoredAccepted}
+                    onChange={(event) => setAcceptedLeftCensoredActivationBuildId(
+                      event.target.checked ? result.build.id : null,
+                    )}
+                  />
+                  <span>
+                    <strong className="text-text-1">设为默认时，我接受 left-censored 回合无券商成本。</strong>
+                    {' '}{result.summary.leftCensoredEpisodeCount.toLocaleString()} 个回合缺少边界前的真实开仓成本与费用；系统不会伪造这些数字，相关结果不进入严格 Headline。
+                  </span>
+                </label>
+              )}
+
               {activationError && (
                 <ApiErrorAlert
                   className="mt-3"
@@ -772,6 +809,12 @@ function CanonicalEpisodeBuildCard({
                     ? '该构建已经是默认复盘构建；默认读取已按服务器状态重新验证。'
                     : 'append-only 默认选择记录已保存；默认读取将重新验证此构建。'}
                 />
+              )}
+
+              {!targetIsCurrent && (
+                <p className="mt-3 text-caption text-warn-strong">
+                  {ACTIVATION_IRREVERSIBLE_WARNING}
+                </p>
               )}
 
               <div className="mt-3 flex flex-wrap items-center gap-3">
@@ -801,6 +844,9 @@ function CanonicalEpisodeBuildCard({
                 )}
                 {targetRequiresGroupFeeScope && !activationGroupFeeScopeAccepted && !targetIsCurrent && (
                   <span className="text-caption text-warn-strong">再次确认组合费用口径后才能设为默认。</span>
+                )}
+                {targetRequiresLeftCensored && !activationLeftCensoredAccepted && !targetIsCurrent && (
+                  <span className="text-caption text-warn-strong">确认 left-censored 回合口径后才能设为默认。</span>
                 )}
               </div>
             </section>
@@ -868,6 +914,243 @@ function CanonicalEpisodeBuildCard({
             <span className="text-caption text-warn-strong">确认组合费用口径后才能生成。</span>
           )}
         </div>
+      </div>
+    </section>
+  );
+}
+
+function viewedBuildSourceLabel(build: EpisodeBuildMetadata): string {
+  if (build.sourceKind === SNAPSHOT_FENCE_SOURCE_KIND) {
+    return `快照围栏 future build · 目标事实集 #${build.canonicalSetId ?? '—'}`;
+  }
+  return `可信事实集构建 · 事实集 #${build.canonicalSetId ?? '—'}`;
+}
+
+function ViewedBuildActivationCard({
+  build,
+  summary,
+  onActivated,
+}: {
+  build: EpisodeBuildMetadata;
+  summary: PositionEpisodeSummary | null;
+  onActivated: (response: EpisodeBuildActivationResponse) => void;
+}) {
+  const [activationState, setActivationState] = useState<EpisodeBuildActivationState | null>(null);
+  const [activationLoading, setActivationLoading] = useState(true);
+  const [activationSubmitting, setActivationSubmitting] = useState(false);
+  const [activationError, setActivationError] = useState<ParsedApiError | null>(null);
+  const [activationConflict, setActivationConflict] = useState(false);
+  const [acceptedAssumedFlat, setAcceptedAssumedFlat] = useState(false);
+  const [acceptedGroupFeeScope, setAcceptedGroupFeeScope] = useState(false);
+  const [acceptedLeftCensored, setAcceptedLeftCensored] = useState(false);
+
+  const loadActivationState = useCallback(async () => {
+    setActivationLoading(true);
+    setActivationError(null);
+    setActivationConflict(false);
+    try {
+      const state = await fetchEpisodeBuildActivation();
+      setActivationState(state);
+    } catch (reason) {
+      setActivationError(parseApiError(reason));
+    } finally {
+      setActivationLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadActivationState();
+  }, [loadActivationState]);
+
+  const isFenceBuild = build.sourceKind === SNAPSHOT_FENCE_SOURCE_KIND;
+  const requiresAssumedFlat = build.assumedFlatUnverified;
+  const requiresGroupFeeScope = (
+    build.groupFeeAffectedEpisodeCount > 0 && !build.legFeeAttributionComplete
+  );
+  const leftCensoredCount = summary?.leftCensoredEpisodeCount ?? 0;
+  const requiresLeftCensored = leftCensoredCount > 0;
+  const targetIsCurrent = (
+    activationState?.selectionSource === 'activation'
+    && activationState.currentBuildId === build.id
+  );
+  const hasImmutableKey = /^[0-9a-f]{64}$/i.test(build.buildKey);
+  const canActivate = Boolean(
+    activationState
+    && hasImmutableKey
+    && !targetIsCurrent
+    && !activationLoading
+    && !activationSubmitting
+    && !activationError
+    && (!requiresAssumedFlat || acceptedAssumedFlat)
+    && (!requiresGroupFeeScope || acceptedGroupFeeScope)
+    && (!requiresLeftCensored || acceptedLeftCensored),
+  );
+
+  const handleActivate = async () => {
+    if (!activationState || !canActivate) return;
+    setActivationSubmitting(true);
+    setActivationError(null);
+    setActivationConflict(false);
+    try {
+      const response = await activateEpisodeBuild(build.id, {
+        expectedBuildKey: build.buildKey,
+        expectedCurrentActivationId: activationState.currentActivationId ?? null,
+        expectedCurrentBuildId: activationState.currentBuildId ?? null,
+        acceptAssumedFlat: requiresAssumedFlat && acceptedAssumedFlat,
+        acceptGroupFeeScope: requiresGroupFeeScope && acceptedGroupFeeScope,
+        acceptLeftCensoredOpenings: requiresLeftCensored && acceptedLeftCensored,
+      });
+      if (
+        response.tradingActionPerformed !== false
+        || response.state.currentBuildId !== build.id
+        || response.state.selectionSource !== 'activation'
+      ) {
+        throw new Error('默认设置结果未通过只读复盘校验，页面没有切换默认复盘构建。');
+      }
+      setActivationState(response.state);
+      onActivated(response);
+    } catch (reason) {
+      const parsed = parseApiError(reason);
+      const stale = parsed.status === 409
+        && parsed.rawMessage.toLowerCase().includes('state changed');
+      if (stale) {
+        let stateReloaded = false;
+        try {
+          const current = await fetchEpisodeBuildActivation();
+          setActivationState(current);
+          stateReloaded = true;
+        } catch {
+          // Keep the actionable CAS conflict; retry can reload state again.
+        }
+        setAcceptedAssumedFlat(false);
+        setAcceptedGroupFeeScope(false);
+        setAcceptedLeftCensored(false);
+        setActivationConflict(true);
+        setActivationError({
+          ...parsed,
+          title: '默认复盘构建已变化',
+          message: stateReloaded
+            ? '另一页面刚刚选择了不同的默认复盘构建。当前状态已重新读取，请核对后再次确认。'
+            : '另一页面刚刚选择了不同的默认复盘构建。请重新读取当前状态，再核对并确认。',
+        });
+      } else {
+        setActivationError(parsed);
+      }
+    } finally {
+      setActivationSubmitting(false);
+    }
+  };
+
+  return (
+    <section
+      className="rounded-ds-md border border-accent/25 bg-accent/5 p-4"
+      aria-label={`将当前查看的构建 #${build.id} 设为默认`}
+    >
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="text-label uppercase tracking-label text-text-3">显式设为默认复盘构建</div>
+          <h3 className="mt-1 text-body font-semibold text-text-1">
+            将构建 #{build.id} 设为默认复盘构建
+          </h3>
+          <p className="mt-1 text-caption text-text-3">
+            {viewedBuildSourceLabel(build)}
+            {' '}· 目标指纹 <span className="font-mono">{build.buildKey.slice(0, 12)}…</span>
+            {' '}· 当前 {activationState?.currentBuildId != null ? `#${activationState.currentBuildId}` : '无默认构建'}
+          </p>
+        </div>
+        <span className="rounded-full border border-up-strong/25 bg-up-subtle px-2.5 py-1 text-caption text-up-strong">
+          零交易动作
+        </span>
+      </div>
+
+      {isFenceBuild && (
+        <p className="mt-2 text-caption text-text-3">
+          这是快照围栏 future build：回合仅覆盖快照边界之后的执行窗口，激活身份绑定其冻结的目标事实集。
+        </p>
+      )}
+
+      {requiresAssumedFlat && !targetIsCurrent && (
+        <label className="mt-3 flex cursor-pointer items-start gap-3 rounded-ds-md border border-warn-strong/30 bg-warn-subtle p-3 text-body-sm text-text-2">
+          <input
+            type="checkbox"
+            className="mt-0.5 h-4 w-4 shrink-0 accent-cyan"
+            checked={acceptedAssumedFlat}
+            onChange={(event) => setAcceptedAssumedFlat(event.target.checked)}
+          />
+          <span>
+            <strong className="text-text-1">设为默认时，我再次接受未验证的期初空仓假设。</strong>
+            {' '}受影响盈亏仍保持条件性标记，不进入严格 Headline。
+          </span>
+        </label>
+      )}
+
+      {requiresGroupFeeScope && !targetIsCurrent && (
+        <label className="mt-3 flex cursor-pointer items-start gap-3 rounded-ds-md border border-warn-strong/30 bg-warn-subtle p-3 text-body-sm text-text-2">
+          <input
+            type="checkbox"
+            className="mt-0.5 h-4 w-4 shrink-0 accent-cyan"
+            checked={acceptedGroupFeeScope}
+            onChange={(event) => setAcceptedGroupFeeScope(event.target.checked)}
+          />
+          <span>
+            <strong className="text-text-1">设为默认时，我再次确认组合费用仅保留在执行组层。</strong>
+            {' '}受影响腿的费用与 Net 仍为空，并继续从严格 Headline 排除。
+          </span>
+        </label>
+      )}
+
+      {requiresLeftCensored && !targetIsCurrent && (
+        <label className="mt-3 flex cursor-pointer items-start gap-3 rounded-ds-md border border-warn-strong/30 bg-warn-subtle p-3 text-body-sm text-text-2">
+          <input
+            type="checkbox"
+            className="mt-0.5 h-4 w-4 shrink-0 accent-cyan"
+            checked={acceptedLeftCensored}
+            onChange={(event) => setAcceptedLeftCensored(event.target.checked)}
+          />
+          <span>
+            <strong className="text-text-1">设为默认时，我接受 {leftCensoredCount.toLocaleString()} 个 left-censored 回合无券商成本。</strong>
+            {' '}snapshot 继承仓位缺少边界前的真实开仓成本与费用；系统不会伪造这些数字，相关结果不进入严格 Headline。
+          </span>
+        </label>
+      )}
+
+      {activationError && (
+        <ApiErrorAlert
+          className="mt-3"
+          error={activationError}
+          actionLabel={activationConflict ? '重新读取默认构建状态' : '刷新默认构建状态'}
+          onAction={() => void loadActivationState()}
+        />
+      )}
+
+      {!targetIsCurrent && (
+        <p className="mt-3 text-caption text-warn-strong">
+          {ACTIVATION_IRREVERSIBLE_WARNING}
+        </p>
+      )}
+
+      <div className="mt-3 flex flex-wrap items-center gap-3">
+        <button
+          type="button"
+          className="btn-primary"
+          disabled={!canActivate}
+          onClick={() => void handleActivate()}
+        >
+          {activationSubmitting
+            ? '设置中…'
+            : targetIsCurrent
+              ? '已设为默认'
+              : '设为默认复盘构建'}
+        </button>
+        {activationLoading && (
+          <span className="text-caption text-text-3">正在读取默认构建状态，完成后才能安全设置。</span>
+        )}
+        {!hasImmutableKey && (
+          <span className="text-caption text-down-strong">构建指纹无效，不能提交设置。</span>
+        )}
+        {requiresLeftCensored && !acceptedLeftCensored && !targetIsCurrent && (
+          <span className="text-caption text-warn-strong">确认 left-censored 回合口径后才能设为默认。</span>
+        )}
       </div>
     </section>
   );
@@ -996,6 +1279,24 @@ export const PositionEpisodesPanel: React.FC<PositionEpisodesPanelProps> = ({
           title={`正在查看构建 #${filters.buildId}`}
           message="这是显式打开的对比视图；默认复盘构建没有改变。"
           action={<button type="button" className="btn-ghost" onClick={() => onSelectBuild()}>回到默认复盘构建</button>}
+        />
+      )}
+      {filters.buildId != null
+        && build != null
+        && build.id === filters.buildId
+        && (build.sourceKind === CANONICAL_SOURCE_KIND
+          || build.sourceKind === SNAPSHOT_FENCE_SOURCE_KIND)
+        && controller.canonicalBuildResult?.build.id !== build.id && (
+        <ViewedBuildActivationCard
+          key={build.id}
+          build={build}
+          summary={summary ?? null}
+          onActivated={() => {
+            onSelectBuild();
+            controller.reload();
+            controller.reloadCanonicalPreview();
+            onImported?.();
+          }}
         />
       )}
       {controller.error && <ApiErrorAlert error={controller.error} actionLabel="重试" onAction={controller.reload} />}

@@ -1024,7 +1024,10 @@ describe('CurrentPositionsSnapshotCard', () => {
     expect(await within(confirmBlock).findByText('正式 Future Build 已写入')).toBeInTheDocument();
     expect(within(confirmBlock).getByText(/Build #77/)).toBeInTheDocument();
     expect(within(confirmBlock).getByText(
-      /已构建 ≠ 已生效：默认复盘视图不变（activation 尚未支持 future build）/,
+      /已构建 ≠ 已生效：激活前默认复盘视图不变/,
+    )).toBeInTheDocument();
+    expect(within(confirmBlock).getByText(
+      /无法回到「零激活」的 CSV 默认状态/,
     )).toBeInTheDocument();
     expect(within(confirmBlock).getByRole('button', { name: '写入正式 Future Build' })).toBeDisabled();
   });
@@ -1078,7 +1081,7 @@ describe('CurrentPositionsSnapshotCard', () => {
 
     expect(await within(confirmBlock).findByText('该 build 已存在（幂等重放）')).toBeInTheDocument();
     expect(within(confirmBlock).getByText(
-      /已构建 ≠ 已生效：默认复盘视图不变（activation 尚未支持 future build）/,
+      /已构建 ≠ 已生效：激活前默认复盘视图不变/,
     )).toBeInTheDocument();
     expect(within(confirmBlock).queryByText('正式 Future Build 已写入')).not.toBeInTheDocument();
   });

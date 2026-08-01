@@ -30,6 +30,7 @@ from src.journal.ledger.models import (
     CanonicalEvidenceSetRecord,
     EpisodeBuild,
     EpisodeBuildCanonicalSource,
+    EpisodeBuildSnapshotFenceSource,
     ImportBatch,
 )
 from src.journal.ledger.openapi_repository import (
@@ -1030,6 +1031,31 @@ def get_journal_refresh_status(
         )
 
     activation = get_episode_build_activation_state(account_key)
+    active_source_through = None
+    active_fence_targets_latest_canonical_set = False
+    if activation.current_build_id is not None:
+        with db.session_scope() as session:
+            active_build = session.get(EpisodeBuild, activation.current_build_id)
+            if active_build is not None:
+                active_source_through = _db_utc(active_build.source_cutoff_at)
+            if canonical_values is not None:
+                fence_link = session.execute(
+                    select(EpisodeBuildSnapshotFenceSource).where(
+                        EpisodeBuildSnapshotFenceSource.episode_build_id
+                        == activation.current_build_id
+                    )
+                ).scalar_one_or_none()
+                # An active snapshot-fence build derives exactly from its
+                # frozen target canonical set (windowed after the snapshot
+                # boundary), so it covers the latest canonical evidence when
+                # its target IS that latest set.
+                active_fence_targets_latest_canonical_set = (
+                    fence_link is not None
+                    and int(fence_link.target_canonical_set_id)
+                    == canonical_values["id"]
+                    and str(fence_link.target_canonical_set_sha256)
+                    == canonical_values["sha256"]
+                )
     expected = _expected_us_evidence_through(now)
     artifact_recorded_at = (
         None if artifact_values is None else artifact_values["recorded_at"]
@@ -1063,20 +1089,16 @@ def get_journal_refresh_status(
     elif (
         activation.selection_source != "activation"
         or activation.canonical_set_id != canonical_values["id"]
-        or activation.current_build_id != canonical_build_values["id"]
+        or (
+            activation.current_build_id != canonical_build_values["id"]
+            and not active_fence_targets_latest_canonical_set
+        )
     ):
         freshness_state = "build_ready"
         pending_stage = "activate"
     else:
         freshness_state = "current"
         pending_stage = "none"
-
-    active_source_through = None
-    if activation.current_build_id is not None:
-        with db.session_scope() as session:
-            active_build = session.get(EpisodeBuild, activation.current_build_id)
-            if active_build is not None:
-                active_source_through = _db_utc(active_build.source_cutoff_at)
 
     return JournalRefreshStatusSnapshot(
         freshness_state=freshness_state,
