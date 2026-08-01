@@ -35,7 +35,11 @@ async function login(page: Page) {
   await expect(stockInput).toBeVisible({ timeout: 10_000 });
 }
 
-test.describe('ReportMarkdown component', () => {
+// TODO(HANDOFF §14.3): 本套件仍依赖已下线的旧 UI（/login 密码表单、首页“历史分析”
+// 面板与 .home-history-item 列表）。当前工作台没有这些入口，且隔离 E2E 后端
+// 关闭了认证，登录流程不存在。等 ReportMarkdown 在当前 UI 中有稳定入口后，
+// 参照 smoke.spec.ts 的隔离空库语义重写；在此之前显式 skip，不允许绿色误导。
+test.describe.skip('ReportMarkdown component', () => {
   test('copy markdown source code', async ({ page, context }) => {
     // Grant clipboard permissions
     await context.grantPermissions(['clipboard-read', 'clipboard-write']);

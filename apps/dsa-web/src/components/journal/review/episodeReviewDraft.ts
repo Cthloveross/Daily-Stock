@@ -1,9 +1,11 @@
 import type {
   PositionEpisodeAiReviewUserContext,
+  PositionEpisodeReviewAnnotation,
+  PositionEpisodeReviewWorkspaceDraft,
   PositionEpisodeTradeLogicDraft,
 } from '../../../types/journal';
 
-const STORAGE_VERSION = 1;
+const STORAGE_VERSION = 2;
 const STORAGE_PREFIX = 'dsa:journal:episode-review-draft:v1';
 
 export const EPISODE_REVIEW_FIELD_MAX_CHARS = 2000;
@@ -19,9 +21,9 @@ const DRAFT_FIELDS = [
 ] as const satisfies readonly (keyof PositionEpisodeTradeLogicDraft)[];
 
 interface StoredEpisodeReviewDraft {
-  version: typeof STORAGE_VERSION;
+  version: 1 | typeof STORAGE_VERSION;
   updatedAt: string;
-  draft: PositionEpisodeTradeLogicDraft;
+  draft: Partial<PositionEpisodeReviewWorkspaceDraft>;
 }
 
 /** Count Unicode code points after the same trim operation used by the API. */
@@ -44,7 +46,7 @@ function localStorageOrNull(): Storage | null {
   }
 }
 
-export function emptyEpisodeReviewDraft(): PositionEpisodeTradeLogicDraft {
+export function emptyEpisodeReviewDraft(): PositionEpisodeReviewWorkspaceDraft {
   return {
     setupThesis: '',
     entryTrigger: '',
@@ -52,6 +54,23 @@ export function emptyEpisodeReviewDraft(): PositionEpisodeTradeLogicDraft {
     positionRationale: '',
     exitReason: '',
     postTradeReflection: '',
+    tags: [],
+    errorTypes: [],
+  };
+}
+
+export function episodeReviewAnnotationToDraft(
+  annotation: PositionEpisodeReviewAnnotation,
+): PositionEpisodeReviewWorkspaceDraft {
+  return {
+    setupThesis: annotation.setupThesis ?? '',
+    entryTrigger: annotation.entryTrigger ?? '',
+    invalidationPlan: annotation.invalidationPlan ?? '',
+    positionRationale: annotation.positionRationale ?? '',
+    exitReason: annotation.exitReason ?? '',
+    postTradeReflection: annotation.postTradeReflection ?? '',
+    tags: Array.isArray(annotation.tags) ? annotation.tags : [],
+    errorTypes: Array.isArray(annotation.errorTypes) ? annotation.errorTypes : [],
   };
 }
 
@@ -76,6 +95,14 @@ export function episodeReviewContextFieldCount(
   return Object.keys(compactEpisodeReviewUserContext(draft)).length;
 }
 
+export function hasEpisodeReviewDraft(
+  draft: PositionEpisodeReviewWorkspaceDraft,
+): boolean {
+  return episodeReviewContextFieldCount(draft) > 0
+    || draft.tags.some((value) => value.trim())
+    || draft.errorTypes.some((value) => value.trim());
+}
+
 export function episodeReviewDraftCharacterCount(
   draft: PositionEpisodeTradeLogicDraft,
 ): number {
@@ -88,7 +115,7 @@ export function episodeReviewDraftCharacterCount(
 export function loadEpisodeReviewDraft(
   buildId: number,
   episodeId: number,
-): PositionEpisodeTradeLogicDraft {
+): PositionEpisodeReviewWorkspaceDraft {
   const storage = localStorageOrNull();
   if (!storage) return emptyEpisodeReviewDraft();
 
@@ -98,7 +125,11 @@ export function loadEpisodeReviewDraft(
 
   try {
     const parsed = JSON.parse(raw) as Partial<StoredEpisodeReviewDraft>;
-    if (parsed.version !== STORAGE_VERSION || !parsed.draft || typeof parsed.draft !== 'object') {
+    if (
+      (parsed.version !== 1 && parsed.version !== STORAGE_VERSION)
+      || !parsed.draft
+      || typeof parsed.draft !== 'object'
+    ) {
       storage.removeItem(key);
       return emptyEpisodeReviewDraft();
     }
@@ -113,6 +144,15 @@ export function loadEpisodeReviewDraft(
         remainingTotal -= episodeReviewTextCharacterCount(restored[field]);
       }
     }
+    const cleanLabels = (value: unknown): string[] => (
+      Array.isArray(value)
+        ? [...new Set(value.filter((item): item is string => typeof item === 'string')
+          .map((item) => item.trim())
+          .filter(Boolean))]
+        : []
+    );
+    restored.tags = cleanLabels(parsed.draft.tags);
+    restored.errorTypes = cleanLabels(parsed.draft.errorTypes);
     return restored;
   } catch {
     storage.removeItem(key);
@@ -124,14 +164,14 @@ export function loadEpisodeReviewDraft(
 export function saveEpisodeReviewDraft(
   buildId: number,
   episodeId: number,
-  draft: PositionEpisodeTradeLogicDraft,
+  draft: PositionEpisodeReviewWorkspaceDraft,
 ): boolean {
   const storage = localStorageOrNull();
   if (!storage) return false;
   const key = episodeReviewDraftStorageKey(buildId, episodeId);
 
   try {
-    if (episodeReviewContextFieldCount(draft) === 0) {
+    if (!hasEpisodeReviewDraft(draft)) {
       storage.removeItem(key);
       return true;
     }

@@ -1,8 +1,19 @@
 import type React from 'react';
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Columns3, Download, Search, SlidersHorizontal, Upload, X } from 'lucide-react';
+import {
+  Columns3,
+  Download,
+  RefreshCw,
+  Save,
+  Search,
+  SlidersHorizontal,
+  Upload,
+  X,
+} from 'lucide-react';
 import { DataTable, EmptyState, Input, Tabs, toast, type ColumnDef } from '../components/ui';
+import { fetchPremarketUniverse, savePremarketUniverse } from '../api/opportunities';
+import type { PremarketUniverseResponse } from '../types/opportunities';
 import { PriceCell } from '../components/data/PriceCell';
 import { ChangeCell } from '../components/data/ChangeCell';
 import { Sparkline } from '../components/data/Sparkline';
@@ -14,6 +25,10 @@ import { useTickerQuotes } from '../hooks/useTickerQuotes';
 import { exportCsv } from '../utils/exportCsv';
 import { cn } from '../utils/cn';
 import { parseTradingViewWatchlist } from '../utils/tradingViewWatchlist';
+import {
+  hasSameOrderedPremarketUniverse,
+  preparePremarketUniverse,
+} from '../utils/premarketUniverse';
 
 type FilterKey = 'all' | 'gainers' | 'losers' | 'movers';
 
@@ -81,6 +96,29 @@ const EMPTY_ROW: Omit<WatchlistRow, 'ticker' | 'isUserAdded'> = {
   sparkline: [],
 };
 
+const PREMARKET_UNIVERSE_SOURCE_LABELS: Record<PremarketUniverseResponse['source'], string> = {
+  persisted: '显式保存',
+  stock_list_fallback: 'STOCK_LIST 建议（未启用）',
+  request_fallback: '请求建议（未启用）',
+  unavailable: '尚未配置',
+};
+
+function formatUniverseUpdatedAt(raw: string | null): string {
+  if (!raw) return '尚未保存';
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return raw;
+  return new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'America/New_York',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).format(parsed);
+}
+
 const WatchlistPage: React.FC = () => {
   const navigate = useNavigate();
   const today = useRegimeStore((s) => s.today);
@@ -95,10 +133,47 @@ const WatchlistPage: React.FC = () => {
   const [filter, setFilter] = useState<FilterKey>('all');
   const [visible, setVisible] = useState<Record<string, boolean>>(DEFAULT_VISIBLE);
   const [columnsOpen, setColumnsOpen] = useState(false);
+  const [officialUniverse, setOfficialUniverse] = useState<PremarketUniverseResponse | null>(null);
+  const [officialUniverseLoading, setOfficialUniverseLoading] = useState(true);
+  const [officialUniverseSaving, setOfficialUniverseSaving] = useState(false);
+  const [officialUniverseError, setOfficialUniverseError] = useState<string | null>(null);
+
+  const preparedPremarketUniverse = useMemo(
+    () => preparePremarketUniverse(userTickers),
+    [userTickers],
+  );
+  const officialUniverseSymbolsInSync = Boolean(
+    officialUniverse?.configured
+    && hasSameOrderedPremarketUniverse(
+      preparedPremarketUniverse.symbols,
+      officialUniverse.symbols,
+    ),
+  );
+  const officialUniverseInSync = Boolean(
+    officialUniverseSymbolsInSync && officialUniverse?.limit === 5,
+  );
+
+  const loadOfficialUniverse = useCallback(async () => {
+    setOfficialUniverseLoading(true);
+    setOfficialUniverseError(null);
+    try {
+      setOfficialUniverse(await fetchPremarketUniverse());
+    } catch (caught) {
+      setOfficialUniverseError(
+        caught instanceof Error ? caught.message : '官方盘前研究池读取失败',
+      );
+    } finally {
+      setOfficialUniverseLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
     if (!today) void loadToday();
   }, [today, loadToday]);
+
+  useEffect(() => {
+    void loadOfficialUniverse();
+  }, [loadOfficialUniverse]);
 
   const { quotes } = useTickerQuotes(userTickers);
 
@@ -166,6 +241,30 @@ const WatchlistPage: React.FC = () => {
       );
     } catch {
       toast.error('TradingView TXT 读取失败，请重新导出后再试。');
+    }
+  };
+
+  const handleSaveOfficialUniverse = async () => {
+    if (preparedPremarketUniverse.symbols.length === 0) {
+      toast.error('本地自选里没有可用于美股期权研究的标的。');
+      return;
+    }
+    setOfficialUniverseSaving(true);
+    setOfficialUniverseError(null);
+    try {
+      const saved = await savePremarketUniverse(preparedPremarketUniverse.symbols, 5);
+      setOfficialUniverse(saved);
+      toast.success(
+        saved.duplicate
+          ? '本地研究池与已保存版本相同，无需重复写入。'
+          : `已保存 ${saved.symbols.length} 只标的为官方盘前研究池。`,
+      );
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : '官方盘前研究池保存失败';
+      setOfficialUniverseError(message);
+      toast.error(message);
+    } finally {
+      setOfficialUniverseSaving(false);
     }
   };
 
@@ -371,6 +470,131 @@ const WatchlistPage: React.FC = () => {
         </div>
       </div>
 
+      <section
+        className="mt-4 rounded-ds-md border border-subtle bg-bg-1 px-4 py-3"
+        aria-label="官方盘前研究池"
+      >
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="text-body-sm font-semibold text-text-1">官方盘前研究池</h2>
+              <span className={`text-caption ${officialUniverseInSync ? 'text-success' : 'text-text-3'}`}>
+                {officialUniverseLoading
+                  ? '读取中'
+                  : officialUniverseInSync
+                    ? '与本地可研究列表一致'
+                    : officialUniverse?.configured
+                      ? officialUniverseSymbolsInSync
+                        ? 'Top 数量需更新'
+                        : '与本地列表不同'
+                      : '尚未保存'}
+              </span>
+            </div>
+            <p className="mt-1 max-w-3xl text-caption text-text-3">
+              后台 09:12 / 09:17 ET 的官方研究只使用这里显式保存的版本。保存顺序会进入版本记录；
+              本地增删不会自动改动服务器。
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => void handleSaveOfficialUniverse()}
+            disabled={
+              officialUniverseLoading
+              || officialUniverseSaving
+              || officialUniverseInSync
+              || preparedPremarketUniverse.symbols.length === 0
+            }
+            className="inline-flex h-7 items-center gap-1.5 rounded-ds-sm border border-default bg-bg-2 px-3 text-body-sm text-text-1 hover:bg-bg-3 disabled:cursor-not-allowed disabled:border-subtle disabled:bg-bg-1 disabled:text-text-3"
+          >
+            {officialUniverseSaving
+              ? <RefreshCw size={14} className="animate-spin" />
+              : <Save size={14} strokeWidth={1.5} />}
+            {officialUniverseInSync
+              ? '已与官方池一致'
+              : officialUniverseSaving
+                ? '正在保存'
+                : '保存为官方盘前研究池'}
+          </button>
+        </div>
+
+        <div className="mt-3 grid gap-3 text-caption md:grid-cols-2">
+          <div className="border-l border-subtle pl-3">
+            <div className="text-text-3">本地可研究列表</div>
+            <div className="mt-0.5 text-text-1">
+              {preparedPremarketUniverse.symbols.length} 只
+              {preparedPremarketUniverse.symbols.length > 0
+                ? ` · ${preparedPremarketUniverse.symbols.join(' · ')}`
+                : ' · 暂无受支持的美股期权标的'}
+            </div>
+          </div>
+          <div className="border-l border-subtle pl-3">
+            <div className="text-text-3">服务器正式版本</div>
+            {officialUniverse?.configured ? (
+              <>
+                <div className="mt-0.5 text-text-1">
+                  {officialUniverse.symbols.length} 只 · Top {officialUniverse.limit}
+                  {' · '}{officialUniverse.symbols.join(' · ')}
+                </div>
+                <div className="mt-0.5 text-text-3">
+                  版本{' '}
+                  <span
+                    className="font-mono text-mono-xs text-text-2"
+                    aria-label={officialUniverse.universeVersionKey
+                      ? `完整版本 ${officialUniverse.universeVersionKey}`
+                      : undefined}
+                  >
+                    {officialUniverse.universeVersionKey?.slice(0, 20) ?? '未报告'}
+                  </span>
+                  {' · '}更新 {formatUniverseUpdatedAt(officialUniverse.createdAt)} ET
+                  {' · '}来源 {PREMARKET_UNIVERSE_SOURCE_LABELS[officialUniverse.source]}
+                </div>
+              </>
+            ) : (
+              <div className="mt-0.5 text-text-2">
+                尚未保存正式版本
+                {officialUniverse?.symbols.length
+                  ? ` · 服务端仅建议 ${officialUniverse.symbols.join(' · ')}`
+                  : ''}
+                {officialUniverse
+                  ? ` · 来源 ${PREMARKET_UNIVERSE_SOURCE_LABELS[officialUniverse.source]}`
+                  : ''}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {(preparedPremarketUniverse.unsupportedSymbols.length > 0
+          || preparedPremarketUniverse.overflowCount > 0) && (
+          <p className="mt-2 text-caption text-warning">
+            保存时
+            {preparedPremarketUniverse.unsupportedSymbols.length > 0
+              ? `忽略 ${preparedPremarketUniverse.unsupportedSymbols.length} 个非美股期权标的（${preparedPremarketUniverse.unsupportedSymbols.join('、')}）`
+              : ''}
+            {preparedPremarketUniverse.unsupportedSymbols.length > 0
+              && preparedPremarketUniverse.overflowCount > 0
+              ? '；'
+              : ''}
+            {preparedPremarketUniverse.overflowCount > 0
+              ? `仅保留顺序中的前 20 只，另有 ${preparedPremarketUniverse.overflowCount} 只不写入`
+              : ''}
+            。
+          </p>
+        )}
+
+        {officialUniverseError && (
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-caption text-warning" role="status">
+            <span>官方盘前研究池暂不可用：{officialUniverseError}</span>
+            <button
+              type="button"
+              onClick={() => void loadOfficialUniverse()}
+              className="underline underline-offset-2 hover:text-text-1"
+            >
+              重试读取
+            </button>
+          </div>
+        )}
+      </section>
+
       <div className="mt-4 flex items-center gap-2">
         <SlidersHorizontal size={12} strokeWidth={1.5} className="text-text-3" />
         <Tabs
@@ -388,7 +612,7 @@ const WatchlistPage: React.FC = () => {
 
       <p className="mt-2 text-caption text-text-3">
         TradingView 暂无面向个人账户的公开自选 REST API；请在 Advanced View 下载 TXT 后在此合并导入。
-        今日机会会从本地自选前 20 只中筛选 Top 5。
+        页面预览从本地可研究标的中筛选；后台官方 Top 5 只使用上方已保存的正式研究池。
       </p>
 
       <section

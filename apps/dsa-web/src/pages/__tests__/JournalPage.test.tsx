@@ -67,6 +67,9 @@ vi.mock('../../hooks/usePositionEpisodes', () => ({
 }));
 
 vi.mock('../../components/journal/JournalImport', () => ({ default: () => null }));
+vi.mock('../../components/journal/CurrentPositionsSnapshotCard', () => ({
+  default: () => <div data-testid="current-positions-snapshot-card" />,
+}));
 vi.mock('../../components/journal/DTEDistribution', () => ({ default: () => null }));
 vi.mock('../../components/journal/MonthlyReviewPanel', () => ({ default: () => null }));
 vi.mock('../../components/journal/RealityTestCard', () => ({ default: () => null }));
@@ -94,6 +97,7 @@ describe('JournalPage active journal routing and legacy isolation', () => {
     );
 
     expect(screen.getByText('仓位复盘')).toHaveClass('text-text-1');
+    expect(screen.getByTestId('current-positions-snapshot-card')).toBeInTheDocument();
     expect(screen.getByText('没有符合当前筛选条件的仓位回合。')).toBeInTheDocument();
     expect(storeMocks.loadStats).not.toHaveBeenCalled();
     expect(storeMocks.loadTrades).not.toHaveBeenCalled();
@@ -137,6 +141,11 @@ describe('JournalPage active journal routing and legacy isolation', () => {
     expect(screen.getByText(/当前为“费用最高”案例精选/)).toBeInTheDocument();
     expect(screen.getByText(/Net 仍可能是条件性数据/)).toBeInTheDocument();
 
+    fireEvent.change(screen.getByLabelText('案例精选'), { target: { value: 'weakest_evidence' } });
+    fireEvent.click(screen.getByRole('button', { name: '应用筛选' }));
+    expect(screen.getByTestId('location')).toHaveTextContent('case=weakest_evidence');
+    expect(screen.getByText(/当前为“证据最不完整”案例精选/)).toBeInTheDocument();
+
     fireEvent.click(screen.getByRole('button', { name: '清除筛选' }));
     expect(screen.getByTestId('location')).toHaveTextContent('/journal?tab=positions');
   });
@@ -151,7 +160,7 @@ describe('JournalPage active journal routing and legacy isolation', () => {
 
     expect(screen.getByText('正在查看构建 #9')).toBeInTheDocument();
     expect(screen.getByTestId('location')).toHaveTextContent('/journal?tab=positions&build_id=9');
-    fireEvent.click(screen.getByRole('button', { name: '回到当前默认构建' }));
+    fireEvent.click(screen.getByRole('button', { name: '回到默认复盘构建' }));
     expect(screen.getByTestId('location')).toHaveTextContent('/journal?tab=positions');
   });
 });

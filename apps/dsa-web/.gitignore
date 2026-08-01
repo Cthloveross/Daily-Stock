@@ -13,6 +13,8 @@ dist-ssr
 *.local
 playwright-report
 test-results
+# isolated E2E backend artifacts (throwaway SQLite DB + generated env file)
+e2e/.artifacts
 
 # Editor directories and files
 .vscode/*

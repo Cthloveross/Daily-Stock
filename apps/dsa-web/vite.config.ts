@@ -26,7 +26,9 @@ export default defineConfig({
     port: 5173,       // 默认端口
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:8000',
+        // E2E（playwright.config.ts）通过该变量把 API 代理指向隔离后端端口，
+        // 避免连到本机常驻的正式后端；默认仍是本地开发后端 8000。
+        target: process.env.DSA_WEB_API_PROXY_TARGET || 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
     },

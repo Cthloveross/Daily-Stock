@@ -477,10 +477,13 @@ const RegimePage: React.FC = () => {
   if (todayLoading && !today) {
     return (
       <div className="mx-auto max-w-7xl space-y-4 p-4">
-        <div className="h-12 animate-pulse rounded-ds-md bg-bg-1" />
-        <div className="grid gap-4 lg:grid-cols-[320px_1fr]">
-          <div className="h-36 animate-pulse rounded-ds-md bg-bg-1" />
-          <div className="h-36 animate-pulse rounded-ds-md bg-bg-1" />
+        <DailyOpportunityList symbols={userTickers} />
+        <div aria-label="Regime 数据读取中" className="space-y-4">
+          <div className="h-12 animate-pulse rounded-ds-md bg-bg-1" />
+          <div className="grid gap-4 lg:grid-cols-[320px_1fr]">
+            <div className="h-36 animate-pulse rounded-ds-md bg-bg-1" />
+            <div className="h-36 animate-pulse rounded-ds-md bg-bg-1" />
+          </div>
         </div>
       </div>
     );

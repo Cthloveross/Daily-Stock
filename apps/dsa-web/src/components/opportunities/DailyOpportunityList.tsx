@@ -2,16 +2,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronRight, RefreshCw } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import {
-  ensureOpportunitySnapshot,
   fetchDailyOpportunities,
+  fetchPremarketCycleStatus,
   evaluateOpportunitySnapshot,
   fetchOpportunityLearningSummary,
-  fetchOpportunityOptionContext,
   fetchOpportunityOptionEvents,
   fetchOpportunityOptionOverview,
   fetchOpportunityOptionWalls,
   fetchOpportunitySnapshots,
   normalizeSupportedUsOptionUnderlying,
+  runPremarketCycle,
 } from '../../api/opportunities';
 import type {
   DailyOpportunityRun,
@@ -29,13 +29,16 @@ import type {
   OpportunityReadinessState,
   OpportunityResearchState,
   OpportunitySnapshot,
+  PremarketCycleResponse,
+  PremarketCycleState,
 } from '../../types/opportunities';
 import { Button, EmptyState } from '../ui';
+import { parseApiTimestamp } from '../../utils/marketTime';
 
 const STATE_LABELS: Record<OpportunityResearchState, string> = {
-  research_ready: '重点研究',
-  watch_only: '等待确认',
-  context_only: '背景观察',
+  research_ready: '基础门禁通过',
+  watch_only: '基础候选 · 非信号',
+  context_only: '仅作背景',
   blocked: '数据阻断',
 };
 
@@ -117,14 +120,41 @@ const SNAPSHOT_ELIGIBILITY_LABELS: Record<string, string> = {
   missing_reference_session: '缺少冻结参考交易日',
   missing_reference_close: '缺少冻结参考收盘价',
   missing_reference_source: '缺少冻结行情来源',
-  candidate_blocked: '候选在冻结时处于证据不足状态',
+  candidate_blocked: '候选在冻结时未通过基础数据门禁',
   no_candidates: '本次没有可冻结候选',
 };
+
+const REGIME_QUALITY_DOMAIN_LABELS: Record<string, string> = {
+  spy: 'SPY 趋势',
+  vix: 'VIX',
+  events: '宏观事件',
+  sectors: '板块广度',
+  prev_day: '昨日结构',
+  premarket: '盘前行情',
+};
+
+const QUALITY_REASON_STATE_LABELS: Record<string, string> = {
+  degraded: '降级',
+  unavailable: '不可用',
+  partial: '部分可用',
+  stale: '已过期',
+};
+
+function formatAnalysisQualityReason(reason: string): string {
+  if (reason === 'analysis_quality_not_eligible') return '完整研究数据质量未达到统计口径';
+  if (reason === 'supporting_regime_partial') return '市场背景支持证据部分可用';
+  const supportingMatch = reason.match(/^regime_supporting_(.+)_(degraded|unavailable|partial|stale)$/);
+  if (supportingMatch) {
+    const [, domain, state] = supportingMatch;
+    return `${REGIME_QUALITY_DOMAIN_LABELS[domain] ?? domain.replaceAll('_', ' ')}${QUALITY_REASON_STATE_LABELS[state] ?? state}`;
+  }
+  return reason.replaceAll('_', ' ');
+}
 
 function formatSnapshotEligibilityReason(reason: string): string {
   if (SNAPSHOT_ELIGIBILITY_LABELS[reason]) return SNAPSHOT_ELIGIBILITY_LABELS[reason];
   if (reason.startsWith('calendar_contract_unavailable:')) return '美股交易日历暂不可用，已停止计入统计';
-  return reason.replaceAll('_', ' ');
+  return formatAnalysisQualityReason(reason);
 }
 
 const CONTEXT_LABELS: Record<string, string> = {
@@ -165,6 +195,59 @@ interface CandidateOptionWallContext {
   message?: string | null;
 }
 
+function optionContextFromWall(
+  wallContext: CandidateOptionWallContext,
+): CandidateOptionContext {
+  if (wallContext.state === 'loading') {
+    return { state: 'loading', message: null };
+  }
+  if (wallContext.state === 'unsupported') {
+    return {
+      state: 'unavailable',
+      message: '当前标的不在支持的美股期权 underlying 范围内。',
+    };
+  }
+  if (wallContext.state === 'unavailable' || !wallContext.item) {
+    return {
+      state: 'unavailable',
+      message: wallContext.message || '同批期权墙快照不可用。',
+    };
+  }
+
+  const wall = wallContext.item;
+  const atm = wall.atmCallIv;
+  if (!atm) {
+    return {
+      state: 'unavailable',
+      message: '期权墙响应尚未包含同批 ATM Call IV；请刷新后重试。',
+    };
+  }
+  const ready = atm.state === 'ready'
+    && typeof atm.atmCallIvPercent === 'number'
+    && Boolean(atm.expiry);
+  return {
+    state: 'settled',
+    item: {
+      ticker: wall.ticker,
+      state: ready ? 'ready' : atm.state,
+      source: `${wall.source} · 同批期权墙快照`,
+      fetchedAt: wall.fetchedAt,
+      expiry: atm.expiry,
+      atmCallIvPercent: ready ? atm.atmCallIvPercent : null,
+      message: ready
+        ? `执行价 ${formatNumber(atm.strike)}；复用 Top 5 墙同批动态快照，未再次请求期权链。`
+        : atm.state === 'not_configured'
+          ? 'Moomoo 期权墙未配置；未请求 ATM Call IV。'
+          : '同批期权墙快照未返回有效的最近到期 ATM Call IV；未使用其他来源回填。',
+      limitations: [
+        '仅为最近到期、最接近现价的 Call 单点隐含波动率。',
+        '不是 IV Rank、异常期权流或买卖信号。',
+      ],
+    },
+    message: null,
+  };
+}
+
 type OptionEventDisplayState = 'loading' | 'settled' | 'unavailable' | 'unsupported';
 
 interface CandidateOptionEventContext {
@@ -174,6 +257,51 @@ interface CandidateOptionEventContext {
 }
 
 type OptionWallScopePreset = '0-7' | '8-45' | '0-45';
+
+type ResearchStageState = 'pending' | 'loading' | 'ready' | 'degraded' | 'failed';
+type OpportunityBaselineSource = 'canonical' | 'preview';
+type PremarketActivity = 'status' | 'run' | 'preview' | null;
+type PremarketLoadIntent = 'initial' | 'refresh' | 'run' | 'poll';
+const MAX_PREMARKET_STATUS_POLLS = 12;
+const PREVIEW_SCHEDULE_GUARD_MS = 60_000;
+
+const RESEARCH_STAGE_LABELS: Record<ResearchStageState, string> = {
+  pending: '等待',
+  loading: '加载中',
+  ready: '就绪',
+  degraded: '降级',
+  failed: '阻断',
+};
+
+const PREMARKET_STATE_LABELS: Record<PremarketCycleState, string> = {
+  non_session: '非交易日',
+  waiting_window: '等待窗口',
+  ready_to_run: '可生成',
+  research_pool_missing: '研究池未保存',
+  running: '生成中',
+  published: '已发布',
+  blocked: '质量门禁阻断',
+  window_closed: '窗口已关闭',
+  failed: '生成失败',
+};
+
+const PREMARKET_STAGE_LABELS: Record<string, string> = {
+  resolve_window: '解析窗口',
+  compute_regime: '计算 Regime',
+  scan_completed_bars: '扫描 T-1 日线',
+  quality_gate: '质量门禁',
+  persist_snapshot: '保存快照',
+};
+
+const PREMARKET_STAGE_STATE_LABELS: Record<string, string> = {
+  pending: '等待',
+  running: '运行中',
+  completed: '完成',
+  degraded: '降级',
+  blocked: '阻断',
+  failed: '失败',
+  skipped: '跳过',
+};
 
 const OPTION_WALL_SCOPES: Record<OptionWallScopePreset, { label: string; dteMin: number; dteMax: number }> = {
   '0-7': { label: '0–7', dteMin: 0, dteMax: 7 },
@@ -275,6 +403,61 @@ function formatValue(item: OpportunityEvidence): string {
 function formatCompletedBar(raw?: string | null): string {
   if (!raw) return '未知';
   return raw.slice(0, 10) || raw;
+}
+
+function formatEtDateTime(raw?: string | null): string {
+  const parsed = parseApiTimestamp(raw);
+  if (!parsed) return '未报告';
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(parsed);
+  const get = (type: Intl.DateTimeFormatPartTypes) => (
+    parts.find((part) => part.type === type)?.value ?? ''
+  );
+  return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')}`;
+}
+
+function formatEtWindow(start?: string | null, end?: string | null): string {
+  if (!start || !end) return '未报告';
+  return `${formatEtDateTime(start)}–${formatEtDateTime(end).slice(11)} ET`;
+}
+
+function canStartManualPremarketRun(cycle: PremarketCycleResponse): boolean {
+  if (!['ready_to_run', 'blocked', 'failed'].includes(cycle.state)) return false;
+  const now = Date.now();
+  const primaryAt = parseApiTimestamp(cycle.primaryScheduledAt)?.getTime();
+  const latestStartAt = parseApiTimestamp(cycle.latestStartAt)?.getTime();
+  if (primaryAt === undefined || now < primaryAt) return false;
+  if (latestStartAt !== undefined && now >= latestStartAt) return false;
+  if (cycle.state === 'ready_to_run') return true;
+  if (!cycle.recoverable) return false;
+  const nextScheduledAt = parseApiTimestamp(cycle.nextScheduledAt)?.getTime();
+  return nextScheduledAt === undefined || now >= nextScheduledAt;
+}
+
+function hasImminentPremarketProviderWork(cycle: PremarketCycleResponse): boolean {
+  if (['ready_to_run', 'running'].includes(cycle.state)) return true;
+  const nextScheduledAt = parseApiTimestamp(cycle.nextScheduledAt)?.getTime();
+  if (nextScheduledAt === undefined) return false;
+  const delay = nextScheduledAt - Date.now();
+  return delay >= 0 && delay <= PREVIEW_SCHEDULE_GUARD_MS;
+}
+
+function completedEvidenceDateRange(run: DailyOpportunityRun): string {
+  const dates = [...new Set(run.candidates
+    .map((candidate) => (
+      candidate.referenceSessionDate || formatCompletedBar(candidate.lastCompletedBarAt)
+    ))
+    .filter((value) => value && value !== '未知'))].sort();
+  if (dates.length === 0) return '未报告';
+  if (dates.length === 1) return dates[0];
+  return `${dates[0]}–${dates[dates.length - 1]}（混合）`;
 }
 
 function formatIvPercent(value: number): string {
@@ -420,8 +603,9 @@ function optionWallTableLabel(context: CandidateOptionWallContext): string {
   if (context.item.state === 'unavailable') return '不可用';
   const call = context.item.walls.callOi[0];
   const put = context.item.walls.putOi[0];
-  if (!call && !put) return '无有效集中位';
-  return `${call ? `C ${call.strike}` : 'C —'} / ${put ? `P ${put.strike}` : 'P —'}`;
+  const coveragePrefix = context.item.state === 'partial' ? '部分覆盖 · ' : '';
+  if (!call && !put) return `${coveragePrefix}无有效集中位`;
+  return `${coveragePrefix}${call ? `C ${call.strike}` : 'C —'} / ${put ? `P ${put.strike}` : 'P —'}`;
 }
 
 function formatOptionWallRequestError(error: unknown): string {
@@ -672,7 +856,16 @@ function OptionWallSnapshot({ context }: { context: CandidateOptionWallContext }
   }
 
   return (
-    <div className="space-y-3" aria-label={`${item.ticker} 期权墙，可用`}>
+    <div
+      className="space-y-3"
+      aria-label={`${item.ticker} 期权墙，${item.state === 'partial' ? '部分覆盖' : '可用'}`}
+    >
+      {item.state === 'partial' && (
+        <div className="border-l-2 border-[color:var(--warn-muted)] pl-3 text-caption text-warning">
+          期权墙部分覆盖 · 有效合约 {item.coverage.validContracts}/{item.coverage.requestedContracts}
+          {' · '}{item.coverage.coveragePercent.toFixed(1)}%
+        </div>
+      )}
       <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-caption">
         <div className="text-text-3">标的现价</div>
         <div className="text-right font-mono text-mono-xs text-text-1">
@@ -864,9 +1057,13 @@ function OptionEventSnapshot({ context }: { context: CandidateOptionEventContext
 function aggregateOutcomeProgress(
   snapshots: OpportunitySnapshot[],
   horizonSessions: 5 | 20,
+  track: 'full-research' | 'underlying-path' = 'full-research',
 ): OpportunityOutcomeProgress {
   return snapshots.reduce<OpportunityOutcomeProgress>((total, snapshot) => {
-    const progress = snapshot.outcomeProgress.find(
+    const source = track === 'underlying-path'
+      ? snapshot.underlyingPathProgress ?? snapshot.outcomeProgress
+      : snapshot.fullResearchProgress ?? snapshot.outcomeProgress;
+    const progress = source.find(
       (item) => item.horizonSessions === horizonSessions,
     );
     if (!progress) return total;
@@ -901,9 +1098,8 @@ function LearningHorizonStatus({
   minimumSummarySamples: number;
   minimumInvestigationSamples: number;
 }) {
-  const directionalSamples = learning
-    ? learning.contextHitCount + learning.contextMissCount + learning.neutralCount
-    : 0;
+  const directionalSamples = learning?.directionalSampleCount ?? 0;
+  const hasStatisticalSamples = progress.eligibleCount > 0 || directionalSamples > 0;
   const hitRate = learning?.summaryVisible && learning.contextHitRatePercent !== null
     ? `${learning.contextHitRatePercent.toLocaleString('en-US', { maximumFractionDigits: 1 })}%`
     : null;
@@ -912,7 +1108,9 @@ function LearningHorizonStatus({
       <div className="flex items-baseline justify-between gap-3">
         <span className="font-mono text-mono-sm font-semibold text-text-1">{horizonSessions}D</span>
         <span className="font-mono text-mono-xs text-text-2">
-          成熟 {progress.matureCount} · 待观察 {progress.pendingCount}
+          {hasStatisticalSamples
+            ? `已回填 ${progress.matureCount} · 等待目标日 ${progress.pendingCount}`
+            : '尚无可统计样本'}
         </span>
       </div>
       {progress.partialCount > 0 && (
@@ -921,17 +1119,23 @@ function LearningHorizonStatus({
       {(progress.dataGapCount ?? 0) > 0 && (
         <div className="mt-1 text-caption text-warning">已到期，待补数据 {progress.dataGapCount}</div>
       )}
-      <div className="mt-1 text-caption text-text-3">
-        {hitRate
-          ? `标的方向命中率 ${hitRate} · ${learning?.distinctSignalSessions ?? 0} 个独立交易日`
-          : `方向样本 ${directionalSamples}/${minimumSummarySamples}；不足门槛不显示命中率`}
-      </div>
+      {hasStatisticalSamples && (
+        <div className="mt-1 text-caption text-text-3">
+          {hitRate
+            ? `标的方向命中率 ${hitRate} · ${learning?.distinctSignalSessions ?? 0} 个独立交易日`
+            : `方向样本 ${directionalSamples}/${minimumSummarySamples}；不足门槛不显示命中率`}
+        </div>
+      )}
       <div className="mt-1 text-[11px] text-text-3">
-        {learning?.investigationReady
-          ? '已达人工调查门槛；仍不会自动调权'
-          : `人工调查须满 ${minimumInvestigationSamples} 个方向样本且 20 个独立交易日`}
+        {!hasStatisticalSamples
+          ? '尚无符合严格统计口径的冻结候选。'
+          : learning?.investigationReady
+            ? '已达人工调查门槛；仍不会自动调权'
+            : `人工调查须满 ${minimumInvestigationSamples} 个方向样本且 20 个独立交易日`}
       </div>
-      <div className="mt-1 text-[11px] text-text-3">仅统计同一 setup / Regime / 方向与策略版本。</div>
+      {hasStatisticalSamples && (
+        <div className="mt-1 text-[11px] text-text-3">仅统计同一 setup / Regime / 方向与策略版本。</div>
+      )}
       {(learning?.excludedQualityCount ?? 0) > 0 && (
         <div className="mt-1 text-[11px] text-warning">
           复权或来源连续性不成立，已排除 {learning?.excludedQualityCount}
@@ -941,11 +1145,23 @@ function LearningHorizonStatus({
   );
 }
 
+function hasTrackableUnderlyingPath(snapshot: OpportunitySnapshot): boolean {
+  if (typeof snapshot.underlyingPathCandidateCount === 'number') {
+    return snapshot.underlyingPathCandidateCount > 0;
+  }
+  const rawTrack = snapshot.qualification?.tracks.find(
+    (track) => track.trackKey === 'raw_underlying_path_v1',
+  );
+  if (rawTrack) {
+    return rawTrack.qualifiedCount > 0 && rawTrack.prospectiveCount > 0;
+  }
+  return snapshot.validationEligible;
+}
+
 function OpportunityLearningPanel({
   snapshots,
   summary,
   loading,
-  saving,
   evaluating,
   error,
   notice,
@@ -954,7 +1170,6 @@ function OpportunityLearningPanel({
   snapshots: OpportunitySnapshot[];
   summary: OpportunityLearningSummaryResponse | null;
   loading: boolean;
-  saving: boolean;
   evaluating: boolean;
   error: string | null;
   notice: string | null;
@@ -963,11 +1178,33 @@ function OpportunityLearningPanel({
   const latestSnapshot = snapshots[0];
   const fiveDay = aggregateOutcomeProgress(snapshots, 5);
   const twentyDay = aggregateOutcomeProgress(snapshots, 20);
-  const minimumSummarySamples = summary?.minimumSummarySamples ?? 10;
+  const rawFiveDay = aggregateOutcomeProgress(snapshots, 5, 'underlying-path');
+  const rawTwentyDay = aggregateOutcomeProgress(snapshots, 20, 'underlying-path');
+  const minimumSummarySamples = summary?.minimumSummarySamples ?? 20;
   const minimumInvestigationSamples = summary?.minimumInvestigationSamples ?? 20;
   const fiveDayLearning = summary?.horizons.find((item) => item.horizonSessions === 5);
   const twentyDayLearning = summary?.horizons.find((item) => item.horizonSessions === 20);
-  const hasEvaluableSnapshot = snapshots.some((snapshot) => snapshot.validationEligible);
+  const hasEvaluableSnapshot = snapshots.some(hasTrackableUnderlyingPath);
+  const hasStatisticalSamples = [
+    fiveDay.eligibleCount,
+    twentyDay.eligibleCount,
+    fiveDayLearning?.directionalSampleCount ?? 0,
+    twentyDayLearning?.directionalSampleCount ?? 0,
+  ].some((count) => count > 0);
+  const hasUnderlyingPathSamples = (
+    rawFiveDay.eligibleCount > fiveDay.eligibleCount
+    || rawTwentyDay.eligibleCount > twentyDay.eligibleCount
+  );
+  const latestFullResearchCount = latestSnapshot?.fullResearchCandidateCount
+    ?? latestSnapshot?.qualification?.tracks.find(
+      (track) => track.trackKey === 'canonical_full_research_v1',
+    )?.qualifiedCount
+    ?? latestSnapshot?.eligibleCandidateCount
+    ?? 0;
+  const latestEligibilityReasons = latestSnapshot?.analysisQualityEligible === false
+    && (latestSnapshot.analysisQualityReasons?.length ?? 0) > 0
+    ? latestSnapshot.analysisQualityReasons ?? []
+    : latestSnapshot?.eligibilityReasons ?? [];
 
   return (
     <details className="group border-b border-subtle bg-bg-0">
@@ -982,9 +1219,9 @@ function OpportunityLearningPanel({
           <span className="text-caption text-text-3">展开查看统计口径</span>
         </span>
         <span className="font-mono text-mono-xs text-text-2">
-          5D 成熟 {fiveDay.matureCount} / 待观察 {fiveDay.pendingCount}
-          {' · '}
-          20D 成熟 {twentyDay.matureCount} / 待观察 {twentyDay.pendingCount}
+          {hasStatisticalSamples
+            ? `5D 已回填 ${fiveDay.matureCount} / 等待目标日 ${fiveDay.pendingCount} · 20D 已回填 ${twentyDay.matureCount} / 等待目标日 ${twentyDay.pendingCount}`
+            : '尚无可统计样本'}
         </span>
       </summary>
 
@@ -994,15 +1231,15 @@ function OpportunityLearningPanel({
       >
         <div className="flex flex-wrap items-start justify-between gap-3">
           <p className="max-w-4xl text-caption text-text-3">
-            清单每天使用上一完整交易日数据自动更新；合法盘前窗口会自动保存当天研究版本，再按 5 / 20 个交易日观察标的路径。
+            这里只读展示已保存研究版本及 5 / 20 个交易日结果；服务器会在 XNYS 收盘后自动回填，到期前不会请求行情。
           </p>
           <Button
             variant="ghost"
             size="sm"
-            disabled={!hasEvaluableSnapshot || saving || evaluating}
+            disabled={!hasEvaluableSnapshot || evaluating}
             onClick={onEvaluate}
           >
-            {evaluating ? '更新中…' : '更新成熟结果'}
+            {evaluating ? '更新中…' : '手动重试到期缺口'}
           </Button>
         </div>
 
@@ -1031,21 +1268,49 @@ function OpportunityLearningPanel({
           </div>
         </div>
 
+        {hasUnderlyingPathSamples && (
+          <div
+            className="mt-2 text-caption text-text-3"
+            aria-label="标的路径审计进度"
+          >
+            标的路径审计（不计完整研究命中率）：
+            5D 已回填 {rawFiveDay.matureCount} / 等待目标日 {rawFiveDay.pendingCount}
+            {' · '}
+            20D 已回填 {rawTwentyDay.matureCount} / 等待目标日 {rawTwentyDay.pendingCount}
+            {((rawFiveDay.dataGapCount ?? 0) + (rawTwentyDay.dataGapCount ?? 0)) > 0
+              ? ` · 待补数据 ${(rawFiveDay.dataGapCount ?? 0) + (rawTwentyDay.dataGapCount ?? 0)}`
+              : ''}
+          </div>
+        )}
+
         <div className="mt-2 flex flex-wrap items-start justify-between gap-x-4 gap-y-1 text-caption text-text-3">
           <span>
             {loading && snapshots.length === 0
               ? '读取保存记录与学习进度…'
-              : saving
-                ? '正在检查今天是否处于自动保存窗口…'
               : latestSnapshot
-                ? `最近保存 ${latestSnapshot.marketDateEt} · ${latestSnapshot.eligibleCandidateCount}/${latestSnapshot.candidateCount} 个候选可验证`
-                : '尚无保存记录；系统只在美股交易日开盘前保存一次，不会在周末或盘后重复创建。'}
+                ? `最近保存 ${latestSnapshot.marketDateEt} · 完整研究 ${latestFullResearchCount}/${latestSnapshot.candidateCount}`
+                : '尚无保存记录；普通预览不会创建旧 v1 快照，也不能在窗口外补写官方盘前版本。'}
           </span>
-          {summary && <span>状态 {summary.strategyState.replaceAll('_', ' ')} · 自动调权：关闭</span>}
+          {summary && (
+            <span>
+              结果自动回填：{summary.automaticMaintenanceEnabled ? '已启用' : '未启用'}
+              {' · '}自动调权：关闭
+            </span>
+          )}
         </div>
-        {latestSnapshot && !latestSnapshot.validationEligible && latestSnapshot.eligibilityReasons.length > 0 && (
+        {summary?.latestMaintenance && (
+          <div className="mt-1 text-caption text-text-3">
+            最近自动检查 {summary.latestMaintenance.sessionDateEt} ET
+            {' · '}{summary.latestMaintenance.state}
+            {' · '}第 {summary.latestMaintenance.attemptCount} 次
+            {' · '}新增 {summary.latestMaintenance.insertedOutcomes}
+            {' · '}缺口 {summary.latestMaintenance.dataGapHorizons}
+          </div>
+        )}
+        {latestSnapshot && !latestSnapshot.validationEligible && latestEligibilityReasons.length > 0 && (
           <div className="mt-1 text-caption text-warning">
-            最近保存版本暂不可验证：{latestSnapshot.eligibilityReasons.map(formatSnapshotEligibilityReason).join('；')}
+            最近保存版本未纳入统计：
+            {latestEligibilityReasons.map(formatSnapshotEligibilityReason).join('；')}
           </div>
         )}
         {notice && <div className="mt-1 text-caption text-text-2" role="status">{notice}</div>}
@@ -1070,6 +1335,7 @@ function CandidateDetail({
   rankingMethod,
   strategyValidationState,
   strategyValidationMessage,
+  officialSnapshotKey,
 }: {
   candidate: OpportunityCandidate;
   optionContext: CandidateOptionContext;
@@ -1081,6 +1347,7 @@ function CandidateDetail({
   rankingMethod: DailyOpportunityRun['rankingMethod'];
   strategyValidationState: DailyOpportunityRun['strategyValidationState'];
   strategyValidationMessage: string;
+  officialSnapshotKey: string | null;
 }) {
   const navigate = useNavigate();
   const supports = candidate.evidence.filter((item) => item.status === 'supports');
@@ -1129,7 +1396,7 @@ function CandidateDetail({
         <Button
           variant="ghost"
           size="sm"
-          onClick={() => navigate(`/regime/opportunity/${candidate.ticker}`)}
+          onClick={() => navigate(opportunityDetailPath(candidate.ticker, officialSnapshotKey))}
           aria-label={`打开 ${candidate.ticker} 完整机会分析`}
         >
           完整分析
@@ -1174,7 +1441,7 @@ function CandidateDetail({
             策略尚未验证
           </h4>
           <div className="mt-1 text-body-sm text-text-2">
-            研究状态：{candidateStateLabel(candidate)} · 策略验证：
+            研究用途：{candidateStateLabel(candidate)} · 策略验证：
             {!strategyValidationState || strategyValidationState === 'not_validated'
               ? '未验证'
               : strategyValidationState}
@@ -1329,20 +1596,340 @@ function CandidateDetail({
   );
 }
 
+function CanonicalPremarketCard({
+  cycle,
+  error,
+  activity,
+  baselineSource,
+}: {
+  cycle: PremarketCycleResponse | null;
+  error: string | null;
+  activity: PremarketActivity;
+  baselineSource: OpportunityBaselineSource | null;
+}) {
+  const publishedSnapshot = cycle?.state === 'published' ? cycle.snapshot : null;
+  const qualificationTrackLabels = [
+    ['raw_underlying_path_v1', '标的路径'],
+    ['underlying_daily_selection_v1', '日线选股'],
+    ['canonical_full_research_v1', '完整研究'],
+  ] as const;
+  const qualificationCounts = publishedSnapshot?.qualification
+    ? qualificationTrackLabels.map(([trackKey, label]) => {
+      const track = publishedSnapshot.qualification?.tracks.find(
+        (item) => item.trackKey === trackKey,
+      );
+      if (!track) return null;
+      const total = track.qualifiedCount + track.excludedCount + track.unverifiedCount;
+      return `${label} ${track.qualifiedCount}/${total}`;
+    })
+    : null;
+  const qualificationCountsLabel = qualificationCounts?.every(
+    (item): item is string => item !== null,
+  )
+    ? qualificationCounts.join('、')
+    : null;
+  const qualityLabel = cycle?.quality === 'ready'
+    ? '完整'
+    : cycle?.quality === 'degraded'
+      ? '支持证据降级'
+      : cycle?.quality === 'blocked'
+        ? '阻断'
+        : '待判定';
+  const publicationLabel = !cycle
+    ? '读取中'
+    : cycle.state === 'published'
+      ? '已发布'
+      : cycle.state === 'running'
+        ? '生成中'
+        : ['waiting_window', 'ready_to_run'].includes(cycle.state)
+          ? '待发布'
+          : cycle.state === 'research_pool_missing'
+            ? '研究池未配置'
+            : cycle.state === 'non_session'
+              ? '今日不发布'
+              : '未发布';
+  const publicationTone = cycle?.state === 'published'
+    ? 'text-success'
+    : cycle?.state === 'blocked' || cycle?.state === 'failed'
+      ? 'text-warning'
+      : 'text-text-2';
+  const statisticsLabel = !cycle
+    ? '读取中'
+    : cycle.state !== 'published'
+      ? '尚未产生'
+      : !publishedSnapshot
+        ? '元数据缺失'
+        : qualificationCountsLabel
+          ? qualificationCountsLabel
+          : publishedSnapshot.validationEligible
+            ? `已纳入 ${publishedSnapshot.eligibleCandidateCount}/${publishedSnapshot.candidateCount}`
+            : `未纳入 ${publishedSnapshot.eligibleCandidateCount}/${publishedSnapshot.candidateCount}`;
+  const statisticsTone = publishedSnapshot?.validationEligible
+    ? 'text-success'
+    : publishedSnapshot
+      ? 'text-warning'
+      : 'text-text-2';
+  const activityLabel = activity === 'status'
+    ? '读取今日研究状态…'
+    : activity === 'run'
+      ? '生成今日研究…'
+      : activity === 'preview'
+        ? '刷新只读预览…'
+        : null;
+  const showNoCanonical = cycle
+    && cycle.state !== 'published'
+    && ['non_session', 'window_closed'].includes(cycle.state);
+  const universeVersion = cycle?.universeVersionKey
+    ? cycle.universeVersionKey.slice(0, 16)
+    : '尚未保存';
+  const primaryTime = cycle?.primaryScheduledAt
+    ? `${formatEtDateTime(cycle.primaryScheduledAt).slice(11)} ET`
+    : '09:12 ET';
+  const retryTime = cycle?.retryScheduledAt
+    ? `${formatEtDateTime(cycle.retryScheduledAt).slice(11)} ET`
+    : '09:17 ET';
+
+  return (
+    <section
+      className="border-b border-subtle bg-bg-1 px-4 py-3"
+      aria-label="官方盘前研究状态"
+      aria-live="polite"
+    >
+      <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
+        <div>
+          <div className="flex flex-wrap items-center gap-2">
+            <h3 className="text-body-sm font-semibold text-text-1">官方盘前研究</h3>
+            {baselineSource && (
+              <span className="text-caption text-text-3">
+                当前榜单：{baselineSource === 'canonical' ? '官方版本' : '只读预览'}
+              </span>
+            )}
+          </div>
+          <div
+            className="mt-2 flex flex-wrap items-center gap-x-5 gap-y-1 text-caption"
+            aria-label="官方盘前研究三层状态"
+          >
+            <span aria-label={`发布状态：${publicationLabel}`}>
+              <span className="text-text-3">发布状态</span>
+              {' '}
+              <strong className={`font-medium ${publicationTone}`}>{publicationLabel}</strong>
+            </span>
+            <span aria-label={`数据质量：${qualityLabel}`}>
+              <span className="text-text-3">数据质量</span>
+              {' '}
+              <strong className={`font-medium ${cycle?.quality === 'degraded' || cycle?.quality === 'blocked' ? 'text-warning' : 'text-text-2'}`}>
+                {qualityLabel}
+              </strong>
+            </span>
+            <span aria-label={`统计入样：${statisticsLabel}`}>
+              <span className="text-text-3">统计入样</span>
+              {' '}
+              <strong className={`font-medium ${statisticsTone}`}>{statisticsLabel}</strong>
+            </span>
+          </div>
+          <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-caption text-text-3">
+            <span>
+              市场日 <strong className="font-mono font-medium text-text-2">{cycle?.marketDateEt ?? '读取中'} ET</strong>
+            </span>
+            <span>
+              T-1 证据 <strong className="font-mono font-medium text-text-2">{cycle?.previousSession ?? '待报告'}</strong>
+            </span>
+            <span>
+              窗口 <strong className="font-mono font-medium text-text-2">
+                {cycle ? formatEtWindow(cycle.windowStartAt, cycle.windowEndAt) : '读取中'}
+              </strong>
+            </span>
+            {cycle?.latestStartAt && (
+              <span>
+                最晚启动 <strong className="font-mono font-medium text-text-2">
+                  {formatEtDateTime(cycle.latestStartAt).slice(11)} ET
+                </strong>
+              </span>
+            )}
+            <span>
+              后台自动研究 <strong className="font-medium text-text-2">
+                {cycle?.schedulerEnabled ? '已启用' : '未启用'}
+              </strong>
+            </span>
+          </div>
+          <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-caption text-text-3">
+            <span>
+              官方池 <strong className="font-medium text-text-2">
+                {cycle ? `${cycle.universe.length} 只` : '读取中'}
+              </strong>
+            </span>
+            <span aria-label={cycle?.universeVersionKey ? `完整版本 ${cycle.universeVersionKey}` : undefined}>
+              版本 <strong className="font-mono font-medium text-text-2">{universeVersion}</strong>
+            </span>
+            <span>
+              自动时点 <strong className="font-mono font-medium text-text-2">
+                {primaryTime} / {retryTime}
+              </strong>
+            </span>
+            {cycle?.nextScheduledAt && (
+              <span>
+                下一步 <strong className="font-mono font-medium text-text-2">
+                  {formatEtDateTime(cycle.nextScheduledAt)} ET
+                </strong>
+              </span>
+            )}
+          </div>
+          <div className="mt-1 text-caption text-text-3">
+            最近执行{' '}
+            {cycle?.attemptKey ? (
+              <>
+                <strong
+                  className="font-mono font-medium text-text-2"
+                  aria-label={`完整执行编号 ${cycle.attemptKey}`}
+                >
+                  {cycle.attemptKey.slice(0, 16)}
+                </strong>
+                {' · '}{cycle.attemptTrigger === 'scheduler' ? '后台' : '手动'}
+                {' · '}{PREMARKET_STATE_LABELS[cycle.state]}
+                {cycle.attemptStartedAt
+                  ? ` · ${formatEtDateTime(cycle.attemptStartedAt)} ET`
+                  : ''}
+                {cycle.state === 'running' && cycle.leaseExpiresAt
+                  ? ` · 租约至 ${formatEtDateTime(cycle.leaseExpiresAt).slice(11)} ET`
+                  : ''}
+                {['blocked', 'failed'].includes(cycle.state)
+                  ? cycle.recoverable ? ' · 可恢复重试' : ' · 尝试已用尽'
+                  : ''}
+                {cycle.recoveredFromAttemptKey ? ' · 已从上一执行恢复' : ''}
+              </>
+            ) : (
+              <span className="text-text-2">暂无持久化执行记录</span>
+            )}
+          </div>
+        </div>
+        {activityLabel && <span className="text-caption text-text-2">{activityLabel}</span>}
+      </div>
+
+      {error ? (
+        <p className="mt-2 text-caption text-warning">
+          今日盘前研究状态或生成暂不可用：{error}。
+          {baselineSource === 'canonical'
+            ? ' 当前继续显示上一份已发布批次。'
+            : baselineSource === 'preview'
+              ? ' 当前继续显示只读预览，不会写入旧快照。'
+              : ' 为避免与未知的服务端任务并发，当前没有启动预览。'}
+        </p>
+      ) : cycle?.state === 'published' ? (
+        <div className="mt-2 border-l-2 border-success/30 pl-3 text-caption text-text-2">
+          {publishedSnapshot ? (
+            <>
+              <div>
+                不可变快照 <span className="font-mono text-mono-xs text-text-1">{publishedSnapshot.snapshotKey}</span>
+                {' · '}冻结 {formatEtDateTime(publishedSnapshot.frozenAt)} ET
+              </div>
+              <div className="mt-0.5 text-text-3">
+                {qualificationCountsLabel
+                  ? `统计入样 ${qualificationCountsLabel}`
+                  : `统计入样 ${publishedSnapshot.eligibleCandidateCount}/${publishedSnapshot.candidateCount}`}
+                {cycle.idempotentReplay ? ' · 返回既有批次' : ' · 本次发布'}
+              </div>
+              {cycle.quality === 'degraded' && (
+                <div className="mt-0.5 text-warning">
+                  官方版本已发布，可用于今日研究；支持证据降级
+                  {!publishedSnapshot.validationEligible ? '，本批次未纳入严格结果统计。' : '。'}
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="text-warning">服务端报告已发布，但未返回快照元数据；请刷新状态核对。</div>
+          )}
+        </div>
+      ) : cycle?.state === 'waiting_window' ? (
+        <p className="mt-2 text-caption text-text-3">
+          等待 {primaryTime} 官方研究时点。页面只读取状态与预览；后台未到时点前不会启动 Regime、行情计算或冻结快照。
+        </p>
+      ) : cycle?.state === 'ready_to_run' ? (
+        <p className="mt-2 text-caption text-text-2">
+          {cycle.schedulerEnabled
+            ? '已到官方研究时点。后台调度会受控执行；也可点击“立即生成”。'
+            : '已到官方研究时点，但后台自动研究未启用；可点击“立即生成”。'}
+          基础发布门禁通过且仍在窗口内即可发布；支持证据降级时会保留官方版本，但不纳入严格结果统计。
+        </p>
+      ) : cycle?.state === 'research_pool_missing' ? (
+        <p className="mt-2 text-caption text-warning">
+          尚未保存官方盘前研究池。请到 Watchlist 显式选择并保存；后台不会从本地列表或其他配置静默取数。
+        </p>
+      ) : cycle?.state === 'running' ? (
+        <p className="mt-2 text-caption text-text-2">
+          服务端今日盘前研究仍在执行。
+          {cycle.retryAfterSeconds ? ` 建议 ${cycle.retryAfterSeconds} 秒后刷新状态。` : ''}
+        </p>
+      ) : showNoCanonical ? (
+        <p className="mt-2 text-caption text-warning">
+          今日未生成官方盘前版本，当前仅为预览。
+          {cycle.state === 'non_session' ? ' 今天不是 XNYS 交易日。' : ' 盘前发布窗口已经关闭。'}
+        </p>
+      ) : cycle && ['blocked', 'failed'].includes(cycle.state) ? (
+        <div className="mt-2 text-caption text-warning">
+          <p>
+            {cycle.state === 'blocked'
+              ? '质量门禁未通过，今日官方盘前版本未发布。'
+              : '今日盘前研究暂时失败，未发布官方版本。'}
+          </p>
+          {cycle.errorCode && <p className="mt-0.5 font-mono text-mono-xs">原因 {cycle.errorCode}</p>}
+        </div>
+      ) : (
+        <p className="mt-2 text-caption text-text-3">正在读取服务端只读状态；尚未启动任何写入。</p>
+      )}
+
+      {cycle && cycle.stages.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-caption text-text-3" aria-label="官方盘前服务端阶段">
+          {cycle.stages.map((stage) => (
+            <span key={`${stage.name}-${stage.startedAt ?? ''}`}>
+              {PREMARKET_STAGE_LABELS[stage.name] ?? stage.name}
+              {' · '}{PREMARKET_STAGE_STATE_LABELS[stage.state] ?? stage.state}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {cycle && cycle.qualityReasons.length > 0 && (
+        <details className="mt-2 text-caption text-text-3">
+          <summary className="cursor-pointer text-text-2 hover:text-text-1">
+            质量原因 {cycle.qualityReasons.length}
+          </summary>
+          <ul className="mt-1 space-y-0.5">
+            {cycle.qualityReasons.map((reason) => (
+              <li key={reason}>· {formatAnalysisQualityReason(reason)}</li>
+            ))}
+          </ul>
+        </details>
+      )}
+    </section>
+  );
+}
+
+/**
+ * 详情页深链：官方 canonical 榜单携带 snapshotKey，让详情页优先读取同一份
+ * 冻结证据；preview/即时扫描没有官方快照可绑，只传 ticker。
+ */
+function opportunityDetailPath(ticker: string, officialSnapshotKey: string | null): string {
+  return officialSnapshotKey
+    ? `/regime/opportunity/${ticker}?snapshotKey=${encodeURIComponent(officialSnapshotKey)}`
+    : `/regime/opportunity/${ticker}`;
+}
+
 export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
   const navigate = useNavigate();
   const [run, setRun] = useState<DailyOpportunityRun | null>(null);
   const runRef = useRef<DailyOpportunityRun | null>(null);
+  const [baselineSource, setBaselineSource] = useState<OpportunityBaselineSource | null>(null);
+  const [premarketCycle, setPremarketCycle] = useState<PremarketCycleResponse | null>(null);
+  const officialSnapshotKey = baselineSource === 'canonical'
+    ? premarketCycle?.snapshot?.snapshotKey ?? null
+    : null;
+  const [premarketError, setPremarketError] = useState<string | null>(null);
+  const [premarketActivity, setPremarketActivity] = useState<PremarketActivity>('status');
+  const [premarketPollSequence, setPremarketPollSequence] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedCandidateId, setSelectedCandidateId] = useState<string | null>(null);
   const selectedCandidateIdRef = useRef<string | null>(null);
-  const [optionContextLoad, setOptionContextLoad] = useState<{
-    requestKey: string;
-    state: 'settled' | 'unavailable';
-    items: Record<string, OpportunityOptionContextItem>;
-    message: string | null;
-  }>({ requestKey: '', state: 'settled', items: {}, message: null });
   const [optionContextRefresh, setOptionContextRefresh] = useState({ runId: '', sequence: 0 });
   const [optionOverviewLoad, setOptionOverviewLoad] = useState<{
     requestKey: string;
@@ -1387,16 +1974,15 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
   const [learningLoading, setLearningLoading] = useState(true);
   const [learningError, setLearningError] = useState<string | null>(null);
   const [learningNotice, setLearningNotice] = useState<string | null>(null);
-  const [freezingSnapshot, setFreezingSnapshot] = useState(false);
   const [evaluatingSnapshots, setEvaluatingSnapshots] = useState(false);
   const requestSequence = useRef(0);
   const learningRequestSequence = useRef(0);
-  const optionContextRequestSequence = useRef(0);
   const optionOverviewRequestSequence = useRef(0);
   const optionEventRequestSequence = useRef(0);
   const optionWallSummaryRequestSequence = useRef(0);
   const optionWallRequestSequence = useRef(0);
-  const ensuredRunIdsRef = useRef(new Set<string>());
+  const premarketPollCount = useRef(0);
+  const premarketPollingAttemptKey = useRef<string | null>(null);
 
   const normalizedSymbols = useMemo(
     () => symbols.map((symbol) => symbol.trim().toUpperCase()).filter(Boolean).slice(0, 20),
@@ -1409,21 +1995,9 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
   const primaryCandidates = useMemo(() => run?.candidates.slice(0, 5) ?? [], [run]);
   const secondaryCandidates = useMemo(() => run?.candidates.slice(5) ?? [], [run]);
 
-  const optionContextSymbols = useMemo(
-    () => {
-      const ticker = selectedCandidate
-        ? normalizeSupportedUsOptionUnderlying(selectedCandidate.ticker)
-        : null;
-      return ticker ? [ticker] : [];
-    },
-    [selectedCandidate],
-  );
   const shouldRefreshOptionContext = Boolean(
     run && optionContextRefresh.runId === run.runId,
   );
-  const optionContextRequestKey = run && optionContextSymbols.length > 0
-    ? `${run.runId}:${optionContextSymbols.join(',')}:${shouldRefreshOptionContext ? `refresh-${optionContextRefresh.sequence}` : 'cached'}`
-    : '';
 
   const optionOverviewSymbols = useMemo(
     () => run?.candidates
@@ -1474,17 +2048,122 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
     setLearningLoading(false);
   }, []);
 
-  const load = useCallback(async (refresh = false) => {
+  const load = useCallback(async (intent: PremarketLoadIntent = 'initial') => {
+    const explicitRun = intent === 'run';
+    const refreshPreview = intent === 'refresh';
+    const userInitiated = explicitRun || refreshPreview;
+    const statusOnly = intent === 'poll';
+    let continueStatusPolling = false;
     const requestId = requestSequence.current + 1;
     requestSequence.current = requestId;
     setLoading(true);
     setError(null);
+    setPremarketError(null);
+    setPremarketActivity('status');
     try {
-      const nextRun = await fetchDailyOpportunities(normalizedSymbols, 10, { refresh });
+      let cycle: PremarketCycleResponse | null = null;
+      let nextRun: DailyOpportunityRun | null = null;
+      let nextBaselineSource: OpportunityBaselineSource = 'preview';
+      let previewAllowed = true;
+
+      try {
+        cycle = await fetchPremarketCycleStatus(5);
+        if (requestSequence.current !== requestId) return;
+        setPremarketCycle(cycle);
+        continueStatusPolling = cycle.state === 'running';
+        if (continueStatusPolling) {
+          const pollingKey = cycle.attemptKey ?? cycle.cycleKey;
+          if (premarketPollingAttemptKey.current !== pollingKey) {
+            premarketPollingAttemptKey.current = pollingKey;
+            premarketPollCount.current = 0;
+          }
+          if (intent !== 'poll') {
+            premarketPollCount.current = 0;
+            setPremarketPollSequence((current) => current + 1);
+          }
+        } else {
+          premarketPollingAttemptKey.current = null;
+          premarketPollCount.current = 0;
+        }
+      } catch (caught) {
+        if (requestSequence.current !== requestId) return;
+        const message = caught instanceof Error ? caught.message : '只读状态读取失败';
+        setPremarketError(message);
+        setError(`官方盘前研究状态不可用，已停止新的预览请求：${message}`);
+        // The status failure could hide a live server-owned attempt. Fail
+        // closed for every intent so /daily never races unknown provider work.
+        previewAllowed = false;
+        if (statusOnly) continueStatusPolling = true;
+      }
+
+      const explicitRunAvailable = Boolean(
+        cycle && explicitRun && canStartManualPremarketRun(cycle),
+      );
+      if (explicitRun && !explicitRunAvailable) previewAllowed = false;
+
+      if (cycle && explicitRunAvailable) {
+        setPremarketActivity('run');
+        try {
+          cycle = await runPremarketCycle(5);
+          if (requestSequence.current !== requestId) return;
+          setPremarketCycle(cycle);
+          if (cycle.run) {
+            nextRun = cycle.run;
+            nextBaselineSource = cycle.state === 'published' ? 'canonical' : 'preview';
+          }
+        } catch (caught) {
+          if (requestSequence.current !== requestId) return;
+          setPremarketError(caught instanceof Error ? caught.message : '今日盘前研究生成失败');
+          try {
+            cycle = await fetchPremarketCycleStatus(5);
+            if (requestSequence.current !== requestId) return;
+            setPremarketCycle(cycle);
+            if (!['blocked', 'failed'].includes(cycle.state)) {
+              setPremarketError(null);
+            }
+            if (cycle.state === 'published' && cycle.run) {
+              nextRun = cycle.run;
+              nextBaselineSource = 'canonical';
+            } else if (cycle.run) {
+              nextRun = cycle.run;
+            } else if (cycle.state === 'running') {
+              previewAllowed = false;
+            }
+          } catch {
+            // The timed-out run may still own server-side provider work. Without
+            // a readable status, do not launch a second /daily scan beside it.
+            previewAllowed = false;
+          }
+        }
+      } else if (cycle?.state === 'published' && cycle.run) {
+        nextRun = cycle.run;
+        nextBaselineSource = 'canonical';
+      } else if (cycle?.run) {
+        nextRun = cycle.run;
+      } else if (
+        statusOnly
+        || (cycle ? hasImminentPremarketProviderWork(cycle) : false)
+        || cycle?.state === 'published'
+      ) {
+        previewAllowed = false;
+      }
+
+      if (!nextRun && previewAllowed) {
+        setPremarketActivity('preview');
+        nextRun = await fetchDailyOpportunities(
+          normalizedSymbols,
+          10,
+          { refresh: refreshPreview },
+        );
+        if (requestSequence.current !== requestId) return;
+      }
+      if (!nextRun) return;
+
       if (requestSequence.current === requestId) {
         const previousRun = runRef.current;
         if (
-          refresh
+          refreshPreview
+          && nextBaselineSource === 'preview'
           && previousRun
           && hasSameUniverse(previousRun, nextRun)
           && hasUsableBaseCandidate(previousRun)
@@ -1502,14 +2181,15 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
           : '';
         runRef.current = nextRun;
         setRun(nextRun);
+        setBaselineSource(nextBaselineSource);
         selectedCandidateIdRef.current = nextSelectedId;
         setSelectedCandidateId(nextSelectedId);
         setOptionContextRefresh((current) => {
-          if (refresh) return { runId: nextRun.runId, sequence: current.sequence + 1 };
+          if (userInitiated) return { runId: nextRun.runId, sequence: current.sequence + 1 };
           return current.runId ? { ...current, runId: '' } : current;
         });
         setOptionWallRefresh((current) => {
-          if (refresh) {
+          if (userInitiated) {
             const refreshedScope = OPTION_WALL_SCOPES[optionWallScopeRef.current];
             return {
               runId: nextRun.runId,
@@ -1522,7 +2202,7 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
           return current.runId ? { ...current, runId: '', ticker: '' } : current;
         });
         setOptionEventRefresh((current) => {
-          if (refresh) {
+          if (userInitiated) {
             return {
               runId: nextRun.runId,
               ticker: nextWallTicker,
@@ -1537,7 +2217,16 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
         setError(caught instanceof Error ? caught.message : '每日机会扫描失败');
       }
     } finally {
-      if (requestSequence.current === requestId) setLoading(false);
+      if (requestSequence.current === requestId) {
+        setLoading(false);
+        setPremarketActivity(null);
+        if (statusOnly && continueStatusPolling) {
+          premarketPollCount.current += 1;
+          if (premarketPollCount.current < MAX_PREMARKET_STATUS_POLLS) {
+            setPremarketPollSequence((current) => current + 1);
+          }
+        }
+      }
     }
   }, [normalizedSymbols]);
 
@@ -1552,7 +2241,7 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
   }, []);
 
   const evaluateMatureOutcomes = useCallback(async () => {
-    const targets = learningSnapshots.filter((snapshot) => snapshot.validationEligible);
+    const targets = learningSnapshots.filter(hasTrackableUnderlyingPath);
     if (targets.length === 0) return;
     setEvaluatingSnapshots(true);
     setLearningError(null);
@@ -1579,24 +2268,45 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
         result.status === 'fulfilled' ? total + result.value.dataGapHorizons : total
       ), 0);
       setLearningNotice(
-        `已检查最近 ${targets.length} 个可验证快照，新增 ${insertedOutcomes} 条成熟结果；`
+        `已检查最近 ${targets.length} 个统计快照，新增 ${insertedOutcomes} 条已回填结果；`
         + `${pendingHorizons} 个观察窗口仍待目标交易日，${dataGapHorizons} 个已到期窗口待补数据。`,
       );
       await loadLearning();
       if (failed > 0) setLearningError(`${failed} 个快照更新失败，可稍后重试`);
     } catch (caught) {
-      setLearningError(caught instanceof Error ? caught.message : '更新成熟结果失败');
+      setLearningError(caught instanceof Error ? caught.message : '更新到期结果失败');
     } finally {
       setEvaluatingSnapshots(false);
     }
   }, [learningSnapshots, loadLearning]);
 
   useEffect(() => {
-    void load(false);
+    void load('initial');
     return () => {
       requestSequence.current += 1;
     };
   }, [load]);
+
+  useEffect(() => {
+    if (premarketCycle?.state !== 'running') return undefined;
+    const delay = Math.min(
+      5_000,
+      Math.max(2_000, (premarketCycle.retryAfterSeconds ?? 3) * 1_000),
+    );
+    const timer = window.setTimeout(() => {
+      void load('poll');
+    }, delay);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [
+    load,
+    premarketCycle?.attemptKey,
+    premarketCycle?.cycleKey,
+    premarketCycle?.retryAfterSeconds,
+    premarketCycle?.state,
+    premarketPollSequence,
+  ]);
 
   useEffect(() => {
     void loadLearning();
@@ -1604,45 +2314,6 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
       learningRequestSequence.current += 1;
     };
   }, [loadLearning]);
-
-  useEffect(() => {
-    if (!run || loading || ensuredRunIdsRef.current.has(run.runId)) return undefined;
-    const ensureSymbols = normalizedSymbols.length > 0 ? normalizedSymbols : run.universe;
-    if (ensureSymbols.length === 0) return undefined;
-    ensuredRunIdsRef.current.add(run.runId);
-    let active = true;
-    setFreezingSnapshot(true);
-    void ensureOpportunitySnapshot(ensureSymbols, 10)
-      .then(async (response) => {
-        if (!active) return;
-        if (response.snapshot) {
-          setLearningSnapshots((current) => [
-            response.snapshot as OpportunitySnapshot,
-            ...current.filter((item) => item.snapshotKey !== response.snapshot?.snapshotKey),
-          ].slice(0, 10));
-          await loadLearning();
-        }
-        if (!active) return;
-        const friendlyMessage = response.state === 'saved'
-          ? `已自动保存 ${response.marketDateEt} 的研究版本；仅用于后续复盘，不会下单。`
-          : response.state === 'existing'
-            ? `${response.marketDateEt} 的研究版本已保存，无需重复操作。`
-            : response.state === 'outside_window'
-              ? '当前不在美股开盘前保存窗口；列表仍使用上一完整交易日数据正常更新。'
-              : response.message;
-        setLearningNotice(friendlyMessage);
-      })
-      .catch((caught) => {
-        if (!active) return;
-        setLearningError(caught instanceof Error ? caught.message : '自动保存检查失败');
-      })
-      .finally(() => {
-        if (active) setFreezingSnapshot(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [loadLearning, loading, normalizedSymbols, run]);
 
   useEffect(() => {
     if (!optionOverviewRequestKey || optionOverviewSymbols.length === 0) return undefined;
@@ -1708,62 +2379,6 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
       optionWallSummaryRequestSequence.current += 1;
     };
   }, [optionWallSummaryRequestKey, optionWallSummarySymbols, shouldRefreshOptionContext]);
-
-  useEffect(() => {
-    if (!optionContextRequestKey || optionContextSymbols.length === 0) return undefined;
-
-    const requestId = optionContextRequestSequence.current + 1;
-    optionContextRequestSequence.current = requestId;
-    const optionContextRequest = shouldRefreshOptionContext
-      ? fetchOpportunityOptionContext(optionContextSymbols, { refresh: true })
-      : fetchOpportunityOptionContext(optionContextSymbols);
-    void optionContextRequest
-      .then((response) => {
-        if (optionContextRequestSequence.current !== requestId) return;
-        const items = Object.fromEntries(response.items.map((item) => [
-          item.ticker.trim().toUpperCase(),
-          item,
-        ]));
-        setOptionContextLoad({
-          requestKey: optionContextRequestKey,
-          state: 'settled',
-          items,
-          message: null,
-        });
-      })
-      .catch((caught) => {
-        if (optionContextRequestSequence.current !== requestId) return;
-        setOptionContextLoad({
-          requestKey: optionContextRequestKey,
-          state: 'unavailable',
-          items: {},
-          message: caught instanceof Error
-            ? caught.message
-            : '期权上下文暂不可用，不影响基础候选。',
-        });
-      });
-
-    return () => {
-      optionContextRequestSequence.current += 1;
-    };
-  }, [optionContextRequestKey, optionContextSymbols, shouldRefreshOptionContext]);
-
-  const getCandidateOptionContext = useCallback((candidate: OpportunityCandidate): CandidateOptionContext => {
-    const contextIsCurrent = optionContextLoad.requestKey === optionContextRequestKey;
-    const normalizedTicker = normalizeSupportedUsOptionUnderlying(candidate.ticker);
-    const isInOptionContextBatch = normalizedTicker !== null
-      && optionContextSymbols.includes(normalizedTicker);
-    const state: OptionContextDisplayState = !isInOptionContextBatch
-      ? 'not_scanned'
-      : !contextIsCurrent
-        ? 'loading'
-        : optionContextLoad.state;
-    return {
-      item: contextIsCurrent ? optionContextLoad.items[normalizedTicker ?? ''] : undefined,
-      state,
-      message: contextIsCurrent ? optionContextLoad.message : null,
-    };
-  }, [optionContextLoad, optionContextRequestKey, optionContextSymbols]);
 
   const getCandidateOptionWallSummary = useCallback((
     candidate: OpportunityCandidate,
@@ -1873,6 +2488,13 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
           item: optionWallDetailLoad.item,
           message: optionWallDetailLoad.message,
         };
+  const selectedAtmOptionWallContext = (
+    selectedCandidate
+    && selectedWallTicker
+    && optionWallSummarySymbols.includes(selectedWallTicker)
+  )
+    ? getCandidateOptionWallSummary(selectedCandidate)
+    : selectedOptionWallContext;
 
   const shouldRefreshOptionEvent = Boolean(
     run
@@ -1940,6 +2562,108 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
     : run
       ? `默认美股池 · 扫描 ${run.universe.length} 只`
       : '默认美股池';
+  const dailyRunReadiness = run?.runReadiness.find(
+    (source) => source.domain === 'daily_history',
+  );
+  const baseStageState: ResearchStageState = loading
+    ? 'loading'
+    : !run
+      ? error
+        ? 'failed'
+        : 'pending'
+      : !hasUsableBaseCandidate(run)
+        ? 'failed'
+        : dailyRunReadiness?.state && dailyRunReadiness.state !== 'ready'
+          ? 'degraded'
+          : 'ready';
+  const overviewStageState: ResearchStageState = !run
+    ? 'pending'
+    : optionOverviewSymbols.length === 0
+      ? 'degraded'
+      : optionOverviewLoad.requestKey !== optionOverviewRequestKey
+        ? 'loading'
+        : optionOverviewLoad.state === 'unavailable'
+          ? 'degraded'
+          : optionOverviewSymbols.some((ticker) => {
+            const item = optionOverviewLoad.items[ticker];
+            return !item || item.state !== 'ready';
+          })
+            ? 'degraded'
+            : 'ready';
+  const wallStageState: ResearchStageState = !run
+    ? 'pending'
+    : optionWallSummarySymbols.length === 0
+      ? 'degraded'
+      : optionWallSummaryLoad.requestKey !== optionWallSummaryRequestKey
+        ? 'loading'
+        : optionWallSummaryLoad.state === 'unavailable'
+          ? 'degraded'
+          : optionWallSummarySymbols.some((ticker) => {
+            const item = optionWallSummaryLoad.items[ticker];
+            return !item || item.state !== 'ready';
+          })
+            ? 'degraded'
+            : 'ready';
+  const researchStages = [
+    { label: '基础榜', state: baseStageState },
+    { label: '期权概览', state: overviewStageState },
+    { label: 'Top 5 墙', state: wallStageState },
+  ] satisfies Array<{ label: string; state: ResearchStageState }>;
+  const activeStageIndex = researchStages.findIndex((stage) => stage.state === 'loading');
+  const researchCycleLoading = activeStageIndex >= 0;
+  const baseIsStale = dailyRunReadiness?.state === 'stale'
+    || Boolean(run?.candidates.some((candidate) => (
+      candidate.readiness.some((source) => (
+        source.domain === 'daily_history' && source.state === 'stale'
+      ))
+    )));
+  const degradedEnhancements = researchStages
+    .slice(1)
+    .filter((stage) => stage.state === 'degraded')
+    .map((stage) => stage.label);
+  const researchStatus = run && loading
+    ? '刷新中 · 显示旧结果'
+    : run && error
+      ? '刷新失败 · 显示旧结果'
+      : activeStageIndex >= 0
+        ? `阶段 ${activeStageIndex + 1}/3 · ${researchStages[activeStageIndex].label}`
+        : baseStageState === 'failed'
+          ? '基础扫描阻断'
+          : baseIsStale
+            ? '基础日线过期 · 仅作背景'
+            : degradedEnhancements.length > 0
+              ? '基础榜可用 · 增强降级'
+              : '研究数据就绪';
+  const researchStatusTone = run && (loading || error)
+    ? 'text-warning'
+    : baseStageState === 'failed' || baseIsStale || degradedEnhancements.length > 0
+      ? 'text-warning'
+      : activeStageIndex >= 0
+        ? 'text-text-2'
+        : 'text-text-1';
+  const canonicalRetryAvailable = Boolean(
+    premarketCycle && canStartManualPremarketRun(premarketCycle),
+  );
+  const idleRefreshLabel = canonicalRetryAvailable
+    ? premarketCycle?.state === 'ready_to_run'
+      ? '立即生成'
+      : '立即重试'
+    : premarketCycle?.state === 'published'
+      ? '读取今日研究状态'
+      : premarketCycle?.state === 'running'
+        ? '读取今日研究状态'
+        : premarketError
+          ? '重试今日研究状态'
+          : '刷新只读预览';
+  const refreshButtonLabel = premarketActivity === 'status'
+    ? '读取今日研究状态'
+    : premarketActivity === 'run'
+      ? '正在生成'
+      : premarketActivity === 'preview'
+        ? '刷新只读预览'
+        : activeStageIndex >= 0
+          ? `阶段 ${activeStageIndex + 1}/3 · ${researchStages[activeStageIndex].label}`
+          : idleRefreshLabel;
 
   const candidateTableHead = () => (
     <thead className="sticky top-0 z-sticky bg-bg-1">
@@ -1950,7 +2674,7 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
         <th className="px-3 py-2 text-right font-medium">量能</th>
         <th className="px-3 py-2 text-right font-medium">IV / Rank</th>
         <th className="px-3 py-2 font-medium">OI / 执行价墙</th>
-        <th className="px-3 py-2 font-medium">研究状态</th>
+        <th className="px-3 py-2 font-medium">研究用途</th>
       </tr>
     </thead>
   );
@@ -1989,7 +2713,7 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
             aria-label={`打开 ${candidate.ticker} 完整机会分析`}
             onClick={(event) => {
               event.stopPropagation();
-              navigate(`/regime/opportunity/${candidate.ticker}`);
+              navigate(opportunityDetailPath(candidate.ticker, officialSnapshotKey));
             }}
             className="text-left hover:text-text-1"
           >
@@ -2057,22 +2781,74 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
         <Button
           variant="secondary"
           size="sm"
-          disabled={loading}
-          onClick={() => void load(true)}
+          disabled={loading || researchCycleLoading}
+          onClick={() => void load(canonicalRetryAvailable ? 'run' : 'refresh')}
         >
-          <RefreshCw size={14} />
-          {loading ? (run ? '后台更新中…' : '读取日线中…') : '重新扫描'}
+          <RefreshCw size={14} className={loading || researchCycleLoading ? 'animate-spin' : undefined} />
+          {refreshButtonLabel}
         </Button>
       </header>
 
+      <CanonicalPremarketCard
+        cycle={premarketCycle}
+        error={premarketError}
+        activity={premarketActivity}
+        baselineSource={baselineSource}
+      />
+
+      <div
+        className="border-b border-subtle bg-bg-0 px-4 py-2.5"
+        aria-label="今日机会研究状态"
+        aria-live="polite"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-caption text-text-3">
+            <span>请求日 <strong className="font-mono font-medium text-text-2">{run?.marketDateEt ?? '读取中'} ET</strong></span>
+            <span>基础证据 <strong className="font-mono font-medium text-text-2">{run ? completedEvidenceDateRange(run) : '读取中'}</strong></span>
+            <span>生成 <strong className="font-mono font-medium text-text-2">{run ? `${formatEtDateTime(run.generatedAt)} ET` : '读取中'}</strong></span>
+          </div>
+          <span className={`text-caption font-medium ${researchStatusTone}`}>{researchStatus}</span>
+        </div>
+        <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-caption" aria-label="研究加载阶段">
+          {researchStages.map((stage, index) => {
+            const stageTone = stage.state === 'failed' || stage.state === 'degraded'
+              ? 'text-warning'
+              : stage.state === 'loading'
+                ? 'text-text-1'
+                : stage.state === 'ready'
+                  ? 'text-text-2'
+                  : 'text-text-3';
+            return (
+              <span key={stage.label} className="inline-flex items-center gap-2">
+                {index > 0 && <span aria-hidden className="text-text-4">→</span>}
+                <span className={stageTone}>
+                  {index + 1} {stage.label} · {RESEARCH_STAGE_LABELS[stage.state]}
+                </span>
+              </span>
+            );
+          })}
+        </div>
+        {!researchCycleLoading && degradedEnhancements.length > 0 && (
+          <div className="mt-1 text-caption text-warning">
+            增强降级：{degradedEnhancements.join('、')}部分或不可用；基础 Top 5 仍可研究。
+          </div>
+        )}
+      </div>
+
       {run && loading && (
         <div className="border-b border-subtle bg-bg-0 px-4 py-2 text-caption text-text-2" role="status">
-          正在更新基础日线（请求最长 35 秒）；上一次成功结果继续保留，期权增强不会锁住主列表。
+          {premarketActivity === 'run'
+            ? '正在执行服务端官方盘前研究；'
+            : premarketActivity === 'status'
+              ? '正在读取今日盘前研究状态；'
+              : '正在刷新基础榜预览（请求最长 35 秒）；'}
+          当前继续显示
+          {' '}{formatEtDateTime(run.generatedAt)} ET 的上一次成功结果。
         </div>
       )}
       {run && error && (
         <div className="border-b border-[color:var(--warn-muted)] bg-bg-0 px-4 py-2 text-caption text-warning" role="status">
-          {error}。当前仍显示上一次可用结果。
+          {error}。当前仍显示 {formatEtDateTime(run.generatedAt)} ET 的上一次可用结果。
         </div>
       )}
 
@@ -2080,7 +2856,6 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
         snapshots={learningSnapshots}
         summary={learningSummary}
         loading={learningLoading}
-        saving={freezingSnapshot}
         evaluating={evaluatingSnapshots}
         error={learningError}
         notice={learningNotice}
@@ -2136,7 +2911,10 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
             title="机会扫描暂不可用"
             description={`${error}。原有复盘和行情不受影响。`}
             size="sm"
-            action={{ label: '重试', onClick: () => void load(true) }}
+            action={{
+              label: '重试',
+              onClick: () => void load(canonicalRetryAvailable ? 'run' : 'refresh'),
+            }}
           />
         </div>
       ) : loading && !run ? (
@@ -2148,6 +2926,28 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
             <div key={item} className="h-12 animate-pulse rounded-ds-sm bg-bg-2" />
           ))}
         </div>
+      ) : !run && premarketCycle?.state === 'running' ? (
+        <EmptyState
+          title="官方盘前研究正在生成"
+          description={premarketCycle.retryAfterSeconds
+            ? `服务端仍在运行；请约 ${premarketCycle.retryAfterSeconds} 秒后刷新状态。为避免重复行情扫描，当前不会并发启动普通预览。`
+            : '服务端仍在运行。为避免重复行情扫描，当前不会并发启动普通预览。'}
+          size="sm"
+        />
+      ) : !run && premarketCycle && hasImminentPremarketProviderWork(premarketCycle) ? (
+        <EmptyState
+          title={canonicalRetryAvailable
+            ? '官方盘前研究等待生成'
+            : '后台盘前研究即将开始'}
+          description={canonicalRetryAvailable
+            ? (
+              premarketCycle.schedulerEnabled
+                ? '后台调度正在接管这个官方时点；也可以点击“立即生成”。当前不会并发启动普通预览。'
+                : '后台自动研究未启用；可点击“立即生成”。当前不会并发启动普通预览。'
+            )
+            : '距离后台研究时点不足 60 秒；当前暂停普通预览，避免两套行情任务并发。'}
+          size="sm"
+        />
       ) : !run || run.candidates.length === 0 ? (
         <EmptyState
           title="当前没有可展示的候选"
@@ -2165,7 +2965,7 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
           </div>
 
           <div className="border-b border-subtle bg-bg-1 px-4 py-2 text-caption text-text-3">
-            数据时点：价格与技术结构＝上一完整交易日；Volume＝本交易日累计；OI＝上一清算日；IV / Rank＝Moomoo 当前快照。IV 只表示预期波动幅度，不表示方向。
+            数据时点：价格、技术结构与相对量能＝上一完整交易日（相对之前 20 个 session）；期权 Call/Put Volume＝当前交易日累计；OI＝上一清算日；IV / Rank＝Moomoo 当前快照。IV 只表示预期波动幅度，不表示方向。
           </div>
 
           <div className="grid lg:grid-cols-[minmax(0,1.45fr)_minmax(380px,0.9fr)]">
@@ -2200,7 +3000,7 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
             {selectedCandidate && (
               <CandidateDetail
                 candidate={selectedCandidate}
-                optionContext={getCandidateOptionContext(selectedCandidate)}
+                optionContext={optionContextFromWall(selectedAtmOptionWallContext)}
                 optionEventContext={selectedOptionEventContext}
                 optionWallContext={selectedOptionWallContext}
                 optionWallScope={optionWallScope}
@@ -2209,6 +3009,7 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
                 rankingMethod={run.rankingMethod}
                 strategyValidationState={run.strategyValidationState}
                 strategyValidationMessage={run.strategyValidationMessage}
+                officialSnapshotKey={officialSnapshotKey}
               />
             )}
           </div>

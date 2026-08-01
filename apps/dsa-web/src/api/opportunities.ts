@@ -7,8 +7,11 @@ import type {
   OpportunityOptionEventResponse,
   OpportunityOptionOverviewResponse,
   OpportunityOptionWallResponse,
+  PremarketCycleResponse,
+  PremarketUniverseResponse,
   OpportunitySnapshot,
   OpportunitySnapshotEnsureResponse,
+  OpportunitySnapshotDetailResponse,
   OpportunitySnapshotEvaluationResponse,
   OpportunitySnapshotListResponse,
 } from '../types/opportunities';
@@ -21,12 +24,17 @@ const OPTION_EVENT_TIMEOUT_MS = 30_000;
 const OPTION_EVENT_CACHE_TTL_MS = 30_000;
 const OPTION_WALL_TIMEOUT_MS = 45_000;
 const OPPORTUNITY_LEARNING_TIMEOUT_MS = 120_000;
+const PREMARKET_STATUS_TIMEOUT_MS = 30_000;
+const PREMARKET_RUN_TIMEOUT_MS = 35_000;
+const PREMARKET_UNIVERSE_TIMEOUT_MS = 30_000;
 const US_OPTION_UNDERLYING_PATTERN = /^[A-Z]{1,5}(?:[.-][A-Z])?$/;
 const dailyInFlight = new Map<string, Promise<DailyOpportunityRun>>();
 const optionContextInFlight = new Map<string, Promise<OpportunityOptionContextResponse>>();
 const optionEventInFlight = new Map<string, Promise<OpportunityOptionEventResponse>>();
 const optionOverviewInFlight = new Map<string, Promise<OpportunityOptionOverviewResponse>>();
 const optionWallInFlight = new Map<string, Promise<OpportunityOptionWallResponse>>();
+const premarketStatusInFlight = new Map<string, Promise<PremarketCycleResponse>>();
+const premarketRunInFlight = new Map<string, Promise<PremarketCycleResponse>>();
 
 function normalizedSymbols(symbols: string[]): string[] {
   return [...new Set(symbols.map((item) => item.trim().toUpperCase()).filter(Boolean))];
@@ -35,6 +43,10 @@ function normalizedSymbols(symbols: string[]): string[] {
 function cacheKey(symbols: string[], limit: number): string {
   const universe = normalizedSymbols(symbols).sort();
   return `opportunities:daily:${universe.join(',')}:${limit}`;
+}
+
+function premarketCycleRequestKey(limit: number): string {
+  return `official:${limit}`;
 }
 
 function hasUsableDailyCandidate(run: DailyOpportunityRun): boolean {
@@ -66,7 +78,7 @@ function optionOverviewCacheKey(symbols: string[]): string {
 }
 
 function optionWallCacheKey(symbols: string[], dteMin: number, dteMax: number): string {
-  return `opportunities:option-walls:${normalizedOptionContextSymbols(symbols).sort().join(',')}:${dteMin}:${dteMax}`;
+  return `opportunities:option-walls-v1.1:${normalizedOptionContextSymbols(symbols).sort().join(',')}:${dteMin}:${dteMax}`;
 }
 
 function optionEventCacheKey(symbols: string[], limitPerSymbol: number): string {
@@ -107,6 +119,64 @@ export async function fetchDailyOpportunities(
 
   dailyInFlight.set(key, request);
   return request;
+}
+
+export async function fetchPremarketCycleStatus(
+  limit = 5,
+): Promise<PremarketCycleResponse> {
+  const key = premarketCycleRequestKey(limit);
+  const pending = premarketStatusInFlight.get(key);
+  if (pending) return pending;
+
+  const request = apiClient.post<Record<string, unknown>>(
+    '/api/v1/opportunities/premarket/status',
+    { symbols: [], limit, manual: false },
+    { timeout: PREMARKET_STATUS_TIMEOUT_MS },
+  ).then((response) => toCamelCase<PremarketCycleResponse>(response.data))
+    .finally(() => {
+      premarketStatusInFlight.delete(key);
+    });
+  premarketStatusInFlight.set(key, request);
+  return request;
+}
+
+export async function runPremarketCycle(
+  limit = 5,
+): Promise<PremarketCycleResponse> {
+  const key = premarketCycleRequestKey(limit);
+  const pending = premarketRunInFlight.get(key);
+  if (pending) return pending;
+
+  const request = apiClient.post<Record<string, unknown>>(
+    '/api/v1/opportunities/premarket/run',
+    { symbols: [], limit, manual: true },
+    { timeout: PREMARKET_RUN_TIMEOUT_MS },
+  ).then((response) => toCamelCase<PremarketCycleResponse>(response.data))
+    .finally(() => {
+      premarketRunInFlight.delete(key);
+    });
+  premarketRunInFlight.set(key, request);
+  return request;
+}
+
+export async function fetchPremarketUniverse(): Promise<PremarketUniverseResponse> {
+  const response = await apiClient.get<Record<string, unknown>>(
+    '/api/v1/opportunities/premarket/universe',
+    { timeout: PREMARKET_UNIVERSE_TIMEOUT_MS },
+  );
+  return toCamelCase<PremarketUniverseResponse>(response.data);
+}
+
+export async function savePremarketUniverse(
+  symbols: string[],
+  limit = 5,
+): Promise<PremarketUniverseResponse> {
+  const response = await apiClient.put<Record<string, unknown>>(
+    '/api/v1/opportunities/premarket/universe',
+    { symbols: normalizedOptionContextSymbols(symbols).slice(0, 20), limit },
+    { timeout: PREMARKET_UNIVERSE_TIMEOUT_MS },
+  );
+  return toCamelCase<PremarketUniverseResponse>(response.data);
 }
 
 export async function fetchOpportunityOptionContext(
@@ -264,6 +334,16 @@ export async function fetchOpportunitySnapshots(
     { params: { limit }, timeout: 30_000 },
   );
   return toCamelCase<OpportunitySnapshotListResponse>(response.data);
+}
+
+export async function fetchOpportunitySnapshotDetail(
+  snapshotKey: string,
+): Promise<OpportunitySnapshotDetailResponse> {
+  const response = await apiClient.get<Record<string, unknown>>(
+    `/api/v1/opportunities/snapshots/${encodeURIComponent(snapshotKey)}`,
+    { timeout: 30_000 },
+  );
+  return toCamelCase<OpportunitySnapshotDetailResponse>(response.data);
 }
 
 export async function evaluateOpportunitySnapshot(

@@ -124,6 +124,38 @@ describe('episode review evidence marker mapping', () => {
     expect(buildEvidenceMarkers(links)).toEqual([]);
   });
 
+  it('does not forward-map evidence just before the first visible candle', () => {
+    const firstRegularBar = Date.parse('2026-07-20T13:30:00Z') / 1000;
+    const links = mapEvidenceToCandles([
+      evidence('fill-100', '2026-07-20T13:29:59Z', 'fill', 'open'),
+    ], [{
+      time: firstRegularBar,
+      open: 150,
+      high: 152,
+      low: 149,
+      close: 151,
+    }], '1m');
+
+    expect(links[0].chartTime).toBeNull();
+    expect(buildEvidenceMarkers(links)).toEqual([]);
+  });
+
+  it('does not carry evidence backward across a New York session boundary', () => {
+    const lastRegularBar = Date.parse('2026-07-20T19:59:00Z') / 1000;
+    const links = mapEvidenceToCandles([
+      evidence('fill-101', '2026-07-20T20:00:30Z', 'fill', 'close'),
+    ], [{
+      time: lastRegularBar,
+      open: 150,
+      high: 152,
+      low: 149,
+      close: 151,
+    }], '5m');
+
+    expect(links[0].chartTime).toBeNull();
+    expect(buildEvidenceMarkers(links)).toEqual([]);
+  });
+
   it('maps daily fallback by the evidence New York calendar date', () => {
     const links = mapEvidenceToCandles([
       evidence('fill-12', '2026-07-21T00:30:00Z', 'fill', 'open'),

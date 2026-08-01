@@ -11,6 +11,7 @@ import PnLByDte from '../components/journal/PnLByDte';
 import FrameworkPanel from '../components/journal/FrameworkPanel';
 import AskJournalChat from '../components/journal/AskJournalChat';
 import PositionEpisodesPanel from '../components/journal/PositionEpisodesPanel';
+import CurrentPositionsSnapshotCard from '../components/journal/CurrentPositionsSnapshotCard';
 import { positionReviewPath } from '../components/journal/review/journalReviewRouting';
 import { useJournalStore } from '../stores/journalStore';
 import { usePositionEpisodes } from '../hooks/usePositionEpisodes';
@@ -46,7 +47,9 @@ const POSITION_CASE_FOCUS = new Set([
   'top_loss',
   'largest_fee',
   'longest_hold',
+  'weakest_evidence',
 ]);
+const POSITION_REVIEW_STATUSES = new Set(['not_started', 'in_progress', 'completed']);
 
 const fmtMoney = (n?: number | null) => {
   if (n == null) return '—';
@@ -81,6 +84,7 @@ const JournalPage: React.FC = () => {
     const lifecycleStatus = params.get('status') ?? '';
     const completenessStatus = params.get('completeness') ?? '';
     const caseFocus = params.get('case') ?? '';
+    const reviewStatus = params.get('review_status') ?? '';
     const requestedPage = Number(params.get('page') ?? '1');
     const requestedBuildId = Number(params.get('build_id') ?? '');
     return {
@@ -93,6 +97,9 @@ const JournalPage: React.FC = () => {
         : '',
       caseFocus: POSITION_CASE_FOCUS.has(caseFocus)
         ? caseFocus as PositionEpisodeFilters['caseFocus']
+        : '',
+      reviewStatus: POSITION_REVIEW_STATUSES.has(reviewStatus)
+        ? reviewStatus as PositionEpisodeFilters['reviewStatus']
         : '',
       buildId: Number.isInteger(requestedBuildId) && requestedBuildId > 0
         ? requestedBuildId
@@ -192,6 +199,7 @@ const JournalPage: React.FC = () => {
     setOrDelete('status', filters.lifecycleStatus);
     setOrDelete('completeness', filters.completenessStatus);
     setOrDelete('case', filters.caseFocus);
+    setOrDelete('review_status', filters.reviewStatus);
     if ((filters.page ?? 1) > 1) next.set('page', String(filters.page));
     else next.delete('page');
     setParams(next, { replace: true });
@@ -253,15 +261,18 @@ const JournalPage: React.FC = () => {
       )}
 
       {tab === 'positions' && (
-        <PositionEpisodesPanel
-          key={`${positionFilters.buildId ?? 'default'}:${positionFilters.underlying ?? ''}:${positionFilters.lifecycleStatus ?? ''}:${positionFilters.completenessStatus ?? ''}:${positionFilters.caseFocus ?? ''}:${positionFilters.page ?? 1}`}
-          filters={positionFilters}
-          controller={positionController}
-          onApplyFilters={applyPositionFilters}
-          onPageChange={changePositionPage}
-          onSelectBuild={selectPositionBuild}
-          onOpenReview={openPositionReview}
-        />
+        <div className="space-y-4">
+          <CurrentPositionsSnapshotCard onOpenEvidence={() => setTab('import')} />
+          <PositionEpisodesPanel
+            key={`${positionFilters.buildId ?? 'default'}:${positionFilters.underlying ?? ''}:${positionFilters.lifecycleStatus ?? ''}:${positionFilters.completenessStatus ?? ''}:${positionFilters.caseFocus ?? ''}:${positionFilters.reviewStatus ?? ''}:${positionFilters.page ?? 1}`}
+            filters={positionFilters}
+            controller={positionController}
+            onApplyFilters={applyPositionFilters}
+            onPageChange={changePositionPage}
+            onSelectBuild={selectPositionBuild}
+            onOpenReview={openPositionReview}
+          />
+        </div>
       )}
 
       {tab === 'overview' && (

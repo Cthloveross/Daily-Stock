@@ -97,6 +97,96 @@ export interface DailyOpportunityRun {
   candidates: OpportunityCandidate[];
 }
 
+export type PremarketCycleState =
+  | 'non_session'
+  | 'waiting_window'
+  | 'ready_to_run'
+  | 'research_pool_missing'
+  | 'running'
+  | 'published'
+  | 'blocked'
+  | 'window_closed'
+  | 'failed';
+
+export type PremarketCycleQuality = 'unknown' | 'ready' | 'degraded' | 'blocked';
+
+export type PremarketUniverseSource =
+  | 'persisted'
+  | 'stock_list_fallback'
+  | 'request_fallback'
+  | 'unavailable';
+
+export interface PremarketUniverseResponse {
+  schemaVersion: 'premarket-research-universe/1.0' | string;
+  configured: boolean;
+  universeVersionKey: string | null;
+  source: PremarketUniverseSource;
+  symbols: string[];
+  limit: number;
+  createdAt: string | null;
+  duplicate: boolean;
+  message: string;
+}
+
+export type PremarketCycleStageState =
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'degraded'
+  | 'blocked'
+  | 'failed'
+  | 'skipped';
+
+export interface PremarketCycleStage {
+  name: string;
+  state: PremarketCycleStageState;
+  startedAt: string | null;
+  completedAt: string | null;
+  errorCode: string | null;
+}
+
+export interface PremarketCycleResponse {
+  schemaVersion: 'canonical-premarket-cycle/1.0' | string;
+  cycleVersion: string;
+  freezePolicyVersion: string;
+  scopeKey: string;
+  cycleKey: string;
+  state: PremarketCycleState;
+  quality: PremarketCycleQuality;
+  marketDateEt: string;
+  previousSession: string | null;
+  regularOpenAt: string | null;
+  windowStartAt: string | null;
+  windowEndAt: string | null;
+  latestStartAt: string | null;
+  cycleAsOf: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  retryAfterSeconds: number | null;
+  universe: string[];
+  requestedLimit: number;
+  universeSource: PremarketUniverseSource;
+  universeVersionKey: string | null;
+  attemptKey: string | null;
+  attemptTrigger: 'manual' | 'scheduler' | null;
+  attemptStartedAt: string | null;
+  leaseExpiresAt: string | null;
+  recoveredFromAttemptKey: string | null;
+  recoverable: boolean;
+  nextScheduledAt: string | null;
+  schedulerEnabled: boolean;
+  primaryScheduledAt: string | null;
+  retryScheduledAt: string | null;
+  stages: PremarketCycleStage[];
+  regimeQuality: Record<string, string>;
+  qualityReasons: string[];
+  run: DailyOpportunityRun | null;
+  snapshot: OpportunitySnapshot | null;
+  idempotentReplay: boolean;
+  errorCode: string | null;
+  message: string;
+}
+
 export type OpportunityOptionContextState = 'ready' | 'not_configured' | 'unavailable';
 
 export interface OpportunityOptionContextItem {
@@ -187,6 +277,13 @@ export interface OpportunityOptionWallItem {
   quoteAsOf: string | null;
   formulaVersion: string;
   spot: number | null;
+  atmCallIv: {
+    state: OpportunityOptionContextState;
+    expiry: string | null;
+    strike: number | null;
+    atmCallIvPercent: number | null;
+    selectionMethod: 'nearest_expiry_atm_call_from_same_wall_snapshot';
+  };
   scope: {
     dteMin: number;
     dteMax: number;
@@ -285,6 +382,31 @@ export interface OpportunityOutcomeProgress {
   dataGapCount?: number;
 }
 
+export type OpportunityQualificationTrackKey =
+  | 'raw_underlying_path_v1'
+  | 'underlying_daily_selection_v1'
+  | 'canonical_full_research_v1';
+
+export interface OpportunityQualificationTrackSummary {
+  trackKey: OpportunityQualificationTrackKey;
+  qualifiedCount: number;
+  excludedCount: number;
+  unverifiedCount: number;
+  prospectiveCount: number;
+  retrospectiveCount: number;
+  observationReadyCount: number;
+}
+
+export interface OpportunityQualificationSummary {
+  assessmentKey: string;
+  policyVersion: string;
+  publicationState: 'canonical_published' | 'audit_frozen' | 'legacy_unverified';
+  analysisQualityState: 'ready' | 'degraded' | 'blocked' | 'unassessed';
+  assessedAt: string;
+  reasonCodes: string[];
+  tracks: OpportunityQualificationTrackSummary[];
+}
+
 export interface OpportunitySnapshot {
   schemaVersion: string;
   snapshotKey: string;
@@ -296,13 +418,27 @@ export interface OpportunitySnapshot {
   eligibleCandidateCount: number;
   validationEligible: boolean;
   eligibilityReasons: string[];
+  analysisQualityEligible?: boolean | null;
+  analysisQualityReasons?: string[];
+  qualification?: OpportunityQualificationSummary | null;
   outcomeProgress: OpportunityOutcomeProgress[];
+  underlyingPathCandidateCount?: number;
+  underlyingPathProgress?: OpportunityOutcomeProgress[];
+  fullResearchCandidateCount?: number;
+  fullResearchProgress?: OpportunityOutcomeProgress[];
   idempotentReplay: boolean;
 }
 
 export interface OpportunitySnapshotListResponse {
   schemaVersion: string;
   items: OpportunitySnapshot[];
+}
+
+export interface OpportunitySnapshotDetailResponse {
+  schemaVersion: string;
+  snapshot: OpportunitySnapshot;
+  /** The frozen board run payload, verbatim as published (same shape as DailyOpportunityRun). */
+  run: DailyOpportunityRun;
 }
 
 export interface OpportunitySnapshotEnsureResponse {
@@ -318,11 +454,14 @@ export interface OpportunitySnapshotEvaluationResponse {
   snapshotKey: string;
   evaluatedAt: string;
   candidateCount: number;
+  trackingCandidateCount?: number;
   insertedOutcomes: number;
   alreadyRecorded: number;
   pendingHorizons: number;
   dataGapHorizons: number;
   outcomeProgress: OpportunityOutcomeProgress[];
+  underlyingPathProgress?: OpportunityOutcomeProgress[];
+  fullResearchProgress?: OpportunityOutcomeProgress[];
   message: string;
 }
 
@@ -330,16 +469,30 @@ export interface OpportunityLearningHorizon {
   horizonSessions: 5 | 20;
   matureCount: number;
   distinctSignalSessions: number;
-  contextHitCount: number;
-  contextMissCount: number;
-  neutralCount: number;
-  nonDirectionalCount: number;
+  directionalSampleCount: number;
+  contextHitCount: number | null;
+  contextMissCount: number | null;
+  neutralCount: number | null;
+  nonDirectionalCount: number | null;
   contextHitRatePercent: number | null;
   summaryVisible: boolean;
   investigationReady: boolean;
   cohortKey?: string | null;
   cohortLabel?: string | null;
   excludedQualityCount?: number;
+}
+
+export interface OpportunityOutcomeMaintenanceStatus {
+  sessionDateEt: string;
+  policyVersion: string;
+  state: 'pending' | 'running' | 'completed' | 'degraded' | 'failed';
+  attemptCount: number;
+  completedAt: string | null;
+  nextRetryAt: string | null;
+  dueSnapshotCount: number;
+  insertedOutcomes: number;
+  dataGapHorizons: number;
+  lastErrorCode: string | null;
 }
 
 export interface OpportunityLearningSummaryResponse {
@@ -349,6 +502,9 @@ export interface OpportunityLearningSummaryResponse {
   autoAdjustment: false;
   minimumSummarySamples: number;
   minimumInvestigationSamples: number;
+  automaticMaintenanceEnabled: boolean;
+  maintenancePolicyVersion: string | null;
+  latestMaintenance: OpportunityOutcomeMaintenanceStatus | null;
   horizons: OpportunityLearningHorizon[];
   limitations: string[];
 }

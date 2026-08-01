@@ -4,6 +4,7 @@ import { Search, Command, User } from 'lucide-react';
 import { cn } from '../../utils/cn';
 import { useRegimeStore } from '../../stores/regimeStore';
 import { MoomooBadge } from '../system/MoomooBadge';
+import { SystemHealthPopover } from '../system/SystemHealthPopover';
 
 interface TopBarProps {
   onSearchOpen: () => void;
@@ -70,6 +71,9 @@ export const TopBar: React.FC<TopBarProps> = ({ onSearchOpen }) => {
 
       {/* Moomoo OpenD live status — green=live, amber=offline, grey=disabled */}
       <MoomooBadge />
+
+      {/* 分层健康：点击按需拉取 /system/health-layers */}
+      <SystemHealthPopover />
 
       <button
         type="button"

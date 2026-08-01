@@ -1,9 +1,10 @@
 import type React from 'react';
 import { useEffect, useMemo, useState } from 'react';
 import { ArrowLeft, Clock3, RefreshCw, ShieldCheck, TriangleAlert } from 'lucide-react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import {
   fetchDailyOpportunities,
+  fetchOpportunitySnapshotDetail,
   fetchOpportunityOptionContext,
   fetchOpportunityOptionEvents,
   fetchOpportunityOptionOverview,
@@ -23,6 +24,7 @@ import type {
   OpportunityOptionWallLevel,
 } from '../types/opportunities';
 import type { StockHistory, StockKLine, Timeframe } from '../types/stockHistory';
+import { computeSmaSeededEmaSeries } from '../utils/ema';
 import { calculateImpliedMove } from '../utils/impliedMove';
 import {
   filterByUsTradingSession,
@@ -105,17 +107,6 @@ function toCandles(klines: StockKLine[]): Candle[] {
     }))
     .filter((bar) => Number.isFinite(bar.time) && bar.time > 0)
     .sort((left, right) => Number(left.time) - Number(right.time));
-}
-
-/** Standard EMA with adjust=false semantics: first close is the seed. */
-function computeEma(candles: Candle[], period: number): MAOverlay['data'] {
-  if (candles.length === 0) return [];
-  const alpha = 2 / (period + 1);
-  let ema = candles[0].close;
-  return candles.map((bar, index) => {
-    if (index > 0) ema = (bar.close * alpha) + (ema * (1 - alpha));
-    return { time: bar.time, value: ema };
-  });
 }
 
 function formatNumber(value: number | null | undefined, digits = 2): string {
@@ -250,9 +241,21 @@ function eventContract(event: OpportunityOptionEvent): string {
   return event.symbol ?? event.optionCode;
 }
 
+type OfficialBinding =
+  | { state: 'official'; snapshotKey: string; frozenAt: string }
+  | { state: 'fallback'; snapshotKey: string; reason: string }
+  | { state: 'live_scan' };
+
+const SNAPSHOT_KEY_PATTERN = /^ops_[0-9a-f]{64}$/;
+
 const OpportunityDetailPage: React.FC = () => {
   const { ticker: tickerParam = '' } = useParams<{ ticker: string }>();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const requestedSnapshotKey = searchParams.get('snapshotKey');
+  const officialSnapshotKey = requestedSnapshotKey && SNAPSHOT_KEY_PATTERN.test(requestedSnapshotKey)
+    ? requestedSnapshotKey
+    : null;
   const ticker = tickerParam.trim().toUpperCase();
   const [refreshKey, setRefreshKey] = useState(0);
   const [timeframe, setTimeframe] = useState<Timeframe>('5m');
@@ -264,6 +267,7 @@ const OpportunityDetailPage: React.FC = () => {
   const [runMeta, setRunMeta] = useState<{ marketDateEt: string; asOf: string; signalVersion: string } | null>(null);
   const [candidateLoading, setCandidateLoading] = useState(true);
   const [candidateError, setCandidateError] = useState<string | null>(null);
+  const [officialBinding, setOfficialBinding] = useState<OfficialBinding>({ state: 'live_scan' });
 
   const [overview, setOverview] = useState<OpportunityOptionOverviewItem | null>(null);
   const [overviewLoading, setOverviewLoading] = useState(true);
@@ -287,13 +291,52 @@ const OpportunityDetailPage: React.FC = () => {
     let cancelled = false;
     const refresh = refreshKey > 0;
 
-    void fetchDailyOpportunities([ticker], 1, { refresh })
-      .then((run) => {
-        if (cancelled) return;
-        setCandidateError(null);
-        setCandidate(run.candidates.find((item) => item.ticker.toUpperCase() === ticker) ?? run.candidates[0] ?? null);
-        setRunMeta({ marketDateEt: run.marketDateEt, asOf: run.asOf, signalVersion: run.signalVersion });
-      })
+    const resolveCandidate = async () => {
+      if (officialSnapshotKey) {
+        try {
+          const detail = await fetchOpportunitySnapshotDetail(officialSnapshotKey);
+          if (cancelled) return;
+          const frozen = detail.run.candidates
+            .find((item) => item.ticker.toUpperCase() === ticker) ?? null;
+          if (frozen) {
+            setCandidateError(null);
+            setCandidate(frozen);
+            setRunMeta({
+              marketDateEt: detail.run.marketDateEt,
+              asOf: detail.run.asOf,
+              signalVersion: detail.run.signalVersion,
+            });
+            setOfficialBinding({
+              state: 'official',
+              snapshotKey: officialSnapshotKey,
+              frozenAt: detail.snapshot.frozenAt,
+            });
+            return;
+          }
+          setOfficialBinding({
+            state: 'fallback',
+            snapshotKey: officialSnapshotKey,
+            reason: '官方快照中没有该标的的冻结候选，以下为即时扫描结果。',
+          });
+        } catch {
+          if (cancelled) return;
+          setOfficialBinding({
+            state: 'fallback',
+            snapshotKey: officialSnapshotKey,
+            reason: '官方快照读取失败，以下为即时扫描结果。',
+          });
+        }
+      } else {
+        setOfficialBinding({ state: 'live_scan' });
+      }
+      const run = await fetchDailyOpportunities([ticker], 1, { refresh });
+      if (cancelled) return;
+      setCandidateError(null);
+      setCandidate(run.candidates.find((item) => item.ticker.toUpperCase() === ticker) ?? run.candidates[0] ?? null);
+      setRunMeta({ marketDateEt: run.marketDateEt, asOf: run.asOf, signalVersion: run.signalVersion });
+    };
+
+    void resolveCandidate()
       .catch((error: unknown) => { if (!cancelled) setCandidateError(requestError(error)); })
       .finally(() => { if (!cancelled) setCandidateLoading(false); });
 
@@ -338,7 +381,7 @@ const OpportunityDetailPage: React.FC = () => {
       .finally(() => { if (!cancelled) setEventsLoading(false); });
 
     return () => { cancelled = true; };
-  }, [refreshKey, ticker]);
+  }, [officialSnapshotKey, refreshKey, ticker]);
 
   useEffect(() => {
     if (!ticker) return;
@@ -368,8 +411,8 @@ const OpportunityDetailPage: React.FC = () => {
     [allCandles, intradayTimeframe, tradingSession],
   );
   const overlays = useMemo<MAOverlay[]>(() => [
-    { period: 8, label: 'EMA 8', color: '#d29922', data: computeEma(candles, 8) },
-    { period: 13, label: 'EMA 13', color: '#5b8def', data: computeEma(candles, 13) },
+    { period: 8, label: 'EMA 8', color: '#d29922', data: computeSmaSeededEmaSeries(candles, 8) },
+    { period: 13, label: 'EMA 13', color: '#5b8def', data: computeSmaSeededEmaSeries(candles, 13) },
   ], [candles]);
 
   const range = getObjectEvidence(candidate, 'prior_20d_range_position');
@@ -504,7 +547,49 @@ const OpportunityDetailPage: React.FC = () => {
           <span>K线 {history?.period ?? timeframe} · {formatEtTime(latestVisibleBarAt)}</span>
           <span>Volume {overview?.sessionVolumeDate ?? '—'} 当日累计</span>
           <span>OI {overview?.openInterestAsOf ?? '—'} · T-1 清算</span>
+          {officialBinding.state === 'official' ? (
+            <span className="inline-flex items-center gap-1 rounded-ds-sm border border-[color:var(--accent-subtle-border)] bg-[color:var(--accent-subtle-bg)] px-2 py-0.5 font-medium text-accent">
+              官方快照 {officialBinding.snapshotKey.slice(0, 12)}… · 冻结于 {officialBinding.frozenAt}
+            </span>
+          ) : (
+            <span className="inline-flex items-center gap-1 rounded-ds-sm border border-subtle px-2 py-0.5 text-text-3">
+              即时扫描 · 未绑定官方快照
+            </span>
+          )}
         </section>
+
+        {officialBinding.state === 'fallback' && (
+          <section
+            className="border border-[color:var(--warning-subtle-border,#8a6d1a)] bg-bg-1 px-4 py-2 text-caption text-text-2"
+            role="status"
+          >
+            {officialBinding.reason}（请求的快照 {officialBinding.snapshotKey.slice(0, 12)}…）
+          </section>
+        )}
+
+        {officialBinding.state === 'official'
+          && candidate?.referenceClose != null
+          && Number.isFinite(candidate.referenceClose)
+          && candidate.referenceClose > 0
+          && wall?.spot != null
+          && Number.isFinite(wall.spot) && (
+          <section
+            className="border border-subtle bg-bg-1 px-4 py-2 text-caption text-text-3"
+            aria-label="冻结与当前差异"
+          >
+            冻结基准 close {formatNumber(candidate.referenceClose)}
+            （{candidate.referenceSessionDate ?? '日期未报告'} 收盘）
+            {' → '}当前 spot {formatNumber(wall.spot)}
+            （{wall.quoteAsOf ?? '时点未报告'} · Moomoo）：
+            <span className="font-mono text-text-2">
+              {(() => {
+                const drift = ((wall.spot - candidate.referenceClose) / candidate.referenceClose) * 100;
+                return `${drift >= 0 ? '+' : ''}${drift.toFixed(2)}%`;
+              })()}
+            </span>
+            。差异只反映快照冻结后的价格变动，不改变冻结榜单结论。
+          </section>
+        )}
 
         <section className="border border-subtle bg-bg-1" aria-labelledby="professional-summary-title">
           <header className="flex flex-wrap items-start justify-between gap-3 border-b border-subtle px-4 py-3">

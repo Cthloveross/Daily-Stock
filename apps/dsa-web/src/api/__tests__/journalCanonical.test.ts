@@ -1,10 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  activateEpisodeBuild,
   createCanonicalPositionEpisodeBuild,
   createPositionEpisodeAiReview,
   fetchCanonicalEpisodeBuildPreview,
+  fetchEpisodeBuildActivation,
+  fetchLatestPositionEpisodeReviewAnnotation,
   fetchPositionEpisodeDetail,
+  fetchPositionEpisodeReviewAnnotationHistory,
   fetchPositionEpisodes,
+  savePositionEpisodeReviewAnnotation,
 } from '../journal';
 
 const apiMocks = vi.hoisted(() => ({
@@ -24,20 +29,108 @@ describe('journal canonical episode API', () => {
       data: { data_state: 'ready', total: 0, page: 1, per_page: 50, items: [] },
     });
 
-    await fetchPositionEpisodes({ buildId: 9, underlying: 'NVDA', caseFocus: 'largest_fee' });
+    await fetchPositionEpisodes({
+      buildId: 9,
+      underlying: 'NVDA',
+      caseFocus: 'largest_fee',
+      reviewStatus: 'in_progress',
+    });
     await fetchPositionEpisodeDetail(41, 9);
 
     expect(apiMocks.get).toHaveBeenNthCalledWith(
       1,
       '/api/v1/journal/v2/position-episodes',
       expect.objectContaining({
-        params: expect.objectContaining({ build_id: 9, underlying: 'NVDA', case_focus: 'largest_fee' }),
+        params: expect.objectContaining({
+          build_id: 9,
+          underlying: 'NVDA',
+          case_focus: 'largest_fee',
+          review_status: 'in_progress',
+        }),
       }),
     );
     expect(apiMocks.get).toHaveBeenNthCalledWith(
       2,
       '/api/v1/journal/v2/position-episodes/41',
       { params: { build_id: 9 } },
+    );
+  });
+
+  it('loads and saves user-authored review annotations with explicit snake_case fields', async () => {
+    apiMocks.get
+      .mockResolvedValueOnce({
+        data: {
+          data_state: 'ready',
+          annotation: {
+            id: 71,
+            episode_build_id: 9,
+            position_episode_id: 41,
+            revision: 2,
+            review_status: 'in_progress',
+            setup_thesis: '趋势延续',
+            tags: ['早盘'],
+            error_types: ['追高'],
+            created_at: '2026-07-22T09:30:00Z',
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          data_state: 'ready',
+          annotations: [{ id: 71, revision: 2, review_status: 'in_progress' }],
+        },
+      });
+    apiMocks.post.mockResolvedValue({
+      data: {
+        data_state: 'ready',
+        created: true,
+        idempotent_replay: false,
+        annotation: { id: 72, revision: 3, review_status: 'completed' },
+      },
+    });
+
+    const latest = await fetchLatestPositionEpisodeReviewAnnotation(41, 9);
+    expect(latest.annotation?.episodeBuildId).toBe(9);
+    expect(latest.annotation?.errorTypes).toEqual(['追高']);
+    const history = await fetchPositionEpisodeReviewAnnotationHistory(41, 9);
+    expect(history.items).toHaveLength(1);
+    await savePositionEpisodeReviewAnnotation(41, {
+      buildId: 9,
+      reviewStatus: 'completed',
+      setupThesis: '  趋势延续  ',
+      entryTrigger: '收回前高',
+      invalidationPlan: '',
+      positionRationale: '半仓',
+      exitReason: '达到目标',
+      postTradeReflection: '等待新触发',
+      tags: [' 早盘 ', '早盘'],
+      errorTypes: ['追高'],
+    });
+
+    expect(apiMocks.get).toHaveBeenNthCalledWith(
+      1,
+      '/api/v1/journal/v2/position-episodes/41/review-annotations/latest',
+      { params: { build_id: 9 } },
+    );
+    expect(apiMocks.get).toHaveBeenNthCalledWith(
+      2,
+      '/api/v1/journal/v2/position-episodes/41/review-annotations',
+      { params: { build_id: 9 } },
+    );
+    expect(apiMocks.post).toHaveBeenCalledWith(
+      '/api/v1/journal/v2/position-episodes/41/review-annotations',
+      {
+        build_id: 9,
+        review_status: 'completed',
+        setup_thesis: '趋势延续',
+        entry_trigger: '收回前高',
+        invalidation_plan: '',
+        position_rationale: '半仓',
+        exit_reason: '达到目标',
+        post_trade_reflection: '等待新触发',
+        tags: ['早盘'],
+        error_types: ['追高'],
+      },
     );
   });
 
@@ -128,6 +221,7 @@ describe('journal canonical episode API', () => {
       canonicalSetSha256: 'a'.repeat(64),
       buildKey: 'b'.repeat(64),
       acceptAssumedFlat: true,
+      acceptGroupFeeScope: false,
     });
     expect(apiMocks.post).toHaveBeenCalledWith(
       '/api/v1/journal/v2/episode-builds/canonical',
@@ -136,8 +230,75 @@ describe('journal canonical episode API', () => {
         canonical_set_sha256: 'a'.repeat(64),
         build_key: 'b'.repeat(64),
         accept_assumed_flat: true,
+        accept_group_fee_scope: false,
       },
       { params: { account_key: undefined } },
     );
+  });
+
+  it('maps activation state and sends the complete compare-and-swap payload', async () => {
+    apiMocks.get.mockResolvedValue({
+      data: {
+        account_key: 'default_moomoo_us',
+        selection_source: 'csv_fallback',
+        current_activation_id: null,
+        current_activation_sequence: null,
+        current_build_id: 7,
+        current_build_key: 'c'.repeat(64),
+        canonical_set_id: null,
+        previous_activation_id: null,
+        previous_build_id: null,
+        activated_at: null,
+      },
+    });
+    apiMocks.post.mockResolvedValue({
+      data: {
+        activation_id: 12,
+        activation_key: 'd'.repeat(64),
+        duplicate: false,
+        state: {
+          account_key: 'default_moomoo_us',
+          selection_source: 'activation',
+          current_activation_id: 12,
+          current_activation_sequence: 1,
+          current_build_id: 9,
+          current_build_key: 'b'.repeat(64),
+          canonical_set_id: 1,
+          previous_activation_id: null,
+          previous_build_id: 7,
+          activated_at: '2026-07-30T14:00:00Z',
+        },
+        message: 'canonical Episode build 9 activated',
+        trading_action_performed: false,
+      },
+    });
+
+    const state = await fetchEpisodeBuildActivation();
+    expect(apiMocks.get).toHaveBeenCalledWith(
+      '/api/v1/journal/v2/episode-builds/activation',
+    );
+    expect(state.selectionSource).toBe('csv_fallback');
+    expect(state.currentBuildId).toBe(7);
+
+    const response = await activateEpisodeBuild(9, {
+      expectedBuildKey: 'b'.repeat(64),
+      expectedCurrentActivationId: state.currentActivationId,
+      expectedCurrentBuildId: state.currentBuildId,
+      acceptAssumedFlat: true,
+      acceptGroupFeeScope: false,
+    });
+    expect(apiMocks.post).toHaveBeenCalledWith(
+      '/api/v1/journal/v2/episode-builds/9/activate',
+      {
+        expected_build_key: 'b'.repeat(64),
+        expected_current_activation_id: null,
+        expected_current_build_id: 7,
+        accept_assumed_flat: true,
+        accept_group_fee_scope: false,
+      },
+    );
+    expect(response.activationId).toBe(12);
+    expect(response.state.currentActivationSequence).toBe(1);
+    expect(response.tradingActionPerformed).toBe(false);
   });
 });

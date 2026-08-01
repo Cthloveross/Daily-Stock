@@ -19,6 +19,7 @@ const apiMocks = vi.hoisted(() => ({
   fetchOptionEvents: vi.fn(),
   fetchOptionOverview: vi.fn(),
   fetchOptionWalls: vi.fn(),
+  fetchSnapshotDetail: vi.fn(),
   getHistory: vi.fn(),
 }));
 
@@ -28,6 +29,7 @@ vi.mock('../../api/opportunities', () => ({
   fetchOpportunityOptionEvents: apiMocks.fetchOptionEvents,
   fetchOpportunityOptionOverview: apiMocks.fetchOptionOverview,
   fetchOpportunityOptionWalls: apiMocks.fetchOptionWalls,
+  fetchOpportunitySnapshotDetail: apiMocks.fetchSnapshotDetail,
 }));
 
 vi.mock('../../api/stocks', () => ({
@@ -209,7 +211,7 @@ const gammaLevel: OpportunityOptionWallLevel = {
 };
 
 const optionWalls: OpportunityOptionWallResponse = {
-  schemaVersion: '1.0',
+  schemaVersion: 'option-wall/1.1',
   marketDateEt: '2026-07-23',
   generatedAt: '2026-07-23T10:00:00-04:00',
   items: [{
@@ -220,6 +222,13 @@ const optionWalls: OpportunityOptionWallResponse = {
     quoteAsOf: '2026-07-23 10:00:00',
     formulaVersion: 'fixture-v1',
     spot: 100,
+    atmCallIv: {
+      state: 'ready',
+      expiry: '2026-08-21',
+      strike: 100,
+      atmCallIvPercent: 42.5,
+      selectionMethod: 'nearest_expiry_atm_call_from_same_wall_snapshot',
+    },
     scope: {
       dteMin: 0,
       dteMax: 45,
@@ -343,14 +352,41 @@ const dailyHistory: StockHistory = {
   ],
 };
 
-function renderPage() {
+function renderPage(initialEntry = '/regime/opportunity/COIN') {
   return render(
-    <MemoryRouter initialEntries={['/regime/opportunity/COIN']}>
+    <MemoryRouter initialEntries={[initialEntry]}>
       <Routes>
         <Route path="/regime/opportunity/:ticker" element={<OpportunityDetailPage />} />
       </Routes>
     </MemoryRouter>,
   );
+}
+
+const officialSnapshotKey = `ops_${'b'.repeat(64)}`;
+
+function snapshotDetailResponse() {
+  return {
+    schemaVersion: 'opportunity-snapshot-detail/1.0',
+    snapshot: {
+      schemaVersion: 'opportunity-snapshot/1.0',
+      snapshotKey: officialSnapshotKey,
+      marketDateEt: '2026-07-22',
+      sourceRunId: 'opr_official',
+      frozenAt: '2026-07-22T12:05:00+00:00',
+      signalVersion: 'fixture-v1',
+      candidateCount: 1,
+      eligibleCandidateCount: 1,
+      validationEligible: true,
+      eligibilityReasons: [],
+      outcomeProgress: [],
+      idempotentReplay: false,
+    },
+    run: {
+      ...opportunityRun,
+      runId: 'opr_official',
+      marketDateEt: '2026-07-22',
+    },
+  };
 }
 
 describe('OpportunityDetailPage', () => {
@@ -360,7 +396,56 @@ describe('OpportunityDetailPage', () => {
     apiMocks.fetchOptionEvents.mockReset().mockResolvedValue(optionEvents);
     apiMocks.fetchOptionOverview.mockReset().mockResolvedValue(optionOverview);
     apiMocks.fetchOptionWalls.mockReset().mockResolvedValue(optionWalls);
+    apiMocks.fetchSnapshotDetail.mockReset().mockResolvedValue(snapshotDetailResponse());
     apiMocks.getHistory.mockReset().mockResolvedValue(history);
+  });
+
+  it('binds to the official frozen snapshot instead of a fresh scan when snapshotKey is present', async () => {
+    renderPage(`/regime/opportunity/COIN?snapshotKey=${officialSnapshotKey}`);
+
+    expect(await screen.findByText(/官方快照 ops_bbbbbbbb…/)).toBeInTheDocument();
+    expect(screen.getByText(/冻结于 2026-07-22T12:05:00\+00:00/)).toBeInTheDocument();
+    expect(apiMocks.fetchSnapshotDetail).toHaveBeenCalledWith(officialSnapshotKey);
+    // 冻结候选存在时不得再用即时扫描覆盖榜单证据。
+    expect(apiMocks.fetchDailyOpportunities).not.toHaveBeenCalled();
+    expect(screen.queryByText('即时扫描 · 未绑定官方快照')).not.toBeInTheDocument();
+    // 信号日来自冻结 run，而不是今天的即时扫描。
+    expect(screen.getAllByText(/信号日 2026-07-22/).length).toBeGreaterThan(0);
+  });
+
+  it('shows the frozen-vs-current drift strip only under official binding', async () => {
+    apiMocks.fetchOptionWalls.mockResolvedValue({
+      ...optionWalls,
+      items: [{ ...optionWalls.items[0], spot: 103, quoteAsOf: '2026-07-23 10:00:00' }],
+    });
+    renderPage(`/regime/opportunity/COIN?snapshotKey=${officialSnapshotKey}`);
+
+    expect(await screen.findByLabelText('冻结与当前差异')).toHaveTextContent('+3.00%');
+    expect(screen.getByLabelText('冻结与当前差异')).toHaveTextContent('冻结基准 close 100');
+    expect(screen.getByLabelText('冻结与当前差异')).toHaveTextContent('不改变冻结榜单结论');
+  });
+
+  it('hides the drift strip on live scans and when spot evidence is missing', async () => {
+    renderPage();
+    expect(await screen.findByText('即时扫描 · 未绑定官方快照')).toBeInTheDocument();
+    expect(screen.queryByLabelText('冻结与当前差异')).not.toBeInTheDocument();
+  });
+
+  it('falls back to a labelled live scan when the official snapshot is unavailable', async () => {
+    apiMocks.fetchSnapshotDetail.mockRejectedValue(new Error('404'));
+    renderPage(`/regime/opportunity/COIN?snapshotKey=${officialSnapshotKey}`);
+
+    expect(await screen.findByText(/官方快照读取失败，以下为即时扫描结果。/)).toBeInTheDocument();
+    expect(apiMocks.fetchDailyOpportunities).toHaveBeenCalledWith(['COIN'], 1, { refresh: false });
+    expect(screen.getByText('即时扫描 · 未绑定官方快照')).toBeInTheDocument();
+  });
+
+  it('labels the page as a live scan when no snapshotKey is provided', async () => {
+    renderPage();
+
+    expect(await screen.findByText('即时扫描 · 未绑定官方快照')).toBeInTheDocument();
+    expect(apiMocks.fetchSnapshotDetail).not.toHaveBeenCalled();
+    expect(apiMocks.fetchDailyOpportunities).toHaveBeenCalledWith(['COIN'], 1, { refresh: false });
   });
 
   it('updates the model interval when switching from 1D to 5D', async () => {

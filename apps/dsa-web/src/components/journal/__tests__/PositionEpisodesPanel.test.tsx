@@ -1,13 +1,27 @@
-import { fireEvent, render, screen, within } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import PositionEpisodesPanel from '../PositionEpisodesPanel';
+import {
+  activateEpisodeBuild,
+  fetchEpisodeBuildActivation,
+} from '../../../api/journal';
 import type {
   CanonicalEpisodeBuildPlanResponse,
+  EpisodeBuildActivationResponse,
+  EpisodeBuildActivationState,
   EpisodeBuildResponse,
   PositionEpisodeDetailResponse,
   PositionEpisodeItem,
   PositionEpisodeListResponse,
 } from '../../../types/journal';
+
+vi.mock('../../../api/journal', () => ({
+  activateEpisodeBuild: vi.fn(),
+  fetchEpisodeBuildActivation: vi.fn(),
+}));
+
+const fetchActivationMock = vi.mocked(fetchEpisodeBuildActivation);
+const activateBuildMock = vi.mocked(activateEpisodeBuild);
 
 const openAggregateEpisode: PositionEpisodeItem = {
   id: 41,
@@ -39,6 +53,9 @@ const openAggregateEpisode: PositionEpisodeItem = {
   realizedPnlGross: null,
   totalFee: '0.2500000000',
   realizedPnlNet: null,
+  reviewStatus: 'in_progress',
+  reviewRevision: 2,
+  reviewUpdatedAt: '2026-07-22T09:30:00Z',
   quality: {
     completenessStatus: 'partial',
     completenessScore: '0.8000',
@@ -50,6 +67,7 @@ const openAggregateEpisode: PositionEpisodeItem = {
     isLeftCensored: true,
     isRightCensored: true,
     pnlSummaryEligible: false,
+    groupFeeUnallocated: false,
     pnlExclusionReasons: ['boundary_unverified', 'open'],
   },
 };
@@ -68,6 +86,9 @@ const closedEpisode: PositionEpisodeItem = {
   realizedPnlGross: '125.0000000000',
   totalFee: '1.2500000000',
   realizedPnlNet: '123.7500000000',
+  reviewStatus: 'completed',
+  reviewRevision: 3,
+  reviewUpdatedAt: '2026-07-22T10:00:00Z',
   quality: {
     ...openAggregateEpisode.quality,
     constructionBasis: 'fills',
@@ -86,12 +107,18 @@ const readyList: PositionEpisodeListResponse = {
     status: 'succeeded',
     sourceBatchIds: [2],
     sourceKind: 'csv_batch',
+    sourceWindowStart: '2026-03-04T00:00:00Z',
     sourceCutoffAt: '2026-07-19T23:59:59Z',
     positionEpisodeCount: 2,
     unresolvedEvidenceCount: 0,
     completenessScore: '0.8000',
     openingBoundaryPolicy: 'assumed_flat_unverified',
     assumedFlatUnverified: true,
+    executionGroupCount: 0,
+    groupFeeAffectedEpisodeCount: 0,
+    retainedExecutionGroupFeeTotal: '0.0000000000',
+    feeConservationByCurrency: {},
+    legFeeAttributionComplete: true,
     partialReasons: ['opening_boundary_unverified'],
     recordedAt: '2026-07-21T10:00:00Z',
   },
@@ -112,6 +139,7 @@ const readyList: PositionEpisodeListResponse = {
     leftCensoredEpisodeCount: 1,
     incompleteEpisodeCount: 1,
     aggregateOnlyEpisodeCount: 1,
+    groupFeeAffectedEpisodeCount: 0,
     headlinePnl: {
       eligibleClosedCount: 0,
       excludedEpisodeCount: 2,
@@ -134,6 +162,12 @@ const readyList: PositionEpisodeListResponse = {
   total: 2,
   page: 1,
   perPage: 50,
+  reviewQueue: {
+    pending: 4,
+    inProgress: 1,
+    completed: 5,
+    total: 10,
+  },
   items: [openAggregateEpisode, closedEpisode],
 };
 
@@ -153,9 +187,23 @@ const canonicalPreview: CanonicalEpisodeBuildPlanResponse = {
   plannedClosedEpisodeCount: 1437,
   sourceKnownFeeTotal: '151750.7500000000',
   allocatedKnownFeeTotal: '151750.7500000000',
+  retainedExecutionGroupFeeTotal: '0.0000000000',
+  feeConservationByCurrency: {
+    USD: {
+      ordinarySource: '151750.7500000000',
+      ordinaryAllocated: '151750.7500000000',
+      retainedExecutionGroup: '0.0000000000',
+      sourceKnown: '151750.7500000000',
+      accounted: '151750.7500000000',
+    },
+  },
   feeConserved: true,
+  executionGroupCount: 0,
+  groupFeeAffectedEpisodeCount: 0,
+  legFeeAttributionComplete: true,
   openingBoundaryPolicy: 'assumed_flat_unverified',
   requiresAssumedFlatAcceptance: true,
+  requiresGroupFeeScopeAcceptance: false,
   defaultBuildId: 7,
   defaultPositionEpisodeCount: 1439,
   episodeCountDelta: 2,
@@ -180,6 +228,40 @@ const canonicalBuildResult: EpisodeBuildResponse = {
   reconciliation: readyList.reconciliation!,
   summary: readyList.summary!,
   message: 'canonical episode build appended',
+};
+
+const activationState: EpisodeBuildActivationState = {
+  accountKey: 'default_moomoo_us',
+  selectionSource: 'csv_fallback',
+  currentActivationId: null,
+  currentActivationSequence: null,
+  currentBuildId: 7,
+  currentBuildKey: 'c'.repeat(64),
+  canonicalSetId: null,
+  canonicalSetSha256: null,
+  previousActivationId: null,
+  previousBuildId: null,
+  activatedAt: null,
+};
+
+const activationResponse: EpisodeBuildActivationResponse = {
+  activationId: 12,
+  activationKey: 'd'.repeat(64),
+  duplicate: false,
+  state: {
+    ...activationState,
+    selectionSource: 'activation',
+    currentActivationId: 12,
+    currentActivationSequence: 1,
+    currentBuildId: 9,
+    currentBuildKey: canonicalBuildResult.build.buildKey,
+    canonicalSetId: 1,
+    canonicalSetSha256: canonicalPreview.canonicalSetSha256,
+    previousBuildId: 7,
+    activatedAt: '2026-07-30T14:00:00Z',
+  },
+  message: 'canonical Episode build 9 activated',
+  tradingActionPerformed: false,
 };
 
 const detail: PositionEpisodeDetailResponse = {
@@ -234,6 +316,12 @@ function controller(overrides: Record<string, unknown> = {}) {
 }
 
 describe('PositionEpisodesPanel', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    fetchActivationMock.mockResolvedValue(activationState);
+    activateBuildMock.mockResolvedValue(activationResponse);
+  });
+
   it('separates partial coverage, conditional PnL, and strict headline PnL', () => {
     render(
       <PositionEpisodesPanel
@@ -252,14 +340,53 @@ describe('PositionEpisodesPanel', () => {
     const conditionalCard = screen.getByLabelText('按期初空仓假设的条件性结果');
     expect(within(conditionalCard).getByText('$123.75')).toBeInTheDocument();
 
+    const replayBasis = screen.getByRole('region', { name: '复盘口径' });
+    expect(within(replayBasis).getByText('证据窗口（ET）起—止')).toBeInTheDocument();
+    expect(within(replayBasis).getByText('窗口末投影 as-of（ET）')).toBeInTheDocument();
+    expect(within(replayBasis).getByText(/不等于券商当前持仓/)).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: '证据窗口末数量' })).toBeInTheDocument();
+    expect(screen.queryByText('Remaining')).not.toBeInTheDocument();
+
     const verifiedNetCard = screen.getByText('Verified Net').closest('div.rounded-ds-md');
     expect(verifiedNetCard).not.toBeNull();
     expect(within(verifiedNetCard as HTMLElement).getByText('—')).toBeInTheDocument();
 
     const openRow = screen.getByText('NVDA260619C00150000').closest('tr');
     expect(openRow).not.toBeNull();
+    expect(within(openRow as HTMLElement).getByText('证据窗口末未归零')).toBeInTheDocument();
     expect(within(openRow as HTMLElement).getByText('2')).toBeInTheDocument();
     expect(within(openRow as HTMLElement).getByText('—')).toBeInTheDocument();
+  });
+
+  it('shows the review queue and applies the persisted review-status filter', () => {
+    const onApplyFilters = vi.fn();
+    render(
+      <PositionEpisodesPanel
+        filters={{ page: 1, perPage: 50 }}
+        controller={controller()}
+        onApplyFilters={onApplyFilters}
+        onPageChange={vi.fn()}
+        onSelectBuild={vi.fn()}
+      />,
+    );
+
+    const queue = screen.getByLabelText('复盘队列');
+    expect(within(queue).getByText('4')).toBeInTheDocument();
+    expect(within(queue).getByText('1')).toBeInTheDocument();
+    expect(within(queue).getByText('5')).toBeInTheDocument();
+    const openRow = screen.getByText('NVDA260619C00150000').closest('tr');
+    const closedRow = screen.getByText('TSLA260619P00200000').closest('tr');
+    expect(within(openRow as HTMLElement).getByText('进行中 · #2')).toBeInTheDocument();
+    expect(within(closedRow as HTMLElement).getByText('已完成 · #3')).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('筛选复盘状态'), {
+      target: { value: 'completed' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '应用筛选' }));
+    expect(onApplyFilters).toHaveBeenCalledWith(expect.objectContaining({
+      reviewStatus: 'completed',
+      page: 1,
+    }));
   });
 
   it('loads structured evidence on row selection and closes the drawer with Escape', () => {
@@ -306,7 +433,8 @@ describe('PositionEpisodesPanel', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '按未验证期初空仓构建' }));
     expect(buildAssumedFlat).not.toHaveBeenCalled();
-    expect(screen.getByText(/把观察窗口开始前的持仓假设为 0/)).toBeInTheDocument();
+    expect(screen.getByText(/把证据窗口开始时的持仓假设为 0/)).toBeInTheDocument();
+    expect(screen.getByText(/当前时点的券商持仓快照，也不能倒推这个历史期初/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: '接受假设并构建' }));
     expect(buildAssumedFlat).toHaveBeenCalledTimes(1);
   });
@@ -326,14 +454,67 @@ describe('PositionEpisodesPanel', () => {
     expect(screen.getByText('5,974 条事件')).toBeInTheDocument();
     expect(screen.getByText('已通过')).toBeInTheDocument();
     expect(screen.getByText('+2 个回合')).toBeInTheDocument();
-    expect(screen.getByText(/不会替换当前默认视图/)).toBeInTheDocument();
+    expect(screen.getByText(/不会替换默认复盘构建/)).toBeInTheDocument();
+    const evidenceWindow = screen.getByRole('region', { name: '构建证据窗口' });
+    expect(within(evidenceWindow).getByText('证据窗口（ET）起—止')).toBeInTheDocument();
+    expect(within(evidenceWindow).getByText('窗口末投影 as-of（ET）')).toBeInTheDocument();
 
     const generate = screen.getByRole('button', { name: '生成仓位复盘构建' });
     expect(generate).toBeDisabled();
-    fireEvent.click(screen.getByRole('checkbox', { name: /我接受未验证的期初空仓假设/ }));
+    fireEvent.click(screen.getByRole('checkbox', {
+      name: /当前时点的券商持仓快照，也不能倒推这个历史证据窗口的期初持仓/,
+    }));
     expect(generate).toBeEnabled();
     fireEvent.click(generate);
-    expect(buildCanonical).toHaveBeenCalledWith(true);
+    expect(buildCanonical).toHaveBeenCalledWith(true, false);
+  });
+
+  it('keeps combo fees at execution-group scope and requires a separate acknowledgement', () => {
+    const buildCanonical = vi.fn().mockResolvedValue(canonicalBuildResult);
+    const groupPreview: CanonicalEpisodeBuildPlanResponse = {
+      ...canonicalPreview,
+      retainedExecutionGroupFeeTotal: '8.0800000000',
+      feeConservationByCurrency: {
+        USD: {
+          ordinarySource: '151750.7500000000',
+          ordinaryAllocated: '151750.7500000000',
+          retainedExecutionGroup: '8.0800000000',
+          sourceKnown: '151758.8300000000',
+          accounted: '151758.8300000000',
+        },
+      },
+      executionGroupCount: 1,
+      groupFeeAffectedEpisodeCount: 2,
+      legFeeAttributionComplete: false,
+      requiresGroupFeeScopeAcceptance: true,
+      warnings: [
+        'execution_group_fee_retained_unallocated',
+        'execution-group fee remains exact only at group scope; affected leg episodes have no fee/net P&L and require explicit acceptance',
+      ],
+    };
+    render(
+      <PositionEpisodesPanel
+        filters={{ page: 1, perPage: 50 }}
+        controller={controller({ canonicalPreview: groupPreview, buildCanonical })}
+        onApplyFilters={vi.fn()}
+        onPageChange={vi.fn()}
+        onSelectBuild={vi.fn()}
+      />,
+    );
+
+    const accounting = screen.getByLabelText('组合执行组费用口径');
+    expect(within(accounting).getByText(/1 个组合执行组 · 2 个腿回合受影响/)).toBeInTheDocument();
+    expect(within(accounting).getByText(/组费用 USD 8.08/)).toBeInTheDocument();
+    expect(screen.getAllByText('组合执行组费用已完整保留在组级；受影响腿不显示费用或净收益，也不进入严格 Headline。')).toHaveLength(1);
+    expect(screen.queryByText('execution_group_fee_retained_unallocated')).not.toBeInTheDocument();
+    expect(screen.queryByText(/execution-group fee remains exact only/)).not.toBeInTheDocument();
+    const generate = screen.getByRole('button', { name: '生成仓位复盘构建' });
+    fireEvent.click(screen.getByRole('checkbox', { name: /我接受未验证的期初空仓假设/ }));
+    expect(generate).toBeDisabled();
+    fireEvent.click(screen.getByRole('checkbox', { name: /我理解组合费用只在执行组层精确保留/ }));
+    expect(generate).toBeEnabled();
+    fireEvent.click(generate);
+    expect(buildCanonical).toHaveBeenCalledWith(true, true);
   });
 
   it('opens a generated build explicitly and offers a return to the default view', () => {
@@ -348,6 +529,8 @@ describe('PositionEpisodesPanel', () => {
       />,
     );
 
+    expect(onSelectBuild).not.toHaveBeenCalled();
+    expect(activateBuildMock).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: '查看这个构建' }));
     expect(onSelectBuild).toHaveBeenCalledWith(9);
 
@@ -361,7 +544,151 @@ describe('PositionEpisodesPanel', () => {
       />,
     );
     expect(screen.getByText('正在查看构建 #9')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: '回到当前默认构建' }));
+    fireEvent.click(screen.getByRole('button', { name: '回到默认复盘构建' }));
     expect(onSelectBuild).toHaveBeenLastCalledWith();
+  });
+
+  it('requires a separate assumed-flat acknowledgement before activation', async () => {
+    render(
+      <PositionEpisodesPanel
+        filters={{ buildId: 9, page: 1, perPage: 50 }}
+        controller={controller({ canonicalBuildResult })}
+        onApplyFilters={vi.fn()}
+        onPageChange={vi.fn()}
+        onSelectBuild={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(fetchActivationMock).toHaveBeenCalledTimes(1));
+    const activate = screen.getByRole('button', { name: '设为默认复盘构建' });
+    expect(activate).toBeDisabled();
+    expect(screen.getByText(/这是独立于“生成构建”的第二次确认/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('checkbox', {
+      name: /设为默认时，我再次接受未验证的期初空仓假设/,
+    }));
+    expect(activate).toBeEnabled();
+  });
+
+  it('requires execution-group fee acknowledgement again before activation', async () => {
+    const groupBuildResult: EpisodeBuildResponse = {
+      ...canonicalBuildResult,
+      build: {
+        ...canonicalBuildResult.build,
+        executionGroupCount: 1,
+        groupFeeAffectedEpisodeCount: 2,
+        retainedExecutionGroupFeeTotal: '8.0800000000',
+        legFeeAttributionComplete: false,
+      },
+    };
+    render(
+      <PositionEpisodesPanel
+        filters={{ buildId: 9, page: 1, perPage: 50 }}
+        controller={controller({ canonicalBuildResult: groupBuildResult })}
+        onApplyFilters={vi.fn()}
+        onPageChange={vi.fn()}
+        onSelectBuild={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(fetchActivationMock).toHaveBeenCalledTimes(1));
+    const activate = screen.getByRole('button', { name: '设为默认复盘构建' });
+    fireEvent.click(screen.getByRole('checkbox', {
+      name: /设为默认时，我再次接受未验证的期初空仓假设/,
+    }));
+    expect(activate).toBeDisabled();
+    fireEvent.click(screen.getByRole('checkbox', {
+      name: /设为默认时，我再次确认组合费用仅保留在执行组层/,
+    }));
+    expect(activate).toBeEnabled();
+    fireEvent.click(activate);
+
+    await waitFor(() => expect(activateBuildMock).toHaveBeenCalledWith(9, expect.objectContaining({
+      acceptAssumedFlat: true,
+      acceptGroupFeeScope: true,
+    })));
+  });
+
+  it('activates with the GET state as CAS, clears explicit build, and reloads defaults', async () => {
+    const onSelectBuild = vi.fn();
+    const onImported = vi.fn();
+    const controlled = controller({ canonicalBuildResult });
+    render(
+      <PositionEpisodesPanel
+        filters={{ buildId: 9, page: 1, perPage: 50 }}
+        controller={controlled}
+        onApplyFilters={vi.fn()}
+        onPageChange={vi.fn()}
+        onSelectBuild={onSelectBuild}
+        onImported={onImported}
+      />,
+    );
+
+    await screen.findByText('历史 CSV 默认构建');
+    fireEvent.click(screen.getByRole('checkbox', {
+      name: /设为默认时，我再次接受未验证的期初空仓假设/,
+    }));
+    fireEvent.click(screen.getByRole('button', { name: '设为默认复盘构建' }));
+
+    await waitFor(() => expect(activateBuildMock).toHaveBeenCalledWith(9, {
+      expectedBuildKey: canonicalBuildResult.build.buildKey,
+      expectedCurrentActivationId: null,
+      expectedCurrentBuildId: 7,
+      acceptAssumedFlat: true,
+      acceptGroupFeeScope: false,
+    }));
+    expect(onSelectBuild).toHaveBeenCalledWith();
+    expect(controlled.reload).toHaveBeenCalledTimes(1);
+    expect(controlled.reloadCanonicalPreview).toHaveBeenCalledTimes(1);
+    expect(onImported).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText('构建 #9 已设为默认复盘构建')).toBeInTheDocument();
+    expect(screen.getByText('零交易动作')).toBeInTheDocument();
+  });
+
+  it('reloads stale CAS state and never switches the default view after failure', async () => {
+    const onSelectBuild = vi.fn();
+    const onImported = vi.fn();
+    const controlled = controller({ canonicalBuildResult });
+    fetchActivationMock
+      .mockResolvedValueOnce(activationState)
+      .mockResolvedValueOnce({
+        ...activationState,
+        selectionSource: 'activation',
+        currentActivationId: 13,
+        currentActivationSequence: 2,
+        currentBuildId: 8,
+      });
+    activateBuildMock.mockRejectedValue({
+      response: {
+        status: 409,
+        data: { detail: 'activation state changed; refresh and retry with the current IDs' },
+      },
+    });
+
+    render(
+      <PositionEpisodesPanel
+        filters={{ buildId: 9, page: 1, perPage: 50 }}
+        controller={controlled}
+        onApplyFilters={vi.fn()}
+        onPageChange={vi.fn()}
+        onSelectBuild={onSelectBuild}
+        onImported={onImported}
+      />,
+    );
+
+    await screen.findByText('历史 CSV 默认构建');
+    fireEvent.click(screen.getByRole('checkbox', {
+      name: /设为默认时，我再次接受未验证的期初空仓假设/,
+    }));
+    fireEvent.click(screen.getByRole('button', { name: '设为默认复盘构建' }));
+
+    expect(await screen.findByText('默认复盘构建已变化')).toBeInTheDocument();
+    expect(screen.getByText(/当前状态已重新读取/)).toBeInTheDocument();
+    expect(fetchActivationMock).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('构建 #8')).toBeInTheDocument();
+    expect(onSelectBuild).not.toHaveBeenCalled();
+    expect(controlled.reload).not.toHaveBeenCalled();
+    expect(controlled.reloadCanonicalPreview).not.toHaveBeenCalled();
+    expect(onImported).not.toHaveBeenCalled();
   });
 });

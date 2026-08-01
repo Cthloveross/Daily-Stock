@@ -1,13 +1,19 @@
 import type React from 'react';
-import { useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ApiErrorAlert } from '../common/ApiErrorAlert';
 import { ConfirmDialog } from '../common/ConfirmDialog';
 import { Drawer } from '../common/Drawer';
 import { InlineAlert } from '../common/InlineAlert';
 import { Pagination } from '../common/Pagination';
-import type { ParsedApiError } from '../../api/error';
+import { parseApiError, type ParsedApiError } from '../../api/error';
+import {
+  activateEpisodeBuild,
+  fetchEpisodeBuildActivation,
+} from '../../api/journal';
 import type {
   CanonicalEpisodeBuildPlanResponse,
+  EpisodeBuildActivationResponse,
+  EpisodeBuildActivationState,
   EpisodeBuildResponse,
   PositionEpisodeDetailResponse,
   PositionEpisodeEvidenceItem,
@@ -34,7 +40,10 @@ interface PositionEpisodeController {
   reloadCanonicalPreview: () => void;
   canonicalBuilding: boolean;
   canonicalBuildResult: EpisodeBuildResponse | null;
-  buildCanonical: (acceptAssumedFlat: boolean) => Promise<EpisodeBuildResponse>;
+  buildCanonical: (
+    acceptAssumedFlat: boolean,
+    acceptGroupFeeScope: boolean,
+  ) => Promise<EpisodeBuildResponse>;
 }
 
 interface PositionEpisodesPanelProps {
@@ -44,6 +53,7 @@ interface PositionEpisodesPanelProps {
   onPageChange: (page: number) => void;
   onSelectBuild: (buildId?: number) => void;
   onOpenReview?: (item: PositionEpisodeItem) => void;
+  onImported?: () => void;
 }
 
 function normaliseDecimal(value: string): { sign: string; whole: string; fraction: string } {
@@ -63,6 +73,11 @@ function formatDecimalDisplay(value?: string | null, money = false): string {
     : significantFraction;
   const body = `${whole}${displayFraction ? `.${displayFraction}` : ''}`;
   return money ? `${sign}$${body}` : `${sign}${body}`;
+}
+
+function formatCurrencyAmount(currency: string, value?: string | null): string {
+  const amount = formatDecimalDisplay(value, false);
+  return amount === '—' ? '—' : `${currency} ${amount}`;
 }
 
 function decimalTone(value?: string | null): string {
@@ -103,9 +118,15 @@ function qualityLabel(item: PositionEpisodeItem): string {
 }
 
 function lifecycleLabel(status: string): string {
-  if (status === 'open') return '账单窗口内未归零';
-  if (status === 'closed') return '账单窗口内已归零';
+  if (status === 'open') return '证据窗口末未归零';
+  if (status === 'closed') return '证据窗口内已归零';
   return status;
+}
+
+function reviewStatusLabel(status?: string): string {
+  if (status === 'in_progress') return '进行中';
+  if (status === 'completed') return '已完成';
+  return '未开始';
 }
 
 const CASE_FOCUS_LABELS: Record<string, string> = {
@@ -113,6 +134,7 @@ const CASE_FOCUS_LABELS: Record<string, string> = {
   top_loss: '亏损最多',
   largest_fee: '费用最高',
   longest_hold: '持有最长',
+  weakest_evidence: '证据最不完整',
 };
 
 function canonicalWarningLabel(warning: string): string {
@@ -122,10 +144,19 @@ function canonicalWarningLabel(warning: string): string {
     episode_quality_partial: '部分仓位回合仍保留“部分证据”质量标记。',
     no_execution_episodes: '当前事实集没有可生成仓位回合的执行事件。',
     unresolved_execution_evidence: '仍有执行证据尚未分配到仓位回合。',
+    execution_group_fee_retained_unallocated: '组合执行组费用已完整保留在组级；受影响腿不显示费用或净收益，也不进入严格 Headline。',
     'explicit assumed-flat acceptance is required': '生成前必须明确接受未验证的期初空仓假设。',
-    'confirming this plan will not replace the default position review': '确认生成后，当前默认仓位复盘不会被替换。',
+    'execution-group fee remains exact only at group scope; affected leg episodes have no fee/net P&L and require explicit acceptance': '组合执行组费用已完整保留在组级；受影响腿不显示费用或净收益，也不进入严格 Headline。',
+    'confirming this plan will not replace the default position review': '确认生成后，默认复盘构建不会被替换。',
   };
   return labels[warning] ?? warning;
+}
+
+function activationSourceLabel(source?: EpisodeBuildActivationState['selectionSource']): string {
+  if (source === 'activation') return '显式默认选择记录';
+  if (source === 'csv_fallback') return '历史 CSV 默认构建';
+  if (source === 'none') return '尚未选择';
+  return '读取中';
 }
 
 function MetaBlock({ title, value }: { title: string; value: Record<string, unknown> }) {
@@ -220,7 +251,7 @@ function EpisodeDrawer({
               ['持有', formatHold(item.holdSeconds)],
               ['开仓数量', formatDecimalDisplay(item.openedQuantity)],
               ['已平数量', formatDecimalDisplay(item.closedQuantity)],
-              ['剩余数量', formatDecimalDisplay(item.remainingQuantity)],
+              ['证据窗口末数量', formatDecimalDisplay(item.remainingQuantity)],
               ['净盈亏', item.lifecycleStatus === 'open' ? '—' : formatDecimalDisplay(item.realizedPnlNet, true)],
               ['证据完整度', item.quality.completenessScore],
               ['构建依据', item.quality.constructionBasis],
@@ -236,7 +267,15 @@ function EpisodeDrawer({
             <InlineAlert
               variant="warning"
               title="未验证期初空仓假设"
-              message="此回合的左边界没有持仓快照证明；盈亏属于条件性结果，不进入 Headline。"
+              message="此回合的历史左边界没有持仓快照证明；当前时点的券商持仓快照也不能倒推该历史期初。盈亏属于条件性结果，不进入 Headline。"
+            />
+          )}
+
+          {item.quality.groupFeeUnallocated && (
+            <InlineAlert
+              variant="warning"
+              title="组合费用仅在执行组层精确保留"
+              message="这条腿的成交证据完整，但券商只提供整组费用。系统没有猜测分摊，因此本回合不显示腿级费用或净收益，也不进入 Headline。"
             />
           )}
 
@@ -290,6 +329,7 @@ function CanonicalEpisodeBuildCard({
   onRetry,
   onBuild,
   onViewBuild,
+  onActivated,
 }: {
   preview: CanonicalEpisodeBuildPlanResponse | null;
   loading: boolean;
@@ -298,10 +338,55 @@ function CanonicalEpisodeBuildCard({
   result: EpisodeBuildResponse | null;
   viewedBuildId?: number;
   onRetry: () => void;
-  onBuild: (acceptAssumedFlat: boolean) => Promise<EpisodeBuildResponse>;
-  onViewBuild: (buildId: number) => void;
+  onBuild: (
+    acceptAssumedFlat: boolean,
+    acceptGroupFeeScope: boolean,
+  ) => Promise<EpisodeBuildResponse>;
+  onViewBuild: (buildId?: number) => void;
+  onActivated: (response: EpisodeBuildActivationResponse) => void;
 }) {
   const [acceptedPreviewKey, setAcceptedPreviewKey] = useState<string | null>(null);
+  const [acceptedGroupFeePreviewKey, setAcceptedGroupFeePreviewKey] = useState<string | null>(null);
+  const [acceptedActivationBuildId, setAcceptedActivationBuildId] = useState<number | null>(null);
+  const [acceptedGroupFeeActivationBuildId, setAcceptedGroupFeeActivationBuildId] = useState<number | null>(null);
+  const [activationState, setActivationState] = useState<EpisodeBuildActivationState | null>(null);
+  const [activationLoading, setActivationLoading] = useState(true);
+  const [activationSubmitting, setActivationSubmitting] = useState(false);
+  const [activationError, setActivationError] = useState<ParsedApiError | null>(null);
+  const [activationConflict, setActivationConflict] = useState(false);
+  const [activationResult, setActivationResult] = useState<EpisodeBuildActivationResponse | null>(null);
+
+  const loadActivationState = useCallback(async () => {
+    setActivationLoading(true);
+    setActivationError(null);
+    setActivationConflict(false);
+    try {
+      const state = await fetchEpisodeBuildActivation();
+      setActivationState(state);
+      return state;
+    } catch (reason) {
+      setActivationError(parseApiError(reason));
+      return null;
+    } finally {
+      setActivationLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!preview || preview.dataState !== 'ready' || preview.canonicalSetId == null) {
+      setActivationLoading(false);
+      return;
+    }
+    void loadActivationState();
+  }, [loadActivationState, preview]);
+
+  useEffect(() => {
+    setAcceptedActivationBuildId(null);
+    setAcceptedGroupFeeActivationBuildId(null);
+    setActivationResult(null);
+    setActivationError(null);
+    setActivationConflict(false);
+  }, [result?.build.id]);
 
   if (loading && !preview) {
     return (
@@ -334,17 +419,113 @@ function CanonicalEpisodeBuildCard({
   const hasImmutableKeys = Boolean(preview.canonicalSetSha256 && preview.buildKey);
   const previewKey = `${preview.canonicalSetId}:${preview.canonicalSetSha256 ?? ''}`;
   const assumptionAccepted = acceptedPreviewKey === previewKey;
+  const groupFeeScopeAccepted = acceptedGroupFeePreviewKey === previewKey;
   const assumptionConfirmed = !preview.requiresAssumedFlatAcceptance || assumptionAccepted;
+  const groupFeeScopeConfirmed = (
+    !preview.requiresGroupFeeScopeAcceptance || groupFeeScopeAccepted
+  );
   const canBuild = preview.confirmAllowed
     && preview.feeConserved
     && !preview.defaultWillChange
     && !error
     && hasImmutableKeys
-    && assumptionConfirmed;
+    && assumptionConfirmed
+    && groupFeeScopeConfirmed;
   const deltaLabel = preview.episodeCountDelta > 0
     ? `+${preview.episodeCountDelta.toLocaleString()}`
     : preview.episodeCountDelta.toLocaleString();
+  const warningLabels = Array.from(new Set(preview.warnings.map(canonicalWarningLabel)));
   const isViewingResult = result?.build.id === viewedBuildId;
+  const targetRequiresAssumedFlat = Boolean(result?.build.assumedFlatUnverified);
+  const targetRequiresGroupFeeScope = Boolean(
+    result
+    && result.build.groupFeeAffectedEpisodeCount > 0
+    && !result.build.legFeeAttributionComplete,
+  );
+  const activationAssumptionAccepted = (
+    result != null && acceptedActivationBuildId === result.build.id
+  );
+  const activationGroupFeeScopeAccepted = (
+    result != null && acceptedGroupFeeActivationBuildId === result.build.id
+  );
+  const targetIsCurrent = (
+    result != null
+    && activationState?.selectionSource === 'activation'
+    && activationState.currentBuildId === result.build.id
+  );
+  const targetHasImmutableKey = Boolean(
+    result?.build.buildKey && /^[0-9a-f]{64}$/i.test(result.build.buildKey),
+  );
+  const canActivate = Boolean(
+    result
+    && activationState
+    && targetHasImmutableKey
+    && !targetIsCurrent
+    && !activationLoading
+    && !activationSubmitting
+    && !activationError
+    && (!targetRequiresAssumedFlat || activationAssumptionAccepted)
+    && (!targetRequiresGroupFeeScope || activationGroupFeeScopeAccepted),
+  );
+
+  const handleActivate = async () => {
+    if (!result || !activationState || !canActivate) return;
+    setActivationSubmitting(true);
+    setActivationError(null);
+    setActivationConflict(false);
+    try {
+      const response = await activateEpisodeBuild(result.build.id, {
+        expectedBuildKey: result.build.buildKey,
+        expectedCurrentActivationId: activationState.currentActivationId ?? null,
+        expectedCurrentBuildId: activationState.currentBuildId ?? null,
+        acceptAssumedFlat: targetRequiresAssumedFlat && activationAssumptionAccepted,
+        acceptGroupFeeScope: (
+          targetRequiresGroupFeeScope && activationGroupFeeScopeAccepted
+        ),
+      });
+      if (
+        response.tradingActionPerformed !== false
+        || response.state.currentBuildId !== result.build.id
+        || response.state.selectionSource !== 'activation'
+      ) {
+        throw new Error('默认设置结果未通过只读复盘校验，页面没有切换默认复盘构建。');
+      }
+      setActivationState(response.state);
+      setActivationResult(response);
+      setAcceptedActivationBuildId(null);
+      setAcceptedGroupFeeActivationBuildId(null);
+      onActivated(response);
+    } catch (reason) {
+      const parsed = parseApiError(reason);
+      const stale = parsed.status === 409
+        && parsed.rawMessage.toLowerCase().includes('state changed');
+      if (stale) {
+        let stateReloaded = false;
+        try {
+          const current = await fetchEpisodeBuildActivation();
+          setActivationState(current);
+          stateReloaded = true;
+        } catch {
+          // Preserve the actionable CAS conflict; the retry button can reload
+          // state again if this secondary read also failed.
+        }
+        setAcceptedActivationBuildId(null);
+        setAcceptedGroupFeeActivationBuildId(null);
+        setActivationConflict(true);
+        setActivationError({
+          ...parsed,
+          title: '默认复盘构建已变化',
+          message: stateReloaded
+            ? '另一页面刚刚选择了不同的默认复盘构建。当前状态已重新读取，请核对后再次确认。'
+            : '另一页面刚刚选择了不同的默认复盘构建。请重新读取当前状态，再核对并确认。',
+        });
+      } else {
+        setActivationError(parsed);
+      }
+    } finally {
+      setActivationSubmitting(false);
+    }
+  };
 
   return (
     <section className="card-base overflow-hidden" aria-label="可信事实集构建预览">
@@ -354,7 +535,7 @@ function CanonicalEpisodeBuildCard({
             <div className="text-label uppercase tracking-label text-text-3">可信事实集构建预览</div>
             <h2 className="mt-1 text-h2 text-text-1">从已确认事实生成一份可对比的仓位复盘</h2>
             <p className="mt-1 text-body-sm text-text-3">
-              生成只会新增一份可追溯构建，<strong className="text-text-1">不会替换当前默认视图</strong>。
+              生成只会新增一份可追溯构建，<strong className="text-text-1">不会替换默认复盘构建</strong>。
             </p>
           </div>
           <span className="rounded-full border border-up-strong/25 bg-up-subtle px-2.5 py-1 text-caption text-up-strong">
@@ -376,7 +557,7 @@ function CanonicalEpisodeBuildCard({
             <dt className="text-caption text-text-3">计划回合</dt>
             <dd className="mt-1 font-mono text-mono-md text-text-1">{preview.plannedPositionEpisodeCount.toLocaleString()}</dd>
             <div className="mt-1 text-caption text-text-3">
-              {preview.plannedClosedEpisodeCount.toLocaleString()} 已归零 · {preview.plannedOpenEpisodeCount.toLocaleString()} 窗口内未归零
+              {preview.plannedClosedEpisodeCount.toLocaleString()} 证据窗口内已归零 · {preview.plannedOpenEpisodeCount.toLocaleString()} 证据窗口末未归零
             </div>
           </div>
           <div className="rounded-ds-md border border-subtle bg-bg-1 p-3">
@@ -385,11 +566,16 @@ function CanonicalEpisodeBuildCard({
               {preview.feeConserved ? '已通过' : '未通过'}
             </dd>
             <div className="mt-1 text-caption text-text-3">
-              来源 {formatDecimalDisplay(preview.sourceKnownFeeTotal, true)} · 分配 {formatDecimalDisplay(preview.allocatedKnownFeeTotal, true)}
+              已知来源 {formatDecimalDisplay(preview.sourceKnownFeeTotal, true)} · 已入账 {formatDecimalDisplay(preview.allocatedKnownFeeTotal, true)}
             </div>
+            {preview.executionGroupCount > 0 && (
+              <div className="mt-1 text-caption text-warn-strong">
+                其中组合组费用 {formatDecimalDisplay(preview.retainedExecutionGroupFeeTotal, true)}
+              </div>
+            )}
           </div>
           <div className="rounded-ds-md border border-subtle bg-bg-1 p-3">
-            <dt className="text-caption text-text-3">相对当前默认构建</dt>
+            <dt className="text-caption text-text-3">相对默认复盘构建</dt>
             <dd className="mt-1 font-mono text-mono-md text-text-1">{deltaLabel} 个回合</dd>
             <div className="mt-1 text-caption text-text-3">
               当前 {preview.defaultPositionEpisodeCount.toLocaleString()} → 计划 {preview.plannedPositionEpisodeCount.toLocaleString()}
@@ -397,20 +583,102 @@ function CanonicalEpisodeBuildCard({
           </div>
         </dl>
 
-        <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-caption text-text-3">
+        {preview.executionGroupCount > 0 && (
+          <section
+            className="mt-4 rounded-ds-md border border-warn-strong/30 bg-warn-subtle p-4"
+            aria-label="组合执行组费用口径"
+          >
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <div className="text-label uppercase tracking-label text-warn-strong">Execution group accounting</div>
+                <h3 className="mt-1 text-body font-semibold text-text-1">
+                  {preview.executionGroupCount.toLocaleString()} 个组合执行组 · {preview.groupFeeAffectedEpisodeCount.toLocaleString()} 个腿回合受影响
+                </h3>
+                <p className="mt-1 max-w-3xl text-caption leading-relaxed text-text-3">
+                  券商费用在整组层面精确，系统不会按腿猜测分摊。受影响腿保留成交和 Gross 证据，但费用与 Net 显示为空，并从严格 Headline 排除。
+                </p>
+              </div>
+              <span className="rounded-full border border-warn-strong/30 px-2.5 py-1 text-caption text-warn-strong">
+                腿级费用未归因
+              </span>
+            </div>
+            {Object.keys(preview.feeConservationByCurrency).length > 0 && (
+              <dl className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                {Object.entries(preview.feeConservationByCurrency).map(([currency, values]) => (
+                  <div key={currency} className="rounded-ds-sm border border-warn-strong/20 bg-bg-1/70 p-3">
+                    <dt className="font-mono text-mono-xs text-text-2">{currency}</dt>
+                    <dd className="mt-1 text-caption text-text-3">
+                      来源 {formatCurrencyAmount(currency, values.sourceKnown)} · 已入账 {formatCurrencyAmount(currency, values.accounted)}
+                    </dd>
+                    <div className="mt-1 text-caption text-warn-strong">
+                      组费用 {formatCurrencyAmount(currency, values.retainedExecutionGroup)}
+                    </div>
+                  </div>
+                ))}
+              </dl>
+            )}
+          </section>
+        )}
+
+        <div className="mt-3 text-caption text-text-3">
           <span>
             来源批次 {preview.sourceBatchIds.length ? preview.sourceBatchIds.join(', ') : '—'}
             {preview.canonicalSetSha256 && (
               <> · 指纹 <span className="font-mono" aria-label={`完整指纹 ${preview.canonicalSetSha256}`}>{preview.canonicalSetSha256.slice(0, 12)}…</span></>
             )}
           </span>
-          <span>{formatEt(preview.sourceWindowStart, true)} – {formatEt(preview.sourceWindowEnd, true)} ET</span>
         </div>
 
-        {preview.warnings.length > 0 && (
+        <section className="mt-4 rounded-ds-md border border-subtle bg-bg-1 p-3" aria-label="构建证据窗口">
+          <div className="text-label uppercase tracking-label text-text-3">Evidence window · Historical projection</div>
+          <dl className="mt-2 grid gap-3 sm:grid-cols-2">
+            <div>
+              <dt className="text-caption text-text-3">证据窗口（ET）起—止</dt>
+              <dd className="mt-1 font-mono text-mono-xs text-text-1">
+                {formatEt(preview.sourceWindowStart, true)} — {formatEt(preview.sourceWindowEnd, true)}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-caption text-text-3">窗口末投影 as-of（ET）</dt>
+              <dd className="mt-1 font-mono text-mono-xs text-text-1">{formatEt(preview.sourceWindowEnd, true)}</dd>
+            </div>
+          </dl>
+          <p className="mt-2 text-caption text-text-3">
+            计划中的未归零数量只投影到证据窗口末，不代表券商此刻持仓。
+          </p>
+        </section>
+
+        <section className="mt-4 rounded-ds-md border border-subtle bg-bg-1 p-3" aria-label="默认复盘构建">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <div className="text-label uppercase tracking-label text-text-3">默认复盘构建</div>
+              <div className="mt-1 text-body-sm font-medium text-text-1">
+                {activationLoading && !activationState
+                  ? '正在读取默认复盘构建…'
+                  : activationState?.currentBuildId != null
+                    ? `构建 #${activationState.currentBuildId}`
+                    : '尚无默认构建'}
+              </div>
+              <p className="mt-1 text-caption text-text-3">
+                {activationSourceLabel(activationState?.selectionSource)}
+                {activationState?.currentActivationSequence != null
+                  ? ` · append-only 序号 #${activationState.currentActivationSequence}`
+                  : ''}
+              </p>
+            </div>
+            <span className="rounded-full border border-subtle px-2.5 py-1 text-caption text-text-2">
+              本地复盘选择
+            </span>
+          </div>
+          <p className="mt-2 text-caption text-text-3">
+            设为默认只会新增一条本地复盘选择记录；不会修改 Moomoo 数据，也不会产生、修改或提交任何交易订单。
+          </p>
+        </section>
+
+        {warningLabels.length > 0 && (
           <ul className="mt-3 list-disc space-y-1 pl-5 text-caption text-warn-strong">
-            {preview.warnings.map((warning, index) => (
-              <li key={`${index}:${warning}`}>{canonicalWarningLabel(warning)}</li>
+            {warningLabels.map((warning) => (
+              <li key={warning}>{warning}</li>
             ))}
           </ul>
         )}
@@ -418,22 +686,125 @@ function CanonicalEpisodeBuildCard({
         {error && <ApiErrorAlert className="mt-4" error={error} actionLabel="重新加载预览" onAction={onRetry} />}
 
         {result && (
-          <InlineAlert
-            className="mt-4"
-            variant="success"
-            title={`构建 #${result.build.id} 已就绪`}
-            message="新构建已安全保存；当前默认视图没有改变。"
-            action={(
-              <button
-                type="button"
-                className="btn-ghost"
-                disabled={isViewingResult}
-                onClick={() => onViewBuild(result.build.id)}
-              >
-                {isViewingResult ? '正在查看这个构建' : '查看这个构建'}
-              </button>
-            )}
-          />
+          <div className="mt-4 space-y-3">
+            <InlineAlert
+              variant="success"
+              title={`构建 #${result.build.id} 已就绪`}
+              message="新构建已追加保存；默认复盘构建没有改变。请先显式查看，需要时再单独设为默认。"
+              action={(
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  disabled={isViewingResult}
+                  onClick={() => onViewBuild(result.build.id)}
+                >
+                  {isViewingResult ? '正在查看这个构建' : '查看这个构建'}
+                </button>
+              )}
+            />
+
+            <section className="rounded-ds-md border border-accent/25 bg-accent/5 p-4" aria-label={`将构建 #${result.build.id} 设为默认`}>
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <div className="text-label uppercase tracking-label text-text-3">第二步 · 显式设为默认</div>
+                  <h3 className="mt-1 text-body font-semibold text-text-1">
+                    将构建 #{result.build.id} 设为默认复盘构建
+                  </h3>
+                  <p className="mt-1 text-caption text-text-3">
+                    目标指纹 <span className="font-mono">{result.build.buildKey.slice(0, 12)}…</span>
+                    {' '}· 当前 {activationState?.currentBuildId != null ? `#${activationState.currentBuildId}` : '无默认构建'}
+                  </p>
+                </div>
+                <span className="rounded-full border border-up-strong/25 bg-up-subtle px-2.5 py-1 text-caption text-up-strong">
+                  零交易动作
+                </span>
+              </div>
+
+              {targetRequiresAssumedFlat && !targetIsCurrent && (
+                <label className="mt-3 flex cursor-pointer items-start gap-3 rounded-ds-md border border-warn-strong/30 bg-warn-subtle p-3 text-body-sm text-text-2">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5 h-4 w-4 shrink-0 accent-cyan"
+                    checked={activationAssumptionAccepted}
+                    onChange={(event) => setAcceptedActivationBuildId(
+                      event.target.checked ? result.build.id : null,
+                    )}
+                  />
+                  <span>
+                    <strong className="text-text-1">设为默认时，我再次接受未验证的期初空仓假设。</strong>
+                    {' '}当前时点的券商持仓快照不能倒推历史期初。这是独立于“生成构建”的第二次确认；受影响盈亏仍保持条件性标记。
+                  </span>
+                </label>
+              )}
+
+              {targetRequiresGroupFeeScope && !targetIsCurrent && (
+                <label className="mt-3 flex cursor-pointer items-start gap-3 rounded-ds-md border border-warn-strong/30 bg-warn-subtle p-3 text-body-sm text-text-2">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5 h-4 w-4 shrink-0 accent-cyan"
+                    checked={activationGroupFeeScopeAccepted}
+                    onChange={(event) => setAcceptedGroupFeeActivationBuildId(
+                      event.target.checked ? result.build.id : null,
+                    )}
+                  />
+                  <span>
+                    <strong className="text-text-1">设为默认时，我再次确认组合费用仅保留在执行组层。</strong>
+                    {' '}受影响腿的费用与 Net 仍为空，并继续从严格 Headline 排除。
+                  </span>
+                </label>
+              )}
+
+              {activationError && (
+                <ApiErrorAlert
+                  className="mt-3"
+                  error={activationError}
+                  actionLabel={activationConflict ? '重新读取默认构建状态' : '刷新默认构建状态'}
+                  onAction={() => void loadActivationState()}
+                />
+              )}
+
+              {activationResult && (
+                <InlineAlert
+                  className="mt-3"
+                  variant="success"
+                  title={`构建 #${activationResult.state.currentBuildId} 已设为默认复盘构建`}
+                  message={activationResult.duplicate
+                    ? '该构建已经是默认复盘构建；默认读取已按服务器状态重新验证。'
+                    : 'append-only 默认选择记录已保存；默认读取将重新验证此构建。'}
+                />
+              )}
+
+              <div className="mt-3 flex flex-wrap items-center gap-3">
+                <button
+                  type="button"
+                  className="btn-primary"
+                  disabled={!canActivate}
+                  onClick={() => void handleActivate()}
+                >
+                  {activationSubmitting
+                    ? '设置中…'
+                    : targetIsCurrent
+                      ? '已设为默认'
+                      : '设为默认复盘构建'}
+                </button>
+                {activationLoading && (
+                  <span className="text-caption text-text-3">正在读取默认构建状态，完成后才能安全设置。</span>
+                )}
+                {!activationLoading && !activationState && !activationError && (
+                  <span className="text-caption text-down-strong">缺少默认构建状态，不能提交设置。</span>
+                )}
+                {!targetHasImmutableKey && (
+                  <span className="text-caption text-down-strong">构建指纹无效，请重新生成。</span>
+                )}
+                {targetRequiresAssumedFlat && !activationAssumptionAccepted && !targetIsCurrent && (
+                  <span className="text-caption text-warn-strong">再次确认边界假设后才能设为默认。</span>
+                )}
+                {targetRequiresGroupFeeScope && !activationGroupFeeScopeAccepted && !targetIsCurrent && (
+                  <span className="text-caption text-warn-strong">再次确认组合费用口径后才能设为默认。</span>
+                )}
+              </div>
+            </section>
+          </div>
         )}
 
         {preview.requiresAssumedFlatAcceptance && (
@@ -446,7 +817,25 @@ function CanonicalEpisodeBuildCard({
             />
             <span>
               <strong className="text-text-1">我接受未验证的期初空仓假设。</strong>
-              {' '}左边界没有持仓快照证明；受影响结果会保留条件性标记，不进入严格 Headline。
+              {' '}左边界没有持仓快照证明；即使另有当前时点的券商持仓快照，也不能倒推这个历史证据窗口的期初持仓。受影响结果会保留条件性标记，不进入严格 Headline。
+            </span>
+          </label>
+        )}
+
+
+        {preview.requiresGroupFeeScopeAcceptance && (
+          <label className="mt-3 flex cursor-pointer items-start gap-3 rounded-ds-md border border-warn-strong/30 bg-warn-subtle p-3 text-body-sm text-text-2">
+            <input
+              type="checkbox"
+              className="mt-0.5 h-4 w-4 shrink-0 accent-cyan"
+              checked={groupFeeScopeAccepted}
+              onChange={(event) => setAcceptedGroupFeePreviewKey(
+                event.target.checked ? previewKey : null,
+              )}
+            />
+            <span>
+              <strong className="text-text-1">我理解组合费用只在执行组层精确保留。</strong>
+              {' '}系统不会猜测腿级分摊；受影响腿不显示费用或 Net，也不进入严格 Headline。
             </span>
           </label>
         )}
@@ -456,7 +845,10 @@ function CanonicalEpisodeBuildCard({
             type="button"
             className="btn-primary"
             disabled={!canBuild || building}
-            onClick={() => void onBuild(assumptionAccepted).catch(() => undefined)}
+            onClick={() => void onBuild(
+              assumptionAccepted,
+              groupFeeScopeAccepted,
+            ).catch(() => undefined)}
           >
             {building ? '生成中…' : '生成仓位复盘构建'}
           </button>
@@ -472,6 +864,9 @@ function CanonicalEpisodeBuildCard({
           {preview.requiresAssumedFlatAcceptance && !assumptionAccepted && (
             <span className="text-caption text-warn-strong">勾选边界假设后才能生成。</span>
           )}
+          {preview.requiresGroupFeeScopeAcceptance && !groupFeeScopeAccepted && (
+            <span className="text-caption text-warn-strong">确认组合费用口径后才能生成。</span>
+          )}
         </div>
       </div>
     </section>
@@ -485,11 +880,13 @@ export const PositionEpisodesPanel: React.FC<PositionEpisodesPanelProps> = ({
   onPageChange,
   onSelectBuild,
   onOpenReview,
+  onImported,
 }) => {
   const [draftSymbol, setDraftSymbol] = useState(filters.underlying ?? '');
   const [draftStatus, setDraftStatus] = useState(filters.lifecycleStatus ?? '');
   const [draftCompleteness, setDraftCompleteness] = useState(filters.completenessStatus ?? '');
   const [draftCaseFocus, setDraftCaseFocus] = useState(filters.caseFocus ?? '');
+  const [draftReviewStatus, setDraftReviewStatus] = useState(filters.reviewStatus ?? '');
   const [selected, setSelected] = useState<PositionEpisodeItem | null>(null);
   const [confirmBuild, setConfirmBuild] = useState(false);
 
@@ -500,6 +897,7 @@ export const PositionEpisodesPanel: React.FC<PositionEpisodesPanelProps> = ({
   const reconciliation = controller.list?.reconciliation;
   const headline = summary?.headlinePnl;
   const conditionalPnl = summary?.conditionalPnl;
+  const reviewQueue = controller.list?.reviewQueue;
   const items = useMemo(() => controller.list?.items ?? [], [controller.list?.items]);
 
   const openEpisode = (item: PositionEpisodeItem) => {
@@ -513,6 +911,7 @@ export const PositionEpisodesPanel: React.FC<PositionEpisodesPanelProps> = ({
       lifecycleStatus: draftStatus as PositionEpisodeFilters['lifecycleStatus'],
       completenessStatus: draftCompleteness as PositionEpisodeFilters['completenessStatus'],
       caseFocus: draftCaseFocus as PositionEpisodeFilters['caseFocus'],
+      reviewStatus: draftReviewStatus as PositionEpisodeFilters['reviewStatus'],
       page: 1,
       perPage: filters.perPage ?? 50,
     });
@@ -523,6 +922,7 @@ export const PositionEpisodesPanel: React.FC<PositionEpisodesPanelProps> = ({
     setDraftStatus('');
     setDraftCompleteness('');
     setDraftCaseFocus('');
+    setDraftReviewStatus('');
     onApplyFilters({ page: 1, perPage: filters.perPage ?? 50 });
   };
 
@@ -537,6 +937,12 @@ export const PositionEpisodesPanel: React.FC<PositionEpisodesPanelProps> = ({
       onRetry={controller.reloadCanonicalPreview}
       onBuild={controller.buildCanonical}
       onViewBuild={(buildId) => onSelectBuild(buildId)}
+      onActivated={() => {
+        onSelectBuild();
+        controller.reload();
+        controller.reloadCanonicalPreview();
+        onImported?.();
+      }}
     />
   );
 
@@ -559,7 +965,7 @@ export const PositionEpisodesPanel: React.FC<PositionEpisodesPanelProps> = ({
             <div className="text-label uppercase tracking-label text-text-3">仓位生命周期</div>
             <h2 className="mt-2 text-h1 text-text-1">证据已存在，尚未构建仓位回合</h2>
             <p className="mt-2 text-body-sm leading-relaxed text-text-3">
-              构建会按合约的有符号持仓归零点划分回合。当前没有经过验证的期初持仓快照，必须明确接受“观察窗口开始时持仓为 0”的条件性假设。
+              构建会按合约的有符号持仓归零点划分回合。当前没有经过验证的历史期初持仓快照，必须明确接受“证据窗口开始时持仓为 0”的条件性假设；当前时点的持仓快照也不能倒推这个历史期初。
             </p>
             <button type="button" className="btn-primary mt-4" onClick={() => setConfirmBuild(true)} disabled={controller.building}>
               {controller.building ? '构建中…' : '按未验证期初空仓构建'}
@@ -569,7 +975,7 @@ export const PositionEpisodesPanel: React.FC<PositionEpisodesPanelProps> = ({
         <ConfirmDialog
           isOpen={confirmBuild}
           title="确认未验证的期初空仓假设"
-          message="当前证据没有经过验证的期初持仓快照。继续会把观察窗口开始前的持仓假设为 0；由此产生的盈亏属于条件性结果，不会进入页面 Headline。确认接受这个未验证假设并构建吗？"
+          message="当前证据没有经过验证的历史期初持仓快照。继续会把证据窗口开始时的持仓假设为 0；即使另有当前时点的券商持仓快照，也不能倒推这个历史期初。由此产生的盈亏属于条件性结果，不会进入页面 Headline。确认接受这个未验证假设并构建吗？"
           confirmText="接受假设并构建"
           onCancel={() => setConfirmBuild(false)}
           onConfirm={() => {
@@ -588,8 +994,8 @@ export const PositionEpisodesPanel: React.FC<PositionEpisodesPanelProps> = ({
         <InlineAlert
           variant="info"
           title={`正在查看构建 #${filters.buildId}`}
-          message="这是显式打开的对比视图；当前默认构建没有改变。"
-          action={<button type="button" className="btn-ghost" onClick={() => onSelectBuild()}>回到当前默认构建</button>}
+          message="这是显式打开的对比视图；默认复盘构建没有改变。"
+          action={<button type="button" className="btn-ghost" onClick={() => onSelectBuild()}>回到默认复盘构建</button>}
         />
       )}
       {controller.error && <ApiErrorAlert error={controller.error} actionLabel="重试" onAction={controller.reload} />}
@@ -612,15 +1018,50 @@ export const PositionEpisodesPanel: React.FC<PositionEpisodesPanelProps> = ({
         <InlineAlert
           variant="warning"
           title="回合基于未验证的期初空仓假设"
-          message="左边界没有持仓快照证明。所有受影响回合均标记为条件性，相关盈亏不会计入 Headline。"
+          message="历史左边界没有持仓快照证明；即使另有当前时点的券商持仓快照，也不能倒推这个历史证据窗口的期初持仓。所有受影响回合均标记为条件性，相关盈亏不会计入 Headline。"
+        />
+      )}
+      {(summary?.groupFeeAffectedEpisodeCount ?? 0) > 0 && (
+        <InlineAlert
+          variant="warning"
+          title={`${summary?.groupFeeAffectedEpisodeCount.toLocaleString()} 个回合含组合组级费用`}
+          message={(
+            <span>
+              组合成交已按真实腿进入仓位回合；整组费用
+              <strong> {formatDecimalDisplay(build?.retainedExecutionGroupFeeTotal, true)} </strong>
+              精确保留，但没有按腿猜测分摊。相关腿的 Net 为空，并从严格 Headline 排除。
+            </span>
+          )}
         />
       )}
 
-      <InlineAlert
-        variant="info"
-        title="Remaining 是账单窗口口径"
-        message="“账单窗口内未归零”只表示导入证据回放到窗口末端时尚未归零；没有期末 position snapshot，因此 Remaining 不等于券商当前持仓。"
-      />
+      {build ? (
+        <section className="rounded-ds-md border border-accent/20 bg-accent/5 p-4" aria-label="复盘口径">
+          <div className="text-label uppercase tracking-label text-accent">Historical reconstruction · Not live positions</div>
+          <h2 className="mt-1 text-h2 text-text-1">证据窗口与窗口末投影</h2>
+          <dl className="mt-3 grid gap-3 sm:grid-cols-2">
+            <div>
+              <dt className="text-caption text-text-3">证据窗口（ET）起—止</dt>
+              <dd className="mt-1 font-mono text-mono-xs text-text-1">
+                {formatEt(build.sourceWindowStart, true)} — {formatEt(build.sourceCutoffAt, true)}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-caption text-text-3">窗口末投影 as-of（ET）</dt>
+              <dd className="mt-1 font-mono text-mono-xs text-text-1">{formatEt(build.sourceCutoffAt, true)}</dd>
+            </div>
+          </dl>
+          <p className="mt-3 text-caption leading-relaxed text-text-3">
+            “证据窗口末数量”只表示导入证据回放到上述 as-of 时点后的投影。系统没有该时点之后的完整成交与持仓快照，因此它不等于券商当前持仓。
+          </p>
+        </section>
+      ) : (
+        <InlineAlert
+          variant="info"
+          title="证据窗口末数量不是实时持仓"
+          message="证据窗口元数据暂不可用；列表数量仍只代表历史证据回放结果，不等于券商当前持仓。"
+        />
+      )}
 
       {conditionalPnl && (
         <section className="rounded-ds-md border border-warn-strong/30 bg-warn-subtle p-4" aria-label="按期初空仓假设的条件性结果">
@@ -647,7 +1088,7 @@ export const PositionEpisodesPanel: React.FC<PositionEpisodesPanelProps> = ({
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
           {[
             ['仓位回合', summary.totalEpisodeCount.toLocaleString(), '当前构建的回合数'],
-            ['窗口内未归零', summary.openEpisodeCount.toLocaleString(), 'Remaining 不等于券商当前持仓；Net 显示 —'],
+            ['证据窗口末未归零', summary.openEpisodeCount.toLocaleString(), '证据窗口末数量不等于券商当前持仓；Net 显示 —'],
             ['Headline eligible', (headline?.eligibleClosedCount ?? 0).toLocaleString(), '仅边界已验证且证据完整的已平回合'],
             ['Verified Net', formatDecimalDisplay(headline?.realizedPnlNet, true), `${headline?.excludedEpisodeCount ?? 0} 个条件性/不完整回合已排除`],
           ].map(([label, value, caption]) => (
@@ -658,6 +1099,30 @@ export const PositionEpisodesPanel: React.FC<PositionEpisodesPanelProps> = ({
             </div>
           ))}
         </div>
+      )}
+
+      {reviewQueue && (
+        <section className="rounded-ds-md border border-subtle bg-bg-1 p-4" aria-label="复盘队列">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="text-label uppercase tracking-label text-text-3">Review queue</div>
+              <h2 className="mt-1 text-h2 text-text-1">复盘进度</h2>
+            </div>
+            <span className="text-caption text-text-3">共 {reviewQueue.total.toLocaleString()} 个回合</span>
+          </div>
+          <dl className="mt-3 grid grid-cols-3 gap-2">
+            {[
+              ['未开始', reviewQueue.pending, 'text-text-1'],
+              ['进行中', reviewQueue.inProgress, 'text-accent'],
+              ['已完成', reviewQueue.completed, 'text-up-strong'],
+            ].map(([label, value, tone]) => (
+              <div key={label as string} className="rounded-ds-sm border border-subtle bg-bg-2 p-3">
+                <dt className="text-caption text-text-3">{label}</dt>
+                <dd className={`mt-1 font-mono text-mono-md ${tone}`}>{Number(value).toLocaleString()}</dd>
+              </div>
+            ))}
+          </dl>
+        </section>
       )}
 
       <div className="card-base p-4">
@@ -674,8 +1139,8 @@ export const PositionEpisodesPanel: React.FC<PositionEpisodesPanelProps> = ({
           />
           <select className="input-base" aria-label="筛选回合状态" value={draftStatus} onChange={(event) => setDraftStatus(event.target.value as typeof draftStatus)}>
             <option value="">状态：全部</option>
-            <option value="open">账单窗口内未归零</option>
-            <option value="closed">账单窗口内已归零</option>
+            <option value="open">证据窗口末未归零</option>
+            <option value="closed">证据窗口内已归零</option>
           </select>
           <select className="input-base" aria-label="筛选证据完整度" value={draftCompleteness} onChange={(event) => setDraftCompleteness(event.target.value as typeof draftCompleteness)}>
             <option value="">完整度：全部</option>
@@ -689,9 +1154,16 @@ export const PositionEpisodesPanel: React.FC<PositionEpisodesPanelProps> = ({
             <option value="top_loss">亏损最多</option>
             <option value="largest_fee">费用最高</option>
             <option value="longest_hold">持有最长</option>
+            <option value="weakest_evidence">证据最不完整</option>
+          </select>
+          <select className="input-base" aria-label="筛选复盘状态" value={draftReviewStatus} onChange={(event) => setDraftReviewStatus(event.target.value as typeof draftReviewStatus)}>
+            <option value="">复盘：全部</option>
+            <option value="not_started">未开始</option>
+            <option value="in_progress">进行中</option>
+            <option value="completed">已完成</option>
           </select>
           <button type="button" className="btn-primary" onClick={apply}>应用筛选</button>
-          {(filters.underlying || filters.lifecycleStatus || filters.completenessStatus || filters.caseFocus) && (
+          {(filters.underlying || filters.lifecycleStatus || filters.completenessStatus || filters.caseFocus || filters.reviewStatus) && (
             <button type="button" className="btn-ghost" onClick={clearFilters}>清除筛选</button>
           )}
         </div>
@@ -712,16 +1184,17 @@ export const PositionEpisodesPanel: React.FC<PositionEpisodesPanelProps> = ({
       <div className="card-base overflow-hidden">
         {controller.loading && <div className="border-b border-subtle px-4 py-2 text-caption text-text-3">更新列表中…</div>}
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[1040px] text-body-sm">
+          <table className="w-full min-w-[1120px] text-body-sm">
             <thead className="bg-bg-2 text-label uppercase tracking-label text-text-3">
               <tr>
                 <th className="px-3 py-2 text-left">合约 / 标的</th>
                 <th className="px-3 py-2 text-left">状态</th>
+                <th className="px-3 py-2 text-left">复盘</th>
                 <th className="px-3 py-2 text-left">方向</th>
                 <th className="px-3 py-2 text-left">开仓时间 ET</th>
                 <th className="px-3 py-2 text-right">开仓</th>
                 <th className="px-3 py-2 text-right">已平</th>
-                <th className="px-3 py-2 text-right">Remaining</th>
+                <th className="px-3 py-2 text-right">证据窗口末数量</th>
                 <th className="px-3 py-2 text-right">Net</th>
                 <th className="px-3 py-2 text-left">证据</th>
               </tr>
@@ -744,6 +1217,18 @@ export const PositionEpisodesPanel: React.FC<PositionEpisodesPanelProps> = ({
                       <div className="mt-0.5 text-caption text-text-3">{item.instrument.underlying} · {item.strategyType}</div>
                     </td>
                     <td className="px-3 py-3"><span className="rounded-full border border-subtle bg-bg-2 px-2 py-1 text-caption text-text-2">{lifecycleLabel(item.lifecycleStatus)}</span></td>
+                    <td className="px-3 py-3">
+                      <span className={`rounded-full border px-2 py-1 text-caption ${
+                        item.reviewStatus === 'completed'
+                          ? 'border-up-strong/25 bg-up-subtle text-up-strong'
+                          : item.reviewStatus === 'in_progress'
+                            ? 'border-accent-subtle-border bg-accent-subtle-bg text-accent'
+                            : 'border-subtle bg-bg-2 text-text-3'
+                      }`}>
+                        {reviewStatusLabel(item.reviewStatus)}
+                        {item.reviewRevision != null ? ` · #${item.reviewRevision}` : ''}
+                      </span>
+                    </td>
                     <td className="px-3 py-3 text-text-2">{item.direction}</td>
                     <td className="px-3 py-3 font-mono text-mono-xs text-text-2">{formatEt(item.openedAt)}</td>
                     <td className="px-3 py-3 text-right font-mono text-mono-sm text-text-2">{formatDecimalDisplay(item.openedQuantity)}</td>
@@ -754,7 +1239,10 @@ export const PositionEpisodesPanel: React.FC<PositionEpisodesPanelProps> = ({
                       {!item.quality.pnlSummaryEligible && item.lifecycleStatus === 'closed' && <div className="text-[10px] text-warn-strong">条件值 · 不进 Headline</div>}
                     </td>
                     <td className="px-3 py-3">
-                      <span className={item.quality.assumedFlatUnverified || item.quality.completenessStatus === 'partial' ? 'text-warn-strong' : 'text-text-2'}>{qualityLabel(item)}</span>
+                      <span className={item.quality.assumedFlatUnverified || item.quality.groupFeeUnallocated || item.quality.completenessStatus === 'partial' ? 'text-warn-strong' : 'text-text-2'}>{qualityLabel(item)}</span>
+                      {item.quality.groupFeeUnallocated && (
+                        <div className="mt-1 text-[10px] text-warn-strong">组合费仅组级 · Net 留空</div>
+                      )}
                     </td>
                   </tr>
                 );
