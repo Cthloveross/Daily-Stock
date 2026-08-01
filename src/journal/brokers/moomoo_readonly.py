@@ -13,10 +13,12 @@ stable ``acc_id`` returned by ``get_acc_list`` instead of the positional
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import math
 import multiprocessing
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, Iterable, Mapping, Optional
@@ -39,8 +41,27 @@ __all__ = [
 
 MAX_HISTORY_WINDOW_DAYS = 7
 MAX_FEE_BATCH_SIZE = 400
+MAX_CONTRACT_SPEC_BATCH_SIZE = 400
 MAX_TOTAL_WINDOW_DAYS = 366
 DEFAULT_OVERALL_TIMEOUT_SECONDS = 180.0
+
+OPTION_STRATEGY_TYPES = {
+    "NONE",
+    "SINGLE",
+    "COVERED",
+    "SPREAD",
+    "STRADDLE",
+    "STRANGLE",
+    "COLLAR",
+    "BUTTERFLY",
+    "CONDOR",
+    "IRON_BUTTERFLY",
+    "IRON_CONDOR",
+    "CALENDAR_SPREAD",
+    "DIAGONAL_SPREAD",
+    "CUSTOM",
+}
+SINGLE_LEG_STRATEGY_TYPES = {"NONE", "SINGLE"}
 
 MARKET_TIMEZONES = {
     "US": ZoneInfo("America/New_York"),
@@ -65,6 +86,8 @@ ORDER_EXPORT_FIELDS = (
     "fill_outside_rth",
     "session",
     "currency",
+    "strategy_type",
+    "combo_legs",
 )
 
 DEAL_EXPORT_FIELDS = (
@@ -84,6 +107,17 @@ FEE_EXPORT_FIELDS = (
     "order_id",
     "fee_amount",
     "fee_details",
+)
+
+# Static option-contract evidence is deliberately separated from trade
+# history.  ``get_market_snapshot`` exposes the number of underlying shares
+# represented by one option contract without requiring us to assume that an
+# OCC-looking symbol is an unadjusted 100-share contract.
+CONTRACT_SPEC_EXPORT_FIELDS = (
+    "code",
+    "lot_size",
+    "option_contract_size",
+    "option_contract_multiplier",
 )
 
 ACCOUNT_SELECTION_FIELDS = (
@@ -109,6 +143,7 @@ class ProbeConfig:
     host: str = "127.0.0.1"
     port: int = 11111
     acc_id: Optional[str] = None
+    account_binding_secret: Optional[str] = field(default=None, repr=False)
     connect_timeout: float = 0.5
     query_timeout: float = 15.0
     retries: int = 2
@@ -157,6 +192,11 @@ class ProbeConfig:
             raise ValueError("retry_delay cannot be negative")
         if self.acc_id is not None and not str(self.acc_id).strip().isdigit():
             raise ValueError("acc_id must contain digits only")
+        if self.account_binding_secret is not None:
+            secret = str(self.account_binding_secret).strip()
+            if len(secret) < 32:
+                raise ValueError("account_binding_secret must contain at least 32 characters")
+            object.__setattr__(self, "account_binding_secret", secret)
 
 
 @dataclass(frozen=True)
@@ -221,6 +261,66 @@ def _clean_value(value: Any) -> Any:
     return str(value)
 
 
+def _combo_leg_member(value: Any, name: str) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(name)
+    try:
+        return getattr(value, name)
+    except AttributeError as exc:
+        raise MoomooReadonlyError(
+            "Moomoo returned an unsupported combo-leg shape; export aborted"
+        ) from exc
+
+
+def _structured_combo_legs(value: Any) -> list[dict[str, Any]]:
+    """Project SDK ``ComboLeg`` values onto the de-identified allowlist."""
+    if not isinstance(value, (list, tuple)):
+        raise MoomooReadonlyError(
+            "Moomoo returned combo_legs outside a supported SDK array; export aborted"
+        )
+    output: list[dict[str, Any]] = []
+    identities: set[tuple[str, str]] = set()
+    for leg in value:
+        code = str(_clean_value(_combo_leg_member(leg, "code")) or "").strip().upper()
+        side = _enum_text(_combo_leg_member(leg, "trd_side"))
+        ratio_value = _clean_value(_combo_leg_member(leg, "qty_ratio"))
+        try:
+            ratio = float(ratio_value)
+        except (TypeError, ValueError) as exc:
+            raise MoomooReadonlyError(
+                "Moomoo returned a combo leg without a valid quantity ratio; export aborted"
+            ) from exc
+        if not code or not side or not math.isfinite(ratio) or ratio <= 0:
+            raise MoomooReadonlyError(
+                "Moomoo returned an invalid combo leg; export aborted"
+            )
+        identity = (code, side)
+        if identity in identities:
+            raise MoomooReadonlyError(
+                "Moomoo returned duplicate combo-leg code/side identities; export aborted"
+            )
+        identities.add(identity)
+        output.append(
+            {
+                "code": code,
+                "trd_side": side,
+                "qty_ratio": ratio_value,
+            }
+        )
+    if output and len(output) < 2:
+        raise MoomooReadonlyError(
+            "Moomoo returned a combo order with fewer than two legs; export aborted"
+        )
+    return sorted(
+        output,
+        key=lambda item: (
+            str(item["code"]),
+            str(item["trd_side"]),
+            str(item["qty_ratio"]),
+        ),
+    )
+
+
 def _records(data: Any, fields: Iterable[str]) -> list[dict[str, Any]]:
     if data is None:
         return []
@@ -243,7 +343,42 @@ def _records(data: Any, fields: Iterable[str]) -> list[dict[str, Any]]:
     for row in rows:
         if not isinstance(row, Mapping):
             raise MoomooReadonlyError("Moomoo returned an unsupported row shape")
-        output.append({key: _clean_value(row.get(key)) for key in allowed if key in row})
+        if "combo_legs" in allowed and not {
+            "strategy_type",
+            "combo_legs",
+        }.issubset(row):
+            raise MoomooReadonlyError(
+                "Moomoo order history does not expose the required combo capability fields"
+            )
+        projected = {
+            key: _clean_value(row.get(key))
+            for key in allowed
+            if key in row and key != "combo_legs"
+        }
+        if "combo_legs" in allowed:
+            strategy_type = _enum_text(row.get("strategy_type"))
+            combo_legs = _structured_combo_legs(row.get("combo_legs"))
+            # The SDK emits the literal ``N/A`` when the protobuf order has no
+            # strategyType field.  Because combo_legs is still present as an
+            # independently parsed array, N/A + no legs is an explicit
+            # non-combo observation, not a missing producer capability.
+            if strategy_type in {"", "N/A", "NA"} and not combo_legs:
+                strategy_type = "NONE"
+            if strategy_type not in OPTION_STRATEGY_TYPES:
+                raise MoomooReadonlyError(
+                    "Moomoo returned an unsupported option strategy type; export aborted"
+                )
+            if strategy_type in SINGLE_LEG_STRATEGY_TYPES and combo_legs:
+                raise MoomooReadonlyError(
+                    "Moomoo returned combo legs for a non-combo strategy; export aborted"
+                )
+            if strategy_type not in SINGLE_LEG_STRATEGY_TYPES and not combo_legs:
+                raise MoomooReadonlyError(
+                    "Moomoo returned a combo strategy without its declared legs; export aborted"
+                )
+            projected["strategy_type"] = strategy_type
+            projected["combo_legs"] = combo_legs
+        output.append(projected)
     return output
 
 
@@ -288,6 +423,22 @@ def _default_context_factory(config: ProbeConfig, sdk: Any):
     # The SDK exposes a connect-timeout setter but no public request-timeout
     # setter.  Its own request loop reads this field and wakes synchronous
     # calls on expiry, so set it explicitly to keep probe calls bounded.
+    if hasattr(ctx, "_query_timeout"):
+        setattr(ctx, "_query_timeout", config.query_timeout)
+    if hasattr(ctx, "set_sync_query_connect_timeout"):
+        ctx.set_sync_query_connect_timeout(config.query_timeout)
+    return ctx
+
+
+def _default_quote_context_factory(config: ProbeConfig, sdk: Any):
+    """Open a bounded, read-only quote context for contract specifications."""
+    suppress_moomoo_sdk_console()
+    quote_context_type = _sdk_member(
+        sdk,
+        "OpenQuoteContext",
+        "read-only quote context",
+    )
+    ctx = quote_context_type(host=config.host, port=config.port)
     if hasattr(ctx, "_query_timeout"):
         setattr(ctx, "_query_timeout", config.query_timeout)
     if hasattr(ctx, "set_sync_query_connect_timeout"):
@@ -395,6 +546,22 @@ def _stable_id(value: Any) -> str:
     return "" if text.lower() in {"", "nan", "none"} else text
 
 
+def _combo_definition(row: Mapping[str, Any]) -> tuple[str, tuple[tuple[str, str, str], ...]]:
+    legs = row.get("combo_legs") or []
+    normalized_legs = tuple(
+        sorted(
+            (
+                str(leg.get("code") or "").strip().upper(),
+                _enum_text(leg.get("trd_side")),
+                format(_float_value(leg.get("qty_ratio")), ".15g"),
+            )
+            for leg in legs
+            if isinstance(leg, Mapping)
+        )
+    )
+    return _enum_text(row.get("strategy_type")), normalized_legs
+
+
 def _dedupe_records(
     records: list[dict[str, Any]],
     *,
@@ -415,6 +582,15 @@ def _dedupe_records(
             unique[stable_id] = row
             continue
         duplicates += 1
+        has_combo_definition = bool(row.get("combo_legs") or previous.get("combo_legs"))
+        if (
+            id_field == "order_id"
+            and has_combo_definition
+            and _combo_definition(row) != _combo_definition(previous)
+        ):
+            raise MoomooReadonlyError(
+                "Moomoo returned a drifting combo definition for one stable order ID; export aborted"
+            )
         if latest_field and str(row.get(latest_field) or "") >= str(previous.get(latest_field) or ""):
             unique[stable_id] = row
 
@@ -543,6 +719,91 @@ def _is_option_code(code: Any) -> bool:
         return False
 
 
+def _executed_option_codes(
+    orders: Iterable[Mapping[str, Any]],
+    deals: Iterable[Mapping[str, Any]],
+) -> tuple[str, ...]:
+    """Return every option contract that contributed execution evidence."""
+    codes: set[str] = {
+        str(deal.get("code") or "").strip().upper()
+        for deal in deals
+        if _float_value(deal.get("qty")) > 0
+        and _is_option_code(deal.get("code"))
+    }
+    for order in orders:
+        if _float_value(order.get("dealt_qty")) <= 0:
+            continue
+        code = str(order.get("code") or "").strip().upper()
+        if _is_option_code(code):
+            codes.add(code)
+        codes.update(
+            str(leg.get("code") or "").strip().upper()
+            for leg in (order.get("combo_legs") or [])
+            if isinstance(leg, Mapping) and _is_option_code(leg.get("code"))
+        )
+    return tuple(sorted(code for code in codes if code))
+
+
+def _fetch_contract_specs(
+    *,
+    config: ProbeConfig,
+    sdk: Any,
+    option_codes: tuple[str, ...],
+    quote_context_factory: Optional[Callable[[ProbeConfig, Any], Any]],
+    sleeper: Callable[[float], None],
+) -> tuple[list[dict[str, Any]], str]:
+    """Fetch static option multipliers without making them trade evidence.
+
+    Quote entitlement is an enhancement boundary: a trade-history query can
+    still complete when static quote access is unavailable, but the planner
+    will keep affected option executions blocked until this frozen evidence
+    exists.  Transport errors are therefore normalized into an explicit
+    status rather than aborting otherwise valid history retrieval.
+    """
+    if not option_codes:
+        return [], "not_applicable"
+    factory = quote_context_factory or _default_quote_context_factory
+    quote_ctx: Any = None
+    try:
+        quote_ctx = factory(config, sdk)
+        rows: list[dict[str, Any]] = []
+        for offset in range(0, len(option_codes), MAX_CONTRACT_SPEC_BATCH_SIZE):
+            batch = option_codes[offset : offset + MAX_CONTRACT_SPEC_BATCH_SIZE]
+            data = _call_with_retry(
+                lambda batch=batch: quote_ctx.get_market_snapshot(list(batch)),
+                ret_ok=sdk.RET_OK,
+                label="option contract specification query",
+                retries=config.retries,
+                retry_delay=config.retry_delay,
+                sleeper=sleeper,
+            )
+            rows.extend(_records(data, CONTRACT_SPEC_EXPORT_FIELDS))
+    except Exception:  # noqa: BLE001 - quote SDK/entitlement errors vary
+        return [], "unavailable"
+    finally:
+        if quote_ctx is not None:
+            try:
+                quote_ctx.close()
+            except Exception:  # noqa: BLE001 - shutdown must not mask status
+                pass
+
+    normalized: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        code = str(row.get("code") or "").strip().upper()
+        if not code or code not in option_codes or code in normalized:
+            continue
+        normalized[code] = {
+            "code": code,
+            "lot_size": row.get("lot_size"),
+            "option_contract_size": row.get("option_contract_size"),
+            "option_contract_multiplier": row.get(
+                "option_contract_multiplier"
+            ),
+        }
+    status = "complete" if set(normalized) == set(option_codes) else "partial"
+    return [normalized[code] for code in sorted(normalized)], status
+
+
 def _reconcile_live_records(
     *,
     filled_orders: list[dict[str, Any]],
@@ -579,10 +840,49 @@ def _reconcile_live_records(
     code_mismatches = 0
     side_mismatches = 0
     average_price_mismatches = 0
+    unsupported_combo_orders = 0
 
     for order_id, order in filled_by_id.items():
         order_deals = deals_by_order.get(order_id, [])
+        combo_legs = order.get("combo_legs") or []
+        if combo_legs:
+            unsupported_combo_orders += 1
         if not order_deals:
+            continue
+
+        expected_qty = _float_value(order.get("dealt_qty"))
+        if combo_legs:
+            declared = {
+                (
+                    str(leg.get("code") or "").strip().upper(),
+                    _enum_text(leg.get("trd_side")),
+                ): _float_value(leg.get("qty_ratio"))
+                for leg in combo_legs
+            }
+            actual: dict[tuple[str, str], float] = {}
+            for deal in order_deals:
+                identity = (
+                    str(deal.get("code") or "").strip().upper(),
+                    _enum_text(deal.get("trd_side")),
+                )
+                actual[identity] = actual.get(identity, 0.0) + _float_value(
+                    deal.get("qty")
+                )
+            if any(identity[0] not in {key[0] for key in declared} for identity in actual):
+                code_mismatches += 1
+            if any(
+                identity not in declared
+                and identity[0] in {key[0] for key in declared}
+                for identity in actual
+            ):
+                side_mismatches += 1
+            if set(actual) != set(declared) or any(
+                abs(actual.get(identity, 0.0) - expected_qty * ratio) > 1e-8
+                for identity, ratio in declared.items()
+            ):
+                quantity_mismatches += 1
+            # Parent combo quantity and average price describe group units/net
+            # economics, not a sum or VWAP of heterogeneous leg executions.
             continue
 
         expected_code = str(order.get("code") or "").strip().upper()
@@ -596,7 +896,6 @@ def _reconcile_live_records(
             side_mismatches += 1
 
         fill_qty = sum(_float_value(deal.get("qty")) for deal in order_deals)
-        expected_qty = _float_value(order.get("dealt_qty"))
         if abs(expected_qty - fill_qty) > 1e-8:
             quantity_mismatches += 1
 
@@ -623,6 +922,7 @@ def _reconcile_live_records(
         "fill_side_mismatches": side_mismatches,
         "fill_average_price_mismatches": average_price_mismatches,
         "filled_orders_without_fees": len(set(filled_by_id) - fee_order_ids),
+        "unsupported_combo_orders": unsupported_combo_orders,
     }
 
 
@@ -633,6 +933,8 @@ def _build_payload(
     orders: list[dict[str, Any]],
     deals: list[dict[str, Any]],
     fees: list[dict[str, Any]],
+    contract_specs: list[dict[str, Any]],
+    contract_spec_status: str,
     duplicates: dict[str, int],
     window_count: int,
     fee_batch_count: int,
@@ -665,14 +967,29 @@ def _build_payload(
         reconciliation_failures = {
             key: value
             for key, value in reconciliation.items()
-            if value not in (None, 0)
+            if key != "unsupported_combo_orders" and value not in (None, 0)
         }
-        analysis_ready = bool(filled_orders) and not reconciliation_failures
+        # Read coverage and economic activity are separate facts.  A complete
+        # LIVE query with no executions is still valid evidence that nothing
+        # happened in the requested interval.
+        analysis_ready = not reconciliation_failures
         reconciliation_status = "passed" if not reconciliation_failures else "failed"
         warnings = [
             f"{key}={value}"
             for key, value in sorted(reconciliation_failures.items())
         ]
+        execution_group_count = int(
+            reconciliation.get("unsupported_combo_orders") or 0
+        )
+        if execution_group_count:
+            warnings.append(
+                f"execution_group_observations={execution_group_count}"
+            )
+            if contract_spec_status != "complete":
+                warnings.append(
+                    "execution_group_contract_specs_"
+                    f"{contract_spec_status}"
+                )
         if not filled_orders:
             warnings.append("no_filled_orders_in_window")
     else:
@@ -684,6 +1001,7 @@ def _build_payload(
             "fill_side_mismatches": None,
             "fill_average_price_mismatches": None,
             "filled_orders_without_fees": None,
+            "unsupported_combo_orders": None,
         }
         analysis_ready = False
         reconciliation_status = "not_applicable"
@@ -702,6 +1020,9 @@ def _build_payload(
         # ``ok`` means the bounded retrieval completed.  Consumers must use
         # ``analysis_ready`` before drawing post-trade conclusions.
         "ok": True,
+        "retrieval_complete": True,
+        "coverage_complete": True,
+        "has_activity": bool(activity),
         "analysis_ready": analysis_ready,
         "reconciliation_status": reconciliation_status,
         "warnings": warnings,
@@ -716,6 +1037,7 @@ def _build_payload(
             "filled_orders": len(filled_orders),
             "fills": len(deals),
             "fees": len(fees),
+            "contract_specs": len(contract_specs),
             "unique_instruments": len(codes),
             "option_activity_rows": sum(1 for row in activity if _is_option_code(row.get("code"))),
         },
@@ -729,27 +1051,42 @@ def _build_payload(
             "orders": duplicates.get("orders", 0),
             "fills": duplicates.get("deals", 0),
             "fees": duplicates.get("fees", 0),
+            "contract_specs": duplicates.get("contract_specs", 0),
         },
         "reconciliation": reconciliation,
         "fee_batches": fee_batch_count,
+        "contract_spec_status": contract_spec_status,
     }
+
+    account_payload = {
+        "environment": config.env,
+        "market": config.market,
+        "selection": selected.selection,
+    }
+    if config.account_binding_secret:
+        binding_message = (
+            "dsa-journal-account-binding-v1|"
+            f"{config.env}|{config.market}|{selected.sdk_acc_id}"
+        ).encode("utf-8")
+        account_payload["binding"] = hmac.new(
+            config.account_binding_secret.encode("utf-8"),
+            binding_message,
+            hashlib.sha256,
+        ).hexdigest()
 
     export_payload = {
         "schema": "dsa.moomoo.readonly-export.v1",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "mode": "read_only",
         "journal_database_written": False,
-        "account": {
-            "environment": config.env,
-            "market": config.market,
-            "selection": selected.selection,
-        },
+        "account": account_payload,
         "window": query_window,
         "summary": summary,
         "records": {
             "orders": orders,
             "deals": deals,
             "fees": fees,
+            "contract_specs": contract_specs,
         },
     }
     return ProbeResult(summary=summary, export_payload=export_payload)
@@ -760,6 +1097,7 @@ def _run_readonly_probe_in_process(
     *,
     sdk: Any,
     context_factory: Optional[Callable[[ProbeConfig, Any], Any]],
+    quote_context_factory: Optional[Callable[[ProbeConfig, Any], Any]],
     tcp_probe: Callable[[str, int, float], None],
     sleeper: Callable[[float], None],
 ) -> ProbeResult:
@@ -812,12 +1150,22 @@ def _run_readonly_probe_in_process(
         else:
             fees, fee_duplicates, fee_batch_count = [], 0, 0
         duplicates["fees"] = fee_duplicates
+        contract_specs, contract_spec_status = _fetch_contract_specs(
+            config=config,
+            sdk=sdk,
+            option_codes=_executed_option_codes(orders, deals),
+            quote_context_factory=quote_context_factory,
+            sleeper=sleeper,
+        )
+        duplicates["contract_specs"] = 0
         return _build_payload(
             config=config,
             selected=selected,
             orders=orders,
             deals=deals,
             fees=fees,
+            contract_specs=contract_specs,
+            contract_spec_status=contract_spec_status,
             duplicates=duplicates,
             window_count=window_count,
             fee_batch_count=fee_batch_count,
@@ -836,6 +1184,7 @@ def _probe_process_worker(config: ProbeConfig, sender: Any) -> None:
             config,
             sdk=None,
             context_factory=None,
+            quote_context_factory=None,
             tcp_probe=_probe_tcp,
             sleeper=time.sleep,
         )
@@ -916,6 +1265,7 @@ def run_readonly_probe(
     *,
     sdk: Any = None,
     context_factory: Optional[Callable[[ProbeConfig, Any], Any]] = None,
+    quote_context_factory: Optional[Callable[[ProbeConfig, Any], Any]] = None,
     tcp_probe: Optional[Callable[[str, int, float], None]] = None,
     sleeper: Optional[Callable[[float], None]] = None,
 ) -> ProbeResult:
@@ -925,11 +1275,21 @@ def run_readonly_probe(
     no asynchronous constructor and may retry forever if OpenD disappears in a
     narrow preflight race.  Dependency-injected test calls remain in-process.
     """
-    if any(value is not None for value in (sdk, context_factory, tcp_probe, sleeper)):
+    if any(
+        value is not None
+        for value in (
+            sdk,
+            context_factory,
+            quote_context_factory,
+            tcp_probe,
+            sleeper,
+        )
+    ):
         return _run_readonly_probe_in_process(
             config,
             sdk=sdk,
             context_factory=context_factory,
+            quote_context_factory=quote_context_factory,
             tcp_probe=tcp_probe or _probe_tcp,
             sleeper=sleeper or time.sleep,
         )

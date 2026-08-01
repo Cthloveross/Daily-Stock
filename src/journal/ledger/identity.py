@@ -321,9 +321,39 @@ def _validate_reconciliation(reconciliation: StatementReconciliation) -> None:
         raise IdentityProjectionError(
             "identity projection requires an analysis-ready reconciliation"
         )
-    mismatch_fields = (
+    count_fields = (
+        "statement_orders",
+        "api_orders",
+        "matched_orders",
         "statement_only_orders",
         "api_only_orders",
+        "overlap_api_only_orders",
+        "incremental_api_only_orders",
+    )
+    if any(getattr(reconciliation, field_name) < 0 for field_name in count_fields):
+        raise IdentityProjectionError(
+            "analysis-ready reconciliation contains negative order counts"
+        )
+    if (
+        reconciliation.api_only_orders
+        != reconciliation.overlap_api_only_orders
+        + reconciliation.incremental_api_only_orders
+    ):
+        raise IdentityProjectionError(
+            "analysis-ready reconciliation has unclassified API-only orders"
+        )
+    if (
+        reconciliation.statement_orders
+        != reconciliation.matched_orders + reconciliation.statement_only_orders
+        or reconciliation.api_orders
+        != reconciliation.matched_orders + reconciliation.api_only_orders
+    ):
+        raise IdentityProjectionError(
+            "analysis-ready reconciliation contains inconsistent order counts"
+        )
+    mismatch_fields = (
+        "statement_only_orders",
+        "overlap_api_only_orders",
         "status_mismatches",
         "fill_count_mismatches",
         "filled_quantity_mismatches",
@@ -342,12 +372,16 @@ def _validate_reconciliation(reconciliation: StatementReconciliation) -> None:
             "analysis-ready reconciliation contains mismatches: "
             + ", ".join(mismatches)
         )
-    if reconciliation.matched_orders <= 0:
-        raise IdentityProjectionError("reconciliation contains no proven order links")
     if len(reconciliation.matches) != reconciliation.matched_orders:
         raise IdentityProjectionError(
             "reconciliation match evidence is incomplete"
         )
+    empty_overlap = (
+        reconciliation.statement_orders == 0
+        and reconciliation.overlap_api_only_orders == 0
+    )
+    if reconciliation.matched_orders <= 0 and not empty_overlap:
+        raise IdentityProjectionError("reconciliation contains no proven order links")
     statement_ids = [item.statement_order_id for item in reconciliation.matches]
     broker_ids = [item.broker_order_id for item in reconciliation.matches]
     if (

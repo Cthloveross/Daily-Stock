@@ -160,6 +160,89 @@ def _payload() -> dict[str, object]:
     }
 
 
+def _combo_payload() -> dict[str, object]:
+    payload = _payload()
+    records = _records(payload)
+    order = records["orders"][0]
+    order.update(
+        {
+            "code": "US.COMBO",
+            "trd_side": "BUY",
+            "dealt_avg_price": 99,
+            "strategy_type": "SPREAD",
+            "combo_legs": [
+                {
+                    "code": "US.AAPL260717C00200000",
+                    "trd_side": "BUY",
+                    "qty_ratio": 1,
+                },
+                {
+                    "code": "US.AAPL260717C00210000",
+                    "trd_side": "SELL",
+                    "qty_ratio": 2,
+                },
+            ],
+        }
+    )
+    records["deals"] = [
+        {
+            "deal_id": "d-buy",
+            "order_id": "o-filled",
+            "code": "US.AAPL260717C00200000",
+            "stock_name": "Deidentified instrument",
+            "deal_market": "US",
+            "trd_side": "BUY",
+            "qty": 1,
+            "price": 3,
+            "create_time": "2026-07-01 09:30:01",
+            "status": "OK",
+        },
+        {
+            "deal_id": "d-sell",
+            "order_id": "o-filled",
+            "code": "US.AAPL260717C00210000",
+            "stock_name": "Deidentified instrument",
+            "deal_market": "US",
+            "trd_side": "SELL",
+            "qty": 2,
+            "price": 1,
+            "create_time": "2026-07-01 09:30:01",
+            "status": "OK",
+        },
+    ]
+    records["contract_specs"] = [
+        {
+            "code": "US.AAPL260717C00210000",
+            "lot_size": 100,
+            "option_contract_size": 100,
+            "option_contract_multiplier": 100,
+        },
+        {
+            "code": "US.AAPL260717C00200000",
+            "lot_size": 100,
+            "option_contract_size": 100,
+            "option_contract_multiplier": 100,
+        },
+    ]
+    summary = _summary(payload)
+    summary["analysis_ready"] = True
+    summary["reconciliation_status"] = "passed"
+    summary["warnings"] = ["execution_group_observations=1"]
+    summary["contract_spec_status"] = "complete"
+    summary["counts"].update(
+        {
+            "fills": 2,
+            "unique_instruments": 2,
+            "option_activity_rows": 2,
+            "contract_specs": 2,
+        }
+    )
+    summary["deduplicated_rows"]["contract_specs"] = 0
+    summary["activity_sides"] = {"buy": 1, "sell": 1, "other": 0}
+    summary["reconciliation"]["unsupported_combo_orders"] = 1
+    return payload
+
+
 def _records(payload: dict[str, object]) -> dict[str, list[dict[str, object]]]:
     return payload["records"]  # type: ignore[return-value]
 
@@ -190,6 +273,7 @@ def test_valid_export_becomes_typed_deidentified_preview() -> None:
     ]
     assert result.orders[0].order_quantity == Decimal("1")
     assert result.orders[0].fill_outside_rth is None
+    assert result.orders[0].combo_definition_available is False
     assert result.fills[0].source_deal_id == "d-filled"
     assert result.fills[0].currency == "USD"
     assert result.fees[0].fee_components == (
@@ -205,11 +289,248 @@ def test_valid_export_becomes_typed_deidentified_preview() -> None:
         "orders": 2,
         "fills": 1,
         "fees": 1,
+        "contract_specs": 0,
         "rejected": 0,
     }
     encoded = json.dumps(public_summary)
     assert "o-filled" not in encoded
     assert "d-filled" not in encoded
+
+
+def test_combo_order_is_typed_reconciled_and_not_a_source_blocker() -> None:
+    result = parse_openapi_export(_combo_payload())
+
+    combo = result.orders[0]
+    assert combo.strategy_type == "SPREAD"
+    assert [
+        (leg.raw_symbol, leg.side, leg.quantity_ratio)
+        for leg in combo.combo_legs
+    ] == [
+        ("US.AAPL260717C00200000", "BUY", Decimal("1")),
+        ("US.AAPL260717C00210000", "SELL", Decimal("2")),
+    ]
+    assert result.metadata.analysis_ready is True
+    assert result.metadata.analysis_level == "exact"
+    assert result.metadata.reconciliation_status == "passed"
+    assert result.metadata.reconciliation.unsupported_combo_orders == 1
+    assert result.metadata.reconciliation.fill_code_mismatches == 0
+    assert result.metadata.reconciliation.fill_side_mismatches == 0
+    assert result.metadata.reconciliation.filled_quantity_mismatches == 0
+    assert result.metadata.reconciliation.fill_average_price_mismatches == 0
+    assert result.metadata.warnings == (
+        "execution_group_observations=1",
+    )
+
+
+def test_contract_specs_are_typed_and_hash_order_is_stable() -> None:
+    baseline_payload = _combo_payload()
+    reordered_payload = copy.deepcopy(baseline_payload)
+    _records(reordered_payload)["contract_specs"].reverse()
+
+    baseline = parse_openapi_export(baseline_payload)
+    reordered = parse_openapi_export(reordered_payload)
+
+    assert [spec.raw_symbol for spec in baseline.contract_specs] == [
+        "US.AAPL260717C00200000",
+        "US.AAPL260717C00210000",
+    ]
+    assert all(spec.lot_size == Decimal("100") for spec in baseline.contract_specs)
+    assert all(
+        spec.option_contract_size == Decimal("100")
+        for spec in baseline.contract_specs
+    )
+    assert all(
+        spec.option_contract_multiplier == Decimal("100")
+        and spec.resolved_multiplier == Decimal("100")
+        and len(spec.source_record_sha256) == 64
+        for spec in baseline.contract_specs
+    )
+    assert baseline.metadata.contract_spec_status == "complete"
+    assert baseline.metadata.contract_spec_observation_count == 2
+    assert baseline.metadata.source_sha256 == reordered.metadata.source_sha256
+    assert baseline.metadata.evidence_sha256 == reordered.metadata.evidence_sha256
+    assert baseline.metadata.batch_key == reordered.metadata.batch_key
+
+
+def test_legacy_combo_only_blocker_is_accepted_and_normalized() -> None:
+    payload = _combo_payload()
+    records = _records(payload)
+    records.pop("contract_specs")
+    summary = _summary(payload)
+    summary["analysis_ready"] = False
+    summary["reconciliation_status"] = "failed"
+    summary["warnings"] = ["combo_order_requires_group_projection=1"]
+    summary.pop("contract_spec_status")
+    summary["counts"].pop("contract_specs")
+    summary["deduplicated_rows"].pop("contract_specs")
+
+    result = parse_openapi_export(payload)
+
+    assert result.metadata.analysis_ready is True
+    assert result.metadata.analysis_level == "exact"
+    assert result.metadata.reconciliation_status == "passed"
+    assert result.metadata.warnings == ("execution_group_observations=1",)
+    assert result.metadata.contract_spec_status == "not_available"
+    assert result.contract_specs == ()
+
+
+def test_combo_hashes_use_normalized_leg_order_and_leg_ratios() -> None:
+    first = _combo_payload()
+    reordered = copy.deepcopy(first)
+    _records(reordered)["orders"][0]["combo_legs"].reverse()
+    changed = copy.deepcopy(first)
+    _records(changed)["orders"][0]["combo_legs"][1]["qty_ratio"] = 3
+    _records(changed)["deals"][1]["qty"] = 3
+
+    baseline = parse_openapi_export(first)
+    same = parse_openapi_export(reordered)
+    different = parse_openapi_export(changed)
+
+    assert baseline.metadata.source_sha256 == same.metadata.source_sha256
+    assert baseline.metadata.evidence_sha256 == same.metadata.evidence_sha256
+    assert baseline.metadata.source_sha256 != different.metadata.source_sha256
+    assert baseline.metadata.evidence_sha256 != different.metadata.evidence_sha256
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda payload: _records(payload)["orders"][0].update(
+                combo_legs=[
+                    {"code": "US.AAPL", "trd_side": "BUY", "qty_ratio": 1}
+                ]
+            ),
+            "at least two legs",
+        ),
+        (
+            lambda payload: _records(payload)["orders"][0]["combo_legs"][0].update(
+                qty_ratio=0
+            ),
+            "greater than zero",
+        ),
+        (
+            lambda payload: _records(payload)["orders"][0]["combo_legs"][1].update(
+                code="US.AAPL260717C00200000", trd_side="BUY"
+            ),
+            "duplicate code/side",
+        ),
+    ],
+)
+def test_combo_definition_validation_fails_closed(mutate, message) -> None:
+    payload = _combo_payload()
+    mutate(payload)
+
+    with pytest.raises(MoomooOpenApiExportError, match=message):
+        parse_openapi_export(payload)
+
+
+@pytest.mark.parametrize("present_field", ["strategy_type", "combo_legs"])
+def test_new_combo_capability_fields_must_appear_as_a_pair(present_field) -> None:
+    payload = _payload()
+    order = _records(payload)["orders"][0]
+    order[present_field] = "SINGLE" if present_field == "strategy_type" else []
+
+    with pytest.raises(MoomooOpenApiExportError, match="must appear together"):
+        parse_openapi_export(payload)
+
+
+@pytest.mark.parametrize(
+    ("strategy_type", "legs", "message"),
+    [
+        ("SPREAD", [], "required for SPREAD"),
+        ("NONE", [
+            {"code": "US.AAPL", "trd_side": "BUY", "qty_ratio": 1},
+            {"code": "US.MSFT", "trd_side": "SELL", "qty_ratio": 1},
+        ], "not allowed for NONE"),
+        ("SINGLE", [
+            {"code": "US.AAPL", "trd_side": "BUY", "qty_ratio": 1},
+            {"code": "US.MSFT", "trd_side": "SELL", "qty_ratio": 1},
+        ], "not allowed for SINGLE"),
+        ("N/A", [], "strategy_type is unsupported"),
+        ("FUTURE_UNKNOWN", [], "strategy_type is unsupported"),
+    ],
+)
+def test_strategy_type_and_declared_legs_must_be_consistent(
+    strategy_type, legs, message
+) -> None:
+    payload = _payload()
+    order = _records(payload)["orders"][0]
+    order.update({"strategy_type": strategy_type, "combo_legs": legs})
+
+    with pytest.raises(MoomooOpenApiExportError, match=message):
+        parse_openapi_export(payload)
+
+
+def test_current_single_strategy_capability_is_accepted_without_legs() -> None:
+    payload = _payload()
+    for order in _records(payload)["orders"]:
+        order.update({"strategy_type": "SINGLE", "combo_legs": []})
+
+    result = parse_openapi_export(payload)
+
+    assert all(order.strategy_type == "SINGLE" for order in result.orders)
+    assert all(order.combo_legs == () for order in result.orders)
+    assert all(order.combo_definition_available for order in result.orders)
+
+
+def test_legacy_absence_and_explicit_empty_combo_capability_hash_differently() -> None:
+    legacy = _payload()
+    capable = copy.deepcopy(legacy)
+    for order in _records(capable)["orders"]:
+        order.update({"strategy_type": "NONE", "combo_legs": []})
+
+    old = parse_openapi_export(legacy)
+    current = parse_openapi_export(capable)
+
+    assert all(not order.combo_definition_available for order in old.orders)
+    assert all(order.combo_definition_available for order in current.orders)
+    assert old.metadata.evidence_sha256 != current.metadata.evidence_sha256
+    assert old.metadata.source_sha256 != current.metadata.source_sha256
+    assert old.metadata.batch_key != current.metadata.batch_key
+
+
+def test_combo_reconciliation_checks_each_declared_leg_quantity() -> None:
+    payload = _combo_payload()
+    _records(payload)["deals"][1]["qty"] = 1
+    summary = _summary(payload)
+    summary["analysis_ready"] = False
+    summary["reconciliation_status"] = "failed"
+    summary["reconciliation"]["filled_quantity_mismatches"] = 1
+    summary["warnings"] = [
+        "filled_quantity_mismatches=1",
+        "execution_group_observations=1",
+    ]
+
+    result = parse_openapi_export(payload)
+
+    assert result.metadata.reconciliation.filled_quantity_mismatches == 1
+    assert result.metadata.reconciliation.fill_average_price_mismatches == 0
+
+
+def test_combo_time_skew_guard_matches_a_declared_leg_not_parent_fields() -> None:
+    payload = _combo_payload()
+    order = _records(payload)["orders"][0]
+    order["create_time"] = "2026-07-01 09:30:00.474"
+    order["updated_time"] = "2026-07-01 09:30:01.099"
+    for deal in _records(payload)["deals"]:
+        deal["create_time"] = "2026-07-01 09:30:00.100"
+    _summary(payload)["activity_time_range"] = {
+        "first": "2026-07-01 09:30:00.100",
+        "last": "2026-07-01 09:30:00.100",
+    }
+
+    result = parse_openapi_export(payload)
+
+    assert result.metadata.warnings == (
+        "execution_group_observations=1",
+        "broker_fill_precedes_order_create_within_1s=2",
+    )
+
+    tampered = copy.deepcopy(payload)
+    _records(tampered)["deals"][0]["code"] = "US.NOT_A_DECLARED_LEG"
+    with pytest.raises(MoomooOpenApiExportError, match="guarded broker timestamp"):
+        parse_openapi_export(tampered)
 
 
 def test_broker_four_digit_fractional_second_is_normalized() -> None:
@@ -221,6 +542,87 @@ def test_broker_four_digit_fractional_second_is_normalized() -> None:
     result = parse_openapi_export(payload)
 
     assert result.orders[0].source_updated_at.microsecond == 100000
+
+
+def test_guarded_subsecond_fill_order_skew_is_preserved_and_audited() -> None:
+    payload = _payload()
+    order = _records(payload)["orders"][0]
+    deal = _records(payload)["deals"][0]
+    order["create_time"] = "2026-07-01 09:30:00.474"
+    order["updated_time"] = "2026-07-01 09:30:01.099"
+    deal["create_time"] = "2026-07-01 09:30:00.1000"
+    _summary(payload)["activity_time_range"] = {
+        "first": deal["create_time"],
+        "last": deal["create_time"],
+    }
+
+    result = parse_openapi_export(payload)
+
+    assert result.metadata.analysis_ready is True
+    assert result.fills[0].filled_at.microsecond == 100000
+    assert result.fills[0].filled_at < result.orders[0].ordered_at
+    assert result.metadata.warnings == (
+        "broker_fill_precedes_order_create_within_1s=1",
+    )
+    assert result.summary()["warnings"] == [
+        "broker_fill_precedes_order_create_within_1s=1"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("order_time", "updated_time", "deal_time", "deal_change"),
+    [
+        (
+            "2026-07-01 09:30:01.101",
+            "2026-07-01 09:30:01.200",
+            "2026-07-01 09:30:00.100",
+            {},
+        ),
+        (
+            "2026-07-01 09:30:00.474",
+            "2026-07-01 09:30:01.101",
+            "2026-07-01 09:30:00.100",
+            {},
+        ),
+        (
+            "2026-07-01 09:30:00.474",
+            "2026-07-01 09:30:01.099",
+            "2026-07-01 09:30:00.100",
+            {"status": "CHANGED"},
+        ),
+        (
+            "2026-07-01 09:30:00.474",
+            "2026-07-01 09:30:01.099",
+            "2026-07-01 09:30:00.100",
+            {"code": "US.MSFT260717C00200000"},
+        ),
+        (
+            "2026-07-01 09:30:00.474",
+            "2026-07-01 09:30:01.099",
+            "2026-07-01 09:30:00.100",
+            {"trd_side": "SELL"},
+        ),
+    ],
+)
+def test_fill_order_skew_outside_guardrails_still_fails_closed(
+    order_time: str,
+    updated_time: str,
+    deal_time: str,
+    deal_change: dict[str, str],
+) -> None:
+    payload = _payload()
+    order = _records(payload)["orders"][0]
+    deal = _records(payload)["deals"][0]
+    order["create_time"] = order_time
+    order["updated_time"] = updated_time
+    deal["create_time"] = deal_time
+    deal.update(deal_change)
+
+    with pytest.raises(
+        MoomooOpenApiExportError,
+        match="precedes the parent order outside the guarded",
+    ):
+        parse_openapi_export(payload)
 
 
 def test_binary_float_noise_is_removed_without_erasing_small_values() -> None:
@@ -539,6 +941,46 @@ def test_structurally_valid_missing_fee_stays_parseable_but_blocked() -> None:
     assert result.metadata.analysis_ready is False
     assert result.fees == ()
     assert result.metadata.reconciliation.filled_orders_without_fees == 1
+
+
+def test_complete_live_window_without_activity_is_exact_coverage_evidence() -> None:
+    payload = _payload()
+    payload["account"]["binding"] = "d" * 64
+    records = _records(payload)
+    records["orders"] = []
+    records["deals"] = []
+    records["fees"] = []
+    summary = _summary(payload)
+    summary.update(
+        {
+            "retrieval_complete": True,
+            "coverage_complete": True,
+            "has_activity": False,
+            "analysis_ready": True,
+            "reconciliation_status": "passed",
+            "warnings": ["no_filled_orders_in_window"],
+            "activity_sides": {"buy": 0, "sell": 0, "other": 0},
+            "activity_time_range": {"first": None, "last": None},
+            "fee_totals_by_currency": {},
+            "fee_batches": 0,
+        }
+    )
+    summary["counts"] = {
+        "orders": 0,
+        "filled_orders": 0,
+        "fills": 0,
+        "fees": 0,
+        "unique_instruments": 0,
+        "option_activity_rows": 0,
+    }
+
+    result = parse_openapi_export(payload)
+
+    assert result.metadata.analysis_ready is True
+    assert result.metadata.retrieval_complete is True
+    assert result.metadata.coverage_complete is True
+    assert result.metadata.has_activity is False
+    assert result.metadata.account_binding == "d" * 64
 
 
 def test_simulate_export_has_typed_not_applicable_reconciliation() -> None:

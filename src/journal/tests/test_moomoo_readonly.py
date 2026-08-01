@@ -77,6 +77,26 @@ class FakeContext:
         self.closed = True
 
 
+class FakeQuoteContext:
+    def __init__(self, *, snapshots=None, fail=False):
+        self.snapshots = snapshots or []
+        self.fail = fail
+        self.snapshot_calls = []
+        self.closed = False
+
+    def get_market_snapshot(self, codes):
+        self.snapshot_calls.append(list(codes))
+        if self.fail:
+            return 1, "quote entitlement unavailable"
+        requested = set(codes)
+        return 0, pd.DataFrame(
+            row for row in self.snapshots if row.get("code") in requested
+        )
+
+    def close(self):
+        self.closed = True
+
+
 def _config(*, days=8, acc_id=None):
     zone = ZoneInfo("America/New_York")
     start = datetime(2026, 7, 1, tzinfo=zone)
@@ -118,6 +138,8 @@ def _orders(count):
             "dealt_qty": 1,
             "dealt_avg_price": 2.5,
             "currency": "USD",
+            "strategy_type": "SINGLE",
+            "combo_legs": [],
             "acc_id": "must-not-export",
         }
         for index in range(count)
@@ -178,6 +200,7 @@ def test_live_probe_chunks_dedupes_and_caps_fee_batches():
         "orders": 405,
         "fills": 1,
         "fees": 0,
+        "contract_specs": 0,
     }
     assert result.summary["fee_totals_by_currency"] == {"USD": 506.25}
     assert result.summary["reconciliation"] == {
@@ -188,6 +211,7 @@ def test_live_probe_chunks_dedupes_and_caps_fee_batches():
         "fill_side_mismatches": 0,
         "fill_average_price_mismatches": 0,
         "filled_orders_without_fees": 0,
+        "unsupported_combo_orders": 0,
     }
     assert result.summary["warnings"] == [
         "filled_orders_without_fills=404",
@@ -199,6 +223,42 @@ def test_live_probe_chunks_dedupes_and_caps_fee_batches():
     assert len(result.export_payload["records"]["orders"]) == 405
     assert len(result.export_payload["records"]["deals"]) == 1
     assert len(result.export_payload["records"]["fees"]) == 405
+
+
+def test_single_option_execution_captures_broker_contract_specification():
+    ctx = FakeContext(
+        accounts=[_real_account()],
+        orders=_orders(1),
+        deals=_deals(),
+    )
+    quote_ctx = FakeQuoteContext(
+        snapshots=[{
+            "code": "US.AAPL260717C00200000",
+            "lot_size": 100,
+            "option_contract_size": 100,
+            "option_contract_multiplier": 100,
+        }]
+    )
+
+    result = run_readonly_probe(
+        _config(days=1),
+        sdk=SDK,
+        context_factory=lambda _config, _sdk: ctx,
+        quote_context_factory=lambda _config, _sdk: quote_ctx,
+        tcp_probe=lambda *_args: None,
+        sleeper=lambda _seconds: None,
+    )
+
+    assert result.summary["analysis_ready"] is True
+    assert result.summary["contract_spec_status"] == "complete"
+    assert result.summary["counts"]["contract_specs"] == 1
+    assert quote_ctx.snapshot_calls == [["US.AAPL260717C00200000"]]
+    assert result.export_payload["records"]["contract_specs"] == [{
+        "code": "US.AAPL260717C00200000",
+        "lot_size": 100,
+        "option_contract_size": 100,
+        "option_contract_multiplier": 100,
+    }]
 
 
 def test_auto_selection_refuses_ambiguous_real_accounts():
@@ -354,6 +414,108 @@ def test_live_probe_is_analysis_ready_only_after_full_reconciliation():
     assert all(value == 0 for value in result.summary["reconciliation"].values())
 
 
+def test_live_probe_records_complete_no_activity_window_and_account_binding():
+    ctx = FakeContext(accounts=[_real_account()], orders=[], deals=[])
+    config = replace(
+        _config(days=1),
+        account_binding_secret="local-test-secret-that-is-long-enough-1234",
+    )
+
+    result = run_readonly_probe(
+        config,
+        sdk=SDK,
+        context_factory=lambda _config, _sdk: ctx,
+        tcp_probe=lambda *_args: None,
+        sleeper=lambda _seconds: None,
+    )
+
+    assert result.summary["analysis_ready"] is True
+    assert result.summary["retrieval_complete"] is True
+    assert result.summary["coverage_complete"] is True
+    assert result.summary["has_activity"] is False
+    assert result.summary["warnings"] == ["no_filled_orders_in_window"]
+    binding = result.export_payload["account"]["binding"]
+    assert len(binding) == 64
+    assert binding.isalnum()
+    assert set(result.export_payload["account"]) == {
+        "environment",
+        "market",
+        "selection",
+        "binding",
+    }
+
+
+@pytest.mark.parametrize("missing_field", ["strategy_type", "combo_legs"])
+def test_nonempty_order_history_requires_combo_capability_fields(missing_field):
+    order = _orders(1)[0]
+    order.pop(missing_field)
+    ctx = FakeContext(accounts=[_real_account()], orders=[order], deals=[])
+
+    with pytest.raises(MoomooReadonlyError, match="combo capability fields"):
+        run_readonly_probe(
+            _config(days=1),
+            sdk=SDK,
+            context_factory=lambda _config, _sdk: ctx,
+            tcp_probe=lambda *_args: None,
+            sleeper=lambda _seconds: None,
+        )
+
+
+def test_sdk_not_applicable_strategy_is_normalized_only_without_combo_legs():
+    order = _orders(1)[0]
+    order["strategy_type"] = "N/A"
+    ctx = FakeContext(accounts=[_real_account()], orders=[order], deals=_deals())
+
+    result = run_readonly_probe(
+        _config(days=1),
+        sdk=SDK,
+        context_factory=lambda _config, _sdk: ctx,
+        tcp_probe=lambda *_args: None,
+        sleeper=lambda _seconds: None,
+    )
+
+    assert result.export_payload["records"]["orders"][0]["strategy_type"] == "NONE"
+    assert result.export_payload["records"]["orders"][0]["combo_legs"] == []
+
+
+def test_sdk_not_applicable_strategy_with_declared_legs_fails_closed():
+    order = _orders(1)[0]
+    order.update(
+        {
+            "strategy_type": "N/A",
+            "combo_legs": [
+                {"code": "US.AAPL260717C00200000", "trd_side": "BUY", "qty_ratio": 1},
+                {"code": "US.AAPL260717C00210000", "trd_side": "SELL", "qty_ratio": 1},
+            ],
+        }
+    )
+    ctx = FakeContext(accounts=[_real_account()], orders=[order], deals=[])
+
+    with pytest.raises(MoomooReadonlyError, match="unsupported option strategy"):
+        run_readonly_probe(
+            _config(days=1),
+            sdk=SDK,
+            context_factory=lambda _config, _sdk: ctx,
+            tcp_probe=lambda *_args: None,
+            sleeper=lambda _seconds: None,
+        )
+
+
+def test_empty_order_history_does_not_require_combo_capability_columns():
+    ctx = FakeContext(accounts=[_real_account()], orders=[], deals=[])
+
+    result = run_readonly_probe(
+        _config(days=1),
+        sdk=SDK,
+        context_factory=lambda _config, _sdk: ctx,
+        tcp_probe=lambda *_args: None,
+        sleeper=lambda _seconds: None,
+    )
+
+    assert result.summary["analysis_ready"] is True
+    assert result.summary["has_activity"] is False
+
+
 def test_reconciliation_checks_code_side_and_weighted_average():
     orders = _orders(3)
     deals = [
@@ -383,6 +545,263 @@ def test_reconciliation_checks_code_side_and_weighted_average():
     assert reconciliation["fill_side_mismatches"] == 1
     assert reconciliation["fill_average_price_mismatches"] == 1
     assert result.summary["analysis_ready"] is False
+
+
+def test_combo_order_is_structured_reconciled_and_not_a_source_blocker():
+    order = _orders(1)[0]
+    order.update(
+        {
+            "code": "US.COMBO",
+            "trd_side": "BUY",
+            "qty": 2,
+            "dealt_qty": 2,
+            "dealt_avg_price": 99,
+            "strategy_type": "SPREAD",
+            "combo_legs": [
+                SimpleNamespace(
+                    code="US.AAPL260717C00200000",
+                    trd_side="BUY",
+                    qty_ratio=1,
+                    acc_id="must-not-export",
+                ),
+                SimpleNamespace(
+                    code="US.AAPL260717C00210000",
+                    trd_side="SELL",
+                    qty_ratio=2,
+                    acc_id="must-not-export",
+                ),
+            ],
+        }
+    )
+    deals = [
+        {
+            "deal_id": "d-buy",
+            "order_id": "o0",
+            "code": "US.AAPL260717C00200000",
+            "deal_market": "US",
+            "trd_side": "BUY",
+            "qty": 2,
+            "price": 3,
+            "create_time": "2026-07-01 09:30:30",
+            "status": "OK",
+        },
+        {
+            "deal_id": "d-sell",
+            "order_id": "o0",
+            "code": "US.AAPL260717C00210000",
+            "deal_market": "US",
+            "trd_side": "SELL",
+            "qty": 4,
+            "price": 1,
+            "create_time": "2026-07-01 09:30:30",
+            "status": "OK",
+        },
+    ]
+    ctx = FakeContext(accounts=[_real_account()], orders=[order], deals=deals)
+    quote_ctx = FakeQuoteContext(
+        snapshots=[
+            {
+                "code": "US.AAPL260717C00210000",
+                "lot_size": 100,
+                "option_contract_size": 100,
+                "option_contract_multiplier": 100,
+                "acc_id": "must-not-export",
+            },
+            {
+                "code": "US.AAPL260717C00200000",
+                "lot_size": 100,
+                "option_contract_size": 100,
+                "option_contract_multiplier": 100,
+                "acc_id": "must-not-export",
+            },
+        ]
+    )
+
+    result = run_readonly_probe(
+        _config(days=1),
+        sdk=SDK,
+        context_factory=lambda _config, _sdk: ctx,
+        quote_context_factory=lambda _config, _sdk: quote_ctx,
+        tcp_probe=lambda *_args: None,
+        sleeper=lambda _seconds: None,
+    )
+
+    assert result.summary["analysis_ready"] is True
+    assert result.summary["reconciliation_status"] == "passed"
+    assert result.summary["reconciliation"] == {
+        "filled_orders_without_fills": 0,
+        "fills_without_orders": 0,
+        "filled_quantity_mismatches": 0,
+        "fill_code_mismatches": 0,
+        "fill_side_mismatches": 0,
+        "fill_average_price_mismatches": 0,
+        "filled_orders_without_fees": 0,
+        "unsupported_combo_orders": 1,
+    }
+    assert result.summary["warnings"] == ["execution_group_observations=1"]
+    assert result.summary["contract_spec_status"] == "complete"
+    assert result.summary["counts"]["contract_specs"] == 2
+    assert quote_ctx.snapshot_calls == [[
+        "US.AAPL260717C00200000",
+        "US.AAPL260717C00210000",
+    ]]
+    assert quote_ctx.closed is True
+    exported_order = result.export_payload["records"]["orders"][0]
+    assert exported_order["strategy_type"] == "SPREAD"
+    assert exported_order["combo_legs"] == [
+        {
+            "code": "US.AAPL260717C00200000",
+            "trd_side": "BUY",
+            "qty_ratio": 1,
+        },
+        {
+            "code": "US.AAPL260717C00210000",
+            "trd_side": "SELL",
+            "qty_ratio": 2,
+        },
+    ]
+    assert "must-not-export" not in json.dumps(exported_order)
+    assert result.export_payload["records"]["contract_specs"] == [
+        {
+            "code": "US.AAPL260717C00200000",
+            "lot_size": 100,
+            "option_contract_size": 100,
+            "option_contract_multiplier": 100,
+        },
+        {
+            "code": "US.AAPL260717C00210000",
+            "lot_size": 100,
+            "option_contract_size": 100,
+            "option_contract_multiplier": 100,
+        },
+    ]
+    assert "must-not-export" not in json.dumps(
+        result.export_payload["records"]["contract_specs"]
+    )
+
+
+def test_combo_contract_snapshot_failure_degrades_without_losing_trade_evidence():
+    order = _orders(1)[0]
+    order.update(
+        {
+            "code": "US.COMBO",
+            "strategy_type": "SPREAD",
+            "combo_legs": [
+                {"code": "US.AAPL260717C00200000", "trd_side": "BUY", "qty_ratio": 1},
+                {"code": "US.AAPL260717C00210000", "trd_side": "SELL", "qty_ratio": 1},
+            ],
+        }
+    )
+    deals = [
+        {
+            "deal_id": "d-buy",
+            "order_id": "o0",
+            "code": "US.AAPL260717C00200000",
+            "deal_market": "US",
+            "trd_side": "BUY",
+            "qty": 1,
+            "price": 3,
+            "create_time": "2026-07-01 09:30:30",
+            "status": "OK",
+        },
+        {
+            "deal_id": "d-sell",
+            "order_id": "o0",
+            "code": "US.AAPL260717C00210000",
+            "deal_market": "US",
+            "trd_side": "SELL",
+            "qty": 1,
+            "price": 0.5,
+            "create_time": "2026-07-01 09:30:30",
+            "status": "OK",
+        },
+    ]
+    ctx = FakeContext(accounts=[_real_account()], orders=[order], deals=deals)
+    quote_ctx = FakeQuoteContext(fail=True)
+
+    result = run_readonly_probe(
+        _config(days=1),
+        sdk=SDK,
+        context_factory=lambda _config, _sdk: ctx,
+        quote_context_factory=lambda _config, _sdk: quote_ctx,
+        tcp_probe=lambda *_args: None,
+        sleeper=lambda _seconds: None,
+    )
+
+    assert result.summary["analysis_ready"] is True
+    assert result.summary["reconciliation_status"] == "passed"
+    assert result.summary["contract_spec_status"] == "unavailable"
+    assert result.summary["warnings"] == [
+        "execution_group_observations=1",
+        "execution_group_contract_specs_unavailable",
+    ]
+    assert result.export_payload["records"]["contract_specs"] == []
+    assert quote_ctx.closed is True
+
+
+def test_duplicate_order_id_with_drifting_combo_definition_is_rejected():
+    first = _orders(1)[0]
+    first.update(
+        {
+            "strategy_type": "SPREAD",
+            "combo_legs": [
+                {"code": "US.AAPL", "trd_side": "BUY", "qty_ratio": 1},
+                {"code": "US.MSFT", "trd_side": "SELL", "qty_ratio": 1},
+            ],
+        }
+    )
+    second = dict(first)
+    second["combo_legs"] = [
+        {"code": "US.AAPL", "trd_side": "BUY", "qty_ratio": 1},
+        {"code": "US.MSFT", "trd_side": "SELL", "qty_ratio": 2},
+    ]
+
+    class DriftingContext(FakeContext):
+        def history_order_list_query(self, **kwargs):
+            self.order_calls.append(kwargs)
+            row = first if len(self.order_calls) == 1 else second
+            return 0, pd.DataFrame([row])
+
+    ctx = DriftingContext(accounts=[_real_account()], orders=[], deals=[])
+
+    with pytest.raises(MoomooReadonlyError, match="drifting combo definition"):
+        run_readonly_probe(
+            _config(days=8),
+            sdk=SDK,
+            context_factory=lambda _config, _sdk: ctx,
+            tcp_probe=lambda *_args: None,
+            sleeper=lambda _seconds: None,
+        )
+
+
+@pytest.mark.parametrize(
+    "legs",
+    [
+        [],
+        [{"code": "US.AAPL", "trd_side": "BUY", "qty_ratio": 1}],
+        [
+            {"code": "US.AAPL", "trd_side": "BUY", "qty_ratio": 1},
+            {"code": "US.AAPL", "trd_side": "BUY", "qty_ratio": 2},
+        ],
+        [
+            {"code": "US.AAPL", "trd_side": "BUY", "qty_ratio": 0},
+            {"code": "US.MSFT", "trd_side": "SELL", "qty_ratio": 1},
+        ],
+    ],
+)
+def test_probe_rejects_malformed_combo_leg_contract(legs):
+    order = _orders(1)[0]
+    order.update({"strategy_type": "SPREAD", "combo_legs": legs})
+    ctx = FakeContext(accounts=[_real_account()], orders=[order], deals=[])
+
+    with pytest.raises(MoomooReadonlyError, match="combo"):
+        run_readonly_probe(
+            _config(days=1),
+            sdk=SDK,
+            context_factory=lambda _config, _sdk: ctx,
+            tcp_probe=lambda *_args: None,
+            sleeper=lambda _seconds: None,
+        )
 
 
 def test_probe_config_normalizes_programmatic_window_to_market_timezone():

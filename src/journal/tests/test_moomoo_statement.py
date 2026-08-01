@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import csv
 import io
+from dataclasses import replace
 from decimal import Decimal
 from typing import Any, Callable
 
@@ -238,6 +239,49 @@ def _readonly_export() -> dict[str, Any]:
     }
 
 
+def _detailed_only_statement():
+    statement = _statement()
+    return replace(statement, rows_total=2, orders=(statement.orders[0],))
+
+
+def _append_api_only_order(
+    payload: dict[str, Any],
+    *,
+    order_id: str,
+    create_time: str,
+    filled: bool = True,
+) -> None:
+    payload["records"]["orders"].append(
+        {
+            "order_id": order_id,
+            "code": "US.EXAMPLE260717C00200000",
+            "trd_side": "BUY",
+            "qty": 1,
+            "create_time": create_time,
+            "order_status": "FILLED_ALL" if filled else "CANCELLED_ALL",
+            "dealt_qty": 1 if filled else 0,
+            "dealt_avg_price": 2.75 if filled else 0,
+        }
+    )
+    if not filled:
+        return
+    payload["records"]["deals"].append(
+        {
+            "deal_id": f"{order_id}-deal",
+            "order_id": order_id,
+            "qty": 1,
+            "price": 2.75,
+        }
+    )
+    payload["records"]["fees"].append(
+        {
+            "order_id": order_id,
+            "fee_amount": 0.7204,
+            "fee_details": _fee_details(),
+        }
+    )
+
+
 def test_parse_preserves_duplicate_headers_and_identical_fill_rows():
     result = _statement()
 
@@ -369,6 +413,116 @@ def test_matching_readonly_export_is_analysis_ready():
     assert result.statement_fee_total == Decimal("0.7204")
     assert result.api_fee_total == Decimal("0.7204")
     assert result.warnings == ()
+
+
+def test_api_only_order_strictly_after_csv_baseline_is_incremental_tail():
+    statement = _detailed_only_statement()
+    baseline_end = statement.orders[0].fills[-1].filled_at
+    payload = copy.deepcopy(_readonly_export())
+    payload["window"]["end"] = "2026-07-20T11:00:00-04:00"
+    _append_api_only_order(
+        payload,
+        order_id="incremental-tail-order",
+        create_time="2026-07-20 10:00:00",
+    )
+
+    result = reconcile_statement_with_readonly_export(
+        statement,
+        payload,
+        baseline_window_end=baseline_end,
+    )
+
+    assert result.analysis_ready is True
+    assert result.matched_orders == 1
+    assert result.api_only_orders == 1
+    assert result.overlap_api_only_orders == 0
+    assert result.incremental_api_only_orders == 1
+    assert result.statement_fee_total == Decimal("0.7204")
+    assert result.api_fee_total == Decimal("0.7204")
+    assert result.summary()["orders"]["incremental_api_only"] == 1
+    assert result.warnings == ()
+
+
+def test_broker_ids_disambiguate_same_second_incremental_tail_orders():
+    statement = _detailed_only_statement()
+    baseline_end = statement.orders[0].fills[-1].filled_at
+    payload = copy.deepcopy(_readonly_export())
+    payload["window"]["end"] = "2026-07-20T11:00:00-04:00"
+    for order_id in ("tail-order-a", "tail-order-b"):
+        _append_api_only_order(
+            payload,
+            order_id=order_id,
+            create_time="2026-07-20 10:00:00",
+        )
+
+    result = reconcile_statement_with_readonly_export(
+        statement,
+        payload,
+        baseline_window_end=baseline_end,
+    )
+
+    assert result.analysis_ready is True
+    assert result.api_only_orders == 2
+    assert result.incremental_api_only_orders == 2
+    assert result.ambiguous_identity_keys == 0
+
+
+@pytest.mark.parametrize(
+    "create_time",
+    ("2026-07-20 09:15:00", "2026-07-20 09:30:01"),
+    ids=("inside-baseline", "at-baseline-end"),
+)
+def test_api_only_order_inside_csv_baseline_remains_blocking_overlap(
+    create_time: str,
+):
+    statement = _detailed_only_statement()
+    baseline_end = statement.orders[0].fills[-1].filled_at
+    payload = copy.deepcopy(_readonly_export())
+    _append_api_only_order(
+        payload,
+        order_id="overlap-api-only-order",
+        create_time=create_time,
+        filled=False,
+    )
+
+    result = reconcile_statement_with_readonly_export(
+        statement,
+        payload,
+        baseline_window_end=baseline_end,
+    )
+
+    assert result.analysis_ready is False
+    assert result.api_only_orders == 1
+    assert result.overlap_api_only_orders == 1
+    assert result.incremental_api_only_orders == 0
+    assert "cross_source_reconciliation_failed" in result.warnings
+
+
+def test_empty_overlap_with_only_incremental_tail_is_reconciliation_ready():
+    statement = _detailed_only_statement()
+    baseline_end = statement.orders[0].fills[-1].filled_at
+    payload = copy.deepcopy(_readonly_export())
+    payload["window"]["start"] = "2026-07-20T10:00:00-04:00"
+    payload["window"]["end"] = "2026-07-20T11:00:00-04:00"
+    payload["records"] = {"orders": [], "deals": [], "fees": []}
+    _append_api_only_order(
+        payload,
+        order_id="pure-incremental-tail-order",
+        create_time="2026-07-20 10:05:00",
+    )
+
+    result = reconcile_statement_with_readonly_export(
+        statement,
+        payload,
+        baseline_window_end=baseline_end,
+    )
+
+    assert result.analysis_ready is True
+    assert result.statement_orders == 0
+    assert result.matched_orders == 0
+    assert result.overlap_api_only_orders == 0
+    assert result.incremental_api_only_orders == 1
+    assert result.matches == ()
 
 
 def test_statement_internal_inconsistency_blocks_cross_source_ready():
