@@ -2,7 +2,7 @@
 
 > **定位**：这是整个仓库的文档入口。所有 `.md`（除 `docs/CHANGELOG.md` 和仓库根的 `README.md` / `AGENTS.md` / `SKILL.md`）都在这里。
 > **维护者**：[@Cthloveross](https://github.com/Cthloveross)
-> **最后更新**：2026-07-22
+> **最后更新**：2026-07-31
 
 ---
 
@@ -12,6 +12,7 @@
 
 | 你要… | 目录 |
 |---|---|
+| 接手当前项目、核对本地/GitHub/运行状态并继续路线图 | [`HANDOFF.md`](./HANDOFF.md) — 当前总交接入口 |
 | 第一次跑通这个项目 | [`user-guide/`](./user-guide/) — 从安装到每日流程 |
 | 看系统怎么组织、为什么这么设计 | [`architecture/`](./architecture/) — 愿景 + 架构总览 + 改造路线 |
 | 改/扩展某个模块（Journal / Regime / Breakout / Options / Agent Skill） | [`modules/`](./modules/) |
@@ -26,7 +27,10 @@
 | 看 Phase 1 OpenAPI 只读预览与跨批次 canonical 规则 | [`phase1/03_OPENAPI_CANONICAL.md`](./phase1/03_OPENAPI_CANONICAL.md) |
 | 看 Phase 1 canonical 事实如何显式生成可对比仓位构建 | [`phase1/04_CANONICAL_EPISODE_BUILD.md`](./phase1/04_CANONICAL_EPISODE_BUILD.md) |
 | 用案例精选、多周期 K 线、成交证据和按需 AI 复盘一个单合约回合 | [`phase1/05_SINGLE_POSITION_REVIEW_WORKSPACE.md`](./phase1/05_SINGLE_POSITION_REVIEW_WORKSPACE.md) |
-| 看每日机会候选、数据 readiness、异常期权流/场外成交边界与结果闭环计划 | [`phase1/06_DAILY_OPPORTUNITY_BOARD.md`](./phase1/06_DAILY_OPPORTUNITY_BOARD.md) |
+| 看每日机会候选、数据 readiness、异常期权流/场外成交边界与结果闭环 | [`phase1/06_DAILY_OPPORTUNITY_BOARD.md`](./phase1/06_DAILY_OPPORTUNITY_BOARD.md) |
+| 配置 Moomoo、Alpaca、Finnhub、OpenAI 并判断哪些付费 API 暂不需要 | [`integrations/options-research-data-setup.md`](./integrations/options-research-data-setup.md) |
+| 看 5D/20D 结果如何在收盘后自动成熟及其统计门槛 | [`phase1/09_AUTOMATIC_OUTCOME_MAINTENANCE.md`](./phase1/09_AUTOMATIC_OUTCOME_MAINTENANCE.md) |
+| 看 Moomoo 当前期权持仓如何只读双采样、显式确认并作为未来边界锚点 | [`phase1/11_CURRENT_POSITION_SNAPSHOTS.md`](./phase1/11_CURRENT_POSITION_SNAPSHOTS.md) |
 | 查看旧版本文档 | [`archive/`](./archive/) |
 
 > **变更日志** 不在这里 —— 在 [`docs/CHANGELOG.md`](../docs/CHANGELOG.md)（自动化与 AGENTS.md 硬规则依赖该路径）。
@@ -38,6 +42,7 @@
 ```
 New-docs/
 ├── README.md                       ← 本文件（总索引）
+├── HANDOFF.md                      ⭐ 当前总交接手册（目标、架构、状态、运维、Git 与路线图）
 │
 ├── architecture/                   战略 · 架构 · 路线图
 │   ├── 01_PROJECT_VISION_v4.md     Phase 0 历史愿景（策略假设背景）
@@ -88,6 +93,7 @@ New-docs/
 │   ├── bot-command_EN.md           同上（英文）
 │   ├── moomoo-roadmap.md           Moomoo OpenAPI 永久只读接入路线图
 │   ├── moomoo-subscription.md      Moomoo 行情权限速查
+│   ├── options-research-data-setup.md Moomoo/Alpaca/Finnhub/OpenAI 与候选数据源配置
 │   ├── openclaw-skill-integration.md  通过 Openclaw Skill 调用 DSA API
 │   └── bots/                       每个平台的配置图文指南
 │       ├── dingding-bot-config.md  + 8 张截图
@@ -119,7 +125,12 @@ New-docs/
 │   ├── 03_OPENAPI_CANONICAL.md     OpenAPI 只读预览、跨批去重规则与 canonical persistence
 │   ├── 04_CANONICAL_EPISODE_BUILD.md 冻结 canonical replay、显式对比构建与默认视图隔离
 │   ├── 05_SINGLE_POSITION_REVIEW_WORKSPACE.md 案例精选、多周期 K 线、现金流买卖点与只读 AI 复盘边界
-│   └── 06_DAILY_OPPORTUNITY_BOARD.md 确定性候选榜、证据 readiness 与期权流/TRF 路线
+│   ├── 06_DAILY_OPPORTUNITY_BOARD.md 确定性候选榜、证据 readiness 与期权流/TRF 路线
+│   ├── 07_CANONICAL_PREMARKET_RESEARCH_CYCLE.md 盘前研究窗口、门禁与证据合同
+│   ├── 08_SERVER_OWNED_PREMARKET_ORCHESTRATION.md 服务端研究池、租约与 09:12/09:17 调度
+│   ├── 09_AUTOMATIC_OUTCOME_MAINTENANCE.md 收盘后 5D/20D 结果自动成熟与统计护栏
+│   ├── 10_JOURNAL_READONLY_REFRESH.md Journal 每日只读刷新、证据发布与构建激活
+│   └── 11_CURRENT_POSITION_SNAPSHOTS.md Moomoo 当前期权持仓双采样与未来边界锚点
 │
 └── archive/                        归档（旧版本 / 一次性盘点）
     ├── PROJECT_VISION_v1-3.md      旧愿景（已被 architecture/01 取代）
