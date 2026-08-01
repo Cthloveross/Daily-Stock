@@ -585,6 +585,7 @@ class PositionEpisodeEvidenceItem(BaseModel):
     allocation_ratio: Optional[str] = None
     broker_order_observation_id: Optional[int] = None
     broker_fill_observation_id: Optional[int] = None
+    parent_broker_order_observation_id: Optional[int] = None
     allocation: dict[str, Any] = Field(default_factory=dict)
     provenance: dict[str, Any] = Field(default_factory=dict)
 

@@ -524,6 +524,8 @@ export interface PositionEpisodeEvidenceItem {
   allocationRatio?: string | null;
   brokerOrderObservationId?: number | null;
   brokerFillObservationId?: number | null;
+  /** 成交证据的父订单 id（后端联表补出；order XOR fill 约束下 fill 行自身不携带订单 id）。 */
+  parentBrokerOrderObservationId?: number | null;
   allocation: Record<string, unknown>;
   provenance: Record<string, unknown>;
 }

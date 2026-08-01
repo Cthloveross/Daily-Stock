@@ -1,6 +1,15 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, Crosshair, Database, Sparkles, TriangleAlert } from 'lucide-react';
+import {
+  ArrowLeft,
+  ChevronDown,
+  ChevronUp,
+  Crosshair,
+  Database,
+  SkipForward,
+  Sparkles,
+  TriangleAlert,
+} from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
@@ -20,7 +29,6 @@ import { EpisodePlaybookLinksPanel } from '../components/journal/review/EpisodeP
 import { TradeLogicDraftPanel } from '../components/journal/review/TradeLogicDraftPanel';
 import {
   buildEmaOverlay,
-  buildEvidenceMarkers,
   filterCandlesByUsTradingSession,
   findEvidenceAtChartTime,
   isTimeInUsTradingSession,
@@ -29,6 +37,12 @@ import {
   type UsTradingSession,
 } from '../components/journal/review/episodeReviewMapping';
 import {
+  buildOrderAwareEvidenceMarkers,
+  consolidateEvidenceLinks,
+  type EvidenceOrderGroup,
+} from '../components/journal/review/evidenceConsolidation';
+import { findNextReviewEpisode } from '../components/journal/review/nextReviewEpisode';
+import {
   clearEpisodeReviewDraft,
   compactEpisodeReviewUserContext,
   emptyEpisodeReviewDraft,
@@ -36,7 +50,10 @@ import {
   hasEpisodeReviewDraft,
   loadEpisodeReviewDraft,
 } from '../components/journal/review/episodeReviewDraft';
-import { journalReturnPath } from '../components/journal/review/journalReviewRouting';
+import {
+  journalReturnPath,
+  positionReviewPath,
+} from '../components/journal/review/journalReviewRouting';
 import type {
   PositionEpisodeAiReviewResponse,
   PositionEpisodeDetailResponse,
@@ -229,13 +246,222 @@ function HistoryNotice({ state }: { state: ReviewHistoryState }) {
   return null;
 }
 
-function EvidenceTimeline({
-  links,
+function sideLabelOf(side: 'buy' | 'sell' | 'unknown'): string {
+  return side === 'buy' ? '买入' : side === 'sell' ? '卖出' : '方向未知';
+}
+
+function sideToneOf(side: 'buy' | 'sell' | 'unknown'): string {
+  return side === 'buy' ? 'text-chart-5' : side === 'sell' ? 'text-down-strong' : 'text-text-2';
+}
+
+function ProxyBadge({ proxy }: { proxy: boolean }) {
+  return (
+    <span className={`rounded-full border px-2 py-1 text-caption ${
+      proxy
+        ? 'border-warn-strong/30 bg-warn-subtle text-warn-strong'
+        : 'border-chart-5/30 bg-chart-5/10 text-chart-5'
+    }`}>
+      {proxy ? '订单时间代理' : '真实逐笔成交'}
+    </span>
+  );
+}
+
+function EvidenceFillButton({
+  link,
+  badge,
+  selected,
+  selectedRef,
+  usTradingSession,
+  onSelect,
+}: {
+  link: EvidenceChartLink;
+  badge: React.ReactNode;
+  selected: boolean;
+  selectedRef?: React.MutableRefObject<HTMLButtonElement | null>;
+  usTradingSession?: UsTradingSession;
+  onSelect: (link: EvidenceChartLink) => void;
+}) {
+  const evidence = link.evidence;
+  const outsideSelectedSession = usTradingSession != null
+    && !isTimeInUsTradingSession(evidence.evidenceTime, usTradingSession);
+  return (
+    <button
+      ref={selected ? selectedRef : undefined}
+      type="button"
+      aria-pressed={selected}
+      onClick={() => onSelect(link)}
+      className={`w-full rounded-ds-md border p-3 text-left transition-colors ${
+        selected
+          ? 'border-accent bg-accent-subtle-bg'
+          : 'border-subtle bg-bg-1 hover:border-default hover:bg-bg-2'
+      }`}
+    >
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div className="flex items-center gap-2">
+          {badge}
+          <div>
+            <div className={`text-body-sm font-medium ${sideToneOf(link.cashFlowSide)}`}>
+              {sideLabelOf(link.cashFlowSide)}
+            </div>
+            <div className="text-caption text-text-3">回合角色：{eventRoleLabel(evidence.eventRole)}</div>
+            <div className="font-mono text-mono-xs text-text-3">{toEt(evidence.evidenceTime, true)} ET</div>
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center justify-end gap-1.5">
+          <ProxyBadge proxy={link.orderTimeProxy} />
+          {link.chartTime == null && (
+            <span className="rounded-full border border-down-strong/30 bg-down-subtle px-2 py-1 text-caption text-down-strong">
+              {outsideSelectedSession ? '所选时段外' : '行情缺口'}
+            </span>
+          )}
+        </div>
+      </div>
+      <dl className="mt-3 grid grid-cols-3 gap-2">
+        <div>
+          <dt className="text-caption text-text-3">分配数量</dt>
+          <dd className="font-mono text-mono-xs text-text-1">{formatDecimal(evidence.allocatedQuantity)}</dd>
+        </div>
+        <div>
+          <dt className="text-caption text-text-3">现金流</dt>
+          <dd className="font-mono text-mono-xs text-text-1">{formatDecimal(evidence.allocatedCashFlow, true)}</dd>
+        </div>
+        <div>
+          <dt className="text-caption text-text-3">费用</dt>
+          <dd className="font-mono text-mono-xs text-text-1">{formatDecimal(evidence.allocatedFee, true)}</dd>
+        </div>
+      </dl>
+      <p className="mt-2 font-mono text-[11px] text-text-4">
+        {evidence.brokerFillObservationId != null
+          ? `fill observation ${evidence.brokerFillObservationId}`
+          : `order observation ${evidence.brokerOrderObservationId ?? '—'}`}
+      </p>
+    </button>
+  );
+}
+
+function ConsolidatedOrderRow({
+  group,
+  index,
   selectedEvidenceKey,
   usTradingSession,
   onSelect,
 }: {
-  links: EvidenceChartLink[];
+  group: EvidenceOrderGroup;
+  index: number;
+  selectedEvidenceKey?: string | null;
+  usTradingSession?: UsTradingSession;
+  onSelect: (link: EvidenceChartLink) => void;
+}) {
+  const [fillsExpanded, setFillsExpanded] = useState(false);
+  const selected = group.links.some(
+    (link) => link.evidence.evidenceKey === selectedEvidenceKey,
+  );
+  const aggregate = group.aggregate;
+  const orderObservationId = group.links[0].evidence.brokerOrderObservationId;
+  return (
+    <div className={`rounded-ds-md border transition-colors ${
+      selected ? 'border-accent bg-accent-subtle-bg' : 'border-subtle bg-bg-1'
+    }`}>
+      <button
+        type="button"
+        aria-pressed={selected}
+        onClick={() => onSelect(group.links[0])}
+        className="w-full p-3 text-left"
+      >
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <span className="flex h-6 w-6 items-center justify-center rounded-full border border-subtle font-mono text-mono-xs text-text-3">
+              {index + 1}
+            </span>
+            <div>
+              <div className={`text-body-sm font-medium ${sideToneOf(group.cashFlowSide)}`}>
+                {sideLabelOf(group.cashFlowSide)} · 一笔订单
+              </div>
+              <div className="text-caption text-text-3">
+                回合角色：{group.eventRoles.map(eventRoleLabel).join(' / ')}
+              </div>
+              <div className="font-mono text-mono-xs text-text-3">
+                {toEt(aggregate?.firstEvidenceTime, true)} → {toEt(aggregate?.lastEvidenceTime, true)} ET
+              </div>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center justify-end gap-1.5">
+            <span className="rounded-full border border-accent-subtle-border bg-accent-subtle-bg px-2 py-1 text-caption text-accent">
+              分 {group.links.length} 笔成交
+            </span>
+            <ProxyBadge proxy={group.orderTimeProxy} />
+            {group.chartTime == null && (
+              <span className="rounded-full border border-down-strong/30 bg-down-subtle px-2 py-1 text-caption text-down-strong">
+                行情缺口
+              </span>
+            )}
+          </div>
+        </div>
+        <dl className="mt-3 grid grid-cols-3 gap-2">
+          <div>
+            <dt className="text-caption text-text-3">总数量</dt>
+            <dd className="font-mono text-mono-xs text-text-1">
+              {formatDecimal(aggregate?.totalQuantity)}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-caption text-text-3">现金流加权均价</dt>
+            <dd className="font-mono text-mono-xs text-text-1">
+              {formatDecimal(aggregate?.weightedAveragePrice, true)}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-caption text-text-3">合计费用</dt>
+            <dd className={`font-mono text-mono-xs ${aggregate?.feeComplete ? 'text-text-1' : 'text-warn-strong'}`}>
+              {aggregate?.feeComplete ? formatDecimal(aggregate?.totalFee, true) : '费用不完整'}
+            </dd>
+          </div>
+        </dl>
+        <p className="mt-2 font-mono text-[11px] text-text-4">
+          order observation {orderObservationId ?? '—'} · 均价 = ∑|现金流| ÷ (∑数量 × 合约乘数)
+        </p>
+      </button>
+      <div className="border-t border-subtle px-3 py-2">
+        <button
+          type="button"
+          aria-expanded={fillsExpanded}
+          className="inline-flex items-center gap-1.5 text-caption text-text-2 hover:text-text-1"
+          onClick={() => setFillsExpanded((value) => !value)}
+        >
+          {fillsExpanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+          {fillsExpanded ? '收起逐笔成交' : `展开 ${group.links.length} 笔逐笔成交`}
+        </button>
+        {fillsExpanded && (
+          <ol className="mt-2 space-y-2" aria-label="逐笔成交明细">
+            {group.links.map((link, memberIndex) => (
+              <li key={link.evidence.evidenceKey}>
+                <EvidenceFillButton
+                  link={link}
+                  badge={(
+                    <span className="flex h-6 shrink-0 items-center justify-center rounded-full border border-subtle px-2 font-mono text-[10px] text-text-3">
+                      第 {memberIndex + 1} 笔
+                    </span>
+                  )}
+                  selected={link.evidence.evidenceKey === selectedEvidenceKey}
+                  usTradingSession={usTradingSession}
+                  onSelect={onSelect}
+                />
+              </li>
+            ))}
+          </ol>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function EvidenceTimeline({
+  groups,
+  selectedEvidenceKey,
+  usTradingSession,
+  onSelect,
+}: {
+  groups: EvidenceOrderGroup[];
   selectedEvidenceKey?: string | null;
   usTradingSession?: UsTradingSession;
   onSelect: (link: EvidenceChartLink) => void;
@@ -246,7 +472,7 @@ function EvidenceTimeline({
     selectedRef.current?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
   }, [selectedEvidenceKey]);
 
-  if (!links.length) {
+  if (!groups.length) {
     return (
       <div className="rounded-ds-md border border-dashed border-default p-6 text-center text-body-sm text-text-3">
         这个回合没有可展示的 execution evidence；K 线不会生成伪造的进出场标记。
@@ -256,84 +482,32 @@ function EvidenceTimeline({
 
   return (
     <ol className="space-y-2" aria-label="成交证据时间线">
-      {links.map((link, index) => {
-        const evidence = link.evidence;
-        const selected = evidence.evidenceKey === selectedEvidenceKey;
-        const outsideSelectedSession = usTradingSession != null
-          && !isTimeInUsTradingSession(evidence.evidenceTime, usTradingSession);
-        const sideLabel = link.cashFlowSide === 'buy'
-          ? '买入'
-          : link.cashFlowSide === 'sell'
-            ? '卖出'
-            : '方向未知';
-        return (
-          <li key={evidence.evidenceKey}>
-            <button
-              ref={selected ? selectedRef : undefined}
-              type="button"
-              aria-pressed={selected}
-              onClick={() => onSelect(link)}
-              className={`w-full rounded-ds-md border p-3 text-left transition-colors ${
-                selected
-                  ? 'border-accent bg-accent-subtle-bg'
-                  : 'border-subtle bg-bg-1 hover:border-default hover:bg-bg-2'
-              }`}
-            >
-              <div className="flex flex-wrap items-start justify-between gap-2">
-                <div className="flex items-center gap-2">
-                  <span className="flex h-6 w-6 items-center justify-center rounded-full border border-subtle font-mono text-mono-xs text-text-3">
-                    {index + 1}
-                  </span>
-                  <div>
-                    <div className={`text-body-sm font-medium ${
-                      link.cashFlowSide === 'buy'
-                        ? 'text-chart-5'
-                        : link.cashFlowSide === 'sell'
-                          ? 'text-down-strong'
-                          : 'text-text-2'
-                    }`}>{sideLabel}</div>
-                    <div className="text-caption text-text-3">回合角色：{eventRoleLabel(evidence.eventRole)}</div>
-                    <div className="font-mono text-mono-xs text-text-3">{toEt(evidence.evidenceTime, true)} ET</div>
-                  </div>
-                </div>
-                <div className="flex flex-wrap items-center justify-end gap-1.5">
-                  <span className={`rounded-full border px-2 py-1 text-caption ${
-                    link.orderTimeProxy
-                      ? 'border-warn-strong/30 bg-warn-subtle text-warn-strong'
-                      : 'border-chart-5/30 bg-chart-5/10 text-chart-5'
-                  }`}>
-                    {link.orderTimeProxy ? '订单时间代理' : '真实逐笔成交'}
-                  </span>
-                  {link.chartTime == null && (
-                    <span className="rounded-full border border-down-strong/30 bg-down-subtle px-2 py-1 text-caption text-down-strong">
-                      {outsideSelectedSession ? '所选时段外' : '行情缺口'}
-                    </span>
-                  )}
-                </div>
-              </div>
-              <dl className="mt-3 grid grid-cols-3 gap-2">
-                <div>
-                  <dt className="text-caption text-text-3">分配数量</dt>
-                  <dd className="font-mono text-mono-xs text-text-1">{formatDecimal(evidence.allocatedQuantity)}</dd>
-                </div>
-                <div>
-                  <dt className="text-caption text-text-3">现金流</dt>
-                  <dd className="font-mono text-mono-xs text-text-1">{formatDecimal(evidence.allocatedCashFlow, true)}</dd>
-                </div>
-                <div>
-                  <dt className="text-caption text-text-3">费用</dt>
-                  <dd className="font-mono text-mono-xs text-text-1">{formatDecimal(evidence.allocatedFee, true)}</dd>
-                </div>
-              </dl>
-              <p className="mt-2 font-mono text-[11px] text-text-4">
-                {evidence.brokerFillObservationId != null
-                  ? `fill observation ${evidence.brokerFillObservationId}`
-                  : `order observation ${evidence.brokerOrderObservationId ?? '—'}`}
-              </p>
-            </button>
-          </li>
-        );
-      })}
+      {groups.map((group, index) => (
+        <li key={group.groupKey}>
+          {group.consolidated ? (
+            <ConsolidatedOrderRow
+              group={group}
+              index={index}
+              selectedEvidenceKey={selectedEvidenceKey}
+              usTradingSession={usTradingSession}
+              onSelect={onSelect}
+            />
+          ) : (
+            <EvidenceFillButton
+              link={group.links[0]}
+              badge={(
+                <span className="flex h-6 w-6 items-center justify-center rounded-full border border-subtle font-mono text-mono-xs text-text-3">
+                  {index + 1}
+                </span>
+              )}
+              selected={group.links[0].evidence.evidenceKey === selectedEvidenceKey}
+              selectedRef={selectedRef}
+              usTradingSession={usTradingSession}
+              onSelect={onSelect}
+            />
+          )}
+        </li>
+      ))}
     </ol>
   );
 }
@@ -800,6 +974,8 @@ const JournalEpisodeReviewPage: React.FC = () => {
   const [reviewHistory, setReviewHistory] = useState<PositionEpisodeReviewAnnotation[] | null>(null);
   const [reviewHistoryLoading, setReviewHistoryLoading] = useState(false);
   const [reviewHistoryError, setReviewHistoryError] = useState<string | null>(null);
+  const [queueBusy, setQueueBusy] = useState<'skip' | 'draft' | 'complete' | null>(null);
+  const [queueNotice, setQueueNotice] = useState<string | null>(null);
 
   const returnToJournal = useCallback(() => {
     navigate(journalReturnPath(searchParams));
@@ -826,6 +1002,8 @@ const JournalEpisodeReviewPage: React.FC = () => {
       setReviewHistory(null);
       setReviewHistoryLoading(false);
       setReviewHistoryError(null);
+      setQueueBusy(null);
+      setQueueNotice(null);
     });
     void fetchPositionEpisodeDetail(episodeId, buildId)
       .then((response) => {
@@ -930,9 +1108,15 @@ const JournalEpisodeReviewPage: React.FC = () => {
     historyState?.period ?? '5m',
   ), [chartCandles, detail?.evidence, historyState?.period]);
 
+  const evidenceGroups = useMemo(() => consolidateEvidenceLinks(
+    links,
+    historyState?.period ?? '5m',
+    detail?.item.instrument.contractMultiplier,
+  ), [detail?.item.instrument.contractMultiplier, historyState?.period, links]);
+
   const markers = useMemo(
-    () => buildEvidenceMarkers(links, selectedEvidenceKey),
-    [links, selectedEvidenceKey],
+    () => buildOrderAwareEvidenceMarkers(evidenceGroups, selectedEvidenceKey),
+    [evidenceGroups, selectedEvidenceKey],
   );
   const emaOverlays = useMemo(() => {
     return [
@@ -948,6 +1132,14 @@ const JournalEpisodeReviewPage: React.FC = () => {
   };
 
   const selectFromChart = (time: number | string, markerId?: string) => {
+    if (markerId != null) {
+      // 合并 marker 的 id 是订单组键；点击选中该合并行（以首笔 fill 为锚点）。
+      const group = evidenceGroups.find((candidate) => candidate.groupKey === markerId);
+      if (group) {
+        setSelectedEvidenceKey(group.links[0].evidence.evidenceKey);
+        return;
+      }
+    }
     const evidence = markerId
       ? detail?.evidence.find((item) => item.evidenceKey === markerId)
       : findEvidenceAtChartTime(links, time);
@@ -967,18 +1159,20 @@ const JournalEpisodeReviewPage: React.FC = () => {
       .finally(() => setReviewHistoryLoading(false));
   };
 
-  const saveReviewWorkspace = async (reviewStatus: 'in_progress' | 'completed') => {
-    if (!detail || episodeId == null) return;
+  const saveReviewWorkspace = async (
+    reviewStatus: 'in_progress' | 'completed',
+  ): Promise<boolean> => {
+    if (!detail || episodeId == null) return false;
     const selfAuthoredFieldCount = Object.keys(
       compactEpisodeReviewUserContext(tradeLogicDraft),
     ).length;
     if (reviewStatus === 'completed' && selfAuthoredFieldCount === 0) {
       setReviewSaveError('至少填写一项用户自述后才能标记复盘完成');
-      return;
+      return false;
     }
     if (!hasEpisodeReviewDraft(tradeLogicDraft)) {
       setReviewSaveError('至少填写一项内容后才能保存复盘');
-      return;
+      return false;
     }
 
     setReviewSaving(true);
@@ -1009,10 +1203,58 @@ const JournalEpisodeReviewPage: React.FC = () => {
         setReviewHistory(null);
         setReviewHistoryError('复盘已保存，但版本历史暂时读取失败');
       }
+      return true;
     } catch (reason) {
       setReviewSaveError(parseApiError(reason).message);
+      return false;
     } finally {
       setReviewSaving(false);
+    }
+  };
+
+  /**
+   * 解析并跳转「下一笔」：与复盘工作台 CTA 共用 `findNextReviewEpisode`
+   * （进行中 → top_loss 未开始 → 最近未开始），排除当前回合；无命中时
+   * 如实提示队列已清空并提供返回列表入口。
+   */
+  const goToNextEpisode = useCallback(async (): Promise<void> => {
+    const next = await findNextReviewEpisode({
+      buildId,
+      excludeEpisodeId: episodeId,
+    });
+    if (next) {
+      setQueueNotice(null);
+      navigate(positionReviewPath(next.id, searchParams));
+    } else {
+      setQueueNotice('全部回合已完成复盘；当前构建没有下一笔待复盘回合。');
+    }
+  }, [buildId, episodeId, navigate, searchParams]);
+
+  const skipToNextEpisode = async () => {
+    if (queueBusy || reviewSaving) return;
+    setQueueBusy('skip');
+    setQueueNotice(null);
+    try {
+      await goToNextEpisode();
+    } catch (reason) {
+      setQueueNotice(`定位下一笔失败：${parseApiError(reason).message}`);
+    } finally {
+      setQueueBusy(null);
+    }
+  };
+
+  const saveAndNextEpisode = async (reviewStatus: 'in_progress' | 'completed') => {
+    if (queueBusy || reviewSaving) return;
+    setQueueBusy(reviewStatus === 'completed' ? 'complete' : 'draft');
+    setQueueNotice(null);
+    try {
+      const saved = await saveReviewWorkspace(reviewStatus);
+      // 保存失败（校验或网络）时停留在当前页并展示错误，不吞掉草稿。
+      if (saved) await goToNextEpisode();
+    } catch (reason) {
+      setQueueNotice(`定位下一笔失败：${parseApiError(reason).message}`);
+    } finally {
+      setQueueBusy(null);
     }
   };
 
@@ -1058,55 +1300,95 @@ const JournalEpisodeReviewPage: React.FC = () => {
   const displayedNet = item.lifecycleStatus === 'closed' ? item.realizedPnlNet : null;
 
   return (
-    <div className="mx-auto max-w-[1440px] space-y-4 p-4 lg:p-6">
-      <header className="flex flex-wrap items-start justify-between gap-4">
-        <div>
+    <div className="mx-auto max-w-[1720px] space-y-4 p-4 lg:p-6">
+      <div
+        className="sticky top-0 z-30 -mx-4 border-b border-subtle bg-bg-0/95 px-4 py-2.5 backdrop-blur lg:-mx-6 lg:px-6"
+        aria-label="复盘快捷操作"
+        data-testid="review-action-bar"
+      >
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
           <button
             type="button"
-            className="mb-3 inline-flex items-center gap-1.5 text-body-sm text-text-3 hover:text-text-1"
+            className="inline-flex items-center gap-1.5 text-body-sm text-text-3 hover:text-text-1"
             onClick={returnToJournal}
           >
             <ArrowLeft size={15} /> 返回仓位复盘
           </button>
-          <div className="flex flex-wrap items-center gap-2">
-            <h1 className="font-mono text-h1 text-text-1">{item.instrument.rawSymbol}</h1>
-            <span className="rounded-full border border-subtle bg-bg-2 px-2.5 py-1 text-caption text-text-2">
-              {lifecycleLabel(item.lifecycleStatus)}
+          <h1 className="font-mono text-h3 text-text-1">{item.instrument.rawSymbol}</h1>
+          <span className="rounded-full border border-subtle bg-bg-2 px-2.5 py-1 text-caption text-text-2">
+            {lifecycleLabel(item.lifecycleStatus)}
+          </span>
+          {conditional && (
+            <span className="rounded-full border border-warn-strong/30 bg-warn-subtle px-2.5 py-1 text-caption text-warn-strong">
+              条件性结果 · 不进 Headline
             </span>
-            {conditional && (
-              <span className="rounded-full border border-warn-strong/30 bg-warn-subtle px-2.5 py-1 text-caption text-warn-strong">
-                条件性结果 · 不进 Headline
-              </span>
-            )}
+          )}
+          <span className="inline-flex items-baseline gap-1.5">
+            <span className="text-caption text-text-3">Net</span>
+            <span className={`font-mono text-mono-sm ${moneyTone(displayedNet)}`}>
+              {item.lifecycleStatus === 'closed' ? formatDecimal(displayedNet, true) : '窗口末未归零'}
+            </span>
+          </span>
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              className="btn-ghost inline-flex items-center gap-1.5"
+              disabled={queueBusy != null || reviewSaving}
+              onClick={() => void skipToNextEpisode()}
+            >
+              <SkipForward size={14} /> {queueBusy === 'skip' ? '定位下一笔…' : '跳过，下一笔 →'}
+            </button>
+            <button
+              type="button"
+              className="btn-secondary"
+              disabled={queueBusy != null || reviewSaving}
+              onClick={() => void saveAndNextEpisode('in_progress')}
+            >
+              {queueBusy === 'draft' ? '保存草稿中…' : '保存草稿并下一笔'}
+            </button>
+            <button
+              type="button"
+              className="btn-primary"
+              disabled={queueBusy != null || reviewSaving}
+              onClick={() => void saveAndNextEpisode('completed')}
+            >
+              {queueBusy === 'complete' ? '完成复盘中…' : '完成复盘并下一笔'}
+            </button>
           </div>
-          <p className="mt-1 text-body-sm text-text-3">
-            {item.instrument.underlying} 底层行情 · 构建 #{detail.build.id} · 不可变 execution evidence
-          </p>
         </div>
-        <span className="rounded-full border border-up-strong/25 bg-up-subtle px-3 py-1 text-caption text-up-strong">
-          Moomoo 只读 · 不下单
-        </span>
-      </header>
-
-      <section className="rounded-ds-md border border-accent/20 bg-accent/5 p-4" aria-label="复盘口径">
-        <div className="text-label uppercase tracking-label text-accent">Historical reconstruction · Not live positions</div>
-        <h2 className="mt-1 text-h2 text-text-1">证据窗口与窗口末投影</h2>
-        <dl className="mt-3 grid gap-3 sm:grid-cols-2">
-          <div>
-            <dt className="text-caption text-text-3">证据窗口（ET）起—止</dt>
-            <dd className="mt-1 font-mono text-mono-xs text-text-1">
-              {toEt(detail.build.sourceWindowStart, true)} — {toEt(detail.build.sourceCutoffAt, true)}
-            </dd>
-          </div>
-          <div>
-            <dt className="text-caption text-text-3">窗口末投影 as-of（ET）</dt>
-            <dd className="mt-1 font-mono text-mono-xs text-text-1">{toEt(detail.build.sourceCutoffAt, true)}</dd>
-          </div>
-        </dl>
-        <p className="mt-3 text-caption leading-relaxed text-text-3">
-          本页重放到上述 as-of 时点。“证据窗口末数量”只属于这段历史证据，不等于券商当前持仓。
+        <p className="mt-1 text-caption text-text-3">
+          {item.instrument.underlying} 底层行情 · 构建 #{detail.build.id} · 不可变 execution evidence · Moomoo 只读 · 不下单 · 下一笔优先级：进行中 → 亏损最大的未复盘 → 最近未开始
         </p>
-      </section>
+        {queueNotice && (
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-caption text-warn-strong" role="status">
+            <span>{queueNotice}</span>
+            <button
+              type="button"
+              className="text-accent underline-offset-2 hover:underline"
+              onClick={returnToJournal}
+            >
+              返回仓位列表
+            </button>
+          </div>
+        )}
+        {reviewSaveError && (
+          <p className="mt-2 text-caption text-down-strong" role="alert">
+            保存未成功：{reviewSaveError}
+          </p>
+        )}
+      </div>
+
+      {/*
+        ≥1280px（xl）双列：左列 = 摘要 + K 线与事件 + 成交证据时间线；
+        右列 = 复盘工作单（sticky，可独立滚动）。窄屏单列且工作单紧跟
+        顶部操作条（order-1），证据区随后。
+      */}
+      <section
+        className="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(400px,460px)]"
+        aria-label="复盘主区"
+        data-testid="review-columns"
+      >
+        <div className="order-2 min-w-0 space-y-4 xl:order-1" data-testid="review-evidence-column">
 
       {item.quality.assumedFlatUnverified && (
         <InlineAlert
@@ -1145,7 +1427,6 @@ const JournalEpisodeReviewPage: React.FC = () => {
       {historyState && <HistoryNotice state={historyState} />}
       {historyError && <ApiErrorAlert error={historyError} />}
 
-      <section className="grid min-h-0 gap-4 xl:grid-cols-[minmax(0,1fr)_390px]">
         <div className="card-base min-w-0 overflow-hidden">
           <div className="flex flex-wrap items-start justify-between gap-3 border-b border-subtle px-4 py-3">
             <div>
@@ -1259,52 +1540,55 @@ const JournalEpisodeReviewPage: React.FC = () => {
                 <div className="text-label uppercase tracking-label text-text-3">Execution evidence</div>
                 <h2 className="mt-1 text-h2 text-text-1">成交证据时间线</h2>
               </div>
-              <span className="font-mono text-mono-xs text-text-3">{links.length} 条</span>
+              <span className="font-mono text-mono-xs text-text-3">
+                {evidenceGroups.length} 项 · {links.length} 条证据
+              </span>
             </div>
-            <p className="mt-1 text-caption text-text-3">点击证据聚焦 K 线；点击带事件的 K 线 bar 会高亮对应证据。</p>
+            <p className="mt-1 text-caption text-text-3">
+              点击证据聚焦 K 线；点击带事件的 K 线 bar 会高亮对应证据。同一订单的分批成交已合并展示，可展开逐笔审阅。
+            </p>
           </div>
           <div className="max-h-[590px] overflow-y-auto p-3">
             <EvidenceTimeline
-              links={links}
+              groups={evidenceGroups}
               selectedEvidenceKey={selectedEvidenceKey}
               usTradingSession={historyState?.mode === 'intraday' ? tradingSession : undefined}
               onSelect={selectEvidence}
             />
           </div>
         </aside>
+        </div>
+
+        <div className="order-1 min-w-0 xl:order-2" data-testid="review-worksheet-column">
+          <div className="xl:sticky xl:top-24 xl:max-h-[calc(100vh-7rem)] xl:overflow-y-auto xl:pr-1">
+            <TradeLogicDraftPanel
+              key={`draft:${episodeId}:${detail.build.id}`}
+              episodeId={episodeId}
+              buildId={detail.build.id}
+              draft={tradeLogicDraft}
+              onChange={(nextDraft) => {
+                setTradeLogicDraft(nextDraft);
+                setReviewRestoreNotice(null);
+                setReviewSaveNotice(null);
+                setReviewSaveError(null);
+              }}
+              annotation={reviewAnnotation}
+              annotationLoading={reviewAnnotationLoading}
+              saving={reviewSaving}
+              saveError={reviewSaveError}
+              saveNotice={reviewSaveNotice}
+              restoreNotice={reviewRestoreNotice}
+              history={reviewHistory}
+              historyLoading={reviewHistoryLoading}
+              historyError={reviewHistoryError}
+              onSave={(status) => {
+                void saveReviewWorkspace(status);
+              }}
+              onLoadHistory={loadSavedReviewHistory}
+            />
+          </div>
+        </div>
       </section>
-
-      <TradeLogicDraftPanel
-        key={`draft:${episodeId}:${detail.build.id}`}
-        episodeId={episodeId}
-        buildId={detail.build.id}
-        draft={tradeLogicDraft}
-        onChange={(nextDraft) => {
-          setTradeLogicDraft(nextDraft);
-          setReviewRestoreNotice(null);
-          setReviewSaveNotice(null);
-          setReviewSaveError(null);
-        }}
-        annotation={reviewAnnotation}
-        annotationLoading={reviewAnnotationLoading}
-        saving={reviewSaving}
-        saveError={reviewSaveError}
-        saveNotice={reviewSaveNotice}
-        restoreNotice={reviewRestoreNotice}
-        history={reviewHistory}
-        historyLoading={reviewHistoryLoading}
-        historyError={reviewHistoryError}
-        onSave={(status) => {
-          void saveReviewWorkspace(status);
-        }}
-        onLoadHistory={loadSavedReviewHistory}
-      />
-
-      <EpisodePlaybookLinksPanel
-        key={`playbook-links:${episodeId}:${detail.build.id}`}
-        episodeId={episodeId}
-        buildId={detail.build.id}
-      />
 
       <AiReviewPanel
         key={`ai:${episodeId}:${detail.build.id}`}
@@ -1313,23 +1597,50 @@ const JournalEpisodeReviewPage: React.FC = () => {
         userContext={tradeLogicDraft}
       />
 
-      <details className="card-base p-4">
+      <EpisodePlaybookLinksPanel
+        key={`playbook-links:${episodeId}:${detail.build.id}`}
+        episodeId={episodeId}
+        buildId={detail.build.id}
+      />
+
+      <details className="card-base p-4" data-testid="evidence-details">
         <summary className="flex cursor-pointer list-none items-center gap-2 text-body-sm text-text-2">
-          <Database size={14} /> 查看技术证据与来源信息
+          <Database size={14} /> 证据明细 · 证据窗口、窗口末投影与技术来源（默认折叠）
         </summary>
-        <div className="mt-4 grid gap-3 lg:grid-cols-3">
-          {[
-            ['Matching', detail.matching],
-            ['Completeness', detail.completeness],
-            ['Provenance', detail.provenance],
-          ].map(([title, value]) => (
-            <section key={title as string} className="rounded-ds-md border border-subtle bg-bg-2 p-3">
-              <h3 className="text-label uppercase tracking-label text-text-3">{title as string}</h3>
-              <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] text-text-2">
-                {JSON.stringify(value, null, 2)}
-              </pre>
-            </section>
-          ))}
+        <div className="mt-4 space-y-4">
+          <section className="rounded-ds-md border border-accent/20 bg-accent/5 p-4" aria-label="复盘口径">
+            <div className="text-label uppercase tracking-label text-accent">Historical reconstruction · Not live positions</div>
+            <h2 className="mt-1 text-h2 text-text-1">证据窗口与窗口末投影</h2>
+            <dl className="mt-3 grid gap-3 sm:grid-cols-2">
+              <div>
+                <dt className="text-caption text-text-3">证据窗口（ET）起—止</dt>
+                <dd className="mt-1 font-mono text-mono-xs text-text-1">
+                  {toEt(detail.build.sourceWindowStart, true)} — {toEt(detail.build.sourceCutoffAt, true)}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-caption text-text-3">窗口末投影 as-of（ET）</dt>
+                <dd className="mt-1 font-mono text-mono-xs text-text-1">{toEt(detail.build.sourceCutoffAt, true)}</dd>
+              </div>
+            </dl>
+            <p className="mt-3 text-caption leading-relaxed text-text-3">
+              本页重放到上述 as-of 时点。“证据窗口末数量”只属于这段历史证据，不等于券商当前持仓。
+            </p>
+          </section>
+          <div className="grid gap-3 lg:grid-cols-3">
+            {[
+              ['Matching', detail.matching],
+              ['Completeness', detail.completeness],
+              ['Provenance', detail.provenance],
+            ].map(([title, value]) => (
+              <section key={title as string} className="rounded-ds-md border border-subtle bg-bg-2 p-3">
+                <h3 className="text-label uppercase tracking-label text-text-3">{title as string}</h3>
+                <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] text-text-2">
+                  {JSON.stringify(value, null, 2)}
+                </pre>
+              </section>
+            ))}
+          </div>
         </div>
       </details>
     </div>

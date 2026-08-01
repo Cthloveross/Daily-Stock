@@ -1035,6 +1035,9 @@ def get_position_episode_v2(
                 broker_fill_observation_id=(
                     item.broker_fill_observation_id
                 ),
+                parent_broker_order_observation_id=getattr(
+                    item, "parent_broker_order_observation_id", None
+                ),
                 allocation=_stringify_nested_decimals(
                     dict(item.allocation_evidence)
                 ),

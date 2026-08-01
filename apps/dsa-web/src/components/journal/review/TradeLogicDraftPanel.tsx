@@ -1,6 +1,8 @@
 import { useState } from 'react';
 import {
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   FilePenLine,
   HardDrive,
   History,
@@ -39,8 +41,8 @@ interface FieldDefinition {
 const PRE_TRADE_FIELDS: FieldDefinition[] = [
   {
     field: 'setupThesis',
-    label: '策略假设 / Setup thesis',
-    helper: '当时看到的结构、方向假设与预期路径。',
+    label: '进场逻辑回忆 / Entry rationale',
+    helper: '当时为什么进场：看到的结构、方向假设与预期路径。',
     placeholder: '例：大盘维持上升趋势，底层回踩 8 EMA 后预期延续；若不是当时写下的，请明确标注为回忆。',
   },
   {
@@ -72,11 +74,39 @@ const POST_TRADE_FIELDS: FieldDefinition[] = [
   },
   {
     field: 'postTradeReflection',
-    label: '事后反思 / Post-trade reflection',
+    label: '复盘反思 / Post-trade reflection',
     helper: '只在这里写结果已知后的观察、偏差与下一次可验证的改进。',
     placeholder: '例：入场符合计划，但加仓没有新触发；下次只有重新站稳结构位才允许加仓。',
   },
 ];
+
+/** 快速复盘默认只展示这两个字段；其余四项在「展开完整工作单」后可见。 */
+const COMPACT_FIELDS: FieldDefinition[] = [
+  PRE_TRADE_FIELDS[0],
+  POST_TRADE_FIELDS[1],
+];
+
+/** 一键写入 `errorTypes` 的预设错误类型（与自由文本共用同一字段，去重）。 */
+const ERROR_TYPE_PRESETS = [
+  '追高进场',
+  '逆势抗单',
+  '仓位过大',
+  '无进场计划',
+  '提前止盈',
+  '止损未执行',
+  '情绪交易',
+  '过度交易',
+] as const;
+
+/** 一键写入 `tags` 的预设交易风格标签（与自由文本共用同一字段，去重）。 */
+const STYLE_TAG_PRESETS = [
+  '突破',
+  '回调',
+  '趋势跟随',
+  '事件驱动',
+  '剥头皮',
+  '波段',
+] as const;
 
 const REVIEW_STATUS_LABELS: Record<PositionEpisodeReviewStatus, string> = {
   not_started: '未开始',
@@ -213,6 +243,7 @@ export function TradeLogicDraftPanel({
   );
   const [limitMessage, setLimitMessage] = useState<string | null>(null);
   const [labelsResetVersion, setLabelsResetVersion] = useState(0);
+  const [expanded, setExpanded] = useState(false);
 
   const updateField = (field: DraftField, value: string) => {
     const exceedsFieldLimit = episodeReviewTextCharacterCount(value)
@@ -255,6 +286,24 @@ export function TradeLogicDraftPanel({
     );
   };
 
+  /** 预设 chip 点击：写入/移除对应分类字段，与自由文本共用一份数据并去重。 */
+  const toggleQuickLabel = (field: 'tags' | 'errorTypes', label: string) => {
+    const current = draft[field];
+    const nextValues = current.includes(label)
+      ? current.filter((item) => item !== label)
+      : [...current, label];
+    const next = { ...draft, [field]: nextValues };
+    onChange(next);
+    // 让自由文本输入框以最新分类值重挂载，避免 chip 与手输内容互相覆盖。
+    setLabelsResetVersion((value) => value + 1);
+    const saved = saveEpisodeReviewDraft(buildId, episodeId, next);
+    setSaveMessage(
+      saved
+        ? (hasEpisodeReviewDraft(next) ? '未提交更改已保存在本机' : '空草稿已从本机移除')
+        : '浏览器本机存储不可用；内容仅保留在当前页面',
+    );
+  };
+
   const clearDraft = () => {
     onChange(emptyEpisodeReviewDraft());
     setLabelsResetVersion((value) => value + 1);
@@ -282,6 +331,43 @@ export function TradeLogicDraftPanel({
   const hasDraft = hasEpisodeReviewDraft(draft);
   const completionDisabled = fieldCount === 0;
   const status = annotation?.reviewStatus ?? 'not_started';
+  const compactFieldSet = new Set(COMPACT_FIELDS.map((definition) => definition.field));
+  const hiddenFilledCount = [...PRE_TRADE_FIELDS, ...POST_TRADE_FIELDS]
+    .filter(({ field }) => !compactFieldSet.has(field) && draft[field].trim())
+    .length;
+
+  const renderQuickChips = (
+    groupLabel: string,
+    presets: readonly string[],
+    field: 'tags' | 'errorTypes',
+  ) => (
+    // aria-label 加后缀，避免与下方同名自由文本输入框的标签冲突。
+    <div role="group" aria-label={`${groupLabel}快速标注`}>
+      <div className="text-caption text-text-3">{groupLabel}</div>
+      <div className="mt-1.5 flex flex-wrap gap-1.5">
+        {presets.map((label) => {
+          const active = draft[field].includes(label);
+          return (
+            <button
+              key={label}
+              type="button"
+              aria-pressed={active}
+              className={`rounded-full border px-2.5 py-1 text-caption transition-colors ${
+                active
+                  ? field === 'errorTypes'
+                    ? 'border-warn-strong/40 bg-warn-subtle text-warn-strong'
+                    : 'border-accent bg-accent-subtle-bg text-accent'
+                  : 'border-subtle bg-bg-2 text-text-2 hover:border-default hover:text-text-1'
+              }`}
+              onClick={() => toggleQuickLabel(field, label)}
+            >
+              {label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
 
   return (
     <section className="card-base overflow-hidden" aria-labelledby="trade-logic-draft-title">
@@ -322,32 +408,18 @@ export function TradeLogicDraftPanel({
       </div>
 
       <div className="space-y-4 p-4">
-        <div className="flex flex-wrap items-start justify-between gap-3 rounded-ds-md border border-up-strong/20 bg-up-subtle p-3">
-          <div className="flex items-start gap-2">
-            <HardDrive size={15} className="mt-0.5 shrink-0 text-up-strong" />
-            <div>
-              <p className="text-body-sm font-medium text-text-1">服务器版本 + 本机未提交草稿</p>
-              <ul className="mt-1 space-y-1 text-caption text-text-3">
-                <li>• 点击下方保存按钮才会写入复盘版本；未提交更改按构建 #{buildId} 与回合 #{episodeId} 留在本机。</li>
-                <li>• 复盘版本只保存你的自述、标签与错误分类，不修改 Moomoo 或 execution evidence。</li>
-                <li>• 点击“生成证据复盘”时，非空草稿会发送给本机服务，不会调用外部模型。</li>
-                <li>• 点击“模型增强”时，非空草稿还会发送给你配置的第三方模型供应商。</li>
-              </ul>
-            </div>
-          </div>
-          <div className="flex flex-wrap items-center justify-end gap-3">
-            <span className="text-right text-caption text-text-3" role="status" aria-live="polite">
-              {saveNotice ?? restoreNotice ?? saveMessage}
-            </span>
-            <button
-              type="button"
-              className="btn-ghost inline-flex items-center gap-1.5"
-              disabled={!hasDraft || saving}
-              onClick={clearDraft}
-            >
-              <Trash2 size={13} /> 清空当前编辑
-            </button>
-          </div>
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-ds-md border border-subtle bg-bg-2 px-3 py-2">
+          <span className="text-caption text-text-3" role="status" aria-live="polite">
+            {saveNotice ?? restoreNotice ?? saveMessage}
+          </span>
+          <button
+            type="button"
+            className="btn-ghost inline-flex items-center gap-1.5"
+            disabled={!hasDraft || saving}
+            onClick={clearDraft}
+          >
+            <Trash2 size={13} /> 清空当前编辑
+          </button>
         </div>
 
         {(limitMessage || totalLimitReached) && (
@@ -368,22 +440,81 @@ export function TradeLogicDraftPanel({
           </div>
         )}
 
-        <fieldset className="rounded-ds-md border border-accent-subtle-border bg-accent-subtle-bg/30 p-3">
-          <legend className="px-1 text-body-sm font-semibold text-text-1">事后回忆的进场前计划 · 只写当时可知信息</legend>
-          <div className="mb-3 mt-1 flex items-start gap-2 text-caption text-text-3">
-            <ShieldCheck size={14} className="mt-0.5 shrink-0 text-accent" />
-            <p>这是事后补录：若内容来自当时的笔记，请注明来源；否则系统只把它视为你的回忆。如果当时没有明确计划，请写“当时未定义”，不要根据盈亏倒推一个 setup。</p>
+        <fieldset className="rounded-ds-md border border-subtle bg-bg-1 p-3" aria-label="快速标注">
+          <legend className="px-1 text-body-sm font-semibold text-text-1">快速标注 · 点选即写入分类</legend>
+          <p className="mb-3 mt-1 text-caption text-text-3">
+            点一下写入、再点取消；与下方自由文本共用同一份标签与错误类型字段，重复项自动去重。
+          </p>
+          <div className="space-y-3">
+            {renderQuickChips('错误类型', ERROR_TYPE_PRESETS, 'errorTypes')}
+            {renderQuickChips('交易风格标签', STYLE_TAG_PRESETS, 'tags')}
           </div>
-          <div className="grid gap-3 lg:grid-cols-2">{renderFields(PRE_TRADE_FIELDS)}</div>
         </fieldset>
 
-        <fieldset className="rounded-ds-md border border-warn-strong/20 bg-warn-subtle/30 p-3">
-          <legend className="px-1 text-body-sm font-semibold text-text-1">交易后记录 · 结果已知后的观察</legend>
-          <p className="mb-3 mt-1 text-caption text-text-3">
-            出场事实和事后反思放在这里，系统不会把它们伪装成进场前就已经知道的条件。
-          </p>
-          <div className="grid gap-3 lg:grid-cols-2">{renderFields(POST_TRADE_FIELDS)}</div>
-        </fieldset>
+        {!expanded && (
+          <fieldset className="rounded-ds-md border border-accent-subtle-border bg-accent-subtle-bg/30 p-3">
+            <legend className="px-1 text-body-sm font-semibold text-text-1">快速复盘 · 进场逻辑与反思</legend>
+            <p className="mb-3 mt-1 text-caption text-text-3">
+              两句话即可保存复盘；这是事后补录，若内容来自当时的笔记请注明来源。需要完整六项自述时展开完整工作单。
+            </p>
+            <div className="grid gap-3">{renderFields(COMPACT_FIELDS)}</div>
+          </fieldset>
+        )}
+
+        {expanded && (
+          <>
+            <fieldset className="rounded-ds-md border border-accent-subtle-border bg-accent-subtle-bg/30 p-3">
+              <legend className="px-1 text-body-sm font-semibold text-text-1">事后回忆的进场前计划 · 只写当时可知信息</legend>
+              <div className="mb-3 mt-1 flex items-start gap-2 text-caption text-text-3">
+                <ShieldCheck size={14} className="mt-0.5 shrink-0 text-accent" />
+                <p>这是事后补录：若内容来自当时的笔记，请注明来源；否则系统只把它视为你的回忆。如果当时没有明确计划，请写“当时未定义”，不要根据盈亏倒推一个 setup。</p>
+              </div>
+              <div className="grid gap-3 lg:grid-cols-2">{renderFields(PRE_TRADE_FIELDS)}</div>
+            </fieldset>
+
+            <fieldset className="rounded-ds-md border border-warn-strong/20 bg-warn-subtle/30 p-3">
+              <legend className="px-1 text-body-sm font-semibold text-text-1">交易后记录 · 结果已知后的观察</legend>
+              <p className="mb-3 mt-1 text-caption text-text-3">
+                出场事实和事后反思放在这里，系统不会把它们伪装成进场前就已经知道的条件。
+              </p>
+              <div className="grid gap-3 lg:grid-cols-2">{renderFields(POST_TRADE_FIELDS)}</div>
+            </fieldset>
+
+            <div className="flex flex-wrap items-start justify-between gap-3 rounded-ds-md border border-up-strong/20 bg-up-subtle p-3">
+              <div className="flex items-start gap-2">
+                <HardDrive size={15} className="mt-0.5 shrink-0 text-up-strong" />
+                <div>
+                  <p className="text-body-sm font-medium text-text-1">服务器版本 + 本机未提交草稿</p>
+                  <ul className="mt-1 space-y-1 text-caption text-text-3">
+                    <li>• 点击下方保存按钮才会写入复盘版本；未提交更改按构建 #{buildId} 与回合 #{episodeId} 留在本机。</li>
+                    <li>• 复盘版本只保存你的自述、标签与错误分类，不修改 Moomoo 或 execution evidence。</li>
+                    <li>• 点击“生成证据复盘”时，非空草稿会发送给本机服务，不会调用外部模型。</li>
+                    <li>• 点击“模型增强”时，非空草稿还会发送给你配置的第三方模型供应商。</li>
+                  </ul>
+                </div>
+              </div>
+            </div>
+          </>
+        )}
+
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            className="btn-secondary inline-flex items-center gap-1.5"
+            aria-expanded={expanded}
+            onClick={() => setExpanded((value) => !value)}
+          >
+            {expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+            {expanded ? '收起完整工作单' : '展开完整工作单'}
+          </button>
+          {!expanded && (
+            <span className="text-caption text-text-3">
+              {hiddenFilledCount > 0
+                ? `已折叠字段中有 ${hiddenFilledCount} 项内容（进场触发、失效点、仓位理由、出场原因）`
+                : '进场触发、失效点与止损、仓位理由、实际出场原因已折叠'}
+            </span>
+          )}
+        </div>
 
         <fieldset className="rounded-ds-md border border-subtle bg-bg-1 p-3">
           <legend className="px-1 text-body-sm font-semibold text-text-1">复盘分类 · 用户自述元数据</legend>

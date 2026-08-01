@@ -17,6 +17,7 @@ const apiMocks = vi.hoisted(() => ({
   fetchReviewHistory: vi.fn(),
   saveReview: vi.fn(),
   getHistory: vi.fn(),
+  fetchEpisodes: vi.fn(),
 }));
 
 vi.mock('../../api/journal', () => ({
@@ -25,6 +26,7 @@ vi.mock('../../api/journal', () => ({
   fetchLatestPositionEpisodeReviewAnnotation: apiMocks.fetchLatestReview,
   fetchPositionEpisodeReviewAnnotationHistory: apiMocks.fetchReviewHistory,
   savePositionEpisodeReviewAnnotation: apiMocks.saveReview,
+  fetchPositionEpisodes: apiMocks.fetchEpisodes,
 }));
 
 vi.mock('../../api/stocks', () => ({
@@ -284,7 +286,8 @@ const savedReviewAnnotation = {
 
 function LocationProbe() {
   const location = useLocation();
-  return <output data-testid="location">{location.pathname}{location.search}</output>;
+  // 用无隐式 ARIA role 的元素，避免与页面内 role="status" 的断言相互干扰。
+  return <div data-testid="location">{location.pathname}{location.search}</div>;
 }
 
 function renderPage() {
@@ -293,11 +296,23 @@ function renderPage() {
       '/journal/review/41?build_id=9&symbol=NVDA&status=open&completeness=partial&case=largest_fee&page=3',
     ]}>
       <Routes>
-        <Route path="/journal/review/:episodeId" element={<JournalEpisodeReviewPage />} />
+        <Route
+          path="/journal/review/:episodeId"
+          element={(
+            <>
+              <JournalEpisodeReviewPage />
+              <LocationProbe />
+            </>
+          )}
+        />
         <Route path="/journal" element={<LocationProbe />} />
       </Routes>
     </MemoryRouter>,
   );
+}
+
+function expandFullWorksheet() {
+  fireEvent.click(screen.getByRole('button', { name: '展开完整工作单' }));
 }
 
 describe('JournalEpisodeReviewPage', () => {
@@ -316,6 +331,13 @@ describe('JournalEpisodeReviewPage', () => {
       idempotentReplay: false,
       annotation: savedReviewAnnotation,
     });
+    apiMocks.fetchEpisodes.mockResolvedValue({
+      dataState: 'ready',
+      total: 0,
+      page: 1,
+      perPage: 5,
+      items: [],
+    });
   });
 
   afterEach(() => {
@@ -328,10 +350,6 @@ describe('JournalEpisodeReviewPage', () => {
     expect(await screen.findByText('NVDA260731C00150000')).toBeInTheDocument();
     expect(apiMocks.fetchDetail).toHaveBeenCalledWith(41, 9);
     expect(screen.getByText('证据窗口内已归零')).toBeInTheDocument();
-    const replayBasis = screen.getByRole('region', { name: '复盘口径' });
-    expect(within(replayBasis).getByText('证据窗口（ET）起—止')).toBeInTheDocument();
-    expect(within(replayBasis).getByText('窗口末投影 as-of（ET）')).toBeInTheDocument();
-    expect(within(replayBasis).getByText(/不等于券商当前持仓/)).toBeInTheDocument();
     expect(screen.getByText(/当前时点的券商持仓快照，也不能倒推这个历史证据窗口的期初持仓/)).toBeInTheDocument();
     await waitFor(() => expect(apiMocks.getHistory).toHaveBeenCalledWith('NVDA', '5m', expect.any(Number)));
     expect(await screen.findByText('5 分钟 · YFinanceFetcher')).toBeInTheDocument();
@@ -536,6 +554,7 @@ describe('JournalEpisodeReviewPage', () => {
     renderPage();
 
     expect(await screen.findByRole('heading', { name: '交易逻辑草稿' })).toBeInTheDocument();
+    expandFullWorksheet();
     expect(screen.getByText('事后回忆的进场前计划 · 只写当时可知信息')).toBeInTheDocument();
     expect(screen.getByText('交易后记录 · 结果已知后的观察')).toBeInTheDocument();
     expect(screen.getByText(/服务器版本 \+ 本机未提交草稿/)).toBeInTheDocument();
@@ -543,7 +562,7 @@ describe('JournalEpisodeReviewPage', () => {
     expect(screen.getByText(/发送给本机服务，不会调用外部模型/)).toBeInTheDocument();
     expect(screen.getByText(/发送给你配置的第三方模型供应商/)).toBeInTheDocument();
 
-    fireEvent.change(screen.getByLabelText('策略假设 / Setup thesis'), {
+    fireEvent.change(screen.getByLabelText('进场逻辑回忆 / Entry rationale'), {
       target: { value: '  回踩 8 EMA 后延续  ' },
     });
     fireEvent.change(screen.getByLabelText('实际出场原因 / Exit reason'), {
@@ -585,6 +604,8 @@ describe('JournalEpisodeReviewPage', () => {
     renderPage();
 
     expect(await screen.findByDisplayValue('服务器保存的趋势延续假设')).toBeInTheDocument();
+    expect(screen.getByText(/已折叠字段中有 4 项内容/)).toBeInTheDocument();
+    expandFullWorksheet();
     expect(screen.getByLabelText('进场触发 / Entry trigger')).toHaveValue('收回前高');
     expect(screen.getByLabelText('复盘标签')).toHaveValue('趋势延续, 早盘');
     expect(screen.getByText('复盘 · 进行中')).toBeInTheDocument();
@@ -637,7 +658,7 @@ describe('JournalEpisodeReviewPage', () => {
 
     await screen.findByRole('heading', { name: '交易逻辑草稿' });
     expect(screen.getByRole('button', { name: '标记复盘完成' })).toBeDisabled();
-    fireEvent.change(screen.getByLabelText('策略假设 / Setup thesis'), {
+    fireEvent.change(screen.getByLabelText('进场逻辑回忆 / Entry rationale'), {
       target: { value: '  回踩 8 EMA 后延续  ' },
     });
     fireEvent.change(screen.getByLabelText('复盘标签'), {
@@ -662,7 +683,7 @@ describe('JournalEpisodeReviewPage', () => {
     }));
     expect(await screen.findByText(/已保存服务器版本 #2/)).toBeInTheDocument();
     expect(window.localStorage.getItem(episodeReviewDraftStorageKey(9, 41))).toBeNull();
-    expect(screen.getByLabelText('策略假设 / Setup thesis')).toHaveValue('  回踩 8 EMA 后延续  ');
+    expect(screen.getByLabelText('进场逻辑回忆 / Entry rationale')).toHaveValue('  回踩 8 EMA 后延续  ');
 
     fireEvent.click(screen.getByRole('button', { name: '标记复盘完成' }));
     await waitFor(() => expect(apiMocks.saveReview).toHaveBeenLastCalledWith(
@@ -688,8 +709,9 @@ describe('JournalEpisodeReviewPage', () => {
   it('enforces the 6000-character aggregate context limit across fields', async () => {
     renderPage();
     await screen.findByRole('heading', { name: '交易逻辑草稿' });
+    expandFullWorksheet();
 
-    fireEvent.change(screen.getByLabelText('策略假设 / Setup thesis'), {
+    fireEvent.change(screen.getByLabelText('进场逻辑回忆 / Entry rationale'), {
       target: { value: '甲'.repeat(2000) },
     });
     fireEvent.change(screen.getByLabelText('进场触发 / Entry trigger'), {
@@ -794,5 +816,298 @@ describe('JournalEpisodeReviewPage', () => {
     expect(screen.getByText(/不会移动 evidence 时间/)).toBeInTheDocument();
     expect(screen.getAllByText('真实逐笔成交')).not.toHaveLength(0);
     expect(screen.getAllByText('行情缺口')).toHaveLength(2);
+  });
+
+  it('renders the sticky queue action bar with identity, net result, and next-episode actions', async () => {
+    renderPage();
+
+    expect(await screen.findByText('NVDA260731C00150000')).toBeInTheDocument();
+    const actionBar = screen.getByTestId('review-action-bar');
+    expect(actionBar.className).toContain('sticky');
+    expect(within(actionBar).getByText('Net')).toBeInTheDocument();
+    expect(within(actionBar).getByText('$48.75')).toBeInTheDocument();
+    expect(within(actionBar).getByRole('button', { name: /跳过，下一笔/ })).toBeEnabled();
+    expect(within(actionBar).getByRole('button', { name: '保存草稿并下一笔' })).toBeEnabled();
+    expect(within(actionBar).getByRole('button', { name: '完成复盘并下一笔' })).toBeEnabled();
+    expect(within(actionBar).getByText(/下一笔优先级：进行中 → 亏损最大的未复盘 → 最近未开始/)).toBeInTheDocument();
+  });
+
+  it('lays the evidence and worksheet columns side by side at wide viewports with the worksheet first on narrow ones', async () => {
+    renderPage();
+    await screen.findByText('NVDA260731C00150000');
+
+    const columns = screen.getByTestId('review-columns');
+    expect(columns.className).toContain('xl:grid-cols-[minmax(0,1fr)_minmax(400px,460px)]');
+    const evidenceColumn = screen.getByTestId('review-evidence-column');
+    expect(evidenceColumn.className).toContain('order-2');
+    expect(evidenceColumn.className).toContain('xl:order-1');
+    expect(within(evidenceColumn).getByText('成交证据时间线')).toBeInTheDocument();
+    expect(within(evidenceColumn).getByText(/底层 K 线与事件/)).toBeInTheDocument();
+    const worksheetColumn = screen.getByTestId('review-worksheet-column');
+    expect(worksheetColumn.className).toContain('order-1');
+    expect(worksheetColumn.className).toContain('xl:order-2');
+    expect(worksheetColumn.querySelector('.xl\\:sticky')).not.toBeNull();
+    expect(within(worksheetColumn).getByRole('heading', { name: '交易逻辑草稿' })).toBeInTheDocument();
+  });
+
+  it('starts the worksheet in quick mode and reveals the four folded fields on demand', async () => {
+    renderPage();
+    await screen.findByRole('heading', { name: '交易逻辑草稿' });
+
+    expect(screen.getByLabelText('进场逻辑回忆 / Entry rationale')).toBeInTheDocument();
+    expect(screen.getByLabelText('复盘反思 / Post-trade reflection')).toBeInTheDocument();
+    expect(screen.queryByLabelText('进场触发 / Entry trigger')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('失效点与止损 / Invalidation')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('仓位理由 / Position rationale')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('实际出场原因 / Exit reason')).not.toBeInTheDocument();
+
+    expandFullWorksheet();
+    expect(screen.getByLabelText('进场触发 / Entry trigger')).toBeInTheDocument();
+    expect(screen.getByLabelText('失效点与止损 / Invalidation')).toBeInTheDocument();
+    expect(screen.getByLabelText('仓位理由 / Position rationale')).toBeInTheDocument();
+    expect(screen.getByLabelText('实际出场原因 / Exit reason')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '收起完整工作单' }));
+    expect(screen.queryByLabelText('进场触发 / Entry trigger')).not.toBeInTheDocument();
+  });
+
+  it('toggles preset chips into the shared tag and error-type fields while keeping free text', async () => {
+    renderPage();
+    await screen.findByRole('heading', { name: '交易逻辑草稿' });
+
+    const errorChip = screen.getByRole('button', { name: '追高进场' });
+    fireEvent.click(errorChip);
+    expect(screen.getByRole('button', { name: '追高进场' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByLabelText('错误类型')).toHaveValue('追高进场');
+
+    fireEvent.click(screen.getByRole('button', { name: '突破' }));
+    expect(screen.getByRole('button', { name: '突破' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByLabelText('复盘标签')).toHaveValue('突破');
+
+    const stored = window.localStorage.getItem(episodeReviewDraftStorageKey(9, 41));
+    expect(stored).toContain('追高进场');
+    expect(stored).toContain('突破');
+
+    // 自由文本与 chip 共用同一字段：手输保留，chip 再点一次只移除自己。
+    fireEvent.change(screen.getByLabelText('错误类型'), {
+      target: { value: '追高进场, 自定义错误' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '追高进场' }));
+    expect(screen.getByRole('button', { name: '追高进场' })).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByLabelText('错误类型')).toHaveValue('自定义错误');
+  });
+
+  it('saves a draft revision and then navigates to the next queued episode', async () => {
+    apiMocks.fetchEpisodes.mockResolvedValue({
+      dataState: 'ready',
+      total: 1,
+      page: 1,
+      perPage: 5,
+      items: [{ id: 52 }],
+    });
+    renderPage();
+    await screen.findByRole('heading', { name: '交易逻辑草稿' });
+    fireEvent.change(screen.getByLabelText('进场逻辑回忆 / Entry rationale'), {
+      target: { value: '回踩 8 EMA 后延续' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: '保存草稿并下一笔' }));
+
+    await waitFor(() => expect(apiMocks.saveReview).toHaveBeenCalledWith(
+      41,
+      expect.objectContaining({ buildId: 9, reviewStatus: 'in_progress' }),
+    ));
+    await waitFor(() => expect(apiMocks.fetchEpisodes).toHaveBeenCalledWith(
+      expect.objectContaining({ buildId: 9, reviewStatus: 'in_progress', page: 1, perPage: 5 }),
+    ));
+    await waitFor(() => expect(apiMocks.fetchDetail).toHaveBeenCalledWith(52, 9));
+    expect(screen.getByTestId('location')).toHaveTextContent(
+      '/journal/review/52?build_id=9&symbol=NVDA&status=open&completeness=partial&case=largest_fee&page=3',
+    );
+  });
+
+  it('completes the review and navigates next only after the completed save succeeds', async () => {
+    apiMocks.fetchEpisodes.mockResolvedValue({
+      dataState: 'ready',
+      total: 1,
+      page: 1,
+      perPage: 5,
+      items: [{ id: 61 }],
+    });
+    renderPage();
+    await screen.findByRole('heading', { name: '交易逻辑草稿' });
+    fireEvent.change(screen.getByLabelText('复盘反思 / Post-trade reflection'), {
+      target: { value: '下次只在重新站稳后加仓' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: '完成复盘并下一笔' }));
+
+    await waitFor(() => expect(apiMocks.saveReview).toHaveBeenCalledWith(
+      41,
+      expect.objectContaining({ reviewStatus: 'completed' }),
+    ));
+    await waitFor(() => expect(apiMocks.fetchDetail).toHaveBeenCalledWith(61, 9));
+  });
+
+  it('skips to the next episode without saving anything', async () => {
+    apiMocks.fetchEpisodes.mockResolvedValue({
+      dataState: 'ready',
+      total: 1,
+      page: 1,
+      perPage: 5,
+      items: [{ id: 52 }],
+    });
+    renderPage();
+    await screen.findByText('NVDA260731C00150000');
+
+    fireEvent.click(screen.getByRole('button', { name: /跳过，下一笔/ }));
+
+    await waitFor(() => expect(apiMocks.fetchDetail).toHaveBeenCalledWith(52, 9));
+    expect(apiMocks.saveReview).not.toHaveBeenCalled();
+    expect(screen.getByTestId('location')).toHaveTextContent('/journal/review/52');
+  });
+
+  it('stays on the page with a visible error when save-and-next fails validation or persistence', async () => {
+    renderPage();
+    await screen.findByRole('heading', { name: '交易逻辑草稿' });
+
+    // 完成复盘校验：没有任何自述时不能完成，也不应去解析下一笔。
+    fireEvent.click(screen.getByRole('button', { name: '完成复盘并下一笔' }));
+    expect(await screen.findByText(/保存未成功：至少填写一项用户自述后才能标记复盘完成/)).toBeInTheDocument();
+    expect(apiMocks.fetchEpisodes).not.toHaveBeenCalled();
+
+    // 服务器保存失败：错误可见、停留当前回合、不导航。
+    apiMocks.saveReview.mockRejectedValueOnce(new Error('server rejected'));
+    fireEvent.change(screen.getByLabelText('进场逻辑回忆 / Entry rationale'), {
+      target: { value: '回踩 8 EMA 后延续' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '保存草稿并下一笔' }));
+    expect(await screen.findByText(/保存未成功：server rejected/)).toBeInTheDocument();
+    expect(apiMocks.fetchEpisodes).not.toHaveBeenCalled();
+    expect(screen.getByTestId('location')).toHaveTextContent('/journal/review/41');
+    expect(apiMocks.fetchDetail).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports an exhausted review queue honestly and offers the way back to the list', async () => {
+    renderPage();
+    await screen.findByText('NVDA260731C00150000');
+
+    fireEvent.click(screen.getByRole('button', { name: /跳过，下一笔/ }));
+
+    expect(await screen.findByText(/全部回合已完成复盘/)).toBeInTheDocument();
+    // in_progress → not_started(top_loss) → not_started 三档都查过且排除当前回合。
+    expect(apiMocks.fetchEpisodes).toHaveBeenCalledTimes(3);
+    fireEvent.click(screen.getByRole('button', { name: '返回仓位列表' }));
+    expect(screen.getByTestId('location')).toHaveTextContent(
+      '/journal?tab=positions&build_id=9&symbol=NVDA&status=open&completeness=partial&case=largest_fee&page=3',
+    );
+  });
+
+  it('keeps the evidence window and technical provenance inside a collapsed evidence-details section', async () => {
+    renderPage();
+    await screen.findByText('NVDA260731C00150000');
+
+    const details = screen.getByTestId('evidence-details');
+    expect(details).not.toHaveAttribute('open');
+    expect(within(details).getByText(/证据明细/)).toBeInTheDocument();
+    expect(within(details).getByText('证据窗口与窗口末投影')).toBeInTheDocument();
+    expect(within(details).getByText('证据窗口（ET）起—止')).toBeInTheDocument();
+    expect(within(details).getByText('窗口末投影 as-of（ET）')).toBeInTheDocument();
+    expect(within(details).getByText(/不等于券商当前持仓/)).toBeInTheDocument();
+    expect(within(details).getByText('Matching')).toBeInTheDocument();
+    expect(within(details).getByText('Completeness')).toBeInTheDocument();
+    expect(within(details).getByText('Provenance')).toBeInTheDocument();
+  });
+
+  it('consolidates same-order partial fills into one auditable row with a single merged marker', async () => {
+    apiMocks.fetchDetail.mockResolvedValue({
+      ...detail,
+      evidence: [
+        {
+          ...detail.evidence[0],
+          id: 21,
+          evidenceKey: 'fill-21',
+          eventRole: 'open',
+          evidenceTime: '2026-07-20T14:32:00Z',
+          allocatedQuantity: '1.0000000000',
+          allocatedFee: '0.6500000000',
+          allocatedCashFlow: '-250.0000000000',
+          brokerOrderObservationId: 10,
+          brokerFillObservationId: 21,
+        },
+        {
+          ...detail.evidence[0],
+          id: 22,
+          evidenceKey: 'fill-22',
+          eventRole: 'add',
+          allocationSequence: 1,
+          evidenceTime: '2026-07-20T14:32:30Z',
+          allocatedQuantity: '2.0000000000',
+          allocatedFee: '1.3000000000',
+          allocatedCashFlow: '-510.0000000000',
+          brokerOrderObservationId: 10,
+          brokerFillObservationId: 22,
+        },
+      ],
+    });
+    renderPage();
+
+    expect(await screen.findByText('分 2 笔成交')).toBeInTheDocument();
+    const timeline = screen.getByRole('list', { name: '成交证据时间线' });
+    const orderRow = within(timeline).getByRole('button', { name: /一笔订单/ });
+    expect(within(orderRow).getByText('买入 · 一笔订单')).toBeInTheDocument();
+    expect(within(orderRow).getByText('回合角色：开仓 / 加仓')).toBeInTheDocument();
+    expect(within(orderRow).getByText('总数量')).toBeInTheDocument();
+    expect(within(orderRow).getByText('3')).toBeInTheDocument();
+    expect(within(orderRow).getByText('现金流加权均价')).toBeInTheDocument();
+    expect(within(orderRow).getByText('$2.5333')).toBeInTheDocument();
+    expect(within(orderRow).getByText('合计费用')).toBeInTheDocument();
+    expect(within(orderRow).getByText('$1.95')).toBeInTheDocument();
+    expect(within(orderRow).getByText('真实逐笔成交')).toBeInTheDocument();
+
+    // 展开后每一笔 fill 仍完整可审计。
+    fireEvent.click(within(timeline).getByRole('button', { name: /展开 2 笔逐笔成交/ }));
+    const fillList = within(timeline).getByRole('list', { name: '逐笔成交明细' });
+    expect(within(fillList).getByText('第 1 笔')).toBeInTheDocument();
+    expect(within(fillList).getByText('第 2 笔')).toBeInTheDocument();
+    expect(within(fillList).getByText('fill observation 21')).toBeInTheDocument();
+    expect(within(fillList).getByText('fill observation 22')).toBeInTheDocument();
+    expect(within(fillList).getAllByText(/回合角色：/)).toHaveLength(2);
+
+    // 同单同 bar 的分批成交只画一个合并 marker；点击选中合并行。
+    const mergedMarker = screen.getByRole('button', { name: /图表事件 order:10 买×2/ });
+    fireEvent.click(mergedMarker);
+    expect(within(timeline).getByRole('button', { name: /一笔订单/ })).toHaveAttribute('aria-pressed', 'true');
+  });
+
+  it('shows an incomplete fee label instead of passing a partial fee sum off as the order total', async () => {
+    apiMocks.fetchDetail.mockResolvedValue({
+      ...detail,
+      evidence: [
+        {
+          ...detail.evidence[0],
+          id: 21,
+          evidenceKey: 'fill-21',
+          evidenceTime: '2026-07-20T14:32:00Z',
+          allocatedFee: '0.6500000000',
+          brokerOrderObservationId: 10,
+          brokerFillObservationId: 21,
+        },
+        {
+          ...detail.evidence[0],
+          id: 22,
+          evidenceKey: 'fill-22',
+          allocationSequence: 1,
+          evidenceTime: '2026-07-20T14:32:30Z',
+          allocatedFee: null,
+          brokerOrderObservationId: 10,
+          brokerFillObservationId: 22,
+        },
+      ],
+    });
+    renderPage();
+
+    expect(await screen.findByText('分 2 笔成交')).toBeInTheDocument();
+    expect(screen.getByText('费用不完整')).toBeInTheDocument();
   });
 });

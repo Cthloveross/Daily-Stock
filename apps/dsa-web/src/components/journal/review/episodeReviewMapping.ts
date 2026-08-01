@@ -32,6 +32,16 @@ const PERIOD_SECONDS: Partial<Record<Timeframe, number>> = {
   '90m': 90 * 60,
 };
 
+/**
+ * 当前周期一根 K 线覆盖的秒数；日线及以上（按日历分桶的周期）返回 null。
+ * 订单级 fill 合并（见 `evidenceConsolidation.ts`）用它判定同一订单的
+ * 分批成交是否相距超过一根 K 线：超过则保留逐笔 marker，不隐藏真实的
+ * 时间分散执行。
+ */
+export function chartBarIntervalSeconds(timeframe: Timeframe): number | null {
+  return PERIOD_SECONDS[timeframe] ?? null;
+}
+
 const NEW_YORK_SESSION_CLOCK = new Intl.DateTimeFormat('en-US', {
   timeZone: 'America/New_York',
   year: 'numeric',
@@ -192,6 +202,11 @@ export function mapEvidenceToCandles(
   });
 }
 
+/**
+ * 逐笔证据 marker（每条 evidence 一个）。同一订单分批成交的“每单一个
+ * marker”合并及其例外（成员相距超过一根 K 线时保留逐笔）由
+ * `evidenceConsolidation.buildOrderAwareEvidenceMarkers` 在本函数之上实现。
+ */
 export function buildEvidenceMarkers(
   links: EvidenceChartLink[],
   selectedEvidenceKey?: string | null,

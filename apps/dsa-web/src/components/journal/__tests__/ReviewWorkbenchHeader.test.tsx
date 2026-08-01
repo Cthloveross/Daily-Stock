@@ -59,10 +59,11 @@ describe('ReviewWorkbenchHeader', () => {
     fireEvent.click(screen.getByRole('button', { name: '继续复盘下一笔' }));
     await waitFor(() => expect(onOpenReview).toHaveBeenCalledWith(openAggregateEpisode));
     expect(fetchEpisodesMock).toHaveBeenCalledTimes(1);
+    // 共享 helper（nextReviewEpisode）用小页拉候选，仍是同一优先级实现。
     expect(fetchEpisodesMock).toHaveBeenCalledWith(expect.objectContaining({
       reviewStatus: 'in_progress',
       page: 1,
-      perPage: 1,
+      perPage: 5,
     }));
   });
 

@@ -1,7 +1,7 @@
 import type React from 'react';
 import { useState } from 'react';
-import { fetchPositionEpisodes } from '../../api/journal';
 import { parseApiError } from '../../api/error';
+import { findNextReviewEpisode } from './review/nextReviewEpisode';
 import type {
   EpisodeBuildMetadata,
   PositionEpisodeItem,
@@ -28,12 +28,10 @@ function buildSourceLabel(sourceKind?: string): string {
 /**
  * 「复盘工作台」头部条：默认构建标识 + Review Queue 计数 + 「继续复盘下一笔」。
  *
- * 「继续复盘下一笔」的确定性优先级（只读，不改变任何后端排序口径）：
- * 1. 先续上「进行中」的回合（最近开仓优先），避免半途而废；
- * 2. 否则从「未开始」里按 top_loss 案例精选取第一笔——亏损最大的已平仓回合
- *    优先复盘，这是职业复盘的默认优先级（top_loss 只覆盖已平仓且净额已知
- *    的回合）；
- * 3. top_loss 无命中时退回「未开始」的最近开仓回合。
+ * 「继续复盘下一笔」的确定性优先级由共享实现
+ * `review/nextReviewEpisode.findNextReviewEpisode` 提供（单笔复盘页的
+ * 「保存并下一笔 / 跳过」使用同一实现）：进行中（最近开仓优先）→
+ * 未开始按 top_loss → 未开始最近开仓；全部无命中时如实提示已完成。
  */
 export const ReviewWorkbenchHeader: React.FC<ReviewWorkbenchHeaderProps> = ({
   build,
@@ -55,21 +53,7 @@ export const ReviewWorkbenchHeader: React.FC<ReviewWorkbenchHeaderProps> = ({
     setFinding(true);
     setFindMessage(null);
     try {
-      const base = { buildId: viewingBuildId, page: 1, perPage: 1 } as const;
-      const inProgress = await fetchPositionEpisodes({ ...base, reviewStatus: 'in_progress' });
-      let target = inProgress.items[0] ?? null;
-      if (!target) {
-        const topLoss = await fetchPositionEpisodes({
-          ...base,
-          reviewStatus: 'not_started',
-          caseFocus: 'top_loss',
-        });
-        target = topLoss.items[0] ?? null;
-      }
-      if (!target) {
-        const recent = await fetchPositionEpisodes({ ...base, reviewStatus: 'not_started' });
-        target = recent.items[0] ?? null;
-      }
+      const target = await findNextReviewEpisode({ buildId: viewingBuildId });
       if (target) {
         onOpenReview(target);
       } else {
