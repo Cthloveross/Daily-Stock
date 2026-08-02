@@ -131,6 +131,42 @@ def _event_payload(ticker: str, sentiments: list[str]) -> SimpleNamespace:
     )
 
 
+def _five_minute_session(date_text: str, *, bar_count: int = 78, burst_tail: bool = False):
+    """Flat 5m regular-session bars; optional 3-bar burst tail (score 9.0)."""
+
+    rows = []
+    for index in range(bar_count):
+        minutes = 9 * 60 + 30 + index * 5
+        rows.append(
+            {
+                "date": f"{date_text}T{minutes // 60:02d}:{minutes % 60:02d}:00-04:00",
+                "open": 100.0,
+                "high": 100.5,
+                "low": 99.5,
+                "close": 100.0,
+                "volume": 1_000.0,
+            }
+        )
+    if burst_tail and bar_count >= 3:
+        # 末窗推力 103 − 100 = 3 → thrust_norm 3；量 3000/バー → vol_norm 3；
+        # score = 9.0（确定性，便于合同断言）。
+        for offset, (open_, close) in enumerate(((100.0, 101.0), (101.0, 102.0), (102.0, 103.0))):
+            row = rows[bar_count - 3 + offset]
+            row.update(open=open_, close=close, high=close + 0.5, low=open_ - 0.5, volume=3_000.0)
+    return rows
+
+
+def _five_minute_bars(symbol: str):
+    """Sessions covering both the Tuesday-regular and Saturday-closed tests."""
+
+    return (
+        _five_minute_session("2026-07-23")
+        + _five_minute_session("2026-07-24", burst_tail=True)
+        + _five_minute_session("2026-07-27")
+        + _five_minute_session("2026-07-28", bar_count=12, burst_tail=True)
+    ), "fixture_5m"
+
+
 def _stub_daily_loader(monkeypatch, *, now: datetime = _FIXED_NOW) -> _FakeManager:
     manager = _FakeManager()
 
@@ -140,6 +176,7 @@ def _stub_daily_loader(monkeypatch, *, now: datetime = _FIXED_NOW) -> _FakeManag
     monkeypatch.setattr(opportunities, "_create_data_fetcher_manager", lambda: manager)
     monkeypatch.setattr(opportunities, "_load_daily_history", load_history)
     monkeypatch.setattr(opportunities, "_intraday_now", lambda: now)
+    monkeypatch.setattr(opportunities, "_fetch_intraday_5m_bars", _five_minute_bars)
     return manager
 
 
@@ -167,8 +204,9 @@ def test_contract_regular_session_full_row(monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert body["schema_version"] == "intraday-top/1.0"
-    assert body["signal_version"] == "intraday_session_evidence_v1"
-    assert body["ranking_method"] == "rule_based_evidence_count"
+    assert body["signal_version"] == "intraday_session_evidence_v2"
+    # 盘中主排序 = 波段爆发分优先。
+    assert body["ranking_method"] == "burst_score_first_then_evidence_count"
     # 不冻结、不入统计的显式标记。
     assert body["statistics_track"] == "none_intraday_v1_unscored"
     assert body["session_state"] == "regular"
@@ -204,6 +242,19 @@ def test_contract_regular_session_full_row(monkeypatch):
     assert activity["dominant_sentiment"] == "bullish"
     assert activity["max_single_turnover"] == 50_002.0
     assert activity["event_as_of"] == "2026-07-28 10:12:00"
+    # 波段爆发（v2 主信号）：末窗 9.0 分（确定性 stub），当日波段含 10:15。
+    bursts = item["session_bursts"]
+    assert bursts["state"] == "ready"
+    assert bursts["session_date_et"] == "2026-07-28"
+    assert bursts["current"]["score"] == pytest.approx(9.0, abs=1e-6)
+    assert bursts["current"]["direction"] == "up"
+    assert [leg["start_et"] for leg in bursts["legs"]] == ["10:15"]
+    burst_evidence = next(
+        entry
+        for entry in item["evidence"]
+        if entry["metric"] == "session_momentum_burst"
+    )
+    assert burst_evidence["status"] == "supports"
     # 证据合同：每条证据带来源 / as-of / 口径 / limitations。
     for evidence in item["evidence"]:
         assert evidence["source"]
@@ -282,6 +333,8 @@ def test_closed_session_labels_last_session_and_snapshot_gap_basis(monkeypatch):
     assert body["session_state"] == "closed"
     assert body["quote_session_scope"] == "latest_prior_session"
     assert body["quote_session_label"] == "最近一个交易时段"
+    # 休市：排序退回 v1 证据计数。
+    assert body["ranking_method"] == "rule_based_evidence_count"
     item = body["candidates"][0]
     # 休市：缺口分母切换为快照自带前收并显式标注，不用日线前收伪装。
     assert item["gap_basis"] == "session_open_vs_moomoo_snapshot_prev_close"
@@ -290,6 +343,11 @@ def test_closed_session_labels_last_session_and_snapshot_gap_basis(monkeypatch):
         entry for entry in item["evidence"] if entry["metric"] == "session_gap_percent"
     )
     assert gap_evidence["observation_window"] == "latest_completed_trading_session"
+    # 仍附最近一个交易时段（2026-07-24 周五）的波段：晚间复盘可见走了几波。
+    bursts = item["session_bursts"]
+    assert bursts["state"] == "ready"
+    assert bursts["session_date_et"] == "2026-07-24"
+    assert [leg["start_et"] for leg in bursts["legs"]] == ["15:45"]
 
 
 def test_ttl_cache_shares_and_refresh_bypasses(monkeypatch):
@@ -407,6 +465,69 @@ def test_event_failure_degrades_one_symbol_only(monkeypatch):
     assert by_ticker["TSLA"]["option_activity"]["dominant_sentiment"] == "unknown"
     # 行情行仍然可用：单一异动失败不拖垮该标的的盘中行。
     assert by_ticker["TSLA"]["last_price"] == 130.5
+
+
+def test_burst_fetch_failure_is_isolated_and_never_blocks_aggregates(monkeypatch):
+    monkeypatch.setenv("MOOMOO_OPEND_ENABLED", "true")
+    _stub_daily_loader(monkeypatch)
+    monkeypatch.setattr(
+        opportunities,
+        "_fetch_underlying_session_quotes",
+        lambda symbols: {"NVDA": _quote()},
+    )
+    _stub_events(monkeypatch, {"NVDA": ["BULLISH", "BULLISH", "BULLISH"]})
+
+    def broken(symbol: str):
+        raise RuntimeError("5m lane down")
+
+    monkeypatch.setattr(opportunities, "_fetch_intraday_5m_bars", broken)
+
+    response = _client().post(
+        "/api/v1/opportunities/intraday-top", json={"symbols": ["NVDA"]}
+    )
+    assert response.status_code == 200
+    item = response.json()["candidates"][0]
+    bursts = item["session_bursts"]
+    assert bursts["state"] == "unavailable"
+    assert bursts["unavailable_reason"] == "history_5m_unavailable:RuntimeError"
+    assert bursts["current"] is None and bursts["legs"] == []
+    burst_evidence = next(
+        entry
+        for entry in item["evidence"]
+        if entry["metric"] == "session_momentum_burst"
+    )
+    assert burst_evidence["status"] == "unknown"
+    # 聚合证据不受影响：缺口/量能/波幅照常，行仍是盘中活跃。
+    assert item["gap_percent"] == pytest.approx(3.225806, abs=1e-4)
+    assert item["volume_pace_ratio"] == pytest.approx(2.5, abs=1e-6)
+    assert item["research_state"] == "active"
+
+
+def test_burst_bars_cached_per_symbol_across_refresh(monkeypatch):
+    monkeypatch.setenv("MOOMOO_OPEND_ENABLED", "true")
+    _stub_daily_loader(monkeypatch)
+    monkeypatch.setattr(
+        opportunities,
+        "_fetch_underlying_session_quotes",
+        lambda symbols: {"NVDA": _quote()},
+    )
+    _stub_events(monkeypatch, {"NVDA": []})
+    fetch_calls: list[str] = []
+
+    def counted(symbol: str):
+        fetch_calls.append(symbol)
+        return _five_minute_bars(symbol)
+
+    monkeypatch.setattr(opportunities, "_fetch_intraday_5m_bars", counted)
+    client = _client()
+    payload = {"symbols": ["NVDA"]}
+    first = client.post("/api/v1/opportunities/intraday-top", json=payload)
+    refreshed = client.post(
+        "/api/v1/opportunities/intraday-top", json={**payload, "refresh": True}
+    )
+    assert first.status_code == refreshed.status_code == 200
+    # refresh 只绕过响应级 TTL；逐标的 5m K 线 60 秒缓存仍命中（一次读取）。
+    assert fetch_calls == ["NVDA"]
 
 
 def test_empty_symbols_falls_back_to_server_stock_list(monkeypatch):

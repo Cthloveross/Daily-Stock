@@ -35,6 +35,7 @@ const VWAP_LABELS: Record<IntradayTopCandidate['vwapPosition'], string> = {
 };
 
 export type IntradaySortKey =
+  | 'burst'
   | 'change'
   | 'gap'
   | 'pace'
@@ -66,6 +67,10 @@ function quoteAsOfLabel(item: IntradayTopCandidate): string {
 
 function sortValue(item: IntradayTopCandidate, key: IntradaySortKey): number | null {
   switch (key) {
+    case 'burst':
+      return item.sessionBursts.state === 'ready'
+        ? item.sessionBursts.current?.score ?? null
+        : null;
     case 'change':
       return item.sessionChangePercent;
     case 'gap':
@@ -79,6 +84,41 @@ function sortValue(item: IntradayTopCandidate, key: IntradaySortKey): number | n
     default:
       return null;
   }
+}
+
+const DIRECTION_ARROWS: Record<'up' | 'down' | 'flat', string> = {
+  up: '↑',
+  down: '↓',
+  flat: '·',
+};
+
+function formatBurstThrust(value: number | null): string {
+  if (value === null) return '—';
+  const sign = value > 0 ? '+' : value < 0 ? '−' : '';
+  return `${sign}${Math.abs(value).toFixed(2)}%`;
+}
+
+/** 「N 波：09:40↓ · 15:15↑」——当日（或最近一个交易时段）的独立波段摘要。 */
+function legsSummary(item: IntradayTopCandidate): string | null {
+  const bursts = item.sessionBursts;
+  if (bursts.state !== 'ready') return null;
+  if (bursts.legs.length === 0) return '0 波';
+  const parts = bursts.legs.map(
+    (leg) => `${leg.startEt}${DIRECTION_ARROWS[leg.direction]}`,
+  );
+  return `${bursts.legs.length} 波：${parts.join(' · ')}`;
+}
+
+function legsDetailLabel(item: IntradayTopCandidate): string | undefined {
+  const bursts = item.sessionBursts;
+  if (bursts.state !== 'ready' || bursts.legs.length === 0) return undefined;
+  return `波段明细：${bursts.legs
+    .map(
+      (leg) =>
+        `${leg.startEt}-${leg.endEt} ${DIRECTION_ARROWS[leg.direction]} `
+        + `${formatBurstThrust(leg.thrustPercent)} · 爆发分 ${leg.score?.toFixed(1) ?? '—'}`,
+    )
+    .join('；')}`;
 }
 
 function optionActivityLabel(item: IntradayTopCandidate): string {
@@ -151,7 +191,10 @@ export function IntradayScanTable({
         <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
           <h2 className="text-h3 font-semibold text-text-1">日内扫描 · 盘中滚动</h2>
           <span className="text-caption text-text-3">
-            证据计数排名（{data?.signalVersion ?? 'intraday_session_evidence_v1'}）· 不冻结 · 不入统计
+            {data?.rankingMethod === 'rule_based_evidence_count'
+              ? '休市 · 证据计数排名'
+              : '波段爆发优先排名'}
+            （{data?.signalVersion ?? 'intraday_session_evidence_v2'}）· 不冻结 · 不入统计
           </span>
         </div>
         {data && (
@@ -183,10 +226,12 @@ export function IntradayScanTable({
         </div>
       ) : (
         <div className="overflow-auto">
-          <table className="w-full min-w-[960px] border-collapse" aria-label="日内扫描表">
+          <table className="w-full min-w-[1180px] border-collapse" aria-label="日内扫描表">
             <thead>
               <tr className="border-b border-subtle text-left text-caption text-text-3">
                 <th className="px-3 py-2 font-medium">标的</th>
+                <th className="px-3 py-2 text-right">{sortableHeader('burst', '当前爆发')}</th>
+                <th className="px-3 py-2 font-medium">今日波段</th>
                 <th className="px-3 py-2 text-right">{sortableHeader('change', '现价 / 当日')}</th>
                 <th className="px-3 py-2 text-right">{sortableHeader('gap', '缺口')}</th>
                 <th className="px-3 py-2 text-right">{sortableHeader('pace', '量能节奏')}</th>
@@ -208,6 +253,47 @@ export function IntradayScanTable({
                     <div className="font-mono text-mono-sm font-semibold text-text-1">{item.ticker}</div>
                     <div className="mt-0.5 text-caption text-text-3">
                       {item.supportingEvidenceCount} 项证据支持
+                    </div>
+                  </td>
+                  <td className="px-3 py-2.5 text-right">
+                    {item.sessionBursts.state === 'ready' && item.sessionBursts.current ? (
+                      <>
+                        <div className="font-mono text-mono-sm text-text-1">
+                          {item.sessionBursts.current.score === null
+                            ? '—'
+                            : item.sessionBursts.current.score.toFixed(1)}
+                          <span className={`ml-1 ${
+                            item.sessionBursts.current.direction === 'up'
+                              ? 'text-up-strong'
+                              : item.sessionBursts.current.direction === 'down'
+                                ? 'text-down-strong'
+                                : 'text-text-3'
+                          }`}
+                          >
+                            {DIRECTION_ARROWS[item.sessionBursts.current.direction]}
+                          </span>
+                        </div>
+                        <div className="mt-0.5 text-caption text-text-3">
+                          15分 {formatBurstThrust(item.sessionBursts.current.thrustPercent)}
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div className="font-mono text-mono-sm text-text-3">—</div>
+                        <div className="mt-0.5 text-caption text-text-3">
+                          {item.sessionBursts.state === 'insufficient_bars' ? 'K线不足' : '标缺'}
+                        </div>
+                      </>
+                    )}
+                  </td>
+                  <td className="px-3 py-2.5">
+                    <div className="text-body-sm text-text-1" aria-label={legsDetailLabel(item)}>
+                      {legsSummary(item) ?? '标缺'}
+                    </div>
+                    <div className="mt-0.5 text-caption text-text-3">
+                      {item.sessionBursts.medianBasis === 'prior_session_fallback'
+                        ? '基准回退上一时段'
+                        : '≥30 分钟独立波段'}
                     </div>
                   </td>
                   <td className="px-3 py-2.5 text-right">
@@ -280,7 +366,7 @@ export function IntradayScanTable({
       )}
 
       <div className="border-t border-subtle bg-bg-0 px-4 py-2 text-caption text-text-3">
-        缺口＝开盘价对参考前收（休市时段改用快照前收并标注）；量能节奏＝当日累计 vs 20 日全日中位（未按时点折算）；波幅扩张＝当日高低价差 ÷ ATR14；期权异动＝最近一页 Moomoo 分类计数，不推断开平仓。缺失字段显式标缺，不以 0 冒充。
+        当前爆发＝最近 15 分钟（3 根 5m K 线）|收−开| ÷ 当日 5m 波幅中位 × 窗口量比（阈值按 2026-07-31 标注样本校准，盘中排序优先，不是信号）；今日波段＝爆发分 ≥ 8 且起点相隔 ≥30 分钟的独立窗口（≤4 个，休市显示最近一个交易时段）；缺口＝开盘价对参考前收（休市时段改用快照前收并标注）；量能节奏＝当日累计 vs 20 日全日中位（未按时点折算）；波幅扩张＝当日高低价差 ÷ ATR14；期权异动＝最近一页 Moomoo 分类计数，不推断开平仓。缺失字段显式标缺，不以 0 冒充。
       </div>
     </section>
   );

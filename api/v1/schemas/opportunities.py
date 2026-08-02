@@ -905,6 +905,42 @@ class IntradayTopPriorDayContext(BaseModel):
     ema_alignment: Optional[Literal["bullish", "bearish", "mixed"]] = None
 
 
+class IntradayBurstWindow(BaseModel):
+    """一个 15 分钟滚动窗口的爆发读数：推力、量比与两者乘积的爆发分。"""
+
+    start_et: str
+    end_et: str
+    thrust_percent: Optional[float] = None
+    thrust_norm: Optional[float] = Field(default=None, ge=0)
+    vol_norm: Optional[float] = Field(default=None, ge=0)
+    score: Optional[float] = Field(default=None, ge=0)
+    direction: Literal["up", "down", "flat"]
+
+
+class IntradaySessionBursts(BaseModel):
+    """波段爆发（v2 主信号）：当前窗口 + 当日（或最近一个交易时段）波段列表。
+
+    K 线不可得或不足时显式标 state + reason，绝不以 0 分冒充平静。
+    """
+
+    state: Literal["ready", "insufficient_bars", "unavailable"]
+    session_date_et: Optional[str] = None
+    bar_count: int = Field(0, ge=0)
+    median_bar_range: Optional[float] = Field(default=None, ge=0)
+    median_bar_volume: Optional[float] = Field(default=None, ge=0)
+    median_basis: Optional[
+        Literal["current_session_bars_so_far", "prior_session_fallback"]
+    ] = None
+    window_minutes: int = Field(15, ge=1)
+    current: Optional[IntradayBurstWindow] = None
+    legs: list[IntradayBurstWindow] = Field(default_factory=list)
+    unavailable_reason: Optional[str] = None
+    source: Optional[str] = None
+    fetched_at: Optional[str] = None
+    basis: str
+    limitations: list[str] = Field(default_factory=list)
+
+
 class IntradayTopCandidate(BaseModel):
     """一行盘中滚动研究候选：每个指标要么有值+口径，要么显式标缺原因。"""
 
@@ -941,6 +977,7 @@ class IntradayTopCandidate(BaseModel):
     atr14_last_bar_date: Optional[str] = None
     atr_range_expansion: Optional[float] = Field(default=None, ge=0)
     range_expansion_unavailable_reason: Optional[str] = None
+    session_bursts: IntradaySessionBursts
     option_activity: IntradayTopOptionActivity
     prior_day_context: IntradayTopPriorDayContext
     evidence: list[EvidenceItem] = Field(default_factory=list)
@@ -980,8 +1017,11 @@ class IntradayTopResponse(BaseModel):
     session_state_basis: Literal["america_new_york_clock_v1"]
     quote_session_scope: Literal["current_session", "latest_prior_session"]
     quote_session_label: str
-    signal_version: Literal["intraday_session_evidence_v1"]
-    ranking_method: Literal["rule_based_evidence_count"]
+    signal_version: Literal["intraday_session_evidence_v2"]
+    ranking_method: Literal[
+        "burst_score_first_then_evidence_count",
+        "rule_based_evidence_count",
+    ]
     statistics_track: Literal["none_intraday_v1_unscored"]
     moomoo_enabled: bool
     universe: list[str] = Field(default_factory=list)

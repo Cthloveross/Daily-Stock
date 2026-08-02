@@ -186,19 +186,24 @@ TradingView 面向个人网站账户没有公开的自选列表 REST API；其�
 
 1. **市场脉搏**（sticky 顶栏）：SPY / QQQ / VIX 快照现价与当日涨跌（分母为快照自带前收，`change_basis=moomoo_snapshot_prev_close`）、盘段状态、ET 数据时点与自动刷新指示。数据来自 `GET /api/v1/opportunities/intraday-pulse`（60 秒 TTL + single-flight）；VIX 与 SPY/QQQ 隔离请求，供应商快照不可得时逐代码显式标缺，不用其他来源或旧值冒充。
 2. **今日计划**：冻结盘前 Top 5 的对照跟踪，直接复用 §2.7 的 `IntradayTrackingPanel`（该组件同时保留在 `/regime` 官方看板下方，行为不变；本页是它的主要使用场景）。今日没有已发布官方版本时显示诚实空态，不用预览榜冒充冻结计划。
-3. **日内扫描表**（核心）：`POST /api/v1/opportunities/intraday-top` 的盘中滚动 Top 5。列：标的 / 现价+当日%（as-of）/ 缺口 / 量能节奏 / VWAP 位置 / 波幅扩张(ATR) / 期权异动（N 笔·偏向·最大单）/ 研究状态；列头可点做客户端排序（第三次点击回到服务端证据排名），行点击进入 `/regime/opportunity/:ticker` 即时扫描详情（不绑定 snapshotKey）。
+3. **日内扫描表**（核心）：`POST /api/v1/opportunities/intraday-top` 的盘中滚动 Top 5。列：标的 / **当前爆发**（首个数据列：爆发分 + 方向箭头 + 15 分钟推力%）/ **今日波段**（如「2 波：09:40↓ · 15:15↑」，每波窗口/推力/爆发分明细以可访问 aria-label 附带；休市显示最近一个交易时段）/ 现价+当日%（as-of）/ 缺口 / 量能节奏 / VWAP 位置 / 波幅扩张(ATR) / 期权异动（N 笔·偏向·最大单）/ 研究状态；默认排序＝服务端排名（盘中爆发分优先），列头可点做客户端排序（第三次点击回到服务端排名），行点击进入 `/regime/opportunity/:ticker` 即时扫描详情（不绑定 snapshotKey）。
 4. **期权异动 feed**：跨自选池、按时间倒序的最近异动成交（接口响应内有界 ≤20 条）：时间 · 标的 · Call/Put · 行权价/到期 · 金额 · Moomoo 情绪分类，底部固定标注「分类不证明开平仓方向」。
 
-`POST /api/v1/opportunities/intraday-top` 合同（`schema_version=intraday-top/1.0`，`signal_version=intraday_session_evidence_v1`）：
+`POST /api/v1/opportunities/intraday-top` 合同（`schema_version=intraday-top/1.0`，`signal_version=intraday_session_evidence_v2`）：
 
 - 请求：`symbols`（≤20，空数组回退服务端 `STOCK_LIST`）、`limit`（默认 5，1–10）、`refresh`。非美股期权 underlying 不参与扫描并在 `unsupported_symbols` 中如实列出。
-- 装配全部复用 G-2 机制：会话快照来自与期权墙相同的 Moomoo Quote-only `get_market_snapshot`；ATR14 / 20 日量能中位 / 上一日结构（前收、前 20 日高低、EMA8/13）来自与每日榜相同的完成日线加载器（15 分钟逐标的记忆）；期权异动逐标的复用 `option-events` 的 30 秒缓存 key（每标最近一页 ≤10 条，失败只降级该标的）。响应级 60 秒 TTL + single-flight，`refresh` 只绕过已完成 TTL。
-- 每个候选带与每日榜同构的 evidence 数组（source / observed_at / fetched_at / observation_window / quality_state / limitations），排序方法固定 `rule_based_evidence_count`。
+- 装配全部复用 G-2 机制：会话快照来自与期权墙相同的 Moomoo Quote-only `get_market_snapshot`；ATR14 / 20 日量能中位 / 上一日结构（前收、前 20 日高低、EMA8/13）来自与每日榜相同的完成日线加载器（15 分钟逐标的记忆）；期权异动逐标的复用 `option-events` 的 30 秒缓存 key（每标最近一页 ≤10 条，失败只降级该标的）。波段爆发的 5m K 线走与 `/stocks/{code}/history?period=5m` 相同的服务端加载器，逐标的只取当前 + 上一交易时段常规时段（有界线程池并发 + 逐标的 60 秒 TTL 缓存；单标的失败只把该标的的波段爆发显式 `unavailable`，绝不阻塞聚合证据）。响应级 60 秒 TTL + single-flight，`refresh` 只绕过已完成 TTL。
+- 每个候选带与每日榜同构的 evidence 数组（source / observed_at / fetched_at / observation_window / quality_state / limitations）。`ranking_method` 盘中为 `burst_score_first_then_evidence_count`（当前爆发分优先，其次证据计数，再次研究状态），休市退回 `rule_based_evidence_count`（但候选仍附最近一个交易时段的波段列表，晚间复盘可见「今日走了几波」）。
 
-v1 排名启发式阈值（代码内常量注释文档化；均为研究优先级起点，不是验证过的 edge；修改必须升 `signal_version`）：
+**波段爆发（v2 主排序信号，`src/opportunities/intraday_bursts.py`）**：对当日常规时段（09:30–16:00 ET）的 5m K 线取滚动 3 根（15 分钟）窗口，`thrust_norm = |窗口末收 − 窗口首开| ÷ 当日 5m 波幅（high−low）中位数`，`vol_norm = 窗口成交量 ÷ (3 × 当日 5m 量中位数)`，`burst_score = thrust_norm × vol_norm`，方向取推力符号。当日不足 6 根 K 线时中位数基准回退上一交易时段并显式标注 `median_basis=prior_session_fallback`。**当前爆发**＝最新窗口；**今日波段**＝`burst_score ≥ LEG_MIN_SCORE(8.0)` 且窗口起点相隔 ≥30 分钟的 top 独立窗口（≤4 个，按时间正序）。证据项「波段爆发」在当前窗口 `burst_score ≥ BURST_SUPPORT_MIN(6.0)` 时记 supports。
+
+校准记录（2026-07-31 周五常规时段，机会由用户标注；K 线固化为永久回归 fixture `src/opportunities/tests/fixtures/intraday_5m_2026-07-31_regular.json`）：MU ~09:45 跳水（−5.2%/15min @4.6× 量）爆发分 35.5、AMZN 09:30 开盘波 18.7、NVDA 09:40 波 9.3、NVDA 15:15 波 8.6——`LEG_MIN_SCORE=8.0` 是四个标注波段全部通过的最大整数档（约束项＝NVDA 15:15 的 8.6）；`BURST_SUPPORT_MIN=6.0` 低一档，让发展中的爆发提前一根 K 线点亮（NVDA 09:35 前奏窗口 6.3）。GOOGL 是 v1 失败样本：全时段聚合曾把它排第一，但其当日最佳窗口仅 15.2，远低于 MU 跳水的 35.5——该修复由校准回归测试永久钉住。阈值均为 v2 启发式，不是验证过的 edge；改动必须重新校准并升 `signal_version`。
+
+v2 聚合证据阈值（保留 v1 语义，退居次要排序因子；代码内常量注释文档化；修改必须升 `signal_version`）：
 
 | 证据 | 记为 supports 的条件 | 口径说明 |
 |---|---|---|
+| 波段爆发 | 当前 15 分钟窗口 burst_score ≥ 6.0 | 推力×量比，中位数归一化；阈值按 2026-07-31 标注样本校准 |
 | 量能节奏 | ≥ 1.5× | 当日累计 ÷ 前 20 交易日全日中位（未按时点折算，同 G-2） |
 | 缺口 | \|开盘−参考前收\| ≥ 0.75×ATR14，或 \|缺口%\| ≥ 1.5% | 参考前收＝日线加载器上一完整日收盘；休市时段切换为快照自带前收并显式改 `gap_basis` |
 | 波幅扩张 | (session high − session low) ÷ ATR14 ≥ 1.0 | ATR14＝已完成日线 Wilder 平滑 |
@@ -207,7 +212,7 @@ v1 排名启发式阈值（代码内常量注释文档化；均为研究优先�
 
 研究状态（`research_state`）：`active`（盘中活跃，≥2 项独立支持）/ `watch`（观察）/ `insufficient`（数据不足——缺可用现价快照时 fail-closed，无论其他证据如何）。上一日结构（前 20 日区间位置、EMA 排列）只作 `research_context` 证据，永不参与盘中排序计数。
 
-诚实合同（响应 `limitations` 固定携带，页头同句展示）：盘中滚动、不冻结、不写快照/qualification/5D/20D 结果（`statistics_track=none_intraday_v1_unscored`）、期权异动不证明方向、排名是确定性证据计数而非胜率模型。休市时段接口仍可用，但 `quote_session_scope=latest_prior_session`、证据口径标注「最近一个交易时段」。前端自动刷新与 §2.7 相同：60 秒、仅页面可见且盘段为盘前/盘中。
+诚实合同（响应 `limitations` 固定携带，页头同句展示）：盘中滚动、不冻结、不写快照/qualification/5D/20D 结果（`statistics_track=none_intraday_v1_unscored`）、期权异动不证明方向、盘中排序＝爆发分优先 + 证据计数次之（均为确定性研究度量而非胜率模型，不是买卖信号）。休市时段接口仍可用，但 `quote_session_scope=latest_prior_session`、证据口径标注「最近一个交易时段」、排序退回证据计数。前端自动刷新与 §2.7 相同：60 秒、仅页面可见且盘段为盘前/盘中。
 
 ## 3. 数据语义修正
 

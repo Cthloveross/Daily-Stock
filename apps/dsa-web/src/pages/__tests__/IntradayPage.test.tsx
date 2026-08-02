@@ -116,6 +116,49 @@ function topCandidate(overrides: Partial<IntradayTopCandidate> = {}): IntradayTo
     atr14LastBarDate: '2026-07-27',
     atrRangeExpansion: 2.333333,
     rangeExpansionUnavailableReason: null,
+    sessionBursts: {
+      state: 'ready',
+      sessionDateEt: '2026-07-28',
+      barCount: 78,
+      medianBarRange: 0.5875,
+      medianBarVolume: 975_948,
+      medianBasis: 'current_session_bars_so_far',
+      windowMinutes: 15,
+      current: {
+        startEt: '15:15',
+        endEt: '15:30',
+        thrustPercent: 0.95,
+        thrustNorm: 3.19,
+        volNorm: 2.68,
+        score: 8.6,
+        direction: 'up',
+      },
+      legs: [
+        {
+          startEt: '09:40',
+          endEt: '09:55',
+          thrustPercent: -0.93,
+          thrustNorm: 3.17,
+          volNorm: 2.95,
+          score: 9.3,
+          direction: 'down',
+        },
+        {
+          startEt: '15:15',
+          endEt: '15:30',
+          thrustPercent: 0.95,
+          thrustNorm: 3.19,
+          volNorm: 2.68,
+          score: 8.6,
+          direction: 'up',
+        },
+      ],
+      unavailableReason: null,
+      source: 'fixture_5m',
+      fetchedAt: '2026-07-28T14:30:06+00:00',
+      basis: 'rolling_15m_thrust_over_median_range_times_volume_ratio',
+      limitations: [],
+    },
     optionActivity: {
       state: 'ready',
       count: 3,
@@ -156,6 +199,22 @@ function topResponse(
       supportingEvidenceCount: 1,
       volumePaceRatio: 1.2,
       sessionChangePercent: -0.5,
+      sessionBursts: {
+        state: 'unavailable',
+        sessionDateEt: null,
+        barCount: 0,
+        medianBarRange: null,
+        medianBarVolume: null,
+        medianBasis: null,
+        windowMinutes: 15,
+        current: null,
+        legs: [],
+        unavailableReason: 'history_5m_unavailable:RuntimeError',
+        source: null,
+        fetchedAt: null,
+        basis: 'rolling_15m_thrust_over_median_range_times_volume_ratio',
+        limitations: [],
+      },
       optionActivity: {
         state: 'empty',
         count: 0,
@@ -184,8 +243,11 @@ function topResponse(
     sessionStateBasis: 'america_new_york_clock_v1',
     quoteSessionScope: sessionState === 'closed' ? 'latest_prior_session' : 'current_session',
     quoteSessionLabel: sessionState === 'closed' ? '最近一个交易时段' : '当前交易时段',
-    signalVersion: 'intraday_session_evidence_v1',
-    rankingMethod: 'rule_based_evidence_count',
+    signalVersion: 'intraday_session_evidence_v2',
+    rankingMethod:
+      sessionState === 'closed'
+        ? 'rule_based_evidence_count'
+        : 'burst_score_first_then_evidence_count',
     statisticsTrack: 'none_intraday_v1_unscored',
     moomooEnabled: true,
     universe: candidates.map((item) => item.ticker),
@@ -274,11 +336,15 @@ describe('IntradayPage', () => {
       await screen.findByText(/今日尚无已发布的冻结盘前计划/),
     ).toBeInTheDocument();
 
-    // 日内扫描表：全部列头 + as-of。
+    // 日内扫描表：全部列头 + as-of；「当前爆发」为首个数据列。
     const table = await screen.findByRole('table', { name: '日内扫描表' });
-    for (const header of ['标的', 'VWAP', '研究状态']) {
+    for (const header of ['标的', '今日波段', 'VWAP', '研究状态']) {
       expect(within(table).getByText(header)).toBeInTheDocument();
     }
+    expect(within(table).getByText('当前爆发')).toBeInTheDocument();
+    const headerCells = within(table).getAllByRole('columnheader');
+    expect(headerCells[1].textContent).toContain('当前爆发');
+    expect(headerCells[2].textContent).toContain('今日波段');
     expect(within(table).getByText('现价 / 当日')).toBeInTheDocument();
     expect(within(table).getByText('缺口')).toBeInTheDocument();
     expect(within(table).getByText('量能节奏')).toBeInTheDocument();
@@ -287,6 +353,17 @@ describe('IntradayPage', () => {
     expect(within(table).getAllByText('10:30:04 ET').length).toBeGreaterThan(0);
     expect(within(table).getByText('盘中活跃')).toBeInTheDocument();
     expect(within(table).getByText('3 笔 · 偏多 · 最大单 $250K')).toBeInTheDocument();
+
+    // 当前爆发：分数 + 方向箭头 + 15 分钟推力%；今日波段摘要；标缺行诚实。
+    expect(within(table).getByText('8.6')).toBeInTheDocument();
+    expect(within(table).getByText('15分 +0.95%')).toBeInTheDocument();
+    expect(within(table).getByText('2 波：09:40↓ · 15:15↑')).toBeInTheDocument();
+    const tslaRow = within(table).getByLabelText('打开 TSLA 即时扫描详情');
+    expect(within(tslaRow).getAllByText('标缺').length).toBeGreaterThan(0);
+
+    // 页头副标题：爆发分优先排名 + v2 版本号。
+    expect(screen.getByText(/波段爆发优先排名/)).toBeInTheDocument();
+    expect(screen.getByText(/intraday_session_evidence_v2/)).toBeInTheDocument();
 
     // 期权异动 feed + 诚实边界文案。
     const feed = screen.getByLabelText('期权异动');
@@ -315,6 +392,13 @@ describe('IntradayPage', () => {
     fireEvent.click(paceHeader); // asc：TSLA 1.2 在前
     expect(tickerOrder()[0]).toContain('TSLA');
     fireEvent.click(paceHeader); // 第三次点击回到服务端证据排名
+    expect(tickerOrder()[0]).toContain('NVDA');
+
+    // 当前爆发列可排序；TSLA 爆发标缺永远排最后（升降序均如此）。
+    const burstHeader = within(table).getByRole('button', { name: '按当前爆发排序' });
+    fireEvent.click(burstHeader); // desc
+    expect(tickerOrder()[0]).toContain('NVDA');
+    fireEvent.click(burstHeader); // asc：标缺仍最后
     expect(tickerOrder()[0]).toContain('NVDA');
   });
 

@@ -643,6 +643,35 @@ export interface IntradayTopPriorDayContext {
   emaAlignment: 'bullish' | 'bearish' | 'mixed' | null;
 }
 
+/** 一个 15 分钟滚动窗口的爆发读数：推力、量比与两者乘积的爆发分。 */
+export interface IntradayBurstWindow {
+  startEt: string;
+  endEt: string;
+  thrustPercent: number | null;
+  thrustNorm: number | null;
+  volNorm: number | null;
+  score: number | null;
+  direction: 'up' | 'down' | 'flat';
+}
+
+/** 波段爆发（v2 主信号）：当前窗口 + 当日（或最近一个交易时段）波段列表。 */
+export interface IntradaySessionBursts {
+  state: 'ready' | 'insufficient_bars' | 'unavailable';
+  sessionDateEt: string | null;
+  barCount: number;
+  medianBarRange: number | null;
+  medianBarVolume: number | null;
+  medianBasis: 'current_session_bars_so_far' | 'prior_session_fallback' | null;
+  windowMinutes: number;
+  current: IntradayBurstWindow | null;
+  legs: IntradayBurstWindow[];
+  unavailableReason: string | null;
+  source: string | null;
+  fetchedAt: string | null;
+  basis: string;
+  limitations: string[];
+}
+
 /** 日内 Top 候选行：每个指标要么有值+口径，要么显式标缺原因。 */
 export interface IntradayTopCandidate {
   ticker: string;
@@ -675,6 +704,7 @@ export interface IntradayTopCandidate {
   atr14LastBarDate: string | null;
   atrRangeExpansion: number | null;
   rangeExpansionUnavailableReason: string | null;
+  sessionBursts: IntradaySessionBursts;
   optionActivity: IntradayTopOptionActivity;
   priorDayContext: IntradayTopPriorDayContext;
   evidence: OpportunityEvidence[];
@@ -712,8 +742,8 @@ export interface IntradayTopResponse {
   sessionStateBasis: 'america_new_york_clock_v1';
   quoteSessionScope: 'current_session' | 'latest_prior_session';
   quoteSessionLabel: string;
-  signalVersion: 'intraday_session_evidence_v1';
-  rankingMethod: 'rule_based_evidence_count';
+  signalVersion: 'intraday_session_evidence_v2';
+  rankingMethod: 'burst_score_first_then_evidence_count' | 'rule_based_evidence_count';
   statisticsTrack: 'none_intraday_v1_unscored';
   moomooEnabled: boolean;
   universe: string[];

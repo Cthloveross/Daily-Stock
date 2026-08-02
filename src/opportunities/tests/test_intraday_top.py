@@ -11,12 +11,15 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
+from src.opportunities.intraday_bursts import BURST_SUPPORT_MIN
 from src.opportunities.intraday_top import (
     ACTIVE_SUPPORT_MIN,
     GAP_BASIS_DAILY_LOADER,
     GAP_BASIS_SNAPSHOT_PREV_CLOSE,
     INTRADAY_STATISTICS_TRACK,
     INTRADAY_TOP_SIGNAL_VERSION,
+    RANKING_METHOD_BURST_FIRST,
+    RANKING_METHOD_EVIDENCE_COUNT,
     IntradayDailyContext,
     IntradayQuoteInput,
     build_intraday_top_candidate,
@@ -27,6 +30,36 @@ from src.opportunities.intraday_top import (
 )
 
 _AS_OF = datetime(2026, 7, 28, 14, 30, tzinfo=timezone.utc)
+
+
+def _burst_profile(score: float | None = 9.5, *, legs: list[dict] | None = None, state: str = "ready"):
+    current = None
+    if score is not None:
+        current = {
+            "start_et": "10:15",
+            "end_et": "10:30",
+            "thrust_percent": 1.8,
+            "thrust_norm": 3.0,
+            "vol_norm": score / 3.0,
+            "score": score,
+            "direction": "up",
+        }
+    return {
+        "state": state,
+        "session_date_et": "2026-07-28",
+        "bar_count": 13,
+        "median_bar_range": 1.0,
+        "median_bar_volume": 1_000.0,
+        "median_basis": "current_session_bars_so_far",
+        "window_minutes": 15,
+        "current": current,
+        "legs": legs if legs is not None else ([current] if current else []),
+        "unavailable_reason": None if state == "ready" else "no_regular_session_bars",
+        "source": "fixture_5m",
+        "fetched_at": "2026-07-28T14:30:06+00:00",
+        "basis": "rolling_15m_thrust_over_median_range_times_volume_ratio",
+        "limitations": [],
+    }
 
 
 def _daily(**overrides) -> IntradayDailyContext:
@@ -269,7 +302,14 @@ class TestRecentEventFeed:
 
 
 class TestRunAssembly:
-    def _run(self, *, session_state="regular", quotes=None, symbols=("NVDA", "TSLA")):
+    def _run(
+        self,
+        *,
+        session_state="regular",
+        quotes=None,
+        symbols=("NVDA", "TSLA"),
+        burst_profiles=None,
+    ):
         return build_intraday_top_run(
             symbols=list(symbols),
             unsupported_symbols=["600519"],
@@ -282,17 +322,24 @@ class TestRunAssembly:
             session_state_basis="america_new_york_clock_v1",
             limit=5,
             moomoo_enabled=True,
+            burst_profiles=burst_profiles,
         )
 
     def test_run_contract_and_statistics_track(self):
         run = self._run()
         assert run["schema_version"] == "intraday-top/1.0"
         assert run["signal_version"] == INTRADAY_TOP_SIGNAL_VERSION
-        assert run["ranking_method"] == "rule_based_evidence_count"
+        assert run["signal_version"] == "intraday_session_evidence_v2"
+        # 盘中（current_session scope）＝爆发分优先；休市退回证据计数。
+        assert run["ranking_method"] == RANKING_METHOD_BURST_FIRST
+        assert self._run(session_state="closed")["ranking_method"] == (
+            RANKING_METHOD_EVIDENCE_COUNT
+        )
         assert run["statistics_track"] == INTRADAY_STATISTICS_TRACK
         assert run["unsupported_symbols"] == ["600519"]
         assert any("不冻结" in text for text in run["limitations"])
         assert any("不推断开平仓" in text for text in run["limitations"])
+        assert any("波段爆发" in text for text in run["limitations"])
 
     def test_ordering_active_before_watch_before_insufficient(self):
         run = self._run(symbols=("TSLA", "NVDA"))
@@ -339,6 +386,113 @@ class TestRunAssembly:
             limit=limit,
             moomoo_enabled=False,
         )
+
+
+class TestBurstEvidence:
+    def test_supports_at_threshold_both_directions(self):
+        below = _candidate(burst_profile=_burst_profile(BURST_SUPPORT_MIN - 0.01))
+        at = _candidate(burst_profile=_burst_profile(BURST_SUPPORT_MIN))
+        assert _evidence_status(below, "session_momentum_burst") == "neutral"
+        assert _evidence_status(at, "session_momentum_burst") == "supports"
+        assert at["supporting_evidence_count"] == below["supporting_evidence_count"] + 1
+
+    def test_missing_profile_is_unknown_and_never_blocks_aggregates(self):
+        candidate = _candidate(burst_profile=None)
+        assert _evidence_status(candidate, "session_momentum_burst") == "unknown"
+        assert candidate["session_bursts"]["state"] == "unavailable"
+        # 聚合证据完全不受影响（缺口/量能/波幅/VWAP/异动仍是 5 项支持）。
+        assert candidate["supporting_evidence_count"] == 5
+        assert candidate["research_state"] == "active"
+
+    def test_unavailable_profile_keeps_reason(self):
+        candidate = _candidate(
+            burst_profile=_burst_profile(None, state="unavailable")
+        )
+        assert candidate["session_bursts"]["state"] == "unavailable"
+        assert _evidence_status(candidate, "session_momentum_burst") == "unknown"
+
+    def test_payload_carries_current_and_legs(self):
+        candidate = _candidate(burst_profile=_burst_profile(12.0))
+        bursts = candidate["session_bursts"]
+        assert bursts["current"]["score"] == 12.0
+        assert bursts["legs"][0]["direction"] == "up"
+        assert bursts["basis"].startswith("rolling_15m")
+
+
+class TestBurstRanking:
+    def _run(self, *, session_state="regular", burst_profiles=None):
+        symbols = ("NVDA", "TSLA")
+        return build_intraday_top_run(
+            symbols=list(symbols),
+            unsupported_symbols=[],
+            quotes={symbol: _quote() for symbol in symbols},
+            dailies={symbol: _daily() for symbol in symbols},
+            option_event_items={
+                "NVDA": _events(["BULLISH"] * 3),
+                "TSLA": _events([]),
+            },
+            as_of=_AS_OF,
+            market_date_et="2026-07-28",
+            session_state=session_state,
+            session_state_basis="america_new_york_clock_v1",
+            limit=5,
+            moomoo_enabled=True,
+            burst_profiles=burst_profiles,
+        )
+
+    def test_in_session_higher_burst_outranks_higher_evidence_count(self):
+        # NVDA 拿满聚合证据；TSLA 证据更少但当前爆发分更高 → TSLA 在前。
+        run = self._run(
+            burst_profiles={
+                "NVDA": _burst_profile(6.5),
+                "TSLA": _burst_profile(20.0),
+            }
+        )
+        assert [item["ticker"] for item in run["candidates"]] == ["TSLA", "NVDA"]
+        assert run["ranking_method"] == RANKING_METHOD_BURST_FIRST
+
+    def test_in_session_missing_burst_falls_behind_scored_rows(self):
+        run = self._run(
+            burst_profiles={"TSLA": _burst_profile(6.5)}
+        )
+        assert [item["ticker"] for item in run["candidates"]] == ["TSLA", "NVDA"]
+
+    def test_closed_session_ranks_v1_but_attaches_last_session_legs(self):
+        legs = [
+            {
+                "start_et": "09:40",
+                "end_et": "09:55",
+                "thrust_percent": -0.93,
+                "thrust_norm": 3.17,
+                "vol_norm": 2.95,
+                "score": 9.33,
+                "direction": "down",
+            },
+            {
+                "start_et": "15:15",
+                "end_et": "15:30",
+                "thrust_percent": 0.95,
+                "thrust_norm": 3.19,
+                "vol_norm": 2.68,
+                "score": 8.56,
+                "direction": "up",
+            },
+        ]
+        run = self._run(
+            session_state="closed",
+            burst_profiles={
+                # TSLA 爆发分远高，但休市排序退回 v1：NVDA（证据更多）在前。
+                "NVDA": _burst_profile(1.0, legs=legs),
+                "TSLA": _burst_profile(50.0),
+            },
+        )
+        assert run["ranking_method"] == RANKING_METHOD_EVIDENCE_COUNT
+        assert [item["ticker"] for item in run["candidates"]] == ["NVDA", "TSLA"]
+        nvda = run["candidates"][0]
+        assert [leg["start_et"] for leg in nvda["session_bursts"]["legs"]] == [
+            "09:40",
+            "15:15",
+        ]
 
 
 class TestDailyContext:

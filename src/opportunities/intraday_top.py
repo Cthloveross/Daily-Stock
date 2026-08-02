@@ -27,9 +27,22 @@ from src.opportunities.intraday import (
     VOLUME_PACE_BASIS,
     VWAP_BASIS_SESSION_TURNOVER_OVER_VOLUME,
 )
+from src.opportunities.intraday_bursts import (
+    BURST_BASIS,
+    BURST_LIMITATIONS,
+    BURST_SUPPORT_MIN,
+    unavailable_burst_profile,
+)
 
-INTRADAY_TOP_SIGNAL_VERSION = "intraday_session_evidence_v1"
+# v2: 波段爆发（15 分钟推力×量比）成为盘中主排序信号；聚合证据退居次序。
+INTRADAY_TOP_SIGNAL_VERSION = "intraday_session_evidence_v2"
 INTRADAY_TOP_SCHEMA_VERSION = "intraday-top/1.0"
+
+# 盘中（盘前/盘中/盘后，quote_session_scope=current_session）：按当前爆发分
+# 优先排序；休市（closed）：退回 v1 证据计数排序，但仍附带最近一个交易时段
+# 的波段列表（晚间复盘可见「今日走了几波」）。
+RANKING_METHOD_BURST_FIRST = "burst_score_first_then_evidence_count"
+RANKING_METHOD_EVIDENCE_COUNT = "rule_based_evidence_count"
 
 # The intraday board is a rolling research surface: it must never be confused
 # with the frozen premarket plan.  It writes no snapshot, no qualification and
@@ -80,7 +93,8 @@ INTRADAY_TOP_LIMITATIONS = (
     "盘中滚动研究：结果随行情持续变化，不冻结任何版本，也不能事后重建。",
     "不写入机会快照、qualification 或 5D/20D 结果统计（statistics_track=none_intraday_v1_unscored）。",
     "期权异动为 Moomoo 分类计数：不推断开平仓，不证明真实主动买卖方向。",
-    "排名是确定性证据计数（v1 启发式阈值），不是胜率或预期收益模型，不是买卖信号。",
+    "盘中排序以 15 分钟波段爆发分（推力×量比，v2 启发式阈值按 2026-07-31 标注样本校准）优先，"
+    "证据计数次之；休市退回证据计数排序。两者都不是胜率或预期收益模型，不是买卖信号。",
     "量能节奏对比 20 个交易日全日中位数，未按盘中时点折算；VWAP 为累计额/量近似。",
 )
 
@@ -340,6 +354,7 @@ def build_intraday_top_candidate(
     as_of: datetime,
     quote_session_scope: str,
     moomoo_enabled: bool,
+    burst_profile: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     """Build one intraday candidate with the board's evidence contract shape."""
 
@@ -390,7 +405,49 @@ def build_intraday_top_candidate(
             (last_price / snapshot_prev_close - 1.0) * 100.0, 6
         )
 
-    # -- 2. gap vs prior close ------------------------------------------------
+    # -- 2. momentum burst（波段爆发，v2 主信号） ------------------------------
+    # 5m K 线来自共享历史加载器，与 Moomoo 快照互相独立：任何一侧失败都只让
+    # 自己显式标缺，绝不拖垮另一侧的证据。
+    bursts = dict(
+        burst_profile
+        if burst_profile is not None
+        else unavailable_burst_profile("burst_input_missing")
+    )
+    burst_current = bursts.get("current") or None
+    burst_score = _finite(
+        burst_current.get("score") if isinstance(burst_current, Mapping) else None
+    )
+    burst_observed = bursts.get("state") == "ready" and burst_score is not None
+    burst_supports = burst_observed and burst_score >= BURST_SUPPORT_MIN
+    evidence.append(
+        _evidence(
+            ticker=ticker,
+            domain="intraday_session",
+            metric="session_momentum_burst",
+            value=(
+                {
+                    "current": dict(burst_current)
+                    if isinstance(burst_current, Mapping)
+                    else None,
+                    "leg_count": len(bursts.get("legs") or ()),
+                    "session_date_et": bursts.get("session_date_et"),
+                    "median_basis": bursts.get("median_basis"),
+                }
+                if burst_observed
+                else None
+            ),
+            unit="ratio",
+            status="supports" if burst_supports else ("neutral" if burst_observed else "unknown"),
+            source=bursts.get("source") or "history_5m_loader",
+            observed_at=bursts.get("session_date_et"),
+            fetched_at=bursts.get("fetched_at") or as_of_text,
+            observation_window=BURST_BASIS,
+            quality_state="derived" if burst_observed else "missing",
+            limitations=list(BURST_LIMITATIONS),
+        )
+    )
+
+    # -- 3. gap vs prior close ------------------------------------------------
     if quote_session_scope == QUOTE_SCOPE_CURRENT:
         gap_reference_close = daily.prior_close
         gap_basis = GAP_BASIS_DAILY_LOADER
@@ -464,7 +521,7 @@ def build_intraday_top_candidate(
         )
     )
 
-    # -- 3. volume pace (G-2 helper output, full-day-median basis) ------------
+    # -- 4. volume pace (G-2 helper output, full-day-median basis) ------------
     volume_pace_ratio: Optional[float] = None
     volume_pace_unavailable_reason: Optional[str] = None
     if quote is None:
@@ -499,7 +556,7 @@ def build_intraday_top_candidate(
         )
     )
 
-    # -- 4. VWAP position, support only when aligned with gap direction -------
+    # -- 5. VWAP position, support only when aligned with gap direction -------
     vwap: Optional[float] = None
     vwap_unavailable_reason: Optional[str] = None
     turnover_value = _finite_positive(session_turnover)
@@ -548,7 +605,7 @@ def build_intraday_top_candidate(
         )
     )
 
-    # -- 5. ATR range expansion ----------------------------------------------
+    # -- 6. ATR range expansion ----------------------------------------------
     atr_range_expansion: Optional[float] = None
     range_expansion_unavailable_reason: Optional[str] = None
     if quote is None:
@@ -594,7 +651,7 @@ def build_intraday_top_candidate(
         )
     )
 
-    # -- 6. option-event activity (provider classification counts only) -------
+    # -- 7. option-event activity (provider classification counts only) -------
     events_observed = events["state"] in {"ready", "empty"}
     event_supports = (
         events["count"] >= OPTION_EVENT_COUNT_SUPPORT_MIN
@@ -632,7 +689,7 @@ def build_intraday_top_candidate(
         )
     )
 
-    # -- 7. prior-day structure: CONTEXT ONLY, never a ranking support --------
+    # -- 8. prior-day structure: CONTEXT ONLY, never a ranking support --------
     range_position: Optional[str] = None
     if last_price is not None and daily.prior_high_20d is not None and daily.prior_low_20d is not None:
         if last_price > daily.prior_high_20d:
@@ -734,6 +791,7 @@ def build_intraday_top_candidate(
         "atr14_last_bar_date": daily.atr14_last_bar_date,
         "atr_range_expansion": atr_range_expansion,
         "range_expansion_unavailable_reason": range_expansion_unavailable_reason,
+        "session_bursts": bursts,
         "option_activity": {
             "state": events["state"],
             "count": events["count"],
@@ -756,10 +814,39 @@ def build_intraday_top_candidate(
     }
 
 
+def _candidate_current_burst_score(candidate: Mapping[str, Any]) -> Optional[float]:
+    bursts = candidate.get("session_bursts")
+    if not isinstance(bursts, Mapping) or bursts.get("state") != "ready":
+        return None
+    current = bursts.get("current")
+    if not isinstance(current, Mapping):
+        return None
+    return _finite(current.get("score"))
+
+
 def _candidate_sort_key(candidate: Mapping[str, Any]) -> tuple[Any, ...]:
+    """v1 ordering: research state, then supports count, then ticker."""
+
     return (
         _STATE_ORDER.get(str(candidate.get("research_state")), 99),
         -int(candidate.get("supporting_evidence_count") or 0),
+        str(candidate.get("ticker") or ""),
+    )
+
+
+def _candidate_burst_sort_key(candidate: Mapping[str, Any]) -> tuple[Any, ...]:
+    """v2 in-session ordering: current burst score first, then supports/state.
+
+    A missing/unavailable burst never fabricates a score of 0 — those rows
+    simply fall back behind every scored row, ordered by the v1 key.
+    """
+
+    score = _candidate_current_burst_score(candidate)
+    return (
+        0 if score is not None else 1,
+        -(score if score is not None else 0.0),
+        -int(candidate.get("supporting_evidence_count") or 0),
+        _STATE_ORDER.get(str(candidate.get("research_state")), 99),
         str(candidate.get("ticker") or ""),
     )
 
@@ -777,6 +864,7 @@ def build_intraday_top_run(
     session_state_basis: str,
     limit: int,
     moomoo_enabled: bool,
+    burst_profiles: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> dict[str, Any]:
     """Assemble the deterministic intraday Top-N research run."""
 
@@ -799,10 +887,19 @@ def build_intraday_top_run(
             as_of=as_of,
             quote_session_scope=quote_session_scope,
             moomoo_enabled=moomoo_enabled,
+            burst_profile=(burst_profiles or {}).get(ticker),
         )
         for ticker in symbols
     ]
-    candidates.sort(key=_candidate_sort_key)
+    # 盘前/盘中/盘后按当前爆发分优先；休市退回 v1 证据计数排序，但候选仍
+    # 携带最近一个交易时段的波段列表（晚间复盘可见「今日走了几波」）。
+    burst_ranked = quote_session_scope == QUOTE_SCOPE_CURRENT
+    candidates.sort(
+        key=_candidate_burst_sort_key if burst_ranked else _candidate_sort_key
+    )
+    ranking_method = (
+        RANKING_METHOD_BURST_FIRST if burst_ranked else RANKING_METHOD_EVIDENCE_COUNT
+    )
 
     as_of_text = _iso(as_of)
     fingerprint = "|".join(
@@ -821,7 +918,7 @@ def build_intraday_top_run(
         "quote_session_scope": quote_session_scope,
         "quote_session_label": quote_session_label,
         "signal_version": INTRADAY_TOP_SIGNAL_VERSION,
-        "ranking_method": "rule_based_evidence_count",
+        "ranking_method": ranking_method,
         "statistics_track": INTRADAY_STATISTICS_TRACK,
         "moomoo_enabled": bool(moomoo_enabled),
         "universe": list(symbols),

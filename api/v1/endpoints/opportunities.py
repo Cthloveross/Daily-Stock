@@ -71,6 +71,10 @@ from src.opportunities.intraday import (
     compute_volume_pace,
     market_session_state,
 )
+from src.opportunities.intraday_bursts import (
+    compute_session_burst_profile,
+    unavailable_burst_profile,
+)
 from src.opportunities.intraday_top import (
     INTRADAY_TOP_SIGNAL_VERSION,
     IntradayDailyContext,
@@ -135,6 +139,14 @@ _INTRADAY_TOP_LEASE_SECONDS = 45.0
 # 端点共用同一逐标的 30 秒 TTL 缓存 key。
 _INTRADAY_TOP_EVENT_PAGE_SIZE = 10
 _INTRADAY_TOP_MAX_EVENT_WORKERS = 4
+# 波段爆发的 5m K 线：走与 /stocks/{code}/history?period=5m 相同的服务端
+# 加载器；只需要当前 + 上一交易时段，跨周末取 4 个自然日再在纯函数内裁剪。
+_INTRADAY_BURST_FETCH_DAYS = 4
+_INTRADAY_BURST_MAX_WORKERS = 4
+# 逐标的 60 秒 TTL：5m K 线每 5 分钟才推进一个 bucket，60 秒缓存保证同一
+# bucket 内最多重取一次，且轮询周期（60s）内的重复请求全部命中缓存。
+_INTRADAY_BURST_CACHE_TTL_SECONDS = 60.0
+_INTRADAY_BURST_CACHE_MAX_ENTRIES = 64
 _INTRADAY_PULSE_SCHEMA = "intraday-pulse/1.0"
 _INTRADAY_PULSE_CACHE_TTL_SECONDS = 60.0
 # SPY/QQQ 走美股 ETF 快照；VIX 指数在 Moomoo 美股快照中不保证可得，
@@ -218,6 +230,7 @@ _scan_cache: dict[tuple[Any, ...], _ScanCacheEntry] = {}
 _scan_flights: dict[tuple[Any, ...], _ScanFlight] = {}
 _scan_flight_generation = 0
 _intraday_daily_cache: dict[tuple[str, str], _ScanCacheEntry] = {}
+_intraday_burst_cache: dict[tuple[str, str, str], _ScanCacheEntry] = {}
 
 
 def _cache_now() -> float:
@@ -308,6 +321,7 @@ def _reset_scan_cache_for_tests() -> None:
     with _scan_cache_lock:
         _scan_cache.clear()
         _intraday_daily_cache.clear()
+        _intraday_burst_cache.clear()
         for flight in _scan_flights.values():
             if flight.error is None:
                 flight.error = OpportunityScanTimeoutError(
@@ -1684,6 +1698,122 @@ def _load_intraday_option_event_items(
     return {symbol: load_one(symbol) for symbol in symbols}
 
 
+def _fetch_intraday_5m_bars(symbol: str) -> tuple[list[dict[str, Any]], Optional[str]]:
+    """Server-side 5m bars via the same loader as /stocks/{code}/history.
+
+    Isolated so tests can stub it; never called when the symbol is cached.
+    """
+
+    from src.services.stock_service import StockService
+
+    result = StockService().get_history_data(
+        symbol,
+        period="5m",
+        days=_INTRADAY_BURST_FETCH_DAYS,
+        include_stock_name=False,
+    )
+    return list(result.get("data") or []), result.get("source")
+
+
+def _prune_intraday_burst_cache(now: float) -> None:
+    expired = [
+        key
+        for key, entry in _intraday_burst_cache.items()
+        if entry.expires_at <= now
+    ]
+    for key in expired:
+        _intraday_burst_cache.pop(key, None)
+    while len(_intraday_burst_cache) >= _INTRADAY_BURST_CACHE_MAX_ENTRIES:
+        oldest = min(
+            _intraday_burst_cache,
+            key=lambda item: _intraday_burst_cache[item].expires_at,
+        )
+        _intraday_burst_cache.pop(oldest, None)
+
+
+def _load_intraday_burst_profiles(
+    symbols: list[str],
+    *,
+    market_date_et: str,
+    quote_session_scope: str,
+) -> dict[str, dict[str, Any]]:
+    """Per-symbol rolling-burst profiles from bounded 5m history reads.
+
+    每标的只取当前 + 上一交易时段的常规时段 5m K 线（跨周末多取的自然日在
+    纯函数内裁掉）；逐标的 60 秒 TTL 缓存 + 有界线程池并发。任何单标的
+    读取失败都只让该标的的波段爆发显式 unavailable，绝不阻塞聚合证据，
+    也绝不让整个 Top 榜 500。
+    """
+
+    now = _cache_now()
+    results: dict[str, dict[str, Any]] = {}
+    missing: list[str] = []
+    with _scan_cache_lock:
+        _prune_intraday_burst_cache(now)
+        for symbol in symbols:
+            entry = _intraday_burst_cache.get(
+                (symbol, market_date_et, quote_session_scope)
+            )
+            if entry is not None and entry.expires_at > now:
+                results[symbol] = copy.deepcopy(entry.result)
+            else:
+                missing.append(symbol)
+    if not missing:
+        return results
+
+    def load_one(symbol: str) -> dict[str, Any]:
+        fetched_at = datetime.now(timezone.utc).isoformat()
+        try:
+            bars, source = _fetch_intraday_5m_bars(symbol)
+        except Exception as exc:  # noqa: BLE001 - one symbol must not fail the run
+            logger.debug(
+                "[opportunities] intraday 5m bars unavailable symbol=%s error_type=%s",
+                symbol,
+                type(exc).__name__,
+            )
+            return unavailable_burst_profile(
+                f"history_5m_unavailable:{type(exc).__name__}",
+                fetched_at=fetched_at,
+            )
+        return compute_session_burst_profile(
+            bars,
+            market_date_et=market_date_et,
+            quote_session_scope=quote_session_scope,
+            source=source,
+            fetched_at=fetched_at,
+        )
+
+    loaded: dict[str, dict[str, Any]] = {}
+    if len(missing) > 1:
+        with ThreadPoolExecutor(
+            max_workers=min(_INTRADAY_BURST_MAX_WORKERS, len(missing)),
+            thread_name_prefix="intraday-top-bursts",
+        ) as executor:
+            futures = {
+                executor.submit(load_one, symbol): symbol for symbol in missing
+            }
+            for future in as_completed(futures):
+                loaded[futures[future]] = future.result()
+    else:
+        loaded = {symbol: load_one(symbol) for symbol in missing}
+
+    completion_time = _cache_now()
+    for symbol, profile in loaded.items():
+        results[symbol] = profile
+        # 失败/无 K 线的 profile 不落缓存：下一次（60 秒 TTL 内的）请求
+        # 直接重试，而不是把失败冻结一个轮询周期。
+        if profile.get("state") == "ready":
+            with _scan_cache_lock:
+                _prune_intraday_burst_cache(completion_time)
+                _intraday_burst_cache[
+                    (symbol, market_date_et, quote_session_scope)
+                ] = _ScanCacheEntry(
+                    expires_at=completion_time + _INTRADAY_BURST_CACHE_TTL_SECONDS,
+                    result=copy.deepcopy(profile),
+                )
+    return results
+
+
 def _execute_intraday_top(
     symbols: list[str], limit: int, *, enabled: bool
 ) -> dict[str, Any]:
@@ -1746,6 +1876,15 @@ def _execute_intraday_top(
         market_date_et=market_date_et,
     )
 
+    # 波段爆发（v2 主排序信号）：5m K 线与 Moomoo 开关无关，休市时段也读取
+    # （附最近一个交易时段的波段供晚间复盘）；单标的失败显式 unavailable。
+    burst_scope = "latest_prior_session" if session_state == "closed" else "current_session"
+    burst_profiles = _load_intraday_burst_profiles(
+        supported,
+        market_date_et=market_date_et,
+        quote_session_scope=burst_scope,
+    )
+
     return build_intraday_top_run(
         symbols=supported,
         unsupported_symbols=unsupported,
@@ -1758,6 +1897,7 @@ def _execute_intraday_top(
         session_state_basis=SESSION_STATE_BASIS,
         limit=limit,
         moomoo_enabled=enabled,
+        burst_profiles=burst_profiles,
     )
 
 
@@ -2435,9 +2575,10 @@ def intraday_top(payload: IntradayTopRequest) -> IntradayTopResponse:
 
     与「周内 Top 5 · 盘前冻结」互不替代：本接口盘中滚动重排、不冻结版本、
     不写快照/qualification/5D/20D 结果（statistics_track=none_intraday_v1_unscored）。
-    证据 = G-2 会话快照（缺口/量能节奏/VWAP/波幅扩张）+ 有界 Moomoo 异动计数；
-    异动是供应商分类，不推断开平仓或真实主动方向。休市时段仍可读取，但显式
-    标注数据属于最近一个交易时段。
+    v2 盘中主排序信号 = 15 分钟波段爆发（5m K 线滚动推力×量比，逐标的当前
+    + 上一交易时段有界读取）；聚合证据（缺口/量能节奏/VWAP/波幅扩张 + 有界
+    Moomoo 异动计数）退居次序。异动是供应商分类，不推断开平仓或真实主动
+    方向。休市时段仍可读取：排序退回证据计数，但附最近一个交易时段的波段。
     """
 
     symbols = payload.symbols or _configured_symbols()
