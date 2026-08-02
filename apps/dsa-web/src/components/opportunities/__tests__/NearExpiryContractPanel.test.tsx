@@ -6,6 +6,7 @@ import {
 } from '../NearExpiryContractPanel';
 import { fetchNearExpiryContracts } from '../../../api/opportunities';
 import type {
+  IntradayEarningsProximity,
   NearExpiryContractItem,
   NearExpiryContractResponse,
   NearExpiryContractRow,
@@ -40,6 +41,24 @@ function contractRow(overrides: Partial<NearExpiryContractRow> = {}): NearExpiry
     quoteState: 'observed',
     unavailableReason: null,
     isAtm: false,
+    ...overrides,
+  };
+}
+
+function earningsProximity(
+  overrides: Partial<IntradayEarningsProximity> = {},
+): IntradayEarningsProximity {
+  return {
+    state: 'ready',
+    daysToEarnings: null,
+    earningsDate: null,
+    withinBlackout: false,
+    blackoutDays: 3,
+    windowDays: 5,
+    basis: 'finnhub_earnings_calendar_forward_window',
+    source: 'finnhub_earnings_calendar',
+    fetchedAt: '2026-08-04T20:00:00+00:00',
+    unavailableReason: null,
     ...overrides,
   };
 }
@@ -88,6 +107,7 @@ function panelItem(overrides: Partial<NearExpiryContractItem> = {}): NearExpiryC
         ],
       },
     ],
+    earningsProximity: earningsProximity(),
     message: '临期合约读数已读取。',
     limitations: [
       'OI 为上一清算交易日（T-1）结算口径，不是盘中实时持仓。',
@@ -248,5 +268,85 @@ describe('NearExpiryContractPanel', () => {
       expect(screen.getByText(/临期合约暂不可用：网络超时/)).toBeInTheDocument();
     });
     expect(screen.queryByRole('table')).not.toBeInTheDocument();
+  });
+
+  it('shows a prominent header badge when earnings fall inside the blackout window', async () => {
+    vi.mocked(fetchNearExpiryContracts).mockResolvedValue(response(panelItem({
+      earningsProximity: earningsProximity({
+        daysToEarnings: 2,
+        earningsDate: '2026-08-06',
+        withinBlackout: true,
+      }),
+    })));
+
+    render(<NearExpiryContractPanel symbol="MU" />);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText('财报 2 天内 · 期权贵 · 你的回避规则'),
+      ).toBeInTheDocument();
+    });
+    expect(screen.queryByText('财报日历标缺 · 未知≠安全')).not.toBeInTheDocument();
+  });
+
+  it('labels a same-day earnings blackout as 今日财报', async () => {
+    vi.mocked(fetchNearExpiryContracts).mockResolvedValue(response(panelItem({
+      earningsProximity: earningsProximity({
+        daysToEarnings: 0,
+        earningsDate: '2026-08-04',
+        withinBlackout: true,
+      }),
+    })));
+
+    render(<NearExpiryContractPanel symbol="MU" />);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText('今日财报 · 期权贵 · 你的回避规则'),
+      ).toBeInTheDocument();
+    });
+  });
+
+  it('renders no earnings marker when ready and outside the blackout window', async () => {
+    // 默认 fixture：state ready、窗口内无财报 → 不加任何财报标注（不制造噪音）。
+    vi.mocked(fetchNearExpiryContracts).mockResolvedValue(response(panelItem()));
+
+    render(<NearExpiryContractPanel symbol="MU" />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/2 DTE · 2026-08-04/)).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/期权贵/)).not.toBeInTheDocument();
+    expect(screen.queryByText('财报日历标缺 · 未知≠安全')).not.toBeInTheDocument();
+  });
+
+  it('marks a missing earnings calendar as unknown, never implied-safe', async () => {
+    vi.mocked(fetchNearExpiryContracts).mockResolvedValue(response(panelItem({
+      earningsProximity: earningsProximity({
+        state: 'unavailable',
+        withinBlackout: null,
+        unavailableReason: 'finnhub_not_configured',
+      }),
+    })));
+
+    render(<NearExpiryContractPanel symbol="MU" />);
+
+    await waitFor(() => {
+      expect(screen.getByText('财报日历标缺 · 未知≠安全')).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/期权贵/)).not.toBeInTheDocument();
+  });
+
+  it('treats a legacy payload without the earnings field as unknown', async () => {
+    // additive 兼容：旧 30 秒会话缓存里可能还有不带该字段的载荷。
+    vi.mocked(fetchNearExpiryContracts).mockResolvedValue(response(panelItem({
+      earningsProximity: undefined,
+    })));
+
+    render(<NearExpiryContractPanel symbol="MU" />);
+
+    await waitFor(() => {
+      expect(screen.getByText('财报日历标缺 · 未知≠安全')).toBeInTheDocument();
+    });
   });
 });

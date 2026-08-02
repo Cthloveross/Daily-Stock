@@ -430,6 +430,11 @@ export interface NearExpiryContractItem {
     excludedUnknownStandardTypeContracts: number;
   };
   expiries: NearExpiryExpiryGroup[];
+  /**
+   * v3 财报临近（additive 字段，与扫描表候选同形状、同一份日历缓存）。
+   * 旧缓存载荷可能缺省 → 按「标缺 · 未知≠安全」处理，绝不冒充安全。
+   */
+  earningsProximity?: IntradayEarningsProximity;
   message: string;
   limitations: string[];
 }

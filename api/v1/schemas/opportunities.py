@@ -696,6 +696,26 @@ class OptionWallResponse(BaseModel):
     items: list[OptionWallItem] = Field(default_factory=list)
 
 
+class IntradayEarningsProximity(BaseModel):
+    """v3 财报临近标记：前向 5 天窗口内最近财报日；不可得时显式标缺。
+
+    within_blackout=None 表示日历不可得（诚实未知），不是「安全」。
+    ≤3 天的「期权贵」阈值是用户自身回避规则的 v1 启发式。
+    日内扫描表候选与临期合约面板（G-8）共用同一形状与同一份日历缓存。
+    """
+
+    state: Literal["ready", "unavailable"]
+    days_to_earnings: Optional[int] = Field(default=None, ge=0)
+    earnings_date: Optional[str] = None
+    within_blackout: Optional[bool] = None
+    blackout_days: int = Field(ge=0)
+    window_days: int = Field(ge=1)
+    basis: Literal["finnhub_earnings_calendar_forward_window"]
+    source: str
+    fetched_at: Optional[str] = None
+    unavailable_reason: Optional[str] = None
+
+
 class NearExpiryContractRequest(BaseModel):
     """临期合约面板请求：单个美股期权 underlying 的 0–max_dte 天合约读数。"""
 
@@ -789,6 +809,9 @@ class NearExpiryContractItem(BaseModel):
     strike_window: NearExpiryStrikeWindow
     coverage: NearExpiryCoverage
     expiries: list[NearExpiryExpiryGroup] = Field(default_factory=list)
+    # v3 财报临近：与扫描表候选同形状、同一份逐 ET 日日历缓存；日历不可得
+    # 时显式 unavailable（未知≠安全），与面板自身 state 正交。
+    earnings_proximity: IntradayEarningsProximity
     message: str
     limitations: list[str] = Field(default_factory=list)
 
@@ -1047,25 +1070,6 @@ class IntradayBurstSpeed(BaseModel):
     previous_score: Optional[float] = Field(default=None, ge=0)
     delta: Optional[float] = None
     basis: Literal["consecutive_rolling_15m_window_burst_score_delta_5m_bars"]
-    unavailable_reason: Optional[str] = None
-
-
-class IntradayEarningsProximity(BaseModel):
-    """v3 财报临近标记：前向 5 天窗口内最近财报日；不可得时显式标缺。
-
-    within_blackout=None 表示日历不可得（诚实未知），不是「安全」。
-    ≤3 天的「期权贵」阈值是用户自身回避规则的 v1 启发式。
-    """
-
-    state: Literal["ready", "unavailable"]
-    days_to_earnings: Optional[int] = Field(default=None, ge=0)
-    earnings_date: Optional[str] = None
-    within_blackout: Optional[bool] = None
-    blackout_days: int = Field(ge=0)
-    window_days: int = Field(ge=1)
-    basis: Literal["finnhub_earnings_calendar_forward_window"]
-    source: str
-    fetched_at: Optional[str] = None
     unavailable_reason: Optional[str] = None
 
 

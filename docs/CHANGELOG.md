@@ -423,6 +423,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] styleMatch 全程 fail-closed：S1 不足 3 根 15m K 线、缺口输入缺失、托举/回落输入缺失、SPY 状态标缺分别给显式 reason（SPY 标缺时 S3 最多 partial，绝不冒充「大盘走弱」）；休市按最近一个交易时段评估并以 `session_date_et` + `quote_session_scope=latest_prior_session` 如实标注；缺口阈值单一真源迁至 `intraday_setups`（`intraday_top` 原名别名导入，数值语义不变）。
 - [测试] 新增 `src/opportunities/tests/test_intraday_setups.py`（25：S1 抬高+突破/未突破 partial/低点走低/K 线不足/平坦无 swing low、S2 阈值双向与同源断言/单边托举 partial/回补 not_matched/输入标缺、S3 大盘走弱 matched/大盘强 partial/标缺 partial、多 setup 同时相似、休市 as-of、Playbook 只读透传、15m 栅格聚合）；`test_intraday_top.py` +4（setup_match 携带且不改证据计数、S1 K 线接线、Playbook refs 注入、休市 scope）；endpoint 合同断言 v4 + setup_match 状态矩阵 + Playbook 只读标注 + 5m 失败仅 S1 标缺；前端形态列徽标/tooltip/—/标缺渲染测试。
 - [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` 新增 §2.10 形态相似度（三 setup v1 规则表、显式不检查项、Playbook 只读对应、诚实边界）；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` 新增 G-10 行；根 README 不承载日内列级细节，故未改动。
+- [新功能] 临期合约面板（G-8）页头接入 v3 财报临近警示：`near-expiry-contracts` 响应新增 additive `earnings_proximity` 字段（与日内扫描表候选同形状，复用同一份逐 ET 日 Finnhub 日历缓存与 `compute_earnings_proximity`，零新增抓取路径、零新增常量），回避窗内（≤3 天）面板页头醒目标注「财报 N 天内 · 期权贵 · 你的回避规则」（0 天为「今日财报…」），ready 且窗外不加任何标注；该字段与面板自身 state 正交（Moomoo 未启用/失败照常返回）。
+- [修复] 临期面板财报字段 fail-closed：日历不可得时 `state=unavailable`、`within_blackout=null`，前端小字「财报日历标缺 · 未知≠安全」；旧会话缓存缺该字段的载荷同样按标缺处理，绝不以缺失冒充安全。
+- [测试] `test_near_expiry_contracts_endpoint.py` +5（回避窗内 3/5/basis 断言、窗外 ready 不标注且不串其他标的、日历 unavailable 诚实、Moomoo 禁用仍带字段、扫描车道已加载日历时临期面板零第二次区间调用）+ autouse Finnhub 日历桩（既有用例绝不打真实 Finnhub）；前端面板 +5（回避窗徽标、今日财报文案、窗外零标注、标缺小字、旧载荷缺字段按标缺）；真实 TestClient 验收：SNDK 财报 2026-08-05（3 天内 → within_blackout=true）、AAPL 窗口内无财报（false），两标的共享一次日历区间调用。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` §2.9 前端小节新增财报临近一行（字段形状、复用口径、三种渲染状态）；根 README 不承载面板级细节，故未改动。
 
 ## [3.11.0] - 2026-03-27
 

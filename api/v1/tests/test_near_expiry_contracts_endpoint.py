@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +19,36 @@ def _clear_opportunity_scan_cache():
     opportunities._reset_scan_cache_for_tests()
     yield
     opportunities._reset_scan_cache_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _stub_earnings_calendar_not_configured(monkeypatch):
+    """默认：财报日历按未配置处理（显式 unavailable），单测绝不打真实 Finnhub。"""
+
+    monkeypatch.setattr(
+        opportunities,
+        "_fetch_earnings_calendar_rows",
+        lambda from_date, to_date: (None, "finnhub_not_configured"),
+    )
+
+
+def _market_date_et() -> date:
+    """与 endpoint 相同口径的 ET 交易日（真实 now → America/New_York）。"""
+
+    return datetime.now(timezone.utc).astimezone(opportunities._NEW_YORK).date()
+
+
+def _stub_earnings_rows(monkeypatch, rows: list[dict]) -> list[tuple[date, date]]:
+    """Replace the shared earnings range fetch with a call-recording stub."""
+
+    calls: list[tuple[date, date]] = []
+
+    def fetch(from_date: date, to_date: date):
+        calls.append((from_date, to_date))
+        return rows, None
+
+    monkeypatch.setattr(opportunities, "_fetch_earnings_calendar_rows", fetch)
+    return calls
 
 
 def _client() -> TestClient:
@@ -385,3 +415,151 @@ def test_invalid_symbol_or_max_dte_is_422(monkeypatch, payload):
     )
 
     assert response.status_code == 422
+
+
+def test_earnings_blackout_is_surfaced_on_the_contract_panel(monkeypatch):
+    monkeypatch.setattr(opportunities, "_moomoo_opend_enabled", lambda: True)
+    monkeypatch.setattr(
+        opportunities,
+        "_compute_near_expiry_chain_moomoo",
+        lambda symbol, *, max_dte: _chain_snapshot(),
+    )
+    market_date = _market_date_et()
+    earnings_date = market_date + timedelta(days=2)
+    _stub_earnings_rows(
+        monkeypatch,
+        [{"symbol": "MU", "date": earnings_date.isoformat()}],
+    )
+
+    response = _client().post(
+        "/api/v1/opportunities/near-expiry-contracts",
+        json={"symbol": "MU"},
+    )
+
+    assert response.status_code == 200
+    proximity = response.json()["item"]["earnings_proximity"]
+    assert proximity["state"] == "ready"
+    assert proximity["earnings_date"] == earnings_date.isoformat()
+    assert proximity["days_to_earnings"] == 2
+    assert proximity["within_blackout"] is True
+    assert proximity["blackout_days"] == 3
+    assert proximity["window_days"] == 5
+    assert proximity["basis"] == "finnhub_earnings_calendar_forward_window"
+
+
+def test_earnings_outside_blackout_stays_unflagged_but_ready(monkeypatch):
+    monkeypatch.setattr(opportunities, "_moomoo_opend_enabled", lambda: True)
+    monkeypatch.setattr(
+        opportunities,
+        "_compute_near_expiry_chain_moomoo",
+        lambda symbol, *, max_dte: _chain_snapshot(),
+    )
+    market_date = _market_date_et()
+    earnings_date = market_date + timedelta(days=5)
+    _stub_earnings_rows(
+        monkeypatch,
+        [
+            # 窗口内但在回避窗（≤3 天）之外 → ready 且不标注。
+            {"symbol": "MU", "date": earnings_date.isoformat()},
+            # 其他标的的财报绝不串到本 underlying。
+            {"symbol": "NVDA", "date": market_date.isoformat()},
+        ],
+    )
+
+    response = _client().post(
+        "/api/v1/opportunities/near-expiry-contracts",
+        json={"symbol": "MU"},
+    )
+
+    assert response.status_code == 200
+    proximity = response.json()["item"]["earnings_proximity"]
+    assert proximity["state"] == "ready"
+    assert proximity["earnings_date"] == earnings_date.isoformat()
+    assert proximity["days_to_earnings"] == 5
+    assert proximity["within_blackout"] is False
+
+
+def test_earnings_calendar_unavailable_never_implies_safe(monkeypatch):
+    # autouse fixture 已把日历打成 finnhub_not_configured；面板自身照常返回。
+    monkeypatch.setattr(opportunities, "_moomoo_opend_enabled", lambda: True)
+    monkeypatch.setattr(
+        opportunities,
+        "_compute_near_expiry_chain_moomoo",
+        lambda symbol, *, max_dte: _chain_snapshot(),
+    )
+
+    response = _client().post(
+        "/api/v1/opportunities/near-expiry-contracts",
+        json={"symbol": "MU"},
+    )
+
+    assert response.status_code == 200
+    item = response.json()["item"]
+    assert item["state"] == "ready"
+    proximity = item["earnings_proximity"]
+    assert proximity["state"] == "unavailable"
+    assert proximity["within_blackout"] is None
+    assert proximity["days_to_earnings"] is None
+    assert proximity["earnings_date"] is None
+    assert proximity["unavailable_reason"] == "finnhub_not_configured"
+
+
+def test_earnings_field_present_even_when_moomoo_disabled(monkeypatch):
+    """财报临近与 Moomoo 可用性正交：not_configured 面板也带该字段。"""
+
+    monkeypatch.setattr(opportunities, "_moomoo_opend_enabled", lambda: False)
+    market_date = _market_date_et()
+    _stub_earnings_rows(
+        monkeypatch,
+        [{"symbol": "MU", "date": market_date.isoformat()}],
+    )
+
+    response = _client().post(
+        "/api/v1/opportunities/near-expiry-contracts",
+        json={"symbol": "MU"},
+    )
+
+    assert response.status_code == 200
+    item = response.json()["item"]
+    assert item["state"] == "not_configured"
+    proximity = item["earnings_proximity"]
+    assert proximity["state"] == "ready"
+    assert proximity["days_to_earnings"] == 0
+    assert proximity["within_blackout"] is True
+
+
+def test_earnings_calendar_cache_is_shared_with_scan_lane(monkeypatch):
+    """扫描表已加载日历时，临期面板复用同一份缓存，不发第二次区间调用。"""
+
+    monkeypatch.setattr(opportunities, "_moomoo_opend_enabled", lambda: True)
+    monkeypatch.setattr(
+        opportunities,
+        "_compute_near_expiry_chain_moomoo",
+        lambda symbol, *, max_dte: _chain_snapshot(),
+    )
+    market_date = _market_date_et()
+    calls = _stub_earnings_rows(
+        monkeypatch,
+        [{"symbol": "MU", "date": (market_date + timedelta(days=1)).isoformat()}],
+    )
+
+    # 扫描表车道加载日历的唯一入口就是这条共享函数（见 _execute_intraday_top）。
+    warmed = opportunities._load_intraday_earnings_calendar(market_date.isoformat())
+    assert warmed["state"] == "ready"
+    assert len(calls) == 1
+
+    client = _client()
+    first = client.post(
+        "/api/v1/opportunities/near-expiry-contracts",
+        json={"symbol": "MU", "max_dte": 3},
+    )
+    # 不同 max_dte → 面板结果缓存 miss，强制重新装配；日历仍不得重拉。
+    second = client.post(
+        "/api/v1/opportunities/near-expiry-contracts",
+        json={"symbol": "MU", "max_dte": 2},
+    )
+
+    assert first.status_code == 200 and second.status_code == 200
+    assert len(calls) == 1
+    assert first.json()["item"]["earnings_proximity"]["within_blackout"] is True
+    assert second.json()["item"]["earnings_proximity"]["within_blackout"] is True

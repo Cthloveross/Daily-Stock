@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
 import { fetchNearExpiryContracts } from '../../api/opportunities';
 import type {
+  IntradayEarningsProximity,
   NearExpiryContractItem,
   NearExpiryContractRow,
   NearExpiryExpiryGroup,
@@ -36,6 +37,36 @@ function quoteTimeLabel(value: string | null): string {
   if (!value) return '标缺';
   const match = value.match(/\d{2}:\d{2}(?::\d{2})?/);
   return match ? `${match[0]} ET` : value;
+}
+
+/**
+ * v3 财报临近头标（与扫描表财报列同一套语义与样式）：
+ * - 回避窗内（≤blackoutDays 天）→ 醒目警示「财报 N 天内 · 期权贵 ·
+ *   你的回避规则」（0 天 →「今日财报…」），在看合约的瞬间可见；
+ * - ready 且在回避窗外 → 不渲染任何标注（不制造噪音）；
+ * - 日历不可得（或旧缓存载荷缺字段）→ 小字「财报日历标缺 · 未知≠安全」，
+ *   绝不以缺失冒充安全。
+ */
+function EarningsProximityBadge({
+  proximity,
+}: {
+  proximity: IntradayEarningsProximity | undefined;
+}) {
+  if (!proximity || proximity.state !== 'ready') {
+    return (
+      <span className="text-caption text-text-3">财报日历标缺 · 未知≠安全</span>
+    );
+  }
+  if (!proximity.withinBlackout || proximity.daysToEarnings === null) {
+    return null;
+  }
+  return (
+    <span className="inline-block rounded-ds-sm border border-[color:var(--warn-muted)] bg-bg-0 px-1.5 py-0.5 text-caption font-medium text-warning">
+      {proximity.daysToEarnings === 0
+        ? '今日财报 · 期权贵 · 你的回避规则'
+        : `财报 ${proximity.daysToEarnings} 天内 · 期权贵 · 你的回避规则`}
+    </span>
+  );
 }
 
 function bidAskLabel(row: NearExpiryContractRow): string {
@@ -155,6 +186,7 @@ export function NearExpiryContractPanel({
           <h3 className="text-body-sm font-semibold text-text-1">
             临期合约 · {symbol}（0–{maxDte} DTE）
           </h3>
+          {item && <EarningsProximityBadge proximity={item.earningsProximity} />}
           <span className="text-caption text-text-3">
             合约选择参考 · 不构成推荐 · 以券商实时盘口为准
           </span>

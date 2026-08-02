@@ -87,6 +87,7 @@ from src.opportunities.intraday_top import (
     IntradayDailyContext,
     IntradayQuoteInput,
     build_intraday_top_run,
+    compute_earnings_proximity,
     compute_intraday_daily_context,
 )
 from src.opportunities.near_expiry_contracts import (
@@ -1550,12 +1551,22 @@ def _execute_near_expiry_contracts(
 ) -> dict[str, Any]:
     requested_at = datetime.now(timezone.utc)
     market_date = requested_at.astimezone(_NEW_YORK).date()
+    market_date_et = market_date.isoformat()
     item = _near_expiry_item(
         symbol,
         enabled=enabled,
         fetched_at=requested_at,
         max_dte=max_dte,
         open_interest_as_of=_previous_xnys_session_label(market_date),
+    )
+    # v3 财报临近：复用扫描表同一份逐 ET 日日历缓存（零新增抓取路径），
+    # 让「财报临近不交易（期权贵）」在看合约的瞬间可见。与面板自身
+    # state 正交：Moomoo 未启用/失败时该字段照常返回；日历不可得时显式
+    # unavailable，绝不以缺失冒充「安全」。
+    item["earnings_proximity"] = compute_earnings_proximity(
+        item["ticker"],
+        _load_intraday_earnings_calendar(market_date_et),
+        market_date_et=market_date_et,
     )
     return {
         "schema_version": _NEAR_EXPIRY_SCHEMA,
