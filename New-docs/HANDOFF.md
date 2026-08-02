@@ -524,7 +524,8 @@ Future preview 的关键边界：
 | `/journal?tab=positions` | 复盘工作台（G-3）：「复盘工作台」头部条（默认构建标识 + Review Queue + 继续复盘下一笔）+ 回合列表/筛选 + 模式观察 + Playbook |
 | `/journal?tab=import` | 「数据与构建」（原「交易证据」，深链不变）：每日刷新、历史导入（CSV/OpenAPI）、当前持仓快照与 future preview、canonical 构建与默认视图（激活）管理 |
 | `/journal/review/:episodeId` | 单一 PositionEpisode 专业复盘 |
-| `/regime` | 官方盘前研究、Top 5、状态与学习面板 |
+| `/intraday` | 日内工作台（G-6）：市场脉搏 + 冻结盘前计划对照 + 盘中滚动扫描 + 期权异动 feed；盘中滚动研究，不冻结不入统计 |
+| `/regime` | 官方盘前研究、周内 Top 5（基于上一完整交易日日线结构）、状态与学习面板 |
 | `/regime/opportunity/:ticker` | 单票机会详情 |
 | `/watchlist` | 浏览器本地自选与官方研究池核对/保存 |
 | `/stocks/:ticker` | 股票分析详情 |

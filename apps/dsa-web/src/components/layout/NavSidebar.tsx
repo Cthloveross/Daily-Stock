@@ -2,6 +2,7 @@ import type React from 'react';
 import { useState } from 'react';
 import { NavLink } from 'react-router-dom';
 import {
+  Activity,
   Gauge,
   CandlestickChart,
   NotebookPen,
@@ -21,6 +22,8 @@ interface NavItem {
 }
 
 const ITEMS: NavItem[] = [
+  // 日内工作台是盘中主界面，置于导航首位。
+  { to: '/intraday', label: '日内', icon: Activity },
   { to: '/regime', label: 'Regime', icon: Gauge },
   { to: '/watchlist', label: 'Watchlist', icon: CandlestickChart },
   { to: '/journal', label: 'Journal', icon: NotebookPen },

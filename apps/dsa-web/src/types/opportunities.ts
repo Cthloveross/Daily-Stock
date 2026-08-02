@@ -601,3 +601,151 @@ export interface IntradayTrackingResponse {
   items: IntradayTrackingItem[];
   limitations: string[];
 }
+
+/** 日内滚动研究状态：盘中活跃 / 观察 / 数据不足（缺核心快照时 fail-closed）。 */
+export type IntradayTopResearchState = 'active' | 'watch' | 'insufficient';
+
+export type IntradayTopDominantSentiment =
+  | 'bullish'
+  | 'bearish'
+  | 'neutral'
+  | 'mixed'
+  | 'unknown';
+
+/** 一页有界 Moomoo 异动的诚实聚合：只有计数与供应商分类，不推断开平仓。 */
+export interface IntradayTopOptionActivity {
+  state: 'ready' | 'empty' | 'not_configured' | 'unavailable';
+  count: number;
+  allCount: number | null;
+  bullishCount: number;
+  bearishCount: number;
+  neutralCount: number;
+  unclassifiedCount: number;
+  dominantSentiment: IntradayTopDominantSentiment;
+  maxSingleTurnover: number | null;
+  eventAsOf: string | null;
+  fetchedAt: string | null;
+  source: string;
+  limitations: string[];
+}
+
+/** 上一完整交易日结构背景；仅作 research_context，不参与盘中排序。 */
+export interface IntradayTopPriorDayContext {
+  priorClose: number | null;
+  priorCloseDate: string | null;
+  priorHigh20d: number | null;
+  priorLow20d: number | null;
+  rangePosition:
+    | 'above_prior_20d_high'
+    | 'below_prior_20d_low'
+    | 'inside_prior_20d_range'
+    | null;
+  emaAlignment: 'bullish' | 'bearish' | 'mixed' | null;
+}
+
+/** 日内 Top 候选行：每个指标要么有值+口径，要么显式标缺原因。 */
+export interface IntradayTopCandidate {
+  ticker: string;
+  researchState: IntradayTopResearchState;
+  stateReason: string;
+  supportingEvidenceCount: number;
+  source: string;
+  fetchedAt: string | null;
+  quoteAsOf: string | null;
+  lastPrice: number | null;
+  sessionOpen: number | null;
+  sessionHigh: number | null;
+  sessionLow: number | null;
+  sessionChangePercent: number | null;
+  sessionChangeBasis: 'moomoo_snapshot_prev_close';
+  gapPercent: number | null;
+  gapAtrMultiple: number | null;
+  gapBasis:
+    | 'session_open_vs_prior_completed_close_daily_loader'
+    | 'session_open_vs_moomoo_snapshot_prev_close';
+  gapUnavailableReason: string | null;
+  volumePaceRatio: number | null;
+  volumePaceBasis: 'session_cumulative_vs_prior_20_session_full_day_median';
+  volumePaceUnavailableReason: string | null;
+  vwap: number | null;
+  vwapPosition: 'above' | 'below' | 'flat' | 'unknown';
+  vwapBasis: 'session_turnover_over_volume';
+  vwapUnavailableReason: string | null;
+  atr14: number | null;
+  atr14LastBarDate: string | null;
+  atrRangeExpansion: number | null;
+  rangeExpansionUnavailableReason: string | null;
+  optionActivity: IntradayTopOptionActivity;
+  priorDayContext: IntradayTopPriorDayContext;
+  evidence: OpportunityEvidence[];
+  message: string;
+  limitations: string[];
+}
+
+/** 跨标的异动 feed 单行；供应商分类原样透传，不改写为方向结论。 */
+export interface IntradayTopRecentOptionEvent {
+  ticker: string;
+  eventId: string;
+  optionCode: string;
+  fillTime: string | null;
+  tickerType: string | null;
+  price: number | null;
+  volume: number | null;
+  turnover: number | null;
+  optionType: string | null;
+  strikePrice: number | null;
+  expiry: string | null;
+  dte: number | null;
+  sentiment: string | null;
+  orderTypes: string[];
+  strategyType: string | null;
+}
+
+/** 盘中滚动 Top N：不冻结、不入统计，与盘前冻结榜互不替代。 */
+export interface IntradayTopResponse {
+  schemaVersion: string;
+  runId: string;
+  generatedAt: string;
+  asOf: string;
+  marketDateEt: string;
+  sessionState: IntradaySessionState;
+  sessionStateBasis: 'america_new_york_clock_v1';
+  quoteSessionScope: 'current_session' | 'latest_prior_session';
+  quoteSessionLabel: string;
+  signalVersion: 'intraday_session_evidence_v1';
+  rankingMethod: 'rule_based_evidence_count';
+  statisticsTrack: 'none_intraday_v1_unscored';
+  moomooEnabled: boolean;
+  universe: string[];
+  unsupportedSymbols: string[];
+  requestedLimit: number;
+  candidateCount: number;
+  candidates: IntradayTopCandidate[];
+  recentOptionEvents: IntradayTopRecentOptionEvent[];
+  limitations: string[];
+}
+
+/** 市场脉搏单行（SPY/QQQ/VIX）：缺失显式标缺，不以 0 冒充。 */
+export interface IntradayPulseItem {
+  ticker: string;
+  state: 'ready' | 'partial' | 'not_configured' | 'unavailable';
+  lastPrice: number | null;
+  prevClose: number | null;
+  changePercent: number | null;
+  changeBasis: 'moomoo_snapshot_prev_close';
+  quoteAsOf: string | null;
+  fetchedAt: string;
+  source: string;
+  message: string;
+  limitations: string[];
+}
+
+export interface IntradayPulseResponse {
+  schemaVersion: string;
+  generatedAt: string;
+  marketDateEt: string;
+  sessionState: IntradaySessionState;
+  sessionStateBasis: 'america_new_york_clock_v1';
+  items: IntradayPulseItem[];
+  limitations: string[];
+}

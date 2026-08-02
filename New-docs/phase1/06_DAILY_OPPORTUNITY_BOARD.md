@@ -175,6 +175,40 @@ TradingView 面向个人网站账户没有公开的自选列表 REST API；其�
 
 刷新策略：手动刷新按钮 + 可选 60 秒自动刷新；自动刷新只在页面可见（`document.visibilityState`）且盘段为盘前/盘中时运行，其余情况彻底停表。Moomoo 未启用或快照缺失时逐标的显式 `not_configured` / `unavailable`，实时字段保持 null，从不显示伪造的 0。
 
+### 2.8 日内工作台与日内 Top（G-6：日内 / 周内看板分离）
+
+2026-08-02 起，原先单一的机会看板显式拆成两种互不替代的研究口径：
+
+- **周内 Top 5 · 盘前冻结**（`/regime`，本文档 §2.1–§2.7 的既有看板）：基于上一完整交易日日线结构，研究周期数日至数周；官方版本在盘前窗口冻结，进入 qualification 与 5D/20D 结果统计。页头副标题 2026-08-02 起如实标注「基于上一完整交易日日线结构 · 数日至数周研究周期」，并提供「进入日内工作台 →」入口。
+- **日内工作台**（`/intraday`，导航首位）：盘中交易时段的单屏主界面，盘中滚动、不冻结、不入统计。
+
+`/intraday` 页面自上而下：
+
+1. **市场脉搏**（sticky 顶栏）：SPY / QQQ / VIX 快照现价与当日涨跌（分母为快照自带前收，`change_basis=moomoo_snapshot_prev_close`）、盘段状态、ET 数据时点与自动刷新指示。数据来自 `GET /api/v1/opportunities/intraday-pulse`（60 秒 TTL + single-flight）；VIX 与 SPY/QQQ 隔离请求，供应商快照不可得时逐代码显式标缺，不用其他来源或旧值冒充。
+2. **今日计划**：冻结盘前 Top 5 的对照跟踪，直接复用 §2.7 的 `IntradayTrackingPanel`（该组件同时保留在 `/regime` 官方看板下方，行为不变；本页是它的主要使用场景）。今日没有已发布官方版本时显示诚实空态，不用预览榜冒充冻结计划。
+3. **日内扫描表**（核心）：`POST /api/v1/opportunities/intraday-top` 的盘中滚动 Top 5。列：标的 / 现价+当日%（as-of）/ 缺口 / 量能节奏 / VWAP 位置 / 波幅扩张(ATR) / 期权异动（N 笔·偏向·最大单）/ 研究状态；列头可点做客户端排序（第三次点击回到服务端证据排名），行点击进入 `/regime/opportunity/:ticker` 即时扫描详情（不绑定 snapshotKey）。
+4. **期权异动 feed**：跨自选池、按时间倒序的最近异动成交（接口响应内有界 ≤20 条）：时间 · 标的 · Call/Put · 行权价/到期 · 金额 · Moomoo 情绪分类，底部固定标注「分类不证明开平仓方向」。
+
+`POST /api/v1/opportunities/intraday-top` 合同（`schema_version=intraday-top/1.0`，`signal_version=intraday_session_evidence_v1`）：
+
+- 请求：`symbols`（≤20，空数组回退服务端 `STOCK_LIST`）、`limit`（默认 5，1–10）、`refresh`。非美股期权 underlying 不参与扫描并在 `unsupported_symbols` 中如实列出。
+- 装配全部复用 G-2 机制：会话快照来自与期权墙相同的 Moomoo Quote-only `get_market_snapshot`；ATR14 / 20 日量能中位 / 上一日结构（前收、前 20 日高低、EMA8/13）来自与每日榜相同的完成日线加载器（15 分钟逐标的记忆）；期权异动逐标的复用 `option-events` 的 30 秒缓存 key（每标最近一页 ≤10 条，失败只降级该标的）。响应级 60 秒 TTL + single-flight，`refresh` 只绕过已完成 TTL。
+- 每个候选带与每日榜同构的 evidence 数组（source / observed_at / fetched_at / observation_window / quality_state / limitations），排序方法固定 `rule_based_evidence_count`。
+
+v1 排名启发式阈值（代码内常量注释文档化；均为研究优先级起点，不是验证过的 edge；修改必须升 `signal_version`）：
+
+| 证据 | 记为 supports 的条件 | 口径说明 |
+|---|---|---|
+| 量能节奏 | ≥ 1.5× | 当日累计 ÷ 前 20 交易日全日中位（未按时点折算，同 G-2） |
+| 缺口 | \|开盘−参考前收\| ≥ 0.75×ATR14，或 \|缺口%\| ≥ 1.5% | 参考前收＝日线加载器上一完整日收盘；休市时段切换为快照自带前收并显式改 `gap_basis` |
+| 波幅扩张 | (session high − session low) ÷ ATR14 ≥ 1.0 | ATR14＝已完成日线 Wilder 平滑 |
+| 期权异动 | 最近一页事件 ≥ 3 条且 Moomoo sentiment 多数方向非中性 | 只统计供应商分类；平票记 `mixed`、无分类记 `unknown`，绝不发明方向 |
+| VWAP 位置 | 与缺口方向一致（缺口向上且价在 VWAP 上方，或反之） | VWAP＝累计额/量近似 |
+
+研究状态（`research_state`）：`active`（盘中活跃，≥2 项独立支持）/ `watch`（观察）/ `insufficient`（数据不足——缺可用现价快照时 fail-closed，无论其他证据如何）。上一日结构（前 20 日区间位置、EMA 排列）只作 `research_context` 证据，永不参与盘中排序计数。
+
+诚实合同（响应 `limitations` 固定携带，页头同句展示）：盘中滚动、不冻结、不写快照/qualification/5D/20D 结果（`statistics_track=none_intraday_v1_unscored`）、期权异动不证明方向、排名是确定性证据计数而非胜率模型。休市时段接口仍可用，但 `quote_session_scope=latest_prior_session`、证据口径标注「最近一个交易时段」。前端自动刷新与 §2.7 相同：60 秒、仅页面可见且盘段为盘前/盘中。
+
 ## 3. 数据语义修正
 
 Moomoo 官方明确说明 [`get_option_chain`](https://openapi.moomoo.com/moomoo-api-doc/en/quote/get-option-chain.html) 只返回静态合约资料。动态 bid/ask、成交量、OI、IV 和 Greeks 必须用合约 code 再调用 [`get_market_snapshot`](https://openapi.moomoo.com/moomoo-api-doc/en/quote/get-market-snapshot.html)。当前适配器已改为分批（每批最多 400 个 code）合并快照；严格检查 `option_valid` 和有限数，缺任一必要动态字段就省略该合约，不再把静态行或缺失值伪装成全 0 实时行情。最近到期 ATM Call IV 仍先用静态链与 spot 锁定单一合约再读取快照；它不是 IV Rank/Percentile，也不代表异常期权大单或买卖方向。

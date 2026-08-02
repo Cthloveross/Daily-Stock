@@ -2,6 +2,8 @@ import apiClient from './index';
 import { toCamelCase } from './utils';
 import type {
   DailyOpportunityRun,
+  IntradayPulseResponse,
+  IntradayTopResponse,
   IntradayTrackingResponse,
   OpportunityLearningSummaryResponse,
   OpportunityOptionContextResponse,
@@ -36,6 +38,11 @@ const optionOverviewInFlight = new Map<string, Promise<OpportunityOptionOverview
 const optionWallInFlight = new Map<string, Promise<OpportunityOptionWallResponse>>();
 const intradayTrackingInFlight = new Map<string, Promise<IntradayTrackingResponse>>();
 const INTRADAY_TRACKING_TIMEOUT_MS = 30_000;
+const intradayTopInFlight = new Map<string, Promise<IntradayTopResponse>>();
+// 服务端装配含逐标的异动读取，lease 45 秒；客户端预算需覆盖它。
+const INTRADAY_TOP_TIMEOUT_MS = 50_000;
+let intradayPulseInFlight: Promise<IntradayPulseResponse> | null = null;
+const INTRADAY_PULSE_TIMEOUT_MS = 30_000;
 const premarketStatusInFlight = new Map<string, Promise<PremarketCycleResponse>>();
 const premarketRunInFlight = new Map<string, Promise<PremarketCycleResponse>>();
 
@@ -329,6 +336,48 @@ export async function fetchIntradayTracking(
     });
 
   intradayTrackingInFlight.set(key, request);
+  return request;
+}
+
+/**
+ * 日内 Top 滚动扫描：盘中持续重排，不冻结、不入统计。
+ * 服务端 60 秒 TTL + single-flight；本函数只做在途去重，不写 sessionCache，
+ * 保证每次轮询拿到的都是服务端允许的最新时点。空 symbols 由服务端回退 STOCK_LIST。
+ */
+export async function fetchIntradayTop(
+  symbols: string[],
+  options: { limit?: number; refresh?: boolean } = {},
+): Promise<IntradayTopResponse> {
+  const requestedSymbols = normalizedSymbols(symbols).slice(0, 20);
+  const limit = options.limit ?? 5;
+  const key = `opportunities:intraday-top:${requestedSymbols.join(',')}:${limit}:${options.refresh ? 'refresh' : 'cached'}`;
+  const pending = intradayTopInFlight.get(key);
+  if (pending) return pending;
+
+  const request = apiClient.post<Record<string, unknown>>(
+    '/api/v1/opportunities/intraday-top',
+    { symbols: requestedSymbols, limit, refresh: Boolean(options.refresh) },
+    { timeout: INTRADAY_TOP_TIMEOUT_MS },
+  ).then((response) => toCamelCase<IntradayTopResponse>(response.data))
+    .finally(() => {
+      intradayTopInFlight.delete(key);
+    });
+
+  intradayTopInFlight.set(key, request);
+  return request;
+}
+
+/** 市场脉搏（SPY/QQQ/VIX 快照读数）：服务端 60 秒 TTL；缺失显式标缺。 */
+export async function fetchIntradayPulse(): Promise<IntradayPulseResponse> {
+  if (intradayPulseInFlight) return intradayPulseInFlight;
+  const request = apiClient.get<Record<string, unknown>>(
+    '/api/v1/opportunities/intraday-pulse',
+    { timeout: INTRADAY_PULSE_TIMEOUT_MS },
+  ).then((response) => toCamelCase<IntradayPulseResponse>(response.data))
+    .finally(() => {
+      intradayPulseInFlight = null;
+    });
+  intradayPulseInFlight = request;
   return request;
 }
 

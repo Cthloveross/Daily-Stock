@@ -131,6 +131,31 @@ test.describe('web smoke (isolated empty-DB backend)', () => {
     expect(unexpectedConsoleErrors(captured)).toEqual([]);
   });
 
+  test('intraday workstation renders honest empty/closed shell', async ({ page }) => {
+    await page.goto('/intraday');
+
+    // 页头 + 诚实边界：盘中滚动研究，不是信号，不进入统计。
+    await expect(page.getByRole('heading', { name: '日内工作台' })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByText('盘中滚动研究 · 不是信号 · 不进入统计')).toBeVisible();
+
+    // 三个区块 shell：市场脉搏、今日计划、日内扫描、期权异动。
+    await expect(page.locator('section[aria-label="市场脉搏"]')).toBeVisible();
+    await expect(page.getByText('今日计划 · 盘前冻结对照')).toBeVisible();
+    await expect(page.locator('section[aria-label="日内扫描"]')).toBeVisible({ timeout: 30_000 });
+    await expect(page.locator('section[aria-label="期权异动"]')).toBeVisible();
+    await expect(
+      page.getByText(/偏多 \/ 偏空 \/ 中性为 Moomoo 供应商分类/),
+    ).toBeVisible();
+
+    // Moomoo 关闭的隔离后端：脉搏必须显式未配置/标缺，不伪造读数。
+    await expect(
+      page.locator('section[aria-label="市场脉搏"]').getByText('未配置').first(),
+    ).toBeVisible({ timeout: 20_000 });
+
+    // 空库无冻结盘前计划：今日计划区必须给诚实空态而不是空白。
+    await expect(page.getByText(/今日尚无已发布的冻结盘前计划|盘前计划状态读取失败|今日官方盘前版本没有可对照的候选/)).toBeVisible({ timeout: 30_000 });
+  });
+
   test('opportunity deep link renders the live-scan shell without an official snapshot', async ({ page }) => {
     await page.goto('/regime/opportunity/AAPL');
 

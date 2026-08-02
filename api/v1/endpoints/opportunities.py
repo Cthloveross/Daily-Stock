@@ -26,6 +26,9 @@ from sqlalchemy import select
 from api.v1.schemas.opportunities import (
     DailyOpportunityRequest,
     DailyOpportunityResponse,
+    IntradayPulseResponse,
+    IntradayTopRequest,
+    IntradayTopResponse,
     IntradayTrackingRequest,
     IntradayTrackingResponse,
     OpportunityLearningSummaryResponse,
@@ -67,6 +70,13 @@ from src.opportunities.intraday import (
     compute_session_vwap,
     compute_volume_pace,
     market_session_state,
+)
+from src.opportunities.intraday_top import (
+    INTRADAY_TOP_SIGNAL_VERSION,
+    IntradayDailyContext,
+    IntradayQuoteInput,
+    build_intraday_top_run,
+    compute_intraday_daily_context,
 )
 from src.opportunities.option_walls import (
     ATM_CALL_IV_METHOD as OPTION_WALL_ATM_CALL_IV_METHOD,
@@ -115,6 +125,27 @@ _OPTION_WALL_ASSUMPTIONS = (
 )
 _INTRADAY_TRACKING_SOURCE = "moomoo_openapi"
 _INTRADAY_TRACKING_SCHEMA = "intraday-tracking/1.0"
+# 日内 Top 榜是盘中滚动研究：60 秒 TTL 与前端 60 秒轮询对齐，一个轮询周期内
+# 的重复请求（多标签页/多组件）只触发一次完整装配。
+_INTRADAY_TOP_CACHE_TTL_SECONDS = 60.0
+# 20 个标的 × 逐标的期权异动一页读取可能超过默认 30 秒 lease；给装配一个
+# 明确的更长租约而不是放大默认值。
+_INTRADAY_TOP_LEASE_SECONDS = 45.0
+# 异动聚合读取最近一页最多 10 条（Moomoo 单页上限内），与 option-events
+# 端点共用同一逐标的 30 秒 TTL 缓存 key。
+_INTRADAY_TOP_EVENT_PAGE_SIZE = 10
+_INTRADAY_TOP_MAX_EVENT_WORKERS = 4
+_INTRADAY_PULSE_SCHEMA = "intraday-pulse/1.0"
+_INTRADAY_PULSE_CACHE_TTL_SECONDS = 60.0
+# SPY/QQQ 走美股 ETF 快照；VIX 指数在 Moomoo 美股快照中不保证可得，
+# 单独隔离请求，失败时显式 unavailable，绝不以 0 或旧值冒充。
+_INTRADAY_PULSE_CORE_SYMBOLS = ("SPY", "QQQ")
+_INTRADAY_PULSE_OPTIONAL_SYMBOLS = ("VIX",)
+_INTRADAY_PULSE_LIMITATIONS = (
+    "市场脉搏为 Moomoo 快照读数：涨跌以快照自带前收为基准，休市时段显示最近一个交易时段。",
+    "VIX 若供应商快照不可得则显式标缺，不用其他来源或旧值冒充。",
+    "仅作盘中背景，不是信号，不进入任何统计。",
+)
 # Completed daily bars only change once per session; memoise the derived
 # ATR14 / 20-session median inputs so a 60s polling panel does not re-run the
 # daily-history providers on every tick.  Live quote fields are never cached
@@ -302,6 +333,7 @@ def _get_or_compute_scan(
     bypass_cache: bool = False,
     wait_timeout_seconds: float = _SCAN_FOLLOWER_WAIT_SECONDS,
     lease_seconds: float = _SCAN_FLIGHT_LEASE_SECONDS,
+    ttl_seconds: Optional[float] = None,
 ) -> dict[str, Any]:
     """Return a cached scan or share one in-flight computation per key.
 
@@ -390,7 +422,8 @@ def _get_or_compute_scan(
             raise flight.error
         _prune_scan_cache(completion_time)
         _scan_cache[key] = _ScanCacheEntry(
-            expires_at=completion_time + _SCAN_CACHE_TTL_SECONDS,
+            expires_at=completion_time
+            + (_SCAN_CACHE_TTL_SECONDS if ttl_seconds is None else ttl_seconds),
             result=stored,
         )
         flight.result = stored
@@ -1399,6 +1432,10 @@ def _intraday_daily_inputs(
         if not bars and history.error:
             atr_reason = f"daily_history_unavailable:{history.error}"
             median_reason = f"daily_history_unavailable:{history.error}"
+        # Additive structural context (prior close / 20d range / EMA) shares
+        # this memo so the intraday Top board never re-runs daily providers
+        # beyond what the tracking panel already triggers.
+        structure = compute_intraday_daily_context(bars)
         payload = {
             "atr14": atr.value,
             "atr14_bar_count": atr.bar_count,
@@ -1407,6 +1444,7 @@ def _intraday_daily_inputs(
             "source": history.source,
             "prior_20d_median_volume": median,
             "median_unavailable_reason": median_reason,
+            **structure,
         }
         results[symbol] = payload
         if atr.value is not None and median is not None:
@@ -1564,6 +1602,279 @@ def _execute_intraday_tracking(
         "tracking_basis": "frozen_premarket_plan_readonly",
         "items": items,
         "limitations": list(_INTRADAY_TRACKING_LIMITATIONS),
+    }
+
+
+def _quote_to_intraday_input(quote: Any) -> IntradayQuoteInput:
+    return IntradayQuoteInput(
+        last_price=getattr(quote, "last_price", None),
+        session_open=getattr(quote, "open_price", None),
+        session_high=getattr(quote, "high_price", None),
+        session_low=getattr(quote, "low_price", None),
+        prev_close=getattr(quote, "prev_close_price", None),
+        session_volume=getattr(quote, "volume", None),
+        session_turnover=getattr(quote, "turnover", None),
+        quote_as_of=getattr(quote, "update_time", None),
+        fetched_at=getattr(quote, "fetched_at", None),
+        source=_INTRADAY_TRACKING_SOURCE,
+    )
+
+
+def _load_intraday_option_event_items(
+    symbols: list[str],
+    *,
+    enabled: bool,
+    market_date_et: str,
+) -> dict[str, dict[str, Any]]:
+    """Per-symbol bounded option-event pages with strict failure isolation.
+
+    Reuses the option-events endpoint's per-symbol cache key (30s TTL +
+    single-flight), so the intraday board and the detail panel share quota
+    work.  Any per-symbol failure — including a scan-timeout from the shared
+    single-flight — degrades that one symbol to an explicit ``unavailable``
+    payload instead of failing the batch.
+    """
+
+    def load_one(symbol: str) -> dict[str, Any]:
+        try:
+            return _get_or_compute_scan(
+                _option_event_cache_key(
+                    symbol,
+                    enabled,
+                    market_date_et,
+                    _INTRADAY_TOP_EVENT_PAGE_SIZE,
+                ),
+                lambda: _option_event_item(
+                    symbol,
+                    enabled=enabled,
+                    fetched_at=datetime.now(timezone.utc),
+                    limit_per_symbol=_INTRADAY_TOP_EVENT_PAGE_SIZE,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - one symbol must not fail the run
+            logger.debug(
+                "[opportunities] intraday option events unavailable symbol=%s error_type=%s",
+                symbol,
+                type(exc).__name__,
+            )
+            return _empty_option_event_payload(
+                ticker=symbol,
+                state="unavailable",
+                fetched_at=datetime.now(timezone.utc),
+                message=(
+                    "Moomoo 异动读取失败或超时；该标的按无异动数据处理，"
+                    "不以旧数据或默认值回填。"
+                ),
+            )
+
+    if not symbols:
+        return {}
+    if enabled and len(symbols) > 1:
+        results: dict[str, dict[str, Any]] = {}
+        with ThreadPoolExecutor(
+            max_workers=min(_INTRADAY_TOP_MAX_EVENT_WORKERS, len(symbols)),
+            thread_name_prefix="intraday-top-events",
+        ) as executor:
+            futures = {
+                executor.submit(load_one, symbol): symbol for symbol in symbols
+            }
+            for future in as_completed(futures):
+                results[futures[future]] = future.result()
+        return results
+    return {symbol: load_one(symbol) for symbol in symbols}
+
+
+def _execute_intraday_top(
+    symbols: list[str], limit: int, *, enabled: bool
+) -> dict[str, Any]:
+    """Assemble the rolling intraday Top-N run from G-2 machinery, read-only.
+
+    没有冻结、没有 qualification、没有 5D/20D 结果写入：statistics_track 固定
+    为 none_intraday_v1_unscored。期权异动只作为活跃度证据聚合，不推断方向。
+    """
+
+    requested_at = _intraday_now()
+    market_date_et = requested_at.astimezone(_NEW_YORK).date().isoformat()
+    session_state = market_session_state(requested_at)
+    supported = [
+        symbol for symbol in symbols if is_supported_us_option_underlying(symbol)
+    ]
+    unsupported = [
+        symbol for symbol in symbols if not is_supported_us_option_underlying(symbol)
+    ]
+
+    daily_raw = _intraday_daily_inputs(
+        supported,
+        as_of=requested_at,
+        market_date_et=market_date_et,
+    )
+    dailies = {
+        symbol: IntradayDailyContext(
+            atr14=payload.get("atr14"),
+            atr14_last_bar_date=payload.get("atr14_last_bar_date"),
+            atr14_unavailable_reason=payload.get("atr14_unavailable_reason"),
+            prior_median_volume=payload.get("prior_20d_median_volume"),
+            median_unavailable_reason=payload.get("median_unavailable_reason"),
+            prior_close=payload.get("prior_close"),
+            prior_close_date=payload.get("prior_close_date"),
+            prior_high_20d=payload.get("prior_high_20d"),
+            prior_low_20d=payload.get("prior_low_20d"),
+            ema8=payload.get("ema8"),
+            ema13=payload.get("ema13"),
+            source=payload.get("source"),
+        )
+        for symbol, payload in daily_raw.items()
+    }
+
+    quotes: dict[str, IntradayQuoteInput] = {}
+    if enabled and supported:
+        try:
+            raw_quotes = _fetch_underlying_session_quotes(supported) or {}
+        except Exception as exc:  # noqa: BLE001 - fail the batch closed per symbol
+            logger.debug(
+                "[opportunities] intraday top session quotes unavailable: %s", exc
+            )
+            raw_quotes = {}
+        quotes = {
+            symbol: _quote_to_intraday_input(quote)
+            for symbol, quote in raw_quotes.items()
+        }
+
+    option_event_items = _load_intraday_option_event_items(
+        supported,
+        enabled=enabled,
+        market_date_et=market_date_et,
+    )
+
+    return build_intraday_top_run(
+        symbols=supported,
+        unsupported_symbols=unsupported,
+        quotes=quotes,
+        dailies=dailies,
+        option_event_items=option_event_items,
+        as_of=requested_at,
+        market_date_et=market_date_et,
+        session_state=session_state,
+        session_state_basis=SESSION_STATE_BASIS,
+        limit=limit,
+        moomoo_enabled=enabled,
+    )
+
+
+def _intraday_pulse_item(
+    ticker: str,
+    quote: Any,
+    *,
+    enabled: bool,
+    fetched_at: datetime,
+) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "ticker": ticker,
+        "state": "unavailable",
+        "last_price": None,
+        "prev_close": None,
+        "change_percent": None,
+        "change_basis": "moomoo_snapshot_prev_close",
+        "quote_as_of": None,
+        "fetched_at": fetched_at.isoformat(),
+        "source": _INTRADAY_TRACKING_SOURCE,
+        "message": "",
+        "limitations": list(_INTRADAY_PULSE_LIMITATIONS),
+    }
+    if not enabled:
+        item.update(
+            state="not_configured",
+            message="MOOMOO_OPEND_ENABLED 未启用；未读取快照。",
+        )
+        return item
+    if quote is None:
+        item.update(
+            message="Moomoo 未返回该代码的快照；显式标缺，不以 0 或旧值冒充。",
+        )
+        return item
+    last_price = getattr(quote, "last_price", None)
+    prev_close = getattr(quote, "prev_close_price", None)
+    quote_fetched_at = getattr(quote, "fetched_at", None)
+    change_percent: Optional[float] = None
+    if (
+        last_price is not None
+        and prev_close is not None
+        and prev_close > 0
+        and math.isfinite(last_price)
+        and math.isfinite(prev_close)
+    ):
+        change_percent = round((last_price / prev_close - 1.0) * 100.0, 6)
+    item.update(
+        last_price=last_price,
+        prev_close=prev_close,
+        change_percent=change_percent,
+        quote_as_of=getattr(quote, "update_time", None),
+        fetched_at=(
+            quote_fetched_at.isoformat()
+            if isinstance(quote_fetched_at, datetime)
+            else fetched_at.isoformat()
+        ),
+    )
+    if last_price is None:
+        item.update(
+            message="快照缺少有效现价；显式标缺。",
+        )
+        return item
+    if change_percent is None:
+        item.update(
+            state="partial",
+            message="现价可用，但缺快照前收，无法计算涨跌幅；不估算回填。",
+        )
+        return item
+    item.update(state="ready", message="快照读数就绪；仅作盘中背景。")
+    return item
+
+
+def _execute_intraday_pulse(*, enabled: bool) -> dict[str, Any]:
+    requested_at = _intraday_now()
+    market_date_et = requested_at.astimezone(_NEW_YORK).date().isoformat()
+    session_state = market_session_state(requested_at)
+    core_quotes: dict[str, Any] = {}
+    optional_quotes: dict[str, Any] = {}
+    if enabled:
+        try:
+            core_quotes = (
+                _fetch_underlying_session_quotes(
+                    list(_INTRADAY_PULSE_CORE_SYMBOLS)
+                )
+                or {}
+            )
+        except Exception as exc:  # noqa: BLE001 - pulse must degrade per symbol
+            logger.debug("[opportunities] pulse core quotes unavailable: %s", exc)
+        try:
+            # VIX is isolated: an invalid/unsupported index code must not be
+            # able to fail the SPY/QQQ batch.
+            optional_quotes = (
+                _fetch_underlying_session_quotes(
+                    list(_INTRADAY_PULSE_OPTIONAL_SYMBOLS)
+                )
+                or {}
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[opportunities] pulse VIX quote unavailable: %s", exc)
+    merged = {**core_quotes, **optional_quotes}
+    items = [
+        _intraday_pulse_item(
+            ticker,
+            merged.get(ticker),
+            enabled=enabled,
+            fetched_at=requested_at,
+        )
+        for ticker in (*_INTRADAY_PULSE_CORE_SYMBOLS, *_INTRADAY_PULSE_OPTIONAL_SYMBOLS)
+    ]
+    return {
+        "schema_version": _INTRADAY_PULSE_SCHEMA,
+        "generated_at": requested_at.isoformat(),
+        "market_date_et": market_date_et,
+        "session_state": session_state,
+        "session_state_basis": SESSION_STATE_BASIS,
+        "items": items,
+        "limitations": list(_INTRADAY_PULSE_LIMITATIONS),
     }
 
 
@@ -2116,3 +2427,71 @@ def intraday_tracking(payload: IntradayTrackingRequest) -> IntradayTrackingRespo
     except OpportunityScanTimeoutError as exc:
         raise _scan_timeout_response(exc) from exc
     return IntradayTrackingResponse.model_validate(result)
+
+
+@router.post("/intraday-top", response_model=IntradayTopResponse)
+def intraday_top(payload: IntradayTopRequest) -> IntradayTopResponse:
+    """Return the rolling intraday Top-N research queue, read-only.
+
+    与「周内 Top 5 · 盘前冻结」互不替代：本接口盘中滚动重排、不冻结版本、
+    不写快照/qualification/5D/20D 结果（statistics_track=none_intraday_v1_unscored）。
+    证据 = G-2 会话快照（缺口/量能节奏/VWAP/波幅扩张）+ 有界 Moomoo 异动计数；
+    异动是供应商分类，不推断开平仓或真实主动方向。休市时段仍可读取，但显式
+    标注数据属于最近一个交易时段。
+    """
+
+    symbols = payload.symbols or _configured_symbols()
+    symbols = normalize_symbols(symbols)[:20]
+    if not symbols:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "empty_universe",
+                "message": "symbols 为空且服务端 STOCK_LIST 未配置。",
+            },
+        )
+    enabled = _moomoo_opend_enabled()
+    requested_at = _intraday_now()
+    market_date_et = requested_at.astimezone(_NEW_YORK).date().isoformat()
+    key = (
+        "intraday_top",
+        INTRADAY_TOP_SIGNAL_VERSION,
+        enabled,
+        tuple(symbols),
+        int(payload.limit),
+        market_date_et,
+    )
+    try:
+        result = _get_or_compute_scan(
+            key,
+            lambda: _execute_intraday_top(symbols, payload.limit, enabled=enabled),
+            bypass_cache=payload.refresh,
+            ttl_seconds=_INTRADAY_TOP_CACHE_TTL_SECONDS,
+            lease_seconds=_INTRADAY_TOP_LEASE_SECONDS,
+            wait_timeout_seconds=_INTRADAY_TOP_LEASE_SECONDS,
+        )
+    except OpportunityScanTimeoutError as exc:
+        raise _scan_timeout_response(exc) from exc
+    return IntradayTopResponse.model_validate(result)
+
+
+@router.get("/intraday-pulse", response_model=IntradayPulseResponse)
+def intraday_pulse() -> IntradayPulseResponse:
+    """Return the SPY/QQQ/VIX market pulse snapshot, read-only.
+
+    VIX 请求与 SPY/QQQ 隔离；供应商不可得时逐代码显式标缺。
+    """
+
+    enabled = _moomoo_opend_enabled()
+    requested_at = _intraday_now()
+    market_date_et = requested_at.astimezone(_NEW_YORK).date().isoformat()
+    key = ("intraday_pulse", _INTRADAY_PULSE_SCHEMA, enabled, market_date_et)
+    try:
+        result = _get_or_compute_scan(
+            key,
+            lambda: _execute_intraday_pulse(enabled=enabled),
+            ttl_seconds=_INTRADAY_PULSE_CACHE_TTL_SECONDS,
+        )
+    except OpportunityScanTimeoutError as exc:
+        raise _scan_timeout_response(exc) from exc
+    return IntradayPulseResponse.model_validate(result)

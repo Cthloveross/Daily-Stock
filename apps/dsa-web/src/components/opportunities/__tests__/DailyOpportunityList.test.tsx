@@ -1009,6 +1009,11 @@ describe('DailyOpportunityList', () => {
     expect(await screen.findByText('NVDA')).toBeInTheDocument();
     expect(screen.getByText('默认美股池 · 扫描 1 只')).toBeInTheDocument();
     expect(screen.getByText(/Top 5 规则匹配候选由/)).toBeInTheDocument();
+    // 周内榜的诚实副标题：日线结构口径 + 数日至数周研究周期 + 日内入口。
+    expect(
+      screen.getByText(/基于上一完整交易日日线结构 · 数日至数周研究周期/),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '进入日内工作台 →' })).toBeInTheDocument();
     expect(screen.queryByText(/最有可能/)).not.toBeInTheDocument();
     expect(fetchDailyOpportunities).toHaveBeenCalledWith([], 10, { refresh: false });
   });

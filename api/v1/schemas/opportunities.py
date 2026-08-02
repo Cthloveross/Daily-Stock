@@ -848,3 +848,174 @@ class IntradayTrackingResponse(BaseModel):
     tracking_basis: Literal["frozen_premarket_plan_readonly"]
     items: list[IntradayTrackingItem] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
+
+
+class IntradayTopRequest(BaseModel):
+    """日内 Top N 滚动扫描请求：空 symbols 回退服务端 STOCK_LIST。"""
+
+    symbols: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        description="候选标的（最多 20 个）；空数组时回退服务端 STOCK_LIST。",
+    )
+    limit: int = Field(5, ge=1, le=10)
+    refresh: bool = Field(
+        False,
+        description="显式刷新时绕过服务端 60 秒 TTL；仍复用同 key 的在途请求。",
+    )
+
+    @field_validator("symbols")
+    @classmethod
+    def normalize_symbols(cls, value: list[str]) -> list[str]:
+        return _normalized_symbols(value)
+
+
+class IntradayTopOptionActivity(BaseModel):
+    """一页有界 Moomoo 异动成交的诚实聚合：只有计数与供应商分类，无方向推断。"""
+
+    state: Literal["ready", "empty", "not_configured", "unavailable"]
+    count: int = Field(0, ge=0)
+    all_count: Optional[int] = Field(default=None, ge=0)
+    bullish_count: int = Field(0, ge=0)
+    bearish_count: int = Field(0, ge=0)
+    neutral_count: int = Field(0, ge=0)
+    unclassified_count: int = Field(0, ge=0)
+    dominant_sentiment: Literal["bullish", "bearish", "neutral", "mixed", "unknown"]
+    max_single_turnover: Optional[float] = Field(default=None, ge=0)
+    event_as_of: Optional[str] = None
+    fetched_at: Optional[str] = None
+    source: str
+    limitations: list[str] = Field(default_factory=list)
+
+
+class IntradayTopPriorDayContext(BaseModel):
+    """上一完整交易日结构背景；仅作 research_context，不参与盘中排序。"""
+
+    prior_close: Optional[float] = Field(default=None, gt=0)
+    prior_close_date: Optional[str] = None
+    prior_high_20d: Optional[float] = Field(default=None, gt=0)
+    prior_low_20d: Optional[float] = Field(default=None, gt=0)
+    range_position: Optional[
+        Literal[
+            "above_prior_20d_high",
+            "below_prior_20d_low",
+            "inside_prior_20d_range",
+        ]
+    ] = None
+    ema_alignment: Optional[Literal["bullish", "bearish", "mixed"]] = None
+
+
+class IntradayTopCandidate(BaseModel):
+    """一行盘中滚动研究候选：每个指标要么有值+口径，要么显式标缺原因。"""
+
+    ticker: str
+    research_state: Literal["active", "watch", "insufficient"]
+    state_reason: str
+    supporting_evidence_count: int = Field(ge=0)
+    source: str
+    fetched_at: Optional[str] = None
+    quote_as_of: Optional[str] = None
+    last_price: Optional[float] = Field(default=None, gt=0)
+    session_open: Optional[float] = Field(default=None, gt=0)
+    session_high: Optional[float] = Field(default=None, gt=0)
+    session_low: Optional[float] = Field(default=None, gt=0)
+    session_change_percent: Optional[float] = None
+    session_change_basis: Literal["moomoo_snapshot_prev_close"]
+    gap_percent: Optional[float] = None
+    gap_atr_multiple: Optional[float] = Field(default=None, ge=0)
+    gap_basis: Literal[
+        "session_open_vs_prior_completed_close_daily_loader",
+        "session_open_vs_moomoo_snapshot_prev_close",
+    ]
+    gap_unavailable_reason: Optional[str] = None
+    volume_pace_ratio: Optional[float] = Field(default=None, ge=0)
+    volume_pace_basis: Literal[
+        "session_cumulative_vs_prior_20_session_full_day_median"
+    ]
+    volume_pace_unavailable_reason: Optional[str] = None
+    vwap: Optional[float] = Field(default=None, gt=0)
+    vwap_position: Literal["above", "below", "flat", "unknown"]
+    vwap_basis: Literal["session_turnover_over_volume"]
+    vwap_unavailable_reason: Optional[str] = None
+    atr14: Optional[float] = Field(default=None, gt=0)
+    atr14_last_bar_date: Optional[str] = None
+    atr_range_expansion: Optional[float] = Field(default=None, ge=0)
+    range_expansion_unavailable_reason: Optional[str] = None
+    option_activity: IntradayTopOptionActivity
+    prior_day_context: IntradayTopPriorDayContext
+    evidence: list[EvidenceItem] = Field(default_factory=list)
+    message: str
+    limitations: list[str] = Field(default_factory=list)
+
+
+class IntradayTopRecentOptionEvent(BaseModel):
+    """跨标的异动 feed 单行；供应商分类原样透传，不改写为方向结论。"""
+
+    ticker: str
+    event_id: str
+    option_code: str
+    fill_time: Optional[str] = None
+    ticker_type: Optional[str] = None
+    price: Optional[float] = Field(default=None, gt=0)
+    volume: Optional[int] = Field(default=None, ge=0)
+    turnover: Optional[float] = Field(default=None, ge=0)
+    option_type: Optional[str] = None
+    strike_price: Optional[float] = Field(default=None, gt=0)
+    expiry: Optional[str] = None
+    dte: Optional[int] = Field(default=None, ge=0)
+    sentiment: Optional[str] = None
+    order_types: list[str] = Field(default_factory=list)
+    strategy_type: Optional[str] = None
+
+
+class IntradayTopResponse(BaseModel):
+    """盘中滚动 Top N：不冻结、不入统计，与盘前冻结榜互不替代。"""
+
+    schema_version: str
+    run_id: str
+    generated_at: str
+    as_of: str
+    market_date_et: str
+    session_state: Literal["premarket", "regular", "afterhours", "closed"]
+    session_state_basis: Literal["america_new_york_clock_v1"]
+    quote_session_scope: Literal["current_session", "latest_prior_session"]
+    quote_session_label: str
+    signal_version: Literal["intraday_session_evidence_v1"]
+    ranking_method: Literal["rule_based_evidence_count"]
+    statistics_track: Literal["none_intraday_v1_unscored"]
+    moomoo_enabled: bool
+    universe: list[str] = Field(default_factory=list)
+    unsupported_symbols: list[str] = Field(default_factory=list)
+    requested_limit: int = Field(ge=1, le=10)
+    candidate_count: int = Field(ge=0)
+    candidates: list[IntradayTopCandidate] = Field(default_factory=list)
+    recent_option_events: list[IntradayTopRecentOptionEvent] = Field(
+        default_factory=list
+    )
+    limitations: list[str] = Field(default_factory=list)
+
+
+class IntradayPulseItem(BaseModel):
+    """市场脉搏单行（SPY/QQQ/VIX）：缺失显式标缺，不以 0 冒充。"""
+
+    ticker: str
+    state: Literal["ready", "partial", "not_configured", "unavailable"]
+    last_price: Optional[float] = Field(default=None, gt=0)
+    prev_close: Optional[float] = Field(default=None, gt=0)
+    change_percent: Optional[float] = None
+    change_basis: Literal["moomoo_snapshot_prev_close"]
+    quote_as_of: Optional[str] = None
+    fetched_at: str
+    source: str
+    message: str
+    limitations: list[str] = Field(default_factory=list)
+
+
+class IntradayPulseResponse(BaseModel):
+    schema_version: str
+    generated_at: str
+    market_date_et: str
+    session_state: Literal["premarket", "regular", "afterhours", "closed"]
+    session_state_basis: Literal["america_new_york_clock_v1"]
+    items: list[IntradayPulseItem] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
