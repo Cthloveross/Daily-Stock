@@ -214,6 +214,32 @@ v2 聚合证据阈值（保留 v1 语义，退居次要排序因子；代码内�
 
 诚实合同（响应 `limitations` 固定携带，页头同句展示）：盘中滚动、不冻结、不写快照/qualification/5D/20D 结果（`statistics_track=none_intraday_v1_unscored`）、期权异动不证明方向、盘中排序＝爆发分优先 + 证据计数次之（均为确定性研究度量而非胜率模型，不是买卖信号）。休市时段接口仍可用，但 `quote_session_scope=latest_prior_session`、证据口径标注「最近一个交易时段」、排序退回证据计数。前端自动刷新与 §2.7 相同：60 秒、仅页面可见且盘段为盘前/盘中。
 
+### 2.9 临期合约面板（G-8：0–3 DTE 合约选择支持）
+
+从「选中标的」到「选中合约」之间此前是空白：系统研究 underlying，但不给任何合约级 bid/ask、点差、流动性或逐行权价 IV。临期合约面板（2026-08-02）补的就是这一层，并且**只是合约选择支持，不是推荐引擎**：不给合约打分、不做偏好排序（只有按 expiry / strike / right 的中性排序）、不生成买卖建议；页头固定「合约选择参考 · 不构成推荐 · 以券商实时盘口为准」。
+
+`POST /api/v1/opportunities/near-expiry-contracts` 合同（`schema_version=near-expiry-contracts/1.0`）：
+
+- 请求：`symbol`（单个美股期权 underlying，`US.` 前缀规范化移除，非法 422）、`max_dte`（默认 3、上限 7、含 0DTE）、`refresh`。
+- 数据路径复用既有 Moomoo 链机制：1 次 `get_option_expiration_date` + 1 次 `get_option_chain` 日期窗口（`max_dte ≤ 7 < 30` 天恒为单窗口，占 §2.1 记录的 10 次/30 秒链额度中的 1 次）+ 1 次 underlying 快照（含 `update_time` 作 spot as-of）+ 近价窗口合约的 `get_market_snapshot`（典型规模远小于单批 400 上限，即 1 个快照批次）。整个读取走与期权墙相同的独占 QuoteContext lane，不与墙扫描交叉使用同一 SDK context。
+- **bid/ask 来源**：`get_market_snapshot` 对期权 code 本就返回 `bid_price` / `ask_price`（单到期 `fetch_chain_via_moomoo` 一直在读；期权墙适配器只是没保留这两个字段）。本面板直接从同一批快照读取，不需要额外的 per-expiry 链调用。
+- 近价窗口：`abs(strike/spot−1) ≤ 5%` 与现价上下各最近 8 档行权价的并集（`src/opportunities/near_expiry_contracts.py`，边界含 1e-9 浮点容差）。窗口只约束供应商请求规模，不是价值判断。
+- 逐合约字段：`code / right / strike / dte / expiry / bid / ask / mid / spread_percent / last_price / session_volume / open_interest / iv_percent / delta / quote_as_of`。`spread_percent = (ask−bid)/mid`；bid/ask 任一缺失时 mid 与 spread 显式 null + reason（`bid_or_ask_unavailable`），**绝不 0 回填**；交叉盘口（ask < bid）保留 mid、点差标缺（`crossed_quote`）。快照缺行或 `option_valid` 无效的合约保留静态行并逐字段标缺（`quote_state=unavailable` + `snapshot_missing/snapshot_invalid`），逐到期隔离：一个到期日的快照失败不影响另一个到期日（组内 `ready / partial / unavailable`）。
+- 时间口径：OI 显式标 T-1 清算口径（`open_interest_as_of` 用 XNYS 上一 session）；volume 为当日累计；IV 为供应商百分数模型值；spot 与逐合约 `quote_as_of` 来自快照自带 `update_time`。与期权墙同一标准合约边界：显式 `NON_STANDARD` 排除、缺 `option_standard_type` 单独计数排除。
+- 额度安全：30 秒完成态 TTL + single-flight，key =（symbol, max_dte, Moomoo 启用状态, ET 日期）；`refresh` 只绕过已完成 TTL、仍复用在途请求。窗口内没有到期日（只有周五到期的标的在周末查 0–3 天窗口时会出现）返回诚实 `empty` 状态，不是失败。
+- 响应固定携带 limitations：OI 结算口径、点差与流动性随时变化、IV 为供应商模型值、面板不构成合约推荐或买卖建议、执行前以券商实时盘口为准。
+
+前端（`NearExpiryContractPanel`）：
+
+- `/intraday` 日内扫描表交互取「行点击不变 + 每行显式按钮」：整行点击仍是既有的即时扫描详情页导航，行尾「临期合约」按钮在该行下方展开内联面板（同一时刻只展开一行，保持表格可用）。选这个方案而不是改行点击语义，是为了不破坏既有肌肉记忆、也不牺牲表格扫读。
+- 面板按到期日分组（`0 DTE / 1 DTE / …` 小节），列：行权价（ATM 行高亮 + 位置标记 badge）/ Call|Put / Bid×Ask（点差%）/ 最新价 / 当日量 / OI（T-1）/ IV / as-of。点差 > 15% 标「流动性差」——这是 v1 启发式展示阈值（`SPREAD_ILLIQUID_THRESHOLD_PERCENT`，未经交易结果验证），只提示点差成本显著；缺 bid/ask 显示「标缺」。
+- `/regime/opportunity/:ticker` 详情页「期权墙」标签底部提供「查看临期合约（0–3 DTE）」按钮，按需展开同一面板组件；只有显式点击才发起读取。
+- 客户端 30 秒缓存 + 在途去重，与服务端 TTL 对齐，不用长缓存冻结盘中读数。
+
+真实验收（2026-08-02 周日休市，TestClient 连本机 OpenD）：MU `max_dte=3` 返回 2026-08-03 / 2026-08-05 两个到期日、64/64 张全部观测报价（MU/NVDA 现有周一/周三/周五到期，周末 3 天窗口并不为空）；NVDA `max_dte=7` 三个到期日 96/96；0 失败批次、0 非标准合约排除。spot as-of 与逐合约报价 as-of 如实显示上一时段（周五 15:59 / 盘后 20:01 ET）、`open_interest_as_of=2026-07-31`。样本行同时覆盖窄点差（NVDA 08-07 ATM Call 3.1%）与将被标「流动性差」的宽点差深度 ITM/OTM 行（NVDA 08-03 P185000 33.3%）。该数值是当次环境证据，不是 SLA。
+
+诚实边界：本面板是快照读数，不是逐笔 NBBO；不提供期限结构、skew、bid/ask size 或可成交滑点；「流动性差」阈值与 ATM 标记都是展示辅助，不是合约质量结论；任何字段都不进入候选排名或统计。
+
 ## 3. 数据语义修正
 
 Moomoo 官方明确说明 [`get_option_chain`](https://openapi.moomoo.com/moomoo-api-doc/en/quote/get-option-chain.html) 只返回静态合约资料。动态 bid/ask、成交量、OI、IV 和 Greeks 必须用合约 code 再调用 [`get_market_snapshot`](https://openapi.moomoo.com/moomoo-api-doc/en/quote/get-market-snapshot.html)。当前适配器已改为分批（每批最多 400 个 code）合并快照；严格检查 `option_valid` 和有限数，缺任一必要动态字段就省略该合约，不再把静态行或缺失值伪装成全 0 实时行情。最近到期 ATM Call IV 仍先用静态链与 spot 锁定单一合约再读取快照；它不是 IV Rank/Percentile，也不代表异常期权大单或买卖方向。

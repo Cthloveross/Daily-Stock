@@ -31,6 +31,8 @@ from api.v1.schemas.opportunities import (
     IntradayTopResponse,
     IntradayTrackingRequest,
     IntradayTrackingResponse,
+    NearExpiryContractRequest,
+    NearExpiryContractResponse,
     OpportunityLearningSummaryResponse,
     OpportunitySnapshotDetailResponse,
     OpportunitySnapshotEnsureResponse,
@@ -82,6 +84,13 @@ from src.opportunities.intraday_top import (
     build_intraday_top_run,
     compute_intraday_daily_context,
 )
+from src.opportunities.near_expiry_contracts import (
+    FORMULA_VERSION as NEAR_EXPIRY_FORMULA_VERSION,
+    NEAR_MONEY_MIN_STRIKES_PER_SIDE,
+    NEAR_MONEY_PERCENT_BAND,
+    STRIKE_WINDOW_BASIS as NEAR_EXPIRY_STRIKE_WINDOW_BASIS,
+    build_near_expiry_contract_payload,
+)
 from src.opportunities.option_walls import (
     ATM_CALL_IV_METHOD as OPTION_WALL_ATM_CALL_IV_METHOD,
     FORMULA_VERSION as OPTION_WALL_FORMULA_VERSION,
@@ -105,6 +114,16 @@ _OPTION_WALL_VERSION = "observable_option_walls_v1_2"
 _OPTION_WALL_SOURCE = "moomoo_openapi"
 _OPTION_EVENT_VERSION = "moomoo_unusual_option_events_v1"
 _OPTION_EVENT_SOURCE = "moomoo_openapi"
+_NEAR_EXPIRY_SCHEMA = "near-expiry-contracts/1.0"
+_NEAR_EXPIRY_SOURCE = "moomoo_openapi"
+# 临期合约面板是合约选择参考，不是推荐引擎：limitations 随每个响应携带。
+_NEAR_EXPIRY_LIMITATIONS = (
+    "OI 为上一清算交易日（T-1）结算口径，不是盘中实时持仓。",
+    "Bid/Ask、点差与流动性随时变化，快照读数不等于可成交价格。",
+    "IV 为供应商模型值，不表达涨跌方向。",
+    "本面板仅为合约选择研究参考，不构成合约推荐或买卖建议。",
+    "执行前以券商实时盘口为准。",
+)
 _OPTION_CONTEXT_LIMITATIONS = (
     "仅为 Moomoo 最近到期合约中最接近现价的 Call 单点隐含波动率。",
     "不是 IV Rank 或 IV Percentile，不包含历史隐含波动率分布。",
@@ -309,6 +328,29 @@ def _option_event_cache_key(
         symbol,
         market_date_et,
         int(limit_per_symbol),
+    )
+
+
+def _near_expiry_cache_key(
+    symbol: str,
+    enabled: bool,
+    market_date_et: str,
+    max_dte: int,
+) -> tuple[Any, ...]:
+    """(symbol, max_dte, Moomoo 状态, ET 日期) + 30 秒 TTL ≈ 分钟级新鲜度。
+
+    与兄弟期权端点相同的 30 秒完成态 TTL + single-flight：同一分钟内的
+    重复请求（多组件/多标签页）只触发一次链 + 快照读取，refresh 只绕过
+    已完成 TTL、仍复用在途请求，避免放大供应商额度消耗。
+    """
+
+    return (
+        "near_expiry_contracts",
+        _NEAR_EXPIRY_SCHEMA,
+        bool(enabled),
+        symbol,
+        market_date_et,
+        int(max_dte),
     )
 
 
@@ -918,6 +960,14 @@ def _compute_option_events_moomoo(symbol: str, *, limit: int):
     return fetch_option_events_moomoo(symbol, limit=limit)
 
 
+def _compute_near_expiry_chain_moomoo(symbol: str, *, max_dte: int):
+    """Read near-the-money 0–max_dte 合约行 through the Quote-only adapter."""
+
+    from data_provider.moomoo_options import fetch_near_expiry_chain_moomoo
+
+    return fetch_near_expiry_chain_moomoo(symbol, max_dte=max_dte)
+
+
 def _option_context_item(
     ticker: str,
     *,
@@ -1350,6 +1400,150 @@ def _execute_option_events(
         "generated_at": generated_at,
         "market_date_et": market_date_et,
         "items": items,
+    }
+
+
+def _empty_near_expiry_payload(
+    *,
+    ticker: str,
+    state: str,
+    fetched_at: datetime,
+    max_dte: int,
+    open_interest_as_of: Optional[str],
+    message: str,
+) -> dict[str, Any]:
+    return {
+        "ticker": ticker,
+        "state": state,
+        "source": _NEAR_EXPIRY_SOURCE,
+        "fetched_at": fetched_at.isoformat(),
+        "formula_version": NEAR_EXPIRY_FORMULA_VERSION,
+        "max_dte": int(max_dte),
+        "spot": None,
+        "spot_as_of": None,
+        "open_interest_as_of": open_interest_as_of,
+        "open_interest_basis": "prior_clearing_session",
+        "strike_window": {
+            "percent_band": NEAR_MONEY_PERCENT_BAND,
+            "min_strikes_per_side": NEAR_MONEY_MIN_STRIKES_PER_SIDE,
+            "basis": NEAR_EXPIRY_STRIKE_WINDOW_BASIS,
+        },
+        "coverage": {
+            "requested_contracts": 0,
+            "snapshot_received_contracts": 0,
+            "observed_contracts": 0,
+            "missing_contracts": 0,
+            "failed_batches": 0,
+            "excluded_nonstandard_contracts": 0,
+            "excluded_unknown_standard_type_contracts": 0,
+        },
+        "expiries": [],
+        "message": message,
+        "limitations": list(_NEAR_EXPIRY_LIMITATIONS),
+    }
+
+
+def _near_expiry_item(
+    ticker: str,
+    *,
+    enabled: bool,
+    fetched_at: datetime,
+    max_dte: int,
+    open_interest_as_of: Optional[str],
+) -> dict[str, Any]:
+    if not enabled:
+        return _empty_near_expiry_payload(
+            ticker=ticker,
+            state="not_configured",
+            fetched_at=fetched_at,
+            max_dte=max_dte,
+            open_interest_as_of=open_interest_as_of,
+            message="MOOMOO_OPEND_ENABLED 未启用；未读取临期合约链。",
+        )
+
+    try:
+        snapshot = _compute_near_expiry_chain_moomoo(ticker, max_dte=max_dte)
+        if snapshot is None:
+            raise ValueError(
+                "Moomoo did not return a usable near-expiry chain snapshot"
+            )
+        payload = build_near_expiry_contract_payload(snapshot, max_dte=max_dte)
+        snapshot_fetched_at = getattr(snapshot, "fetched_at", fetched_at)
+        fetched_at_text = (
+            snapshot_fetched_at.isoformat()
+            if isinstance(snapshot_fetched_at, datetime)
+            else str(snapshot_fetched_at or fetched_at.isoformat())
+        )
+        state = payload["state"]
+        if state == "empty":
+            message = (
+                f"{max_dte} 天内没有该标的的期权到期日；这是诚实空态，"
+                "不是数据失败。"
+            )
+        else:
+            coverage = payload["coverage"]
+            message = (
+                f"临期合约读数已读取：{len(payload['expiries'])} 个到期日、"
+                f"观测报价 {coverage['observed_contracts']}/"
+                f"{coverage['requested_contracts']}。仅为合约选择参考，"
+                "不构成推荐。"
+            )
+            if state == "partial":
+                message += " 部分合约快照缺失，对应行显式标缺。"
+            elif state == "unavailable":
+                message = (
+                    "临期到期日存在，但本次动态快照全部缺失；"
+                    "各行显式标缺，未以 0 或旧值回填。"
+                )
+        return {
+            "ticker": ticker,
+            "source": _NEAR_EXPIRY_SOURCE,
+            "fetched_at": fetched_at_text,
+            "open_interest_as_of": open_interest_as_of,
+            "open_interest_basis": "prior_clearing_session",
+            **payload,
+            "message": message,
+            "limitations": list(_NEAR_EXPIRY_LIMITATIONS),
+        }
+    except Exception as exc:  # noqa: BLE001 - single-symbol read fails closed
+        logger.debug(
+            "[opportunities] near-expiry contracts unavailable for %s: %s",
+            ticker,
+            exc,
+        )
+        return _empty_near_expiry_payload(
+            ticker=ticker,
+            state="unavailable",
+            fetched_at=fetched_at,
+            max_dte=max_dte,
+            open_interest_as_of=open_interest_as_of,
+            message=(
+                "Moomoo OpenAPI 未返回可用的临期合约链；"
+                "未以默认值、旧数据或第三方估算回填。"
+            ),
+        )
+
+
+def _execute_near_expiry_contracts(
+    symbol: str,
+    *,
+    enabled: bool,
+    max_dte: int,
+) -> dict[str, Any]:
+    requested_at = datetime.now(timezone.utc)
+    market_date = requested_at.astimezone(_NEW_YORK).date()
+    item = _near_expiry_item(
+        symbol,
+        enabled=enabled,
+        fetched_at=requested_at,
+        max_dte=max_dte,
+        open_interest_as_of=_previous_xnys_session_label(market_date),
+    )
+    return {
+        "schema_version": _NEAR_EXPIRY_SCHEMA,
+        "generated_at": str(item["fetched_at"]),
+        "market_date_et": market_date.isoformat(),
+        "item": item,
     }
 
 
@@ -2536,6 +2730,45 @@ def option_events(payload: OptionEventRequest) -> OptionEventResponse:
         limit_per_symbol=payload.limit_per_symbol,
     )
     return OptionEventResponse.model_validate(result)
+
+
+@router.post(
+    "/near-expiry-contracts",
+    response_model=NearExpiryContractResponse,
+)
+def near_expiry_contracts(
+    payload: NearExpiryContractRequest,
+) -> NearExpiryContractResponse:
+    """Return the read-only near-expiry (0–max_dte) contract panel data.
+
+    合约选择支持，不是推荐引擎：只返回近价窗口内 Call/Put 合约的
+    bid/ask/点差/最新价/当日量/T-1 OI/供应商 IV/delta 读数与 as-of，
+    按到期日中性分组，不打分、不排序偏好、不生成买卖建议，也不调用
+    任何交易接口。缺失字段逐字段显式 null + reason，绝不 0 回填。
+    """
+
+    enabled = _moomoo_opend_enabled()
+    requested_at = datetime.now(timezone.utc)
+    market_date_et = requested_at.astimezone(_NEW_YORK).date().isoformat()
+    key = _near_expiry_cache_key(
+        payload.symbol,
+        enabled,
+        market_date_et,
+        payload.max_dte,
+    )
+    try:
+        result = _get_or_compute_scan(
+            key,
+            lambda: _execute_near_expiry_contracts(
+                payload.symbol,
+                enabled=enabled,
+                max_dte=payload.max_dte,
+            ),
+            bypass_cache=payload.refresh,
+        )
+    except OpportunityScanTimeoutError as exc:
+        raise _scan_timeout_response(exc) from exc
+    return NearExpiryContractResponse.model_validate(result)
 
 
 @router.post("/intraday-tracking", response_model=IntradayTrackingResponse)

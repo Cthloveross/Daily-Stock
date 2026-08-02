@@ -364,6 +364,83 @@ export interface OpportunityOptionWallResponse {
   items: OpportunityOptionWallItem[];
 }
 
+export type NearExpiryContractState =
+  | 'ready'
+  | 'partial'
+  | 'empty'
+  | 'not_configured'
+  | 'unavailable';
+
+/** 单张临期合约的只读读数：逐字段可空、缺失显式标缺；不含打分或推荐。 */
+export interface NearExpiryContractRow {
+  code: string;
+  right: 'C' | 'P';
+  strike: number;
+  expiry: string;
+  dte: number;
+  bid: number | null;
+  ask: number | null;
+  mid: number | null;
+  spreadPercent: number | null;
+  spreadUnavailableReason: string | null;
+  lastPrice: number | null;
+  sessionVolume: number | null;
+  openInterest: number | null;
+  ivPercent: number | null;
+  delta: number | null;
+  quoteAsOf: string | null;
+  quoteState: 'observed' | 'unavailable';
+  unavailableReason: string | null;
+  isAtm: boolean;
+}
+
+export interface NearExpiryExpiryGroup {
+  expiry: string;
+  dte: number;
+  state: 'ready' | 'partial' | 'unavailable';
+  contractCount: number;
+  observedQuoteCount: number;
+  contracts: NearExpiryContractRow[];
+}
+
+/** 临期合约面板（0–max_dte DTE）：合约选择参考，不构成推荐。 */
+export interface NearExpiryContractItem {
+  ticker: string;
+  state: NearExpiryContractState;
+  source: string;
+  fetchedAt: string;
+  formulaVersion: string;
+  maxDte: number;
+  spot: number | null;
+  spotAsOf: string | null;
+  openInterestAsOf: string | null;
+  openInterestBasis: 'prior_clearing_session';
+  strikeWindow: {
+    percentBand: number;
+    minStrikesPerSide: number;
+    basis: string;
+  };
+  coverage: {
+    requestedContracts: number;
+    snapshotReceivedContracts: number;
+    observedContracts: number;
+    missingContracts: number;
+    failedBatches: number;
+    excludedNonstandardContracts: number;
+    excludedUnknownStandardTypeContracts: number;
+  };
+  expiries: NearExpiryExpiryGroup[];
+  message: string;
+  limitations: string[];
+}
+
+export interface NearExpiryContractResponse {
+  schemaVersion: string;
+  generatedAt: string;
+  marketDateEt: string;
+  item: NearExpiryContractItem;
+}
+
 export type OpportunityOptionEventState =
   | 'ready'
   | 'empty'

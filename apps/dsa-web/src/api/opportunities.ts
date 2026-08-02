@@ -5,6 +5,7 @@ import type {
   IntradayPulseResponse,
   IntradayTopResponse,
   IntradayTrackingResponse,
+  NearExpiryContractResponse,
   OpportunityLearningSummaryResponse,
   OpportunityOptionContextResponse,
   OpportunityOptionEventResponse,
@@ -36,6 +37,11 @@ const optionContextInFlight = new Map<string, Promise<OpportunityOptionContextRe
 const optionEventInFlight = new Map<string, Promise<OpportunityOptionEventResponse>>();
 const optionOverviewInFlight = new Map<string, Promise<OpportunityOptionOverviewResponse>>();
 const optionWallInFlight = new Map<string, Promise<OpportunityOptionWallResponse>>();
+const nearExpiryInFlight = new Map<string, Promise<NearExpiryContractResponse>>();
+// 服务端 30 秒 TTL + single-flight；客户端同样只缓存 30 秒，保证盘中读数
+// 不被长缓存冻结。
+const NEAR_EXPIRY_TIMEOUT_MS = 30_000;
+const NEAR_EXPIRY_CACHE_TTL_MS = 30_000;
 const intradayTrackingInFlight = new Map<string, Promise<IntradayTrackingResponse>>();
 const INTRADAY_TRACKING_TIMEOUT_MS = 30_000;
 const intradayTopInFlight = new Map<string, Promise<IntradayTopResponse>>();
@@ -309,6 +315,45 @@ export async function fetchOpportunityOptionEvents(
   });
 
   optionEventInFlight.set(key, request);
+  return request;
+}
+
+/**
+ * 临期合约面板（0–maxDte DTE）：合约选择参考，不构成推荐。
+ * 服务端 30 秒 TTL + single-flight；客户端 30 秒缓存 + 在途去重，
+ * refresh 只绕过已完成缓存。
+ */
+export async function fetchNearExpiryContracts(
+  symbol: string,
+  maxDte = 3,
+  options: { refresh?: boolean } = {},
+): Promise<NearExpiryContractResponse> {
+  const normalized = normalizeSupportedUsOptionUnderlying(symbol);
+  if (!normalized) {
+    throw new Error(`不支持的美股期权标的：${symbol}`);
+  }
+  const key = `opportunities:near-expiry:${normalized}:${maxDte}`;
+  if (!options.refresh) {
+    const cached = sessionCache.get<NearExpiryContractResponse>(key);
+    if (cached) return cached;
+  }
+
+  const pending = nearExpiryInFlight.get(key);
+  if (pending) return pending;
+
+  const request = apiClient.post<Record<string, unknown>>(
+    '/api/v1/opportunities/near-expiry-contracts',
+    { symbol: normalized, max_dte: maxDte, refresh: Boolean(options.refresh) },
+    { timeout: NEAR_EXPIRY_TIMEOUT_MS },
+  ).then((response) => {
+    const result = toCamelCase<NearExpiryContractResponse>(response.data);
+    sessionCache.set(key, result, NEAR_EXPIRY_CACHE_TTL_MS);
+    return result;
+  }).finally(() => {
+    nearExpiryInFlight.delete(key);
+  });
+
+  nearExpiryInFlight.set(key, request);
   return request;
 }
 

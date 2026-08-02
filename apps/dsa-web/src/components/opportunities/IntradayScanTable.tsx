@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { Fragment, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type {
   IntradayTopCandidate,
@@ -6,6 +6,7 @@ import type {
 } from '../../types/opportunities';
 import { parseApiTimestamp } from '../../utils/marketTime';
 import { formatCompactUsd, formatRatio, formatSignedPercent } from './intradayFormat';
+import { NearExpiryContractPanel } from './NearExpiryContractPanel';
 
 const STATE_LABELS: Record<IntradayTopCandidate['researchState'], string> = {
   active: '盘中活跃',
@@ -133,6 +134,10 @@ function optionActivityLabel(item: IntradayTopCandidate): string {
 /**
  * 日内扫描表：确定性证据计数排名的盘中滚动 Top N。
  * 列头可点击做客户端排序（不改变服务端排名口径）；行点击进入即时扫描详情页。
+ *
+ * 临期合约交互取「行点击不变 + 每行显式按钮」：整行点击仍是既有的详情页
+ * 导航（不改变肌肉记忆），行尾「临期合约」按钮在行下方展开只读合约面板；
+ * 同一时刻只展开一行，保持表格可用性。
  */
 export function IntradayScanTable({
   data,
@@ -145,6 +150,7 @@ export function IntradayScanTable({
 }) {
   const navigate = useNavigate();
   const [sort, setSort] = useState<SortState | null>(null);
+  const [expandedTicker, setExpandedTicker] = useState<string | null>(null);
 
   const rows = useMemo(() => {
     const candidates = data?.candidates ?? [];
@@ -239,12 +245,13 @@ export function IntradayScanTable({
                 <th className="px-3 py-2 text-right">{sortableHeader('expansion', '波幅扩张(ATR)')}</th>
                 <th className="px-3 py-2">{sortableHeader('events', '期权异动')}</th>
                 <th className="px-3 py-2 font-medium">研究状态</th>
+                <th className="px-3 py-2 font-medium">合约</th>
               </tr>
             </thead>
             <tbody>
               {rows.map((item) => (
+                <Fragment key={item.ticker}>
                 <tr
-                  key={item.ticker}
                   onClick={() => navigate(`/regime/opportunity/${item.ticker}`)}
                   className="cursor-pointer border-b border-subtle last:border-b-0 hover:bg-bg-2"
                   aria-label={`打开 ${item.ticker} 即时扫描详情`}
@@ -358,7 +365,33 @@ export function IntradayScanTable({
                       {STATE_LABELS[item.researchState]}
                     </div>
                   </td>
+                  <td className="px-3 py-2.5">
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        // 阻断整行导航：按钮只负责展开/收起合约面板。
+                        event.stopPropagation();
+                        setExpandedTicker((current) => (
+                          current === item.ticker ? null : item.ticker
+                        ));
+                      }}
+                      className="whitespace-nowrap rounded-ds-sm border border-subtle px-2 py-1 text-caption text-text-2 hover:bg-bg-2 hover:text-text-1"
+                      aria-expanded={expandedTicker === item.ticker}
+                      aria-label={`展开 ${item.ticker} 临期合约`}
+                    >
+                      临期合约
+                      {expandedTicker === item.ticker ? ' ▴' : ' ▾'}
+                    </button>
+                  </td>
                 </tr>
+                {expandedTicker === item.ticker && (
+                  <tr className="border-b border-subtle last:border-b-0">
+                    <td colSpan={11} className="bg-bg-0 px-3 py-3">
+                      <NearExpiryContractPanel symbol={item.ticker} />
+                    </td>
+                  </tr>
+                )}
+                </Fragment>
               ))}
             </tbody>
           </table>

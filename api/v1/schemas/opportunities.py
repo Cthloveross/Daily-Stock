@@ -696,6 +696,110 @@ class OptionWallResponse(BaseModel):
     items: list[OptionWallItem] = Field(default_factory=list)
 
 
+class NearExpiryContractRequest(BaseModel):
+    """临期合约面板请求：单个美股期权 underlying 的 0–max_dte 天合约读数。"""
+
+    symbol: str = Field(
+        description="单个美股期权 underlying；US. 前缀会被规范化移除。",
+    )
+    max_dte: int = Field(
+        3,
+        ge=0,
+        le=7,
+        description="纳入的最大 DTE（含 0DTE）；默认 3，上限 7。",
+    )
+    refresh: bool = Field(
+        False,
+        description="显式刷新时绕过服务端短 TTL；仍复用同 key 的在途请求。",
+    )
+
+    @field_validator("symbol")
+    @classmethod
+    def normalize_us_option_underlying(cls, value: str) -> str:
+        symbol = str(value or "").strip().upper()
+        if symbol.startswith("US."):
+            symbol = symbol[3:]
+        if not _US_OPTION_UNDERLYING_PATTERN.fullmatch(symbol):
+            raise ValueError(f"unsupported US option underlying: {value!r}")
+        return symbol
+
+
+class NearExpiryContractRow(BaseModel):
+    """单张临期合约的只读读数：逐字段可空，缺失显式标缺，不打分不推荐。"""
+
+    code: str
+    right: Literal["C", "P"]
+    strike: float = Field(gt=0)
+    expiry: str
+    dte: int = Field(ge=0)
+    bid: Optional[float] = Field(default=None, ge=0)
+    ask: Optional[float] = Field(default=None, ge=0)
+    mid: Optional[float] = Field(default=None, ge=0)
+    spread_percent: Optional[float] = Field(default=None, ge=0)
+    spread_unavailable_reason: Optional[str] = None
+    last_price: Optional[float] = Field(default=None, gt=0)
+    session_volume: Optional[int] = Field(default=None, ge=0)
+    open_interest: Optional[int] = Field(default=None, ge=0)
+    iv_percent: Optional[float] = Field(default=None, gt=0)
+    delta: Optional[float] = Field(default=None, ge=-1, le=1)
+    quote_as_of: Optional[str] = None
+    quote_state: Literal["observed", "unavailable"]
+    unavailable_reason: Optional[str] = None
+    is_atm: bool = False
+
+
+class NearExpiryExpiryGroup(BaseModel):
+    expiry: str
+    dte: int = Field(ge=0)
+    state: Literal["ready", "partial", "unavailable"]
+    contract_count: int = Field(ge=0)
+    observed_quote_count: int = Field(ge=0)
+    contracts: list[NearExpiryContractRow] = Field(default_factory=list)
+
+
+class NearExpiryStrikeWindow(BaseModel):
+    percent_band: float = Field(gt=0)
+    min_strikes_per_side: int = Field(ge=1)
+    basis: str
+
+
+class NearExpiryCoverage(BaseModel):
+    requested_contracts: int = Field(ge=0)
+    snapshot_received_contracts: int = Field(ge=0)
+    observed_contracts: int = Field(ge=0)
+    missing_contracts: int = Field(ge=0)
+    failed_batches: int = Field(ge=0)
+    excluded_nonstandard_contracts: int = Field(ge=0)
+    excluded_unknown_standard_type_contracts: int = Field(ge=0)
+
+
+class NearExpiryContractItem(BaseModel):
+    ticker: str
+    state: Literal["ready", "partial", "empty", "not_configured", "unavailable"]
+    source: str
+    fetched_at: str
+    formula_version: str
+    max_dte: int = Field(ge=0, le=7)
+    spot: Optional[float] = Field(default=None, gt=0)
+    spot_as_of: Optional[str] = None
+    open_interest_as_of: Optional[str] = None
+    open_interest_basis: Literal["prior_clearing_session"] = (
+        "prior_clearing_session"
+    )
+    strike_window: NearExpiryStrikeWindow
+    coverage: NearExpiryCoverage
+    expiries: list[NearExpiryExpiryGroup] = Field(default_factory=list)
+    message: str
+    limitations: list[str] = Field(default_factory=list)
+
+
+class NearExpiryContractResponse(BaseModel):
+    schema_version: str
+    generated_at: str
+    market_date_et: str
+    item: NearExpiryContractItem
+
+
 class OptionEventRequest(BaseModel):
     symbols: list[str] = Field(
         min_length=1,

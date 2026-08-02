@@ -12,6 +12,7 @@ import {
 } from '../api/opportunities';
 import { stocksApi } from '../api/stocks';
 import { CandlestickChart, type Candle, type MAOverlay } from '../components/charts/CandlestickChart';
+import { NearExpiryContractPanel } from '../components/opportunities/NearExpiryContractPanel';
 import { WallLevelExpiryBreakdown } from '../components/opportunities/WallLevelExpiryBreakdown';
 import { Tabs } from '../components/ui';
 import type {
@@ -288,6 +289,8 @@ const OpportunityDetailPage: React.FC = () => {
   const [wall, setWall] = useState<OpportunityOptionWallItem | null>(null);
   const [wallLoading, setWallLoading] = useState(true);
   const [wallError, setWallError] = useState<string | null>(null);
+  // 临期合约面板按需展开：只有用户显式点击才发起 0–3 DTE 合约读取。
+  const [nearExpiryOpen, setNearExpiryOpen] = useState(false);
   const [eventItem, setEventItem] = useState<OpportunityOptionEventItem | null>(null);
   const [eventsLoading, setEventsLoading] = useState(true);
   const [eventsError, setEventsError] = useState<string | null>(null);
@@ -954,6 +957,23 @@ const OpportunityDetailPage: React.FC = () => {
                 )}
                 {!wallLoading && !wallError && wall && wall.state !== 'ready' && wall.state !== 'partial' && (
                   <p className="text-body-sm text-text-3">{wall.message}</p>
+                )}
+                {ticker && (
+                  <div className="mt-4 border-t border-subtle pt-3">
+                    <button
+                      type="button"
+                      onClick={() => setNearExpiryOpen((current) => !current)}
+                      className="rounded-ds-sm border border-subtle px-2 py-1 text-caption text-text-2 hover:bg-bg-2 hover:text-text-1"
+                      aria-expanded={nearExpiryOpen}
+                    >
+                      查看临期合约（0–3 DTE）{nearExpiryOpen ? ' ▴' : ' ▾'}
+                    </button>
+                    {nearExpiryOpen && (
+                      <div className="mt-3">
+                        <NearExpiryContractPanel symbol={ticker} />
+                      </div>
+                    )}
+                  </div>
                 )}
               </div>
             )}

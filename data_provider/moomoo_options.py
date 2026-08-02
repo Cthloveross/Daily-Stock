@@ -19,6 +19,10 @@ Surface
   → read-only strike-level OI / volume / gamma inputs with explicit coverage
 - :func:`fetch_option_events_moomoo(symbol, limit)` → recent, provider-labelled
   unusual option transactions from the quote-only event feed
+- :func:`fetch_near_expiry_chain_moomoo(symbol, max_dte, ref_date)` →
+  near-the-money contract rows (bid/ask/last/volume/OI/IV/delta, per-field
+  nullable) for expiries within ``max_dte`` days, for the read-only
+  contract-selection panel
 
 All public quote helpers short-circuit to a no-op (returning empty / None) when
 ``MOOMOO_OPEND_ENABLED!=true`` so callers can do ``moomoo first → yfinance
@@ -286,6 +290,56 @@ class MoomooOptionUnderlyingOverview:
     hv_120d_percentile: Optional[float]
     hv_365d_percent: Optional[float]
     hv_365d_percentile: Optional[float]
+
+
+@dataclass(frozen=True)
+class MoomooNearExpiryContract:
+    """One near-the-money contract row for the near-expiry (0–3 DTE) panel.
+
+    静态字段（code/expiry/dte/right/strike）来自期权链元数据；动态报价
+    字段逐字段 nullable：快照缺行、``option_valid`` 无效或字段非法时保持
+    ``None``，绝不以 0 冒充报价。``snapshot_state`` 记录该行动态快照的
+    观测状态（``observed`` / ``missing`` / ``invalid``）。本行只是读数，
+    不携带任何打分或推荐语义。
+    """
+
+    code: str
+    expiry: str
+    dte: int
+    right: str
+    strike: float
+    bid: Optional[float]
+    ask: Optional[float]
+    last_price: Optional[float]
+    volume: Optional[int]
+    open_interest: Optional[int]
+    iv_percent: Optional[float]
+    delta: Optional[float]
+    update_time: Optional[str]
+    snapshot_state: str
+
+
+@dataclass(frozen=True)
+class MoomooNearExpiryChainSnapshot:
+    """Near-the-money contracts for expiries within ``max_dte``, with coverage.
+
+    ``expiries`` 是 ``(expiry_iso, dte)`` 元组；为空表示该标的在窗口内
+    没有临期到期日（诚实空态，不是失败）。OI 为 T-1 清算口径、IV 为
+    供应商百分数模型值，由消费方负责时间口径标注。
+    """
+
+    symbol: str
+    spot: float
+    spot_as_of: Optional[str]
+    fetched_at: datetime
+    max_dte: int
+    expiries: tuple[tuple[str, int], ...]
+    contracts: tuple[MoomooNearExpiryContract, ...]
+    requested_contract_count: int
+    snapshot_received_count: int
+    failed_batch_count: int
+    excluded_nonstandard_count: int
+    excluded_unknown_standard_type_count: int
 
 
 @dataclass(frozen=True)
@@ -632,13 +686,36 @@ def _spot_from_ctx(
     context_lock=None,
 ) -> Optional[float]:
     """Read a finite positive underlying spot from an already leased context."""
+    spot, _ = _spot_with_time_from_ctx(
+        ctx,
+        symbol,
+        ret_ok,
+        context_lock=context_lock,
+    )
+    return spot
+
+
+def _spot_with_time_from_ctx(
+    ctx,
+    symbol: str,
+    ret_ok,
+    *,
+    context_lock=None,
+) -> tuple[Optional[float], Optional[str]]:
+    """Read ``(spot, provider update_time)`` from an already leased context.
+
+    ``update_time`` 缺失时保持 ``None``，不用本地时钟冒充供应商时点。
+    """
     lock = context_lock or _ctx_lock
     with lock:
         ret, data = ctx.get_market_snapshot([_to_moomoo_underlying(symbol)])
     if ret != ret_ok or data is None or data.empty:
-        return None
-    last = _safe_float(data.iloc[0].get("last_price"))
-    return last if last is not None and last > 0 else None
+        return None, None
+    row = data.iloc[0]
+    last = _safe_float(row.get("last_price"))
+    if last is None or last <= 0:
+        return None, None
+    return last, _safe_text(row.get("update_time"))
 
 
 def _get_static_chain_frame(ctx, underlying: str, expiry: str, ret_ok):
@@ -1346,6 +1423,233 @@ def fetch_option_wall_snapshot_moomoo(
     except Exception as exc:  # noqa: BLE001 - quote failures degrade to unavailable
         logger.warning(
             "[moomoo_options] option-wall snapshot(%s) failed: %s",
+            normalized_symbol,
+            exc,
+        )
+        return None
+
+
+def fetch_near_expiry_chain_moomoo(
+    symbol: str,
+    max_dte: int = 3,
+    ref_date: Optional[date] = None,
+) -> Optional[MoomooNearExpiryChainSnapshot]:
+    """Fetch near-the-money contract rows for expiries within ``max_dte``.
+
+    合约选择支持的数据读取，仅使用 Quote 元数据与市场快照：不订阅、
+    不解锁交易、不下单，也不推断任何合约优劣。
+
+    额度成本（受 §2.1 记录的 10 次链查询 / 30 秒与 60 次快照 / 30 秒
+    约束）：1 次 ``get_option_expiration_date`` + 1 次 ``get_option_chain``
+    日期窗口（``max_dte`` ≤ 7 < 30 天，恒为单窗口）+ 1 次 underlying
+    快照 + 近价窗口合约的 ``get_market_snapshot``（每到期日 Call/Put 各
+    ≤ 现价上下 8 档或 ±5% 带内档位，典型 ≤ 2 个到期日合计远小于单批
+    400 上限，即 1 个快照批次）。
+
+    与期权墙一致：显式 ``NON_STANDARD`` 合约排除，缺 ``option_standard_type``
+    的行单独计数排除、绝不改标 STANDARD。窗口内没有到期日时返回空
+    ``expiries`` 的快照（诚实空态）；OpenD 不可达、spot 缺失或链窗口
+    失败时返回 ``None``（fail closed）。
+    """
+
+    if not isinstance(max_dte, int) or isinstance(max_dte, bool):
+        raise ValueError("max_dte must be an integer")
+    if not 0 <= max_dte <= 7:
+        raise ValueError("require 0 <= max_dte <= 7")
+    if not _enabled():
+        return None
+
+    try:
+        from moomoo import RET_OK
+    except ImportError:
+        return None
+
+    from src.opportunities.near_expiry_contracts import select_near_money_strikes
+
+    target_date = ref_date or _new_york_market_date()
+    if not isinstance(target_date, date):
+        raise ValueError("ref_date must be a date")
+    normalized_symbol = str(symbol or "").strip().upper()
+    underlying = _to_moomoo_underlying(normalized_symbol)
+    if not underlying.startswith("US."):
+        return None
+
+    try:
+        with _lease_wall_context() as leased:
+            if leased is None:
+                return None
+            ctx, context_lock = leased
+
+            available_expiries = _expiration_dates_from_ctx(
+                ctx,
+                underlying,
+                RET_OK,
+            )
+            if available_expiries is None:
+                return None
+            selected: list[tuple[str, int]] = []
+            for expiry in available_expiries:
+                parsed = _safe_iso_date(expiry)
+                if parsed is None or parsed < target_date:
+                    continue
+                dte = (parsed - target_date).days
+                if dte <= max_dte:
+                    selected.append((expiry, dte))
+
+            spot, spot_as_of = _spot_with_time_from_ctx(
+                ctx,
+                normalized_symbol,
+                RET_OK,
+                context_lock=context_lock,
+            )
+            if spot is None or spot <= 0:
+                return None
+
+            fetched_at = datetime.now(timezone.utc)
+            if not selected:
+                return MoomooNearExpiryChainSnapshot(
+                    symbol=normalized_symbol,
+                    spot=spot,
+                    spot_as_of=spot_as_of,
+                    fetched_at=fetched_at,
+                    max_dte=max_dte,
+                    expiries=(),
+                    contracts=(),
+                    requested_contract_count=0,
+                    snapshot_received_count=0,
+                    failed_batch_count=0,
+                    excluded_nonstandard_count=0,
+                    excluded_unknown_standard_type_count=0,
+                )
+
+            selected_expiry_set = {expiry for expiry, _ in selected}
+            frame = _get_static_chain_range_frame(
+                ctx,
+                underlying,
+                target_date,
+                target_date + timedelta(days=max_dte),
+                RET_OK,
+                context_lock=context_lock,
+            )
+            if frame is None:
+                return None
+            static_contracts, excluded_nonstandard, unknown_standard = (
+                _wall_static_contracts(
+                    frame,
+                    target_date=target_date,
+                    dte_min=0,
+                    dte_max=max_dte,
+                    allowed_expiries=selected_expiry_set,
+                )
+            )
+
+            by_expiry: dict[str, list[dict]] = {}
+            for static in static_contracts:
+                by_expiry.setdefault(static["expiry"], []).append(static)
+            requested_by_code: dict[str, dict] = {}
+            for expiry, _dte in selected:
+                rows = by_expiry.get(expiry, [])
+                chosen = set(
+                    select_near_money_strikes(
+                        [row["strike"] for row in rows],
+                        spot,
+                    )
+                )
+                for row in rows:
+                    if row["strike"] in chosen:
+                        requested_by_code.setdefault(row["code"], row)
+
+            snapshot_result = _get_option_snapshots(
+                ctx,
+                list(requested_by_code),
+                RET_OK,
+                context_lock=context_lock,
+            )
+
+        contracts: list[MoomooNearExpiryContract] = []
+        for code, static in requested_by_code.items():
+            dynamic = snapshot_result.snapshots.get(code)
+            if dynamic is None:
+                snapshot_state = "missing"
+            elif not _snapshot_option_valid(dynamic):
+                snapshot_state = "invalid"
+            else:
+                snapshot_state = "observed"
+            if snapshot_state != "observed":
+                contracts.append(
+                    MoomooNearExpiryContract(
+                        code=code,
+                        expiry=static["expiry"],
+                        dte=static["dte"],
+                        right=static["right"],
+                        strike=static["strike"],
+                        bid=None,
+                        ask=None,
+                        last_price=None,
+                        volume=None,
+                        open_interest=None,
+                        iv_percent=None,
+                        delta=None,
+                        update_time=None,
+                        snapshot_state=snapshot_state,
+                    )
+                )
+                continue
+
+            delta = _safe_float(_first_present(dynamic, "option_delta", "delta"))
+            if delta is not None and not -1 <= delta <= 1:
+                delta = None
+            contracts.append(
+                MoomooNearExpiryContract(
+                    code=code,
+                    expiry=static["expiry"],
+                    dte=static["dte"],
+                    right=static["right"],
+                    strike=static["strike"],
+                    bid=_valid_nonnegative_float(dynamic.get("bid_price")),
+                    ask=_valid_nonnegative_float(dynamic.get("ask_price")),
+                    last_price=_valid_positive_float(dynamic.get("last_price")),
+                    volume=_valid_nonnegative_int(dynamic.get("volume")),
+                    open_interest=_valid_nonnegative_int(
+                        _first_present(
+                            dynamic,
+                            "option_open_interest",
+                            "open_interest",
+                        )
+                    ),
+                    iv_percent=_valid_positive_float(
+                        _first_present(
+                            dynamic,
+                            "option_implied_volatility",
+                            "implied_volatility",
+                        )
+                    ),
+                    delta=delta,
+                    update_time=_safe_text(dynamic.get("update_time")),
+                    snapshot_state="observed",
+                )
+            )
+
+        contracts.sort(
+            key=lambda item: (item.expiry, item.strike, item.right, item.code)
+        )
+        return MoomooNearExpiryChainSnapshot(
+            symbol=normalized_symbol,
+            spot=spot,
+            spot_as_of=spot_as_of,
+            fetched_at=datetime.now(timezone.utc),
+            max_dte=max_dte,
+            expiries=tuple(selected),
+            contracts=tuple(contracts),
+            requested_contract_count=len(requested_by_code),
+            snapshot_received_count=len(snapshot_result.snapshots),
+            failed_batch_count=snapshot_result.failed_batch_count,
+            excluded_nonstandard_count=excluded_nonstandard,
+            excluded_unknown_standard_type_count=unknown_standard,
+        )
+    except Exception as exc:  # noqa: BLE001 - quote failures degrade to unavailable
+        logger.warning(
+            "[moomoo_options] near-expiry chain(%s) failed: %s",
             normalized_symbol,
             exc,
         )
