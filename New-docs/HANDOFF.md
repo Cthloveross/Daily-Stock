@@ -81,43 +81,32 @@
 
 ## 1. 一屏结论
 
-| 维度 | 2026-07-31 真实状态 | 接手判断 |
+| 维度 | 2026-08-02 真实状态 | 接手判断 |
 |---|---|---|
-| 产品 | 已形成“交易证据 → canonical 事实 → PositionEpisode → 单笔复盘”和“官方研究池 → Top 5 → 期权增强 → 5D/20D outcome 维护”的主体框架 | 当前只有 15 个 complete 5D、没有成熟 20D；已不是原型，但还不是可无监督依赖的生产交易系统 |
+| 产品 | 「交易证据 → canonical 事实 → PositionEpisode → 单笔复盘 → Playbook」与「官方研究池 → 周内 Top 5 → 期权增强 → 5D/20D outcome 维护」双闭环完成；`/intraday` 日内工作台上线（波段爆发 v2 按用户标注样本校准、噪音过滤 v3 时段/财报/大盘/速度、styleMatch v1 形态标注、临期合约面板含财报警示） | 5D/20D 完整研究样本仍在积累期，不得展示策略命中率；日内榜 statistics_track=none 属有意设计 |
 | 交易权限 | Moomoo 只读，代码禁止 unlock/place/modify/cancel | 必须永久保持 |
-| Web | `http://127.0.0.1:8000` 正在运行，`/api/health` 返回 200 | 当前可看，不代表远端已有最新源码 |
-| OpenD | 本机 `127.0.0.1:11111` 可达，SDK 已安装，状态接口显示 read-only | TCP 可达不等于历史证据、订阅与权限全部健康 |
-| Journal 历史事实 | 正确 Moomoo CSV 已导入；canonical set #1；已有 1,441 个 Episode | 默认视图仍回退到 v2 CSV-backed fallback build；canonical-linked build #2 尚未由用户显式激活 |
-| 当前持仓 | 只读双采样、确认账本、continuity readiness 和 future preview 已实现 | 正式库尚无已确认 snapshot，future preview 当前为 `no_snapshot` |
-| 复盘 | 案例精选、多周期 K 线、买卖证据、EMA8/13、确定性与模型增强分析、人工 annotation 已实现 | 需统一 EMA 算法，继续提高数据时点一致性与 AI 输出价值 |
-| 今日机会 | 服务端研究池、官方盘前发布、Top 5、期权墙、期权事件、结果回填框架已实现 | 最新可用发布为 degraded；完整研究样本仍为 0，不得展示策略命中率 |
-| GitHub | GitHub `main` 指向 `4dc04fd` | 只包含基线提交，不含当前大量本地改动 |
-| 本地 Git | 当前分支 `codex/options-research-workbench`，HEAD 同为 `4dc04fd`，工作树大量未提交 | 最新功能主要只在本机，必须先保护再发布 |
-| CI | 本地曾完整通过；最后 compatibility patch 后仅做定向复跑；GitHub 当前 SHA 没有完整 backend/web/docker gate | 发布前必须重新跑全量 gate 并恢复远端 CI 证据 |
-| 最大风险 | 未提交工作树、旧 LaunchAgent、日志长期增长、数据时点混合、详情未绑定官方 snapshot | 先稳态化，再扩功能 |
+| Web | `http://127.0.0.1:8000` 运行中（LaunchAgent com.dailystock.uvicorn），`static/` 从磁盘服务：前端改动只需重建、后端改动需 kickstart 重启 | 交易日主屏是 `/intraday`；复盘主屏是 `/journal` |
+| OpenD | 本机 `127.0.0.1:11111` 可达，只读；期权 bid/ask 经批量 get_market_snapshot 直读 | TCP 可达不等于历史证据、订阅与权限全部健康 |
+| Journal 历史事实 | canonical set #2；build #3（1,663 Episode，成交按母单合并）已构建**未激活**（激活不可逆，用户门控）；用户交易原则已入库为 6 条 Playbook 候选（S1-S3/R1-R3，待用户晋升）；statement 解析器 v3 支持组合单（审计级父单，不伪装单腿） | 用户最新 CSV（06-04→07-31）经核对完全被现有账本覆盖（03-04→07-31），无需导入 |
+| 当前持仓 | 只读双采样、确认账本、continuity readiness、future preview 已实现；fence build 经冻结目标 canonical 身份激活 | 正式库尚无已确认 snapshot（B-4 实弹演练用户门控） |
+| 复盘 | 复盘工作流 v2 + 快捷标签已对齐用户打法分类（S1/S2/S3 风格、噪音时段/速度不足等错误标签）；「模式观察」只读聚合标注 | 用户逐笔打标后统计才有积累价值 |
+| 今日机会 | 周内榜 21:12 自动发布（premarket-scheduler 已挂载）+ outcome 调度器运行中；2026-07-31 首次 events+premarket 域恢复的健康发布 | 2026-08-03 晚为三重实战验证首日（发布→计划条→日内工作台全链路） |
+| GitHub | 分支 `codex/options-research-workbench` 已推送，PR #3 打开，远端 `main` 仍为基线 `4dc04fd` | 用户合并 PR #3 后 main 才含全部功能 |
+| 本地 Git | 工作树干净，HEAD 与远端分支同步（见 `git log --oneline -5`） | 每轮功能经双 gate + 真实页面验收后单独 commit+push（用户已授权本分支） |
+| CI | 本地 `./scripts/ci_gate.sh` 在 HEAD 全绿（2,861 passed）+ Node 22 web gate 全绿；PR #3 远端 CI 逐提交重跑 | 合并前以 PR 页最新提交的远端 CI 为准 |
+| 最大风险 | build #3 未激活（用户决策）、旧 moomoo-sync LaunchAgent 每 15 分钟空转报「已暂停」（F-1 清理待确认）、周一实战验证未发生 | 先完成实战验证，再谈下一批功能 |
 
 ### 1.1 “本地和 GitHub 都有了吗”的准确答案
 
-没有完全同步。
+分支已同步，`main` 待合并（截至 2026-08-02 晚）。
 
-- GitHub `main` 与本地当前 `HEAD` 都是 `4dc04fdd0a98682aba4e9555adb607d7ab4ae857`。
-- 这个 SHA 的提交标题是 `feat: build evidence-first trading research workbench`。
-- GitHub 有这个基线提交。
-- 当前工作树中的新功能、修复、测试和文档尚未提交，因此只在本机。
-- 当前分支没有 upstream；GitHub 上没有同名的 `codex/options-research-workbench` 分支。
-- 本地 `main` 仍停在 `db94455`，比 GitHub `main` 落后一个提交；不要因此误把本地 `main` 当成发布真源。
-- `data/stock_analysis.db`、`.env`、`logs/` 和构建后的 `static/` 属于忽略或本地运行资产，本来就不应作为普通源码推到 GitHub。
+- 分支 `codex/options-research-workbench` 已推送到 GitHub 并打开 PR #3，本地工作树干净、HEAD 与远端分支一致。
+- GitHub `main` 仍指向基线 `4dc04fdd0a98682aba4e9555adb607d7ab4ae857`（`feat: build evidence-first trading research workbench`）；PR #3 合并前 main 不含本分支功能。
+- 本地 `main` 停在 `db94455`，比 GitHub `main` 落后一个提交；不要误把本地 `main` 当发布真源。
+- `data/stock_analysis.db`、`.env`、`logs/` 和构建后的 `static/` 属于忽略或本地运行资产，不进 Git。
+- 每轮功能验收后单独 commit+push（commit message 英文、无 Co-Authored-By；用户已对本分支授权），推送后核对远端 CI。
 
-本手册、文档索引和 changelog 落盘后，工作树精确计数为：
-
-- 93 个 tracked modified；
-- 78 个 untracked；
-- 0 个 staged；
-- 共 171 个路径；
-- tracked diff `+21,305 / -1,388`；
-- `New-docs/HANDOFF.md` 本身仍是 untracked。
-
-后续继续开发会改变这些数字；每次交接都应重跑第 13 节的只读命令。
+每次交接仍应重跑第 13 节的只读命令，以当时输出为准。
 
 ### 1.2 接手后的前十分钟
 
@@ -136,9 +125,10 @@ curl -fsS http://127.0.0.1:8000/api/v1/system/health-layers
 
 然后在浏览器依次打开：
 
-1. `http://127.0.0.1:8000/journal?tab=positions`；
-2. `http://127.0.0.1:8000/journal?tab=import`；
-3. `http://127.0.0.1:8000/regime`。
+1. `http://127.0.0.1:8000/intraday`（交易日主屏）；
+2. `http://127.0.0.1:8000/journal?tab=positions`；
+3. `http://127.0.0.1:8000/journal?tab=import`；
+4. `http://127.0.0.1:8000/regime`。
 
 只观察，不先点击任何 confirm/activate/run。确认页面与本文状态一致后，再选择一个最小目标。若本地服务不可达，按第 12 节启动；若 Git 工作树数字和本文不同，先解释差异，不要 reset、checkout 或清理 untracked。
 

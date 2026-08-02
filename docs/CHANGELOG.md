@@ -427,6 +427,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] 临期面板财报字段 fail-closed：日历不可得时 `state=unavailable`、`within_blackout=null`，前端小字「财报日历标缺 · 未知≠安全」；旧会话缓存缺该字段的载荷同样按标缺处理，绝不以缺失冒充安全。
 - [测试] `test_near_expiry_contracts_endpoint.py` +5（回避窗内 3/5/basis 断言、窗外 ready 不标注且不串其他标的、日历 unavailable 诚实、Moomoo 禁用仍带字段、扫描车道已加载日历时临期面板零第二次区间调用）+ autouse Finnhub 日历桩（既有用例绝不打真实 Finnhub）；前端面板 +5（回避窗徽标、今日财报文案、窗外零标注、标缺小字、旧载荷缺字段按标缺）；真实 TestClient 验收：SNDK 财报 2026-08-05（3 天内 → within_blackout=true）、AAPL 窗口内无财报（false），两标的共享一次日历区间调用。
 - [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` §2.9 前端小节新增财报临近一行（字段形状、复用口径、三种渲染状态）；根 README 不承载面板级细节，故未改动。
+- [文档] `New-docs/HANDOFF.md` §1「一屏结论」与 §1.1 同步 2026-08-02 真实状态（分支已推送 + PR #3、canonical set #2 与 build #3 未激活、日内工作台 G-1..G-10、周内榜 21:12 自动发布就绪、moomoo-sync 旧 LaunchAgent 待 F-1 清理），§1.2 浏览器核对清单新增 `/intraday` 交易日主屏。
 
 ## [3.11.0] - 2026-03-27
 
