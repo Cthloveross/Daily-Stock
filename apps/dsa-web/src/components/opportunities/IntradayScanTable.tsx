@@ -191,8 +191,8 @@ export function IntradayScanTable({
         <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
           <h2 className="text-h3 font-semibold text-text-1">日内扫描 · 盘中滚动</h2>
           <span className="text-caption text-text-3">
-            {data?.rankingMethod === 'rule_based_evidence_count'
-              ? '休市 · 证据计数排名'
+            {data?.quoteSessionScope === 'latest_prior_session'
+              ? '休市 · 按最近交易时段最强波段排序'
               : '波段爆发优先排名'}
             （{data?.signalVersion ?? 'intraday_session_evidence_v2'}）· 不冻结 · 不入统计
           </span>

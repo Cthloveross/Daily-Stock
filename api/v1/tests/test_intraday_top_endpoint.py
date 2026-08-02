@@ -334,7 +334,7 @@ def test_closed_session_labels_last_session_and_snapshot_gap_basis(monkeypatch):
     assert body["quote_session_scope"] == "latest_prior_session"
     assert body["quote_session_label"] == "最近一个交易时段"
     # 休市：排序退回 v1 证据计数。
-    assert body["ranking_method"] == "rule_based_evidence_count"
+    assert body["ranking_method"] == "burst_score_first_then_evidence_count"
     item = body["candidates"][0]
     # 休市：缺口分母切换为快照自带前收并显式标注，不用日线前收伪装。
     assert item["gap_basis"] == "session_open_vs_moomoo_snapshot_prev_close"

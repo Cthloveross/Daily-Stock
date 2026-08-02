@@ -824,6 +824,32 @@ def _candidate_current_burst_score(candidate: Mapping[str, Any]) -> Optional[flo
     return _finite(current.get("score"))
 
 
+def _candidate_best_burst_score(candidate: Mapping[str, Any]) -> Optional[float]:
+    """会话内最强波段分：取当前窗口与全部已识别波段的最大值。
+
+    休市复盘视角下「今天谁走出过最强的波」比收盘时点的末窗口分更有意义；
+    盘中该值与当前窗口分共同决定排序上限。缺失时返回 None，不以 0 冒充。
+    """
+
+    bursts = candidate.get("session_bursts")
+    if not isinstance(bursts, Mapping) or bursts.get("state") != "ready":
+        return None
+    scores: list[float] = []
+    current = bursts.get("current")
+    if isinstance(current, Mapping):
+        value = _finite(current.get("score"))
+        if value is not None:
+            scores.append(value)
+    legs = bursts.get("legs")
+    if isinstance(legs, Sequence):
+        for leg in legs:
+            if isinstance(leg, Mapping):
+                value = _finite(leg.get("score"))
+                if value is not None:
+                    scores.append(value)
+    return max(scores) if scores else None
+
+
 def _candidate_sort_key(candidate: Mapping[str, Any]) -> tuple[Any, ...]:
     """v1 ordering: research state, then supports count, then ticker."""
 
@@ -842,6 +868,21 @@ def _candidate_burst_sort_key(candidate: Mapping[str, Any]) -> tuple[Any, ...]:
     """
 
     score = _candidate_current_burst_score(candidate)
+    return (
+        0 if score is not None else 1,
+        -(score if score is not None else 0.0),
+        -int(candidate.get("supporting_evidence_count") or 0),
+        _STATE_ORDER.get(str(candidate.get("research_state")), 99),
+        str(candidate.get("ticker") or ""),
+    )
+
+
+def _candidate_session_best_burst_sort_key(
+    candidate: Mapping[str, Any],
+) -> tuple[Any, ...]:
+    """休市排序：最近交易时段的最强波段分优先，缺失退回 v1 序。"""
+
+    score = _candidate_best_burst_score(candidate)
     return (
         0 if score is not None else 1,
         -(score if score is not None else 0.0),
@@ -891,15 +932,17 @@ def build_intraday_top_run(
         )
         for ticker in symbols
     ]
-    # 盘前/盘中/盘后按当前爆发分优先；休市退回 v1 证据计数排序，但候选仍
-    # 携带最近一个交易时段的波段列表（晚间复盘可见「今日走了几波」）。
+    # 盘前/盘中/盘后按当前爆发分优先；休市按「最近交易时段的最强波段分」
+    # 排序（复盘视角：今天谁走出过最强的波），两种口径都不冻结、不入统计。
     burst_ranked = quote_session_scope == QUOTE_SCOPE_CURRENT
     candidates.sort(
-        key=_candidate_burst_sort_key if burst_ranked else _candidate_sort_key
+        key=(
+            _candidate_burst_sort_key
+            if burst_ranked
+            else _candidate_session_best_burst_sort_key
+        )
     )
-    ranking_method = (
-        RANKING_METHOD_BURST_FIRST if burst_ranked else RANKING_METHOD_EVIDENCE_COUNT
-    )
+    ranking_method = RANKING_METHOD_BURST_FIRST
 
     as_of_text = _iso(as_of)
     fingerprint = "|".join(

@@ -333,7 +333,7 @@ class TestRunAssembly:
         # 盘中（current_session scope）＝爆发分优先；休市退回证据计数。
         assert run["ranking_method"] == RANKING_METHOD_BURST_FIRST
         assert self._run(session_state="closed")["ranking_method"] == (
-            RANKING_METHOD_EVIDENCE_COUNT
+            RANKING_METHOD_BURST_FIRST
         )
         assert run["statistics_track"] == INTRADAY_STATISTICS_TRACK
         assert run["unsupported_symbols"] == ["600519"]
@@ -457,7 +457,7 @@ class TestBurstRanking:
         )
         assert [item["ticker"] for item in run["candidates"]] == ["TSLA", "NVDA"]
 
-    def test_closed_session_ranks_v1_but_attaches_last_session_legs(self):
+    def test_closed_session_ranks_by_strongest_session_leg(self):
         legs = [
             {
                 "start_et": "09:40",
@@ -481,14 +481,15 @@ class TestBurstRanking:
         run = self._run(
             session_state="closed",
             burst_profiles={
-                # TSLA 爆发分远高，但休市排序退回 v1：NVDA（证据更多）在前。
+                # 休市按最近交易时段的最强波段分排序：TSLA（50.0）在前，
+                # NVDA（最强腿 9.33）在后；波段列表仍完整携带供复盘。
                 "NVDA": _burst_profile(1.0, legs=legs),
                 "TSLA": _burst_profile(50.0),
             },
         )
-        assert run["ranking_method"] == RANKING_METHOD_EVIDENCE_COUNT
-        assert [item["ticker"] for item in run["candidates"]] == ["NVDA", "TSLA"]
-        nvda = run["candidates"][0]
+        assert run["ranking_method"] == RANKING_METHOD_BURST_FIRST
+        assert [item["ticker"] for item in run["candidates"]] == ["TSLA", "NVDA"]
+        nvda = run["candidates"][1]
         assert [leg["start_et"] for leg in nvda["session_bursts"]["legs"]] == [
             "09:40",
             "15:15",
