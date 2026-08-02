@@ -6,6 +6,7 @@ import copy
 import csv
 import io
 from dataclasses import replace
+from datetime import date
 from decimal import Decimal
 from typing import Any, Callable
 
@@ -317,7 +318,7 @@ def test_parse_preserves_duplicate_headers_and_identical_fill_rows():
     assert aggregate.fills == ()
 
     assert result.summary() == {
-        "parser_version": "moomoo-statement-v2",
+        "parser_version": "moomoo-statement-v3",
         "rows_total": 3,
         "orders_total": 2,
         "status_counts": {"FILLED": 2},
@@ -326,6 +327,9 @@ def test_parse_preserves_duplicate_headers_and_identical_fill_rows():
         "aggregate_only_filled_orders": 1,
         "inconsistent_filled_orders": 0,
         "fill_records": 2,
+        "combo_parent_orders": 0,
+        "combo_parent_leg_rows": 0,
+        "combo_parent_fee_total": "0",
         "orphan_fill_rows": 0,
         "filled_fee_total": "1.0206",
         "detail_backed_fee_total": "0.7204",
@@ -348,6 +352,154 @@ def test_header_only_statement_has_zero_orders():
     assert result.rows_total == 0
     assert result.orders == ()
     assert result.summary()["orders_total"] == 0
+
+
+# Exact header and row text of a 2026 Moomoo history export containing a
+# vertical-spread combo parent (unit quantity, no OCC symbol) followed by its
+# broker leg display rows and ordinary neighbour orders.
+_REAL_EXPORT_HEADER = (
+    '"Side","Symbol","Name","Order Price","Order Qty","Order Amount",'
+    '"Status","Filled@Avg Price","Order Time","Order Type","Time-in-Force",'
+    '"Allow Pre-Market","Session","Trigger price","Position Opening",'
+    '"Markets","Currency","Order Source","Fill Qty","Fill Price",'
+    '"Fill Amount","Fill Time","Markets","Currency","Counterparty",'
+    '"Remarks","Commission","Platform Fees","Options Regulatory Fees",'
+    '"OCC Fees","Contract Fees","Consolidated Audit Trail Fees","SEC Fees",'
+    '"Trading Activity Fees","Total","Settlement Fees"'
+)
+_REAL_COMBO_ROWS = (
+    '"Buy","MU260731P745000","MU 260731 745.00P","24.35","4","9,740.00",'
+    '"Filled","4@24.35","Jul 29, 2026 15:36:46 ET","Limit","Day","","","",'
+    '"","US","USD","","4","24.35","9,740.00","Jul 29, 2026 15:36:47 ET",'
+    '"US","USD","","","2.6","1.2","0.05","0.1","2.6","0","","","6.55",""',
+    '"Sell","MU260731P745/760"," Vertical","6.70","2unit(s)","1,340.00",'
+    '"Filled","2unit(s)@7.00","Jul 29, 2026 15:35:34 ET","Limit","Day","",'
+    '"","","","US","USD","","","","","","","","","","3.98","1.2","0.04",'
+    '"0.12","2.6","0","0.12","0.02","8.08",""',
+    '"Buy","MU260731P745000","MU 260731 745.00P","","2","","","","","","",'
+    '"","","","","","","","1","24.30","2,430.00",'
+    '"Jul 29, 2026 15:35:50 ET","US","USD","","","","","","","","","","",'
+    '"",""',
+    '"","","","","","","","","","","","","","","","","","","1","24.30",'
+    '"2,430.00","Jul 29, 2026 15:35:50 ET","US","USD","","","","","","",'
+    '"","","","","",""',
+    '"Sell","MU260731P760000","MU 260731 760.00P","","2","","","","","",'
+    '"","","","","","","","","1","31.30","3,130.00",'
+    '"Jul 29, 2026 15:35:50 ET","US","USD","","","","","","","","","","",'
+    '"",""',
+    '"","","","","","","","","","","","","","","","","","","1","31.30",'
+    '"3,130.00","Jul 29, 2026 15:35:50 ET","US","USD","","","","","","",'
+    '"","","","","",""',
+    '"Short Sell","MU260731P745000","MU 260731 745.00P","21.60","2",'
+    '"4,320.00","Filled","2@21.60","Jul 29, 2026 15:23:19 ET","Limit",'
+    '"Day","","","","","US","USD","","2","21.60","4,320.00",'
+    '"Jul 29, 2026 15:23:19 ET","US","USD","","","1.99","0.6","0.03",'
+    '"0.05","1.3","0","0.09","0.01","4.07",""',
+)
+
+
+def _real_combo_statement_bytes() -> bytes:
+    return (
+        "\n".join((_REAL_EXPORT_HEADER, *_REAL_COMBO_ROWS)) + "\n"
+    ).encode("utf-8")
+
+
+def test_combo_parent_row_parses_as_combo_parent_not_single_leg():
+    result = parse_statement(_real_combo_statement_bytes())
+
+    assert result.rows_total == 7
+    # The four leg display/continuation rows never become orders.
+    assert len(result.orders) == 3
+    first, combo, last = result.orders
+
+    assert combo.order_kind == "combo_parent"
+    assert combo.is_combo_parent
+    assert combo.evidence_level == "combo_parent"
+    assert combo.evidence_warnings == ()
+    assert combo.symbol == "MU260731P745/760"
+    assert combo.name == "Vertical"
+    assert combo.side == "SELL"
+    assert combo.status == "FILLED"
+    # Quantities are combo units, never contracts or shares, and no
+    # contract multiplier is derived anywhere on the parent.
+    assert combo.order_quantity == Decimal("2")
+    assert combo.combo_unit_quantity == Decimal("2")
+    assert combo.summary_filled_quantity == Decimal("2")
+    assert combo.summary_average_price == Decimal("7.00")
+    assert combo.order_price == Decimal("6.70")
+    assert combo.order_amount == Decimal("1340.00")
+    # The fee tail is the broker's group-scope total.
+    assert combo.total_fee == Decimal("8.08")
+    components = dict(combo.fee_components)
+    assert components["Commission"] == Decimal("3.98")
+    assert components["Platform Fees"] == Decimal("1.2")
+    assert components["Options Regulatory Fees"] == Decimal("0.04")
+    assert components["OCC Fees"] == Decimal("0.12")
+    assert components["Contract Fees"] == Decimal("2.6")
+    assert components["SEC Fees"] == Decimal("0.12")
+    assert components["Trading Activity Fees"] == Decimal("0.02")
+    # The spread symbol is never OCC-decoded into a fake single strike.
+    assert combo.combo_underlying == "MU"
+    assert combo.combo_expiry == date(2026, 7, 31)
+    assert combo.combo_option_right == "P"
+    assert combo.combo_strikes_text == "745/760"
+    assert combo.fills == ()
+
+    assert len(combo.combo_legs) == 2
+    buy_leg, sell_leg = combo.combo_legs
+    assert buy_leg.symbol == "MU260731P745000"
+    assert buy_leg.side == "BUY"
+    assert buy_leg.order_quantity == Decimal("2")
+    assert [
+        (fill.quantity, fill.price) for fill in buy_leg.fills
+    ] == [(Decimal("1"), Decimal("24.30")), (Decimal("1"), Decimal("24.30"))]
+    assert sell_leg.symbol == "MU260731P760000"
+    assert sell_leg.side == "SELL"
+    assert sell_leg.order_quantity == Decimal("2")
+    assert [
+        (fill.quantity, fill.price) for fill in sell_leg.fills
+    ] == [(Decimal("1"), Decimal("31.30")), (Decimal("1"), Decimal("31.30"))]
+
+    # Ordinary neighbour rows keep their existing classification untouched.
+    assert first.order_kind == "single"
+    assert first.evidence_level == "fill_detail"
+    assert first.symbol == "MU260731P745000"
+    assert len(first.fills) == 1
+    assert last.order_kind == "single"
+    assert last.side == "SELL_SHORT"
+    assert last.evidence_level == "fill_detail"
+
+    summary = result.summary()
+    assert summary["orders_total"] == 3
+    assert summary["combo_parent_orders"] == 1
+    assert summary["combo_parent_leg_rows"] == 2
+    assert summary["combo_parent_fee_total"] == "8.08"
+    assert summary["detail_backed_filled_orders"] == 2
+    assert summary["aggregate_only_filled_orders"] == 0
+    assert summary["inconsistent_filled_orders"] == 0
+    assert summary["warnings"] == []
+
+
+def test_combo_parent_is_excluded_from_reconciliation_with_warning():
+    statement = parse_statement(_real_combo_statement_bytes())
+    payload = _readonly_export()
+    payload["window"] = {
+        "start": "2026-07-29T15:00:00-04:00",
+        "end": "2026-07-29T15:59:59-04:00",
+        "timezone": "America/New_York",
+    }
+    payload["records"] = {"orders": [], "deals": [], "fees": []}
+
+    result = reconcile_statement_with_readonly_export(statement, payload)
+
+    # Only the two ordinary orders enter cross-source matching; the combo
+    # parent is excluded explicitly instead of posing as a single-leg order.
+    assert result.statement_orders == 2
+    assert (
+        "csv_combo_parent_orders_excluded_from_reconciliation=1"
+        in result.warnings
+    )
+    assert result.analysis_ready is False
 
 
 def test_cancelled_order_with_partial_fill_keeps_execution_evidence():

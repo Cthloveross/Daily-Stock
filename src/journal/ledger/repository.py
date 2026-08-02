@@ -17,7 +17,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Optional, Sequence
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 
 from src.journal.brokers.moomoo_openapi_export import OpenApiExportPreview
 
@@ -164,6 +164,8 @@ class LedgerImportResult:
     order_observations: int
     fill_observations: int
     journal_legacy_written: bool = False
+    # CSV combo parents stored as audit-only execution-group observations.
+    execution_group_observations: int = 0
 
 
 @dataclass(frozen=True)
@@ -232,6 +234,10 @@ class CanonicalObservationInputs:
     source_batch_ids: tuple[int, ...]
     csv_baseline_batch_id: Optional[int]
     execution_groups: tuple[Any, ...] = ()
+    # CSV combo parents are audit-only observations without a broker group
+    # identity or declared leg definition; they are excluded from canonical
+    # selection fail-closed instead of becoming fake execution-group facts.
+    excluded_csv_execution_group_observations: int = 0
 
 
 @dataclass(frozen=True)
@@ -439,7 +445,12 @@ def _analysis_level(statement: StatementParseResult) -> str:
         or statement.warnings
     ):
         return "blocked"
-    if summary["aggregate_only_filled_orders"]:
+    if summary["aggregate_only_filled_orders"] or summary.get(
+        "combo_parent_orders"
+    ):
+        # Combo parents carry combo-unit and group-fee evidence only; the
+        # leg-level truth must come from the OpenAPI source, so an explicit
+        # partial acknowledgement is required before persisting them.
         return "partial"
     return "exact"
 
@@ -551,6 +562,47 @@ def _order_record(order: StatementOrder) -> dict[str, Any]:
         "evidence_level": order.evidence_level,
         "evidence_warnings": list(order.evidence_warnings),
     }
+
+
+def _combo_leg_display_rows(order: StatementOrder) -> list[dict[str, Any]]:
+    """Serialize combo leg display rows verbatim as retained evidence."""
+    return [
+        {
+            "source_row": leg.source_row,
+            "symbol": leg.symbol,
+            "name": leg.name,
+            "side": leg.side,
+            "order_quantity": leg.order_quantity,
+            "fills": [
+                {
+                    "source_row": fill.source_row,
+                    "quantity": fill.quantity,
+                    "price": fill.price,
+                    "amount": fill.amount,
+                    "filled_at": fill.filled_at,
+                    "currency": fill.currency,
+                }
+                for fill in leg.fills
+            ],
+        }
+        for leg in order.combo_legs
+    ]
+
+
+def _combo_parent_record(order: StatementOrder) -> dict[str, Any]:
+    record = _order_record(order)
+    record.update(
+        {
+            "order_kind": order.order_kind,
+            "combo_unit_quantity": order.combo_unit_quantity,
+            "combo_underlying": order.combo_underlying,
+            "combo_expiry": order.combo_expiry,
+            "combo_option_right": order.combo_option_right,
+            "combo_strikes_text": order.combo_strikes_text,
+            "combo_leg_display_rows": _combo_leg_display_rows(order),
+        }
+    )
+    return record
 
 
 def _fill_key(order: StatementOrder, fill: Any) -> str:
@@ -746,6 +798,12 @@ def import_statement_batch(
 
     init_ledger_schema()
     key = _batch_key(statement, account_key)
+    single_orders = [
+        order for order in statement.orders if not order.is_combo_parent
+    ]
+    combo_parents = [
+        order for order in statement.orders if order.is_combo_parent
+    ]
     db = get_db()
     with db.session_scope() as session:
         existing = session.execute(
@@ -759,6 +817,12 @@ def import_statement_batch(
                     reconciliation,
                     reconciliation_source_sha256,
                 )
+            existing_group_count = session.execute(
+                select(func.count(BrokerExecutionGroupObservation.id)).where(
+                    BrokerExecutionGroupObservation.import_batch_id
+                    == existing.id
+                )
+            ).scalar_one()
             return LedgerImportResult(
                 batch_id=int(existing.id),
                 batch_key=key,
@@ -766,10 +830,11 @@ def import_statement_batch(
                 analysis_level=str(existing.analysis_level),
                 order_observations=int(existing.order_observation_count),
                 fill_observations=int(existing.fill_observation_count),
+                execution_group_observations=int(existing_group_count),
             )
 
         order_times = [order.order_time for order in statement.orders]
-        fill_count = sum(len(order.fills) for order in statement.orders)
+        fill_count = sum(len(order.fills) for order in single_orders)
         summary = statement.summary()
         reconciliation_status, reconciliation_json = _reconciliation_payload(
             reconciliation
@@ -790,7 +855,7 @@ def import_statement_batch(
             status="accepted",
             analysis_level=level,
             analysis_ready=level in {"exact", "partial"},
-            order_observation_count=len(statement.orders),
+            order_observation_count=len(single_orders),
             fill_observation_count=fill_count,
             rejected_record_count=0,
             reconciliation_status=reconciliation_status,
@@ -807,6 +872,8 @@ def import_statement_batch(
                     "inconsistent_filled_orders": summary[
                         "inconsistent_filled_orders"
                     ],
+                    "combo_parent_orders": summary["combo_parent_orders"],
+                    "combo_parent_leg_rows": summary["combo_parent_leg_rows"],
                 }
             ),
             warnings_json=_canonical_json(summary["warnings"]),
@@ -824,7 +891,7 @@ def import_statement_batch(
         session.add(batch)
         session.flush()
 
-        for order in statement.orders:
+        for order in single_orders:
             instrument = _instrument_fields(order)
             order_record = _order_record(order)
             order_score = {
@@ -951,6 +1018,157 @@ def import_statement_batch(
                     )
                 )
 
+        for order in combo_parents:
+            # HANDOFF §2.3: a combo parent is never disguised as an ordinary
+            # single-leg order, its fee stays group-scoped, and leg economics
+            # are never guessed from CSV display rows.  The observation is
+            # audit-only evidence; the OpenAPI execution group remains the
+            # only leg-level truth, so this row is excluded from canonical
+            # selection (see load_canonical_observation_inputs).
+            if order.order_quantity <= 0:
+                raise LedgerImportError(
+                    "combo parent unit quantity must be positive on source "
+                    f"row {order.source_row}"
+                )
+            combo_record = _combo_parent_record(order)
+            has_execution = order.has_execution_evidence
+            fee_status = "complete" if has_execution else "not_applicable"
+            strategy_name = order.name.strip() or "UNKNOWN"
+            group_row = BrokerExecutionGroupObservation(
+                import_batch_id=batch.id,
+                observation_key=order.derived_order_id,
+                broker="moomoo",
+                account_key=account_key,
+                source_execution_group_id=order.derived_order_id,
+                identity_strength="derived_strong",
+                source_row_number=order.source_row,
+                source_updated_at=None,
+                raw_strategy_type=strategy_name,
+                strategy_type=strategy_name.upper(),
+                raw_parent_symbol=order.symbol,
+                parent_side=order.side,
+                status=order.status,
+                order_type=order.order_type or None,
+                time_in_force=order.time_in_force or None,
+                session=order.session or None,
+                fill_outside_rth=None,
+                currency=order.currency or "USD",
+                ordered_at=_to_utc(order.order_time),
+                group_order_quantity=order.order_quantity,
+                broker_reported_dealt_quantity=(
+                    order.summary_filled_quantity
+                    if order.summary_filled_quantity is not None
+                    else Decimal("0")
+                ),
+                broker_reported_order_price=order.order_price,
+                broker_reported_net_average_price=(
+                    order.summary_average_price
+                ),
+                parent_quantity_semantics=(
+                    "csv_combo_package_units_audit_only"
+                ),
+                parent_price_semantics="csv_net_price_audit_only",
+                evidence_level="combo_parent_aggregate",
+                fee_evidence_status=fee_status,
+                evidence_json=_canonical_json(
+                    {
+                        "warnings": list(order.evidence_warnings),
+                        "combo_definition_available": False,
+                        "combo_unit_quantity": order.combo_unit_quantity,
+                        "combo_underlying": order.combo_underlying,
+                        "combo_expiry": order.combo_expiry,
+                        "combo_option_right": order.combo_option_right,
+                        "combo_strikes_text": order.combo_strikes_text,
+                        "summary_filled_unit_quantity": (
+                            order.summary_filled_quantity
+                        ),
+                        "summary_net_average_price": (
+                            order.summary_average_price
+                        ),
+                        # Broker leg display rows retained verbatim; they are
+                        # not a declared combo definition and never become
+                        # canonical single-leg facts.
+                        "leg_display_rows": _combo_leg_display_rows(order),
+                    }
+                ),
+                completeness_score=Decimal("0.6500"),
+                completeness_json=_canonical_json(
+                    {
+                        "group_identity": "csv_derived",
+                        "parent_quantity": "csv_package_units_audit_only",
+                        "parent_price": "csv_net_audit_only",
+                        "leg_definition": "csv_display_rows_untrusted",
+                        "fill_evidence": (
+                            "csv_leg_display_rows_untrusted"
+                            if order.combo_legs
+                            else "not_applicable"
+                        ),
+                        "fee_evidence": fee_status,
+                    }
+                ),
+                provenance_json=_canonical_json(
+                    {
+                        "batch_key": key,
+                        "source": "moomoo_csv",
+                        "identity_basis": (
+                            "symbol_side_unit_quantity_order_time"
+                        ),
+                        "parent_economics_used_for_positions": False,
+                        "canonical_scope": "excluded_csv_combo_parent",
+                        "canonical_exclusion_reason": (
+                            "csv_combo_parent_has_no_broker_group_identity_"
+                            "or_declared_leg_definition"
+                        ),
+                    }
+                ),
+                source_record_sha256=_sha256_json(combo_record),
+                raw_payload_json=None,
+            )
+            session.add(group_row)
+            session.flush()
+
+            if has_execution:
+                session.add(
+                    BrokerExecutionGroupFeeObservation(
+                        import_batch_id=batch.id,
+                        execution_group_observation_id=group_row.id,
+                        observation_key=(
+                            "moomoo_csv_group_fee_" + order.derived_order_id
+                        ),
+                        broker="moomoo",
+                        account_key=account_key,
+                        source_execution_group_id=order.derived_order_id,
+                        currency=order.currency or "USD",
+                        total_fee=order.total_fee,
+                        fee_components_json=_canonical_json(
+                            dict(order.fee_components)
+                        ),
+                        evidence_json=_canonical_json(
+                            {
+                                "component_count": len(order.fee_components),
+                                "fee_scope": "execution_group",
+                            }
+                        ),
+                        provenance_json=_canonical_json(
+                            {
+                                "batch_key": key,
+                                "source": "moomoo_csv",
+                                "identity_basis": (
+                                    "symbol_side_unit_quantity_order_time"
+                                ),
+                                "allocation_to_legs_or_fills": False,
+                            }
+                        ),
+                        source_record_sha256=_sha256_json(
+                            {
+                                "order_id": order.derived_order_id,
+                                "total_fee": order.total_fee,
+                                "fee_components": dict(order.fee_components),
+                            }
+                        ),
+                    )
+                )
+
         if reconciliation is not None:
             _append_reconciliation_attestation(
                 session,
@@ -964,8 +1182,9 @@ def import_statement_batch(
             batch_key=key,
             duplicate=False,
             analysis_level=level,
-            order_observations=len(statement.orders),
+            order_observations=len(single_orders),
             fill_observations=fill_count,
+            execution_group_observations=len(combo_parents),
         )
 
 
@@ -3119,8 +3338,19 @@ def load_canonical_observation_inputs(
             )
 
         execution_groups = []
+        excluded_csv_execution_groups = 0
         for group_row in execution_group_rows:
             batch = batch_by_id[int(group_row.import_batch_id)]
+            if str(batch.source_kind) == "csv":
+                # A CSV combo parent has no broker execution-group identity
+                # and no declared leg definition; projecting it here would
+                # create a second, fake canonical group next to the
+                # authoritative OpenAPI execution group.  It stays stored as
+                # audit-only evidence (see its provenance
+                # ``canonical_scope=excluded_csv_combo_parent``) and is
+                # excluded from canonical selection fail-closed.
+                excluded_csv_execution_groups += 1
+                continue
             ordered_at = _utc_from_database(group_row.ordered_at)
             source_updated_at = _utc_from_database(
                 group_row.source_updated_at
@@ -3256,6 +3486,9 @@ def load_canonical_observation_inputs(
                 None if csv_baseline is None else int(csv_baseline.id)
             ),
             execution_groups=tuple(execution_groups),
+            excluded_csv_execution_group_observations=(
+                excluded_csv_execution_groups
+            ),
         )
 
 

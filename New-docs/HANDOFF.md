@@ -279,7 +279,7 @@ flowchart LR
 
 Journal：
 
-- `src/journal/brokers/moomoo_statement.py`：History CSV loss-aware parser。
+- `src/journal/brokers/moomoo_statement.py`：History CSV loss-aware parser（v3 起识别组合单父单：`Nunit(s)` 组合 unit 数量、`MU260731P745/760` 型价差符号与腿展示行；父单为 audit-only 证据，组级费用不分摊、不推导乘数或腿数量，CSV 组合父单被 canonical 选择显式排除，腿级真相仍以 OpenAPI execution group 为准；详见 `New-docs/phase1/01_MOOMOO_EVIDENCE_LEDGER.md` §4.3）。
 - `src/journal/brokers/moomoo_readonly.py`：OpenD 历史数据只读探测。
 - `src/journal/brokers/moomoo_openapi_export.py`：去标识化 OpenAPI export 严格解析。
 - `src/journal/ledger/models.py`：核心 evidence/canonical/Episode 模型；不是全部 Journal 模型的单一文件。

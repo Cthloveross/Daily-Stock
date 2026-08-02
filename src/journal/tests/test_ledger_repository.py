@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+import json
 import threading
 from zoneinfo import ZoneInfo
 
@@ -14,6 +15,7 @@ from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 
 from src.journal.brokers.moomoo_statement import (
+    StatementComboLeg,
     StatementFill,
     StatementApiMatch,
     StatementOrder,
@@ -1129,6 +1131,179 @@ def test_reimport_is_idempotent_and_does_not_add_observations():
         assert session.execute(
             select(func.count(BrokerFillObservation.id))
         ).scalar_one() == 2
+
+
+def _combo_statement() -> StatementParseResult:
+    base = _statement()
+    detailed = base.orders[0]
+    leg_fill_time = datetime(2026, 7, 20, 11, 0, 16, tzinfo=ET)
+    combo = StatementOrder(
+        source_row=6,
+        derived_order_id="moomoo_csv_combo_parent",
+        symbol="EXAMPLE260717P190/200",
+        name="Vertical",
+        side="SELL",
+        status="FILLED",
+        order_quantity=Decimal("2"),
+        order_price=Decimal("6.70"),
+        order_price_text="6.70",
+        order_amount=Decimal("1340.00"),
+        order_time=datetime(2026, 7, 20, 11, 0, tzinfo=ET),
+        order_type="Limit",
+        time_in_force="Day",
+        session="Regular Trading Hours",
+        market="US",
+        currency="USD",
+        summary_filled_quantity=Decimal("2"),
+        summary_average_price=Decimal("7.00"),
+        fills=(),
+        fee_components=FEE_COMPONENTS,
+        total_fee=Decimal("8.08"),
+        evidence_level="combo_parent",
+        order_kind="combo_parent",
+        combo_unit_quantity=Decimal("2"),
+        combo_underlying="EXAMPLE",
+        combo_expiry=date(2026, 7, 17),
+        combo_option_right="P",
+        combo_strikes_text="190/200",
+        combo_legs=(
+            StatementComboLeg(
+                source_row=7,
+                symbol="EXAMPLE260717P190000",
+                name="Deidentified leg",
+                side="BUY",
+                order_quantity=Decimal("2"),
+                fills=(
+                    StatementFill(
+                        source_row=7,
+                        quantity=Decimal("2"),
+                        price=Decimal("24.30"),
+                        filled_at=leg_fill_time,
+                        amount=Decimal("4860"),
+                        market="US",
+                        currency="USD",
+                    ),
+                ),
+            ),
+            StatementComboLeg(
+                source_row=9,
+                symbol="EXAMPLE260717P200000",
+                name="Deidentified leg",
+                side="SELL",
+                order_quantity=Decimal("2"),
+                fills=(
+                    StatementFill(
+                        source_row=9,
+                        quantity=Decimal("2"),
+                        price=Decimal("31.30"),
+                        filled_at=leg_fill_time,
+                        amount=Decimal("6260"),
+                        market="US",
+                        currency="USD",
+                    ),
+                ),
+            ),
+        ),
+    )
+    return replace(
+        base,
+        source_sha256="b" * 64,
+        rows_total=8,
+        orders=(detailed, combo),
+    )
+
+
+def test_import_stores_combo_parent_as_audit_only_execution_group():
+    statement = _combo_statement()
+    # A combo parent alone forces the explicit partial acknowledgement.
+    with pytest.raises(LedgerImportError, match="explicitly allow"):
+        import_statement_batch(statement)
+
+    result = import_statement_batch(statement, allow_partial=True)
+    assert result.duplicate is False
+    assert result.analysis_level == "partial"
+    assert result.order_observations == 1
+    assert result.fill_observations == 2
+    assert result.execution_group_observations == 1
+
+    db = get_db()
+    with db.session_scope() as session:
+        orders = session.execute(
+            select(BrokerOrderObservation)
+        ).scalars().all()
+        # The combo parent is never disguised as a single-leg order row.
+        assert [order.source_order_id for order in orders] == [
+            "moomoo_csv_detailed"
+        ]
+        groups = session.execute(
+            select(BrokerExecutionGroupObservation)
+        ).scalars().all()
+        assert len(groups) == 1
+        group = groups[0]
+        assert group.source_execution_group_id == "moomoo_csv_combo_parent"
+        assert group.raw_parent_symbol == "EXAMPLE260717P190/200"
+        assert group.strategy_type == "VERTICAL"
+        assert (
+            group.parent_quantity_semantics
+            == "csv_combo_package_units_audit_only"
+        )
+        assert group.parent_price_semantics == "csv_net_price_audit_only"
+        assert group.evidence_level == "combo_parent_aggregate"
+        assert Decimal(group.group_order_quantity) == Decimal("2")
+        assert Decimal(group.broker_reported_dealt_quantity) == Decimal("2")
+        provenance = json.loads(group.provenance_json)
+        assert provenance["canonical_scope"] == "excluded_csv_combo_parent"
+        assert provenance["parent_economics_used_for_positions"] is False
+        evidence = json.loads(group.evidence_json)
+        assert evidence["combo_definition_available"] is False
+        assert len(evidence["leg_display_rows"]) == 2
+
+        # No leg-level facts are invented from CSV display rows, and the
+        # group fee stays at execution-group scope.
+        assert session.execute(
+            select(func.count(BrokerExecutionGroupLegObservation.id))
+        ).scalar_one() == 0
+        group_fees = session.execute(
+            select(BrokerExecutionGroupFeeObservation)
+        ).scalars().all()
+        assert len(group_fees) == 1
+        assert Decimal(group_fees[0].total_fee) == Decimal("8.08")
+        fee_provenance = json.loads(group_fees[0].provenance_json)
+        assert fee_provenance["allocation_to_legs_or_fills"] is False
+        fills = session.execute(
+            select(BrokerFillObservation)
+        ).scalars().all()
+        assert all(
+            fill.source_order_id != "moomoo_csv_combo_parent"
+            for fill in fills
+        )
+
+    duplicate = import_statement_batch(statement, allow_partial=True)
+    assert duplicate.duplicate is True
+    assert duplicate.execution_group_observations == 1
+    assert duplicate.order_observations == 1
+
+
+def test_canonical_inputs_exclude_csv_combo_parent_fail_closed():
+    import_statement_batch(_combo_statement(), allow_partial=True)
+
+    inputs = load_canonical_observation_inputs()
+    assert inputs.execution_groups == ()
+    assert inputs.excluded_csv_execution_group_observations == 1
+
+    evidence_set = canonicalize_observations(
+        inputs.orders,
+        inputs.fills,
+        inputs.execution_groups,
+    )
+    # The CSV combo parent creates neither a canonical order nor a canonical
+    # execution group; existing single-leg facts stay untouched.
+    assert evidence_set.execution_groups == ()
+    assert all(
+        order.source_order_id != "moomoo_csv_combo_parent"
+        for order in evidence_set.orders
+    )
+    assert len(evidence_set.orders) == 1
 
 
 def test_sqlite_rejects_update_and_delete_on_v2_evidence():

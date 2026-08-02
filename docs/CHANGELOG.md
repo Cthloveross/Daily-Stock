@@ -409,6 +409,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] Web 新增 `NearExpiryContractPanel`：`/intraday` 日内扫描表行尾「临期合约」按钮内联展开（整行点击仍是既有详情页导航、同一时刻只展开一行以保持表格可用），`/regime/opportunity/:ticker` 期权墙标签底部「查看临期合约（0–3 DTE）」按需展开；ATM 行高亮为位置标记、点差 >15% 标「流动性差」（v1 启发式展示阈值，未经交易结果验证）、缺失字段显示「标缺」，页头固定「合约选择参考 · 不构成推荐 · 以券商实时盘口为准」。
 - [测试] 临期合约确定性测试：`src/opportunities/tests/test_near_expiry_contracts.py`（18：近价窗口 ±5%/稀疏链扩到 8 档/边界含入、点差数学与缺 bid/ask null-not-zero/交叉盘口标缺、逐到期隔离、ATM 双边标记、失败批次降级）；`api/v1/tests/test_near_expiry_contracts_endpoint.py`（17：未启用零 Moomoo 调用、TTL 复用/refresh 旁路/single-flight、max_dte 隔离缓存 key、非法 symbol 与 max_dte 422、诚实空态与 unavailable 降级）；前端 `NearExpiryContractPanel.test.tsx` + `IntradayScanTable.test.tsx`（分组与 as-of + 诚实页头、流动性差阈值严格大于、标缺渲染、按钮展开不触发行导航、单行展开）。
 - [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` 新增 §2.9 临期合约面板（bid/ask 来源结论、额度成本、近价窗口、诚实边界与交互选择）；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` 新增 G-8 行。
+- [新功能] Moomoo History CSV parser 升级到 `moomoo-statement-v3`：识别组合单（多腿价差）父单行的 `Nunit(s)` 组合 unit 数量、`2unit(s)@7.00` unit 成交摘要与 `MU260731P745/760` 型价差符号（保留原始符号并在无歧义时解析 underlying/到期/方向/行权价文本，不做 OCC 单行权价伪解码），父单后的腿展示行与其成交续行作为腿证据保留在父单上；含组合父单的 CSV 不再整体解析失败，父单永不伪装成普通单腿订单。
+- [改进] CSV 组合父单入账为 audit-only `BrokerExecutionGroupObservation`（组合 unit 语义）+ 组级费用观测：不分摊费用到腿、不推导合约乘数或腿级数量、不写腿/成交观测；canonical 选择将 CSV 组合父单显式排除（provenance `canonical_scope=excluded_csv_combo_parent`），腿级真相仍由 OpenAPI execution group 提供；preview 新增 `combo_parent_orders` 等 additive 计数并把含组合父单的 CSV 至少判为 `partial`，旧版 CSV↔readonly 对账将窗口内组合父单显式排除并输出警示。
+- [测试] 新增真实导出行文本的组合父单解析回归（unit 数量/成交摘要/组级费用尾列/价差符号/两条腿展示行、邻近普通单不受影响）、对账排除警示、账本组合父单 audit-only 入账与 canonical fail-closed 排除、preview/import API 组合计数与部分级别断言；既有 parser 与账本测试全部保持通过。
+- [文档] `New-docs/phase1/01_MOOMOO_EVIDENCE_LEDGER.md` 新增 §4.3 组合单父单解析与 canonical 排除语义；`New-docs/HANDOFF.md` §4.2 更新 parser 条目；根 README 未涉及该专题细节，故未改动。
 
 ## [3.11.0] - 2026-03-27
 

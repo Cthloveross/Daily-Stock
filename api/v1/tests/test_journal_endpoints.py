@@ -619,6 +619,117 @@ def test_v2_import_preview_is_read_only_and_marks_aggregate_evidence():
     assert not db_path.exists()
 
 
+_COMBO_EXPORT_HEADER = (
+    '"Side","Symbol","Name","Order Price","Order Qty","Order Amount",'
+    '"Status","Filled@Avg Price","Order Time","Order Type","Time-in-Force",'
+    '"Allow Pre-Market","Session","Trigger price","Position Opening",'
+    '"Markets","Currency","Order Source","Fill Qty","Fill Price",'
+    '"Fill Amount","Fill Time","Markets","Currency","Counterparty",'
+    '"Remarks","Commission","Platform Fees","Options Regulatory Fees",'
+    '"OCC Fees","Contract Fees","Consolidated Audit Trail Fees","SEC Fees",'
+    '"Trading Activity Fees","Total","Settlement Fees"'
+)
+
+
+def _combo_moomoo_csv() -> bytes:
+    rows = (
+        _COMBO_EXPORT_HEADER,
+        '"Buy","MU260731P745000","MU 260731 745.00P","24.35","4","9,740.00",'
+        '"Filled","4@24.35","Jul 29, 2026 15:36:46 ET","Limit","Day","","",'
+        '"","","US","USD","","4","24.35","9,740.00",'
+        '"Jul 29, 2026 15:36:47 ET","US","USD","","","2.6","1.2","0.05",'
+        '"0.1","2.6","0","","","6.55",""',
+        '"Sell","MU260731P745/760"," Vertical","6.70","2unit(s)","1,340.00",'
+        '"Filled","2unit(s)@7.00","Jul 29, 2026 15:35:34 ET","Limit","Day",'
+        '"","","","","US","USD","","","","","","","","","","3.98","1.2",'
+        '"0.04","0.12","2.6","0","0.12","0.02","8.08",""',
+        '"Buy","MU260731P745000","MU 260731 745.00P","","2","","","","","",'
+        '"","","","","","","","","1","24.30","2,430.00",'
+        '"Jul 29, 2026 15:35:50 ET","US","USD","","","","","","","","","",'
+        '"","",""',
+        '"","","","","","","","","","","","","","","","","","","1","24.30",'
+        '"2,430.00","Jul 29, 2026 15:35:50 ET","US","USD","","","","","",'
+        '"","","","","","",""',
+        '"Sell","MU260731P760000","MU 260731 760.00P","","2","","","","",'
+        '"","","","","","","","","","1","31.30","3,130.00",'
+        '"Jul 29, 2026 15:35:50 ET","US","USD","","","","","","","","","",'
+        '"","",""',
+        '"","","","","","","","","","","","","","","","","","","1","31.30",'
+        '"3,130.00","Jul 29, 2026 15:35:50 ET","US","USD","","","","","",'
+        '"","","","","","",""',
+    )
+    return ("\n".join(rows) + "\n").encode("utf-8")
+
+
+def test_v2_import_preview_reports_combo_parent_counts():
+    c = _client()
+    db_path = Path(os.environ["DATABASE_PATH"])
+    resp = c.post(
+        "/api/v1/journal/v2/imports/preview",
+        files={"file": ("history.csv", _combo_moomoo_csv(), "text/csv")},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["analysis_level"] == "partial"
+    assert body["orders_total"] == 2
+    assert body["combo_parent_orders"] == 1
+    assert body["combo_parent_leg_rows"] == 2
+    assert body["combo_parent_fee_total"] == "8.08"
+    assert body["detail_backed_filled_orders"] == 1
+    assert body["aggregate_only_filled_orders"] == 0
+    assert body["inconsistent_filled_orders"] == 0
+    assert "combo_parent_orders_are_audit_only_evidence" in body["warnings"]
+    assert (
+        "older_filled_orders_have_aggregate_evidence_only"
+        not in body["warnings"]
+    )
+    assert body["journal_database_written"] is False
+    assert not db_path.exists()
+
+
+def test_v2_import_appends_combo_parent_as_execution_group():
+    c = _client()
+    resp = c.post(
+        "/api/v1/journal/v2/imports?allow_partial=true",
+        files={"file": ("history.csv", _combo_moomoo_csv(), "text/csv")},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["analysis_level"] == "partial"
+    assert body["order_observations"] == 1
+    assert body["fill_observations"] == 1
+    assert body["execution_group_observations"] == 1
+    assert body["legacy_journal_written"] is False
+
+    from src.journal.ledger.models import (
+        BrokerExecutionGroupLegObservation,
+        BrokerExecutionGroupObservation,
+        BrokerOrderObservation,
+    )
+    from src.storage import get_db
+    from sqlalchemy import func, select
+
+    db = get_db()
+    with db.session_scope() as session:
+        assert session.execute(
+            select(func.count(BrokerOrderObservation.id))
+        ).scalar_one() == 1
+        groups = session.execute(
+            select(BrokerExecutionGroupObservation)
+        ).scalars().all()
+        assert len(groups) == 1
+        assert groups[0].raw_parent_symbol == "MU260731P745/760"
+        assert (
+            groups[0].parent_quantity_semantics
+            == "csv_combo_package_units_audit_only"
+        )
+        assert session.execute(
+            select(func.count(BrokerExecutionGroupLegObservation.id))
+        ).scalar_one() == 0
+
+
 def test_v2_import_preview_marks_header_only_export_blocked():
     c = _client()
     resp = c.post(

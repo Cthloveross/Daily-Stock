@@ -105,6 +105,9 @@ class MoomooStatementPreviewResponse(BaseModel):
     aggregate_only_filled_orders: int
     inconsistent_filled_orders: int
     fill_records: int
+    combo_parent_orders: int = 0
+    combo_parent_leg_rows: int = 0
+    combo_parent_fee_total: str = "0"
     orphan_fill_rows: int
     filled_fee_total: str
     detail_backed_fee_total: str
@@ -394,6 +397,7 @@ class LedgerImportResponse(BaseModel):
     analysis_level: str
     order_observations: int
     fill_observations: int
+    execution_group_observations: int = 0
     legacy_journal_written: bool = False
     message: str
 
