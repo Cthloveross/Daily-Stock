@@ -183,6 +183,8 @@ def _stub_daily_loader(monkeypatch, *, now: datetime = _FIXED_NOW) -> _FakeManag
         "_fetch_earnings_calendar_rows",
         lambda from_date, to_date: (None, "finnhub_not_configured"),
     )
+    # 默认：Playbook 只读对应关系为空（单测绝不读真实 journal_v2 数据库）。
+    monkeypatch.setattr(opportunities, "_load_intraday_playbook_refs", lambda: {})
     return manager
 
 
@@ -240,7 +242,7 @@ def test_contract_regular_session_full_row(monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert body["schema_version"] == "intraday-top/1.0"
-    assert body["signal_version"] == "intraday_session_evidence_v3"
+    assert body["signal_version"] == "intraday_session_evidence_v4"
     # 盘中主排序 = 波段爆发分优先。
     assert body["ranking_method"] == "burst_score_first_then_evidence_count"
     # 不冻结、不入统计的显式标记。
@@ -304,6 +306,25 @@ def test_contract_regular_session_full_row(monkeypatch):
     assert body["market_context"]["state"] == "ready"
     assert body["market_context"]["vwap_position"] == "above"
     assert item["market_alignment"]["state"] == "aligned"
+    # v4 形态相似度（styleMatch v1）：+3.2% 跳空、最低 127.5 未回补前收 124、
+    # 现价 130.5 ≥ VWAP 130.5 → S2 matched；平坦 5m fixture 无 swing low →
+    # S1 not_matched；现价未跌破开盘/VWAP → S3 not_matched。纯标注，不进计数。
+    setup_match = item["setup_match"]
+    assert setup_match["style_match_version"] == "style_match_v1"
+    assert setup_match["state"] == "ready"
+    assert setup_match["matched_setups"] == ["S2"]
+    setup_states = {
+        row["setup_key"]: row["state"] for row in setup_match["setups"]
+    }
+    assert setup_states == {
+        "S1": "not_matched",
+        "S2": "matched",
+        "S3": "not_matched",
+    }
+    assert setup_match["bar_count_15m"] == 4
+    # Playbook 对应关系默认 stub 为空：徽标如实缺 Playbook 标注。
+    assert all(row["playbook"] is None for row in setup_match["setups"])
+    assert any("形态相似 ≠ 可交易" in text for text in body["limitations"])
     burst_evidence = next(
         entry
         for entry in item["evidence"]
@@ -413,6 +434,10 @@ def test_closed_session_labels_last_session_and_snapshot_gap_basis(monkeypatch):
     assert proximity["state"] == "unavailable"
     assert proximity["unavailable_reason"] == "finnhub_not_configured"
     assert proximity["within_blackout"] is None
+    # v4 形态相似度在休市同样按最近一个交易时段评估并如实标注 as-of。
+    setup_match = item["setup_match"]
+    assert setup_match["quote_session_scope"] == "latest_prior_session"
+    assert setup_match["session_date_et"] == "2026-07-24"
 
 
 def test_ttl_cache_shares_and_refresh_bypasses(monkeypatch):
@@ -566,6 +591,51 @@ def test_burst_fetch_failure_is_isolated_and_never_blocks_aggregates(monkeypatch
     assert item["gap_percent"] == pytest.approx(3.225806, abs=1e-4)
     assert item["volume_pace_ratio"] == pytest.approx(2.5, abs=1e-6)
     assert item["research_state"] == "active"
+    # v4 形态相似度：5m 缺失只让 S1 显式 unavailable，
+    # 纯快照几何的 S2 仍照常评估（缺口托举 matched）。
+    setup_states = {
+        row["setup_key"]: row["state"] for row in item["setup_match"]["setups"]
+    }
+    assert setup_states["S1"] == "unavailable"
+    assert setup_states["S2"] == "matched"
+
+
+def test_playbook_refs_attach_to_setup_badges_read_only(monkeypatch):
+    monkeypatch.setenv("MOOMOO_OPEND_ENABLED", "true")
+    _stub_daily_loader(monkeypatch)
+    monkeypatch.setattr(
+        opportunities,
+        "_fetch_underlying_session_quotes",
+        lambda symbols: {"NVDA": _quote()},
+    )
+    _stub_events(monkeypatch, {"NVDA": []})
+    monkeypatch.setattr(
+        opportunities,
+        "_load_intraday_playbook_refs",
+        lambda: {
+            "S2": {
+                "setup_key": "S2",
+                "candidate_key": "b" * 64,
+                "status": "candidate",
+                "title": "S2 · 跳空高开托举（轻仓试错，需二次确认）",
+            }
+        },
+    )
+
+    response = _client().post(
+        "/api/v1/opportunities/intraday-top", json={"symbols": ["NVDA"]}
+    )
+    assert response.status_code == 200
+    setups = {
+        row["setup_key"]: row
+        for row in response.json()["candidates"][0]["setup_match"]["setups"]
+    }
+    # S2 matched 且带只读 Playbook 对应（候选）；其余 setup 无 Playbook 标注。
+    assert setups["S2"]["state"] == "matched"
+    assert setups["S2"]["playbook"]["status"] == "candidate"
+    assert setups["S2"]["playbook"]["candidate_key"] == "b" * 64
+    assert setups["S1"]["playbook"] is None
+    assert setups["S3"]["playbook"] is None
 
 
 def test_burst_bars_cached_per_symbol_across_refresh(monkeypatch):

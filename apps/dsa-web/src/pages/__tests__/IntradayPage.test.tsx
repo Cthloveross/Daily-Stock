@@ -204,6 +204,51 @@ function topCandidate(overrides: Partial<IntradayTopCandidate> = {}): IntradayTo
       basis: 'candidate_current_burst_direction_vs_spy_session_vwap_position',
       unavailableReason: null,
     },
+    setupMatch: {
+      state: 'ready',
+      styleMatchVersion: 'style_match_v1',
+      quoteSessionScope: 'current_session',
+      sessionDateEt: '2026-07-28',
+      barCount5M: 78,
+      barCount15M: 26,
+      matchedSetups: [],
+      partialSetups: [],
+      setups: [
+        {
+          setupKey: 'S1',
+          label: 'S1 低点抬高',
+          title: '十五分钟低点抬高突破',
+          state: 'not_matched',
+          reason: '可识别的 15m swing low 不足 2 个。',
+          evidenceLines: [],
+          basis: '15m_rising_swing_lows_then_break_above_structure_high',
+          playbook: null,
+        },
+        {
+          setupKey: 'S2',
+          label: 'S2 跳空托举',
+          title: '跳空高开托举',
+          state: 'not_matched',
+          reason: '无达到阈值的向上跳空。',
+          evidenceLines: [],
+          basis: 'gap_up_support_hold_above_reference_close_and_session_vwap',
+          playbook: null,
+        },
+        {
+          setupKey: 'S3',
+          label: 'S3 高开遇阻',
+          title: '高开遇阻回落（做空）',
+          state: 'not_matched',
+          reason: '无达到阈值的向上跳空。',
+          evidenceLines: [],
+          basis: 'gap_up_rejection_below_open_or_vwap_requires_spy_below_vwap',
+          playbook: null,
+        },
+      ],
+      basis: 'session_5m_bars_aggregated_to_15m_grid_plus_session_quote_geometry',
+      unavailableReason: null,
+      limitations: [],
+    },
     optionActivity: {
       state: 'ready',
       count: 3,
@@ -331,7 +376,7 @@ function topResponse(
       source: 'moomoo_openapi',
       unavailableReason: null,
     },
-    signalVersion: 'intraday_session_evidence_v3',
+    signalVersion: 'intraday_session_evidence_v4',
     rankingMethod:
       sessionState === 'closed'
         ? 'rule_based_evidence_count'
@@ -464,7 +509,7 @@ describe('IntradayPage', () => {
 
     // 页头副标题：爆发分优先排名 + v3 版本号。
     expect(screen.getByText(/波段爆发优先排名/)).toBeInTheDocument();
-    expect(screen.getByText(/intraday_session_evidence_v3/)).toBeInTheDocument();
+    expect(screen.getByText(/intraday_session_evidence_v4/)).toBeInTheDocument();
 
     // 期权异动 feed + 诚实边界文案。
     const feed = screen.getByLabelText('期权异动');

@@ -1121,6 +1121,52 @@ class IntradaySessionBursts(BaseModel):
     limitations: list[str] = Field(default_factory=list)
 
 
+class IntradaySetupPlaybookRef(BaseModel):
+    """S1/S2/S3 形态对应的 Playbook 条目：只读展示，规则不反哺评分或排序。"""
+
+    setup_key: Literal["S1", "S2", "S3"]
+    candidate_key: Optional[str] = None
+    status: Literal["candidate", "promoted"]
+    title: str
+
+
+class IntradaySetupMatch(BaseModel):
+    """单个 setup 的 v1 几何相似度：matched/partial/not_matched/unavailable。
+
+    reason 与 evidence_lines 说明 v1 检查了什么、缺了什么；形态相似 ≠ 可交易。
+    """
+
+    setup_key: Literal["S1", "S2", "S3"]
+    label: str
+    title: str
+    state: Literal["matched", "partial", "not_matched", "unavailable"]
+    reason: str
+    evidence_lines: list[str] = Field(default_factory=list)
+    basis: str
+    playbook: Optional[IntradaySetupPlaybookRef] = None
+
+
+class IntradaySetupMatchProfile(BaseModel):
+    """v4 styleMatch v1：当前时段几何形状 vs 用户三个 Playbook setup。
+
+    纯标注：不参与排序、不隐藏行、不是信号；5m 聚合到 15m 近似，
+    非 2m/1m 确认帧，不含 8/13 EMA 托举与回踩企稳细节。
+    """
+
+    state: Literal["ready", "unavailable"]
+    style_match_version: Literal["style_match_v1"]
+    quote_session_scope: Literal["current_session", "latest_prior_session"]
+    session_date_et: Optional[str] = None
+    bar_count_5m: int = Field(0, ge=0)
+    bar_count_15m: int = Field(0, ge=0)
+    matched_setups: list[Literal["S1", "S2", "S3"]] = Field(default_factory=list)
+    partial_setups: list[Literal["S1", "S2", "S3"]] = Field(default_factory=list)
+    setups: list[IntradaySetupMatch] = Field(default_factory=list)
+    basis: str
+    unavailable_reason: Optional[str] = None
+    limitations: list[str] = Field(default_factory=list)
+
+
 class IntradayTopCandidate(BaseModel):
     """一行盘中滚动研究候选：每个指标要么有值+口径，要么显式标缺原因。"""
 
@@ -1160,6 +1206,7 @@ class IntradayTopCandidate(BaseModel):
     session_bursts: IntradaySessionBursts
     earnings_proximity: IntradayEarningsProximity
     market_alignment: IntradayMarketAlignment
+    setup_match: IntradaySetupMatchProfile
     option_activity: IntradayTopOptionActivity
     prior_day_context: IntradayTopPriorDayContext
     evidence: list[EvidenceItem] = Field(default_factory=list)
@@ -1203,7 +1250,7 @@ class IntradayTopResponse(BaseModel):
     quote_session_scope: Literal["current_session", "latest_prior_session"]
     quote_session_label: str
     market_context: IntradayMarketContext
-    signal_version: Literal["intraday_session_evidence_v3"]
+    signal_version: Literal["intraday_session_evidence_v4"]
     ranking_method: Literal[
         "burst_score_first_then_evidence_count",
         "rule_based_evidence_count",

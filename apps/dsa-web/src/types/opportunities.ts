@@ -790,6 +790,48 @@ export interface IntradayMarketContext {
   unavailableReason: string | null;
 }
 
+/** v4 styleMatch：S1/S2/S3 的 setup key。 */
+export type IntradaySetupKey = 'S1' | 'S2' | 'S3';
+
+/** S1/S2/S3 形态对应的 Playbook 条目：只读展示，规则不反哺评分或排序。 */
+export interface IntradaySetupPlaybookRef {
+  setupKey: IntradaySetupKey;
+  candidateKey: string | null;
+  status: 'candidate' | 'promoted';
+  title: string;
+}
+
+/** 单个 setup 的 v1 几何相似度：matched/partial/not_matched/unavailable。 */
+export interface IntradaySetupMatch {
+  setupKey: IntradaySetupKey;
+  label: string;
+  title: string;
+  state: 'matched' | 'partial' | 'not_matched' | 'unavailable';
+  reason: string;
+  evidenceLines: string[];
+  basis: string;
+  playbook: IntradaySetupPlaybookRef | null;
+}
+
+/**
+ * v4 styleMatch v1：当前时段几何形状 vs 用户三个 Playbook setup。
+ * 纯标注：不参与排序、不隐藏行、不是信号；5m 聚合到 15m 近似，非 2m/1m 确认帧。
+ */
+export interface IntradaySetupMatchProfile {
+  state: 'ready' | 'unavailable';
+  styleMatchVersion: 'style_match_v1';
+  quoteSessionScope: 'current_session' | 'latest_prior_session';
+  sessionDateEt: string | null;
+  barCount5M: number;
+  barCount15M: number;
+  matchedSetups: IntradaySetupKey[];
+  partialSetups: IntradaySetupKey[];
+  setups: IntradaySetupMatch[];
+  basis: string;
+  unavailableReason: string | null;
+  limitations: string[];
+}
+
 /** 波段爆发（v2 主信号）：当前窗口 + 当日（或最近一个交易时段）波段列表。 */
 export interface IntradaySessionBursts {
   state: 'ready' | 'insufficient_bars' | 'unavailable';
@@ -844,6 +886,7 @@ export interface IntradayTopCandidate {
   sessionBursts: IntradaySessionBursts;
   earningsProximity: IntradayEarningsProximity;
   marketAlignment: IntradayMarketAlignment;
+  setupMatch: IntradaySetupMatchProfile;
   optionActivity: IntradayTopOptionActivity;
   priorDayContext: IntradayTopPriorDayContext;
   evidence: OpportunityEvidence[];
@@ -885,7 +928,7 @@ export interface IntradayTopResponse {
   quoteSessionScope: 'current_session' | 'latest_prior_session';
   quoteSessionLabel: string;
   marketContext: IntradayMarketContext;
-  signalVersion: 'intraday_session_evidence_v3';
+  signalVersion: 'intraday_session_evidence_v4';
   rankingMethod: 'burst_score_first_then_evidence_count' | 'rule_based_evidence_count';
   statisticsTrack: 'none_intraday_v1_unscored';
   moomooEnabled: boolean;

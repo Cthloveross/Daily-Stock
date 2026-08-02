@@ -3,10 +3,67 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { IntradayScanTable } from '../IntradayScanTable';
 import { fetchNearExpiryContracts } from '../../../api/opportunities';
 import type {
+  IntradaySetupKey,
+  IntradaySetupMatch,
+  IntradaySetupMatchProfile,
   IntradayTopCandidate,
   IntradayTopResponse,
   NearExpiryContractResponse,
 } from '../../../types/opportunities';
+
+const SETUP_LABELS: Record<IntradaySetupKey, string> = {
+  S1: 'S1 低点抬高',
+  S2: 'S2 跳空托举',
+  S3: 'S3 高开遇阻',
+};
+
+const SETUP_TITLES: Record<IntradaySetupKey, string> = {
+  S1: '十五分钟低点抬高突破',
+  S2: '跳空高开托举',
+  S3: '高开遇阻回落（做空）',
+};
+
+function setupRow(
+  key: IntradaySetupKey,
+  state: IntradaySetupMatch['state'],
+  overrides: Partial<IntradaySetupMatch> = {},
+): IntradaySetupMatch {
+  return {
+    setupKey: key,
+    label: SETUP_LABELS[key],
+    title: SETUP_TITLES[key],
+    state,
+    reason: '无达到阈值的向上跳空。',
+    evidenceLines: [],
+    basis: 'fixture_basis',
+    playbook: null,
+    ...overrides,
+  };
+}
+
+function setupMatchProfile(
+  overrides: Partial<IntradaySetupMatchProfile> = {},
+): IntradaySetupMatchProfile {
+  return {
+    state: 'ready',
+    styleMatchVersion: 'style_match_v1',
+    quoteSessionScope: 'current_session',
+    sessionDateEt: '2026-08-04',
+    barCount5M: 12,
+    barCount15M: 4,
+    matchedSetups: [],
+    partialSetups: [],
+    setups: [
+      setupRow('S1', 'not_matched'),
+      setupRow('S2', 'not_matched'),
+      setupRow('S3', 'not_matched'),
+    ],
+    basis: 'session_5m_bars_aggregated_to_15m_grid_plus_session_quote_geometry',
+    unavailableReason: null,
+    limitations: [],
+    ...overrides,
+  };
+}
 
 const navigateMock = vi.fn();
 
@@ -99,6 +156,7 @@ function candidate(overrides: Partial<IntradayTopCandidate> = {}): IntradayTopCa
       basis: 'candidate_current_burst_direction_vs_spy_session_vwap_position',
       unavailableReason: 'burst_direction_unavailable',
     },
+    setupMatch: setupMatchProfile(),
     optionActivity: {
       state: 'empty',
       count: 0,
@@ -155,7 +213,7 @@ function topResponse(): IntradayTopResponse {
       source: 'moomoo_openapi',
       unavailableReason: 'spy_quote_unavailable',
     },
-    signalVersion: 'intraday_session_evidence_v3',
+    signalVersion: 'intraday_session_evidence_v4',
     rankingMethod: 'burst_score_first_then_evidence_count',
     statisticsTrack: 'none_intraday_v1_unscored',
     moomooEnabled: true,
@@ -311,6 +369,99 @@ describe('IntradayScanTable v3 上下文列（财报/大盘/速度）', () => {
     expect(tickerOrder()[0]).toContain('NVDA');
     fireEvent.click(within(table).getByRole('button', { name: '按财报排序' }));
     expect(tickerOrder()[0]).toContain('NVDA');
+  });
+});
+
+describe('IntradayScanTable v4 形态列（styleMatch v1）', () => {
+  beforeEach(() => {
+    navigateMock.mockReset();
+    vi.mocked(fetchNearExpiryContracts).mockReset();
+    vi.mocked(fetchNearExpiryContracts).mockImplementation(
+      async (symbol: string) => nearExpiryEmpty(symbol),
+    );
+  });
+
+  it('renders the 形态 column with matched solid and partial outline badges', () => {
+    const matched = candidate({
+      setupMatch: setupMatchProfile({
+        matchedSetups: ['S1'],
+        partialSetups: ['S3'],
+        setups: [
+          setupRow('S1', 'matched', {
+            reason: '15m 低点连续抬高且已突破结构高点（几何相似，非进场确认）。',
+            evidenceLines: [
+              '低点序列 10:15 745.20 → 10:45 747.80',
+              '结构高点 749.60（10:15–11:00）',
+              '突破 11:00 收 750.10 > 749.60',
+            ],
+            playbook: {
+              setupKey: 'S1',
+              candidateKey: 'a'.repeat(64),
+              status: 'candidate',
+              title: 'S1 · 15分钟低点抬高突破（主力打法）',
+            },
+          }),
+          setupRow('S2', 'not_matched'),
+          setupRow('S3', 'partial', {
+            reason: '形态似 S3 但大盘未走弱（SPY 未处于 VWAP 下方）。',
+          }),
+        ],
+      }),
+    });
+    render(
+      <IntradayScanTable
+        data={{ ...topResponse(), candidates: [matched], universe: ['NVDA'] }}
+        loading={false}
+        error={null}
+      />,
+    );
+    const table = screen.getByRole('table', { name: '日内扫描表' });
+    expect(within(table).getByText('形态')).toBeInTheDocument();
+    // matched=实底徽标（aria-label 与共享 Tooltip 携带证据行 + 只读 Playbook 标注）。
+    const matchedBadge = within(table).getByText('S1 低点抬高');
+    expect(matchedBadge).toHaveClass('bg-bg-2');
+    expect(matchedBadge.getAttribute('aria-label')).toContain(
+      '低点序列 10:15 745.20 → 10:45 747.80',
+    );
+    expect(matchedBadge.getAttribute('aria-label')).toContain('对应 Playbook: S1（候选）');
+    // partial=描边徽标 + 「· 似」后缀 + 原因说明。
+    const partialBadge = within(table).getByText(/S3 高开遇阻 · 似/);
+    expect(partialBadge).toHaveClass('border-dashed');
+    expect(partialBadge.getAttribute('aria-label')).toContain('形态似 S3 但大盘未走弱');
+    // not_matched 的 S2 不渲染徽标。
+    expect(within(table).queryByText('S2 跳空托举')).not.toBeInTheDocument();
+    // footer 诚实边界。
+    expect(
+      screen.getByText(/形态相似度为 v1 几何检测（5m近似），不含你的进场确认帧（2m\/1m 回踩8\/13EMA），不是信号/),
+    ).toBeInTheDocument();
+  });
+
+  it('renders — when no setup is similar and 标缺 when inputs are unavailable', () => {
+    const none = candidate(); // 默认全 not_matched。
+    const unavailable = candidate({
+      ticker: 'MU',
+      setupMatch: setupMatchProfile({
+        state: 'unavailable',
+        unavailableReason: 'no_usable_bars_and_missing_quote_inputs',
+        setups: [
+          setupRow('S1', 'unavailable'),
+          setupRow('S2', 'unavailable'),
+          setupRow('S3', 'unavailable'),
+        ],
+      }),
+    });
+    render(
+      <IntradayScanTable
+        data={{ ...topResponse(), candidates: [none, unavailable], universe: ['NVDA', 'MU'] }}
+        loading={false}
+        error={null}
+      />,
+    );
+    const table = screen.getByRole('table', { name: '日内扫描表' });
+    expect(within(table).getByText('无相似形态 · 非信号')).toBeInTheDocument();
+    expect(within(table).getByText('K线/快照输入不足')).toBeInTheDocument();
+    // 标缺行仍完整在表：形态列绝不隐藏候选。
+    expect(within(table).getByLabelText('打开 MU 即时扫描详情')).toBeInTheDocument();
   });
 });
 

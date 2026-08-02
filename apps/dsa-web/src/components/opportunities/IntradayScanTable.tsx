@@ -1,10 +1,12 @@
 import { Fragment, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type {
+  IntradaySetupMatch,
   IntradayTopCandidate,
   IntradayTopResponse,
 } from '../../types/opportunities';
 import { parseApiTimestamp } from '../../utils/marketTime';
+import { Tooltip } from '../common/Tooltip';
 import { formatCompactUsd, formatRatio, formatSignedPercent } from './intradayFormat';
 import { NearExpiryContractPanel } from './NearExpiryContractPanel';
 
@@ -220,6 +222,75 @@ function speedCaption(item: IntradayTopCandidate): string {
 }
 
 /**
+ * v4 styleMatch：形态徽标 tooltip——matched 给证据行，partial 给未满足的原因，
+ * 有 Playbook 对应时附一行只读标注（候选/已晋升）。
+ */
+function setupTooltip(setup: IntradaySetupMatch): string {
+  const parts: string[] = [`${setup.label}（${setup.title}）：${setup.reason}`];
+  if (setup.evidenceLines.length > 0) parts.push(setup.evidenceLines.join('；'));
+  if (setup.playbook) {
+    parts.push(
+      `对应 Playbook: ${setup.playbook.setupKey}（${
+        setup.playbook.status === 'promoted' ? '已晋升' : '候选'
+      }）`,
+    );
+  }
+  return parts.join('\n');
+}
+
+/** 形态列内容：matched=实底徽标、partial=描边徽标、无相似=—、不可评估=标缺。 */
+function setupMatchCell(item: IntradayTopCandidate) {
+  const profile = item.setupMatch;
+  if (!profile || profile.state === 'unavailable') {
+    return (
+      <>
+        <div className="text-body-sm text-text-3">标缺</div>
+        <div className="mt-0.5 text-caption text-text-3">K线/快照输入不足</div>
+      </>
+    );
+  }
+  const visible = profile.setups.filter(
+    (setup) => setup.state === 'matched' || setup.state === 'partial',
+  );
+  if (visible.length === 0) {
+    return (
+      <>
+        <div className="text-body-sm text-text-3">—</div>
+        <div className="mt-0.5 text-caption text-text-3">无相似形态 · 非信号</div>
+      </>
+    );
+  }
+  return (
+    <>
+      <div className="flex flex-wrap gap-1">
+        {visible.map((setup) => (
+          <Tooltip
+            key={setup.setupKey}
+            focusable
+            content={
+              <span className="whitespace-pre-line">{setupTooltip(setup)}</span>
+            }
+          >
+            <span
+              aria-label={setupTooltip(setup)}
+              className={
+                setup.state === 'matched'
+                  ? 'inline-block whitespace-nowrap rounded-ds-sm border border-subtle bg-bg-2 px-1.5 py-0.5 text-caption font-medium text-text-1'
+                  : 'inline-block whitespace-nowrap rounded-ds-sm border border-dashed border-subtle px-1.5 py-0.5 text-caption text-text-2'
+              }
+            >
+              {setup.label}
+              {setup.state === 'partial' ? ' · 似' : ''}
+            </span>
+          </Tooltip>
+        ))}
+      </div>
+      <div className="mt-0.5 text-caption text-text-3">v1 几何 · 非信号</div>
+    </>
+  );
+}
+
+/**
  * 日内扫描表：确定性证据计数排名的盘中滚动 Top N。
  * 列头可点击做客户端排序（不改变服务端排名口径）；行点击进入即时扫描详情页。
  *
@@ -288,7 +359,7 @@ export function IntradayScanTable({
             {data?.quoteSessionScope === 'latest_prior_session'
               ? '休市 · 按最近交易时段最强波段排序'
               : '波段爆发优先排名'}
-            （{data?.signalVersion ?? 'intraday_session_evidence_v3'}）· 不冻结 · 不入统计
+            （{data?.signalVersion ?? 'intraday_session_evidence_v4'}）· 不冻结 · 不入统计
           </span>
         </div>
         {data && (
@@ -320,13 +391,14 @@ export function IntradayScanTable({
         </div>
       ) : (
         <div className="overflow-auto">
-          <table className="w-full min-w-[1420px] border-collapse" aria-label="日内扫描表">
+          <table className="w-full min-w-[1560px] border-collapse" aria-label="日内扫描表">
             <thead>
               <tr className="border-b border-subtle text-left text-caption text-text-3">
                 <th className="px-3 py-2 font-medium">标的</th>
                 <th className="px-3 py-2 text-right">{sortableHeader('burst', '当前爆发')}</th>
                 <th className="px-3 py-2 font-medium">速度</th>
                 <th className="px-3 py-2 font-medium">今日波段</th>
+                <th className="px-3 py-2 font-medium">形态</th>
                 <th className="px-3 py-2 text-right">{sortableHeader('change', '现价 / 当日')}</th>
                 <th className="px-3 py-2 text-right">{sortableHeader('gap', '缺口')}</th>
                 <th className="px-3 py-2 text-right">{sortableHeader('pace', '量能节奏')}</th>
@@ -400,6 +472,7 @@ export function IntradayScanTable({
                         : '≥30 分钟独立波段'}
                     </div>
                   </td>
+                  <td className="px-3 py-2.5">{setupMatchCell(item)}</td>
                   <td className="px-3 py-2.5 text-right">
                     <div className="font-mono text-mono-sm text-text-1">
                       {formatPrice(item.lastPrice)}
@@ -508,7 +581,7 @@ export function IntradayScanTable({
                 </tr>
                 {expandedTicker === item.ticker && (
                   <tr className="border-b border-subtle last:border-b-0">
-                    <td colSpan={14} className="bg-bg-0 px-3 py-3">
+                    <td colSpan={15} className="bg-bg-0 px-3 py-3">
                       <NearExpiryContractPanel symbol={item.ticker} />
                     </td>
                   </tr>
@@ -521,7 +594,7 @@ export function IntradayScanTable({
       )}
 
       <div className="border-t border-subtle bg-bg-0 px-4 py-2 text-caption text-text-3">
-        当前爆发＝最近 15 分钟（3 根 5m K 线）|收−开| ÷ 当日 5m 波幅中位 × 窗口量比（阈值按 2026-07-31 标注样本校准，盘中排序优先，不是信号）；速度＝相邻两个 15 分钟窗口爆发分之差（5m 近似，非 1m/2m 秒级；减速=你的离场信号，R1）；今日波段＝爆发分 ≥ 8 且起点相隔 ≥30 分钟的独立窗口（≤4 个，休市显示最近一个交易时段）；缺口＝开盘价对参考前收（休市时段改用快照前收并标注）；量能节奏＝当日累计 vs 20 日全日中位（未按时点折算）；大盘＝候选爆发方向 vs SPY 会话 VWAP 位置（累计额/量近似）；波幅扩张＝当日高低价差 ÷ ATR14；财报＝Finnhub 前向 5 天窗口，≤3 天标「期权贵」（你的回避规则）；期权异动＝最近一页 Moomoo 分类计数，不推断开平仓。时段/财报/大盘/速度均为 v3 上下文标注——系统标注，用户过滤：不隐藏行、不阻断操作、不参与排序。缺失字段显式标缺，不以 0 冒充。
+        当前爆发＝最近 15 分钟（3 根 5m K 线）|收−开| ÷ 当日 5m 波幅中位 × 窗口量比（阈值按 2026-07-31 标注样本校准，盘中排序优先，不是信号）；速度＝相邻两个 15 分钟窗口爆发分之差（5m 近似，非 1m/2m 秒级；减速=你的离场信号，R1）；今日波段＝爆发分 ≥ 8 且起点相隔 ≥30 分钟的独立窗口（≤4 个，休市显示最近一个交易时段）；缺口＝开盘价对参考前收（休市时段改用快照前收并标注）；量能节奏＝当日累计 vs 20 日全日中位（未按时点折算）；大盘＝候选爆发方向 vs SPY 会话 VWAP 位置（累计额/量近似）；波幅扩张＝当日高低价差 ÷ ATR14；财报＝Finnhub 前向 5 天窗口，≤3 天标「期权贵」（你的回避规则）；期权异动＝最近一页 Moomoo 分类计数，不推断开平仓。时段/财报/大盘/速度均为 v3 上下文标注——系统标注，用户过滤：不隐藏行、不阻断操作、不参与排序。形态＝styleMatch v1（S1 低点抬高 / S2 跳空托举 / S3 高开遇阻，与你的 Playbook setup 的形状对比；「· 似」=部分相似，缺 K 线或快照输入时标缺）：形态相似度为 v1 几何检测（5m近似），不含你的进场确认帧（2m/1m 回踩8/13EMA），不是信号。缺失字段显式标缺，不以 0 冒充。
       </div>
     </section>
   );

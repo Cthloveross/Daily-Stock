@@ -186,10 +186,10 @@ TradingView 面向个人网站账户没有公开的自选列表 REST API；其�
 
 1. **市场脉搏**（sticky 顶栏）：**时段上下文标签**（v3，条首醒目位，见下）+ SPY / QQQ / VIX 快照现价与当日涨跌（分母为快照自带前收，`change_basis=moomoo_snapshot_prev_close`）+ SPY/QQQ 会话 VWAP 位置（v3，累计额/量近似）、盘段状态、ET 数据时点与自动刷新指示。数据来自 `GET /api/v1/opportunities/intraday-pulse`（60 秒 TTL + single-flight）；VIX 与 SPY/QQQ 隔离请求，供应商快照不可得时逐代码显式标缺，不用其他来源或旧值冒充。
 2. **今日计划**：冻结盘前 Top 5 的对照跟踪，直接复用 §2.7 的 `IntradayTrackingPanel`（该组件同时保留在 `/regime` 官方看板下方，行为不变；本页是它的主要使用场景）。今日没有已发布官方版本时显示诚实空态，不用预览榜冒充冻结计划。
-3. **日内扫描表**（核心）：`POST /api/v1/opportunities/intraday-top` 的盘中滚动 Top 5。列：标的 / **当前爆发**（首个数据列：爆发分 + 方向箭头 + 15 分钟推力%）/ **速度**（v3：加速/减速/持平/标缺）/ **今日波段**（如「2 波：09:40↓ · 15:15↑」，每波窗口/推力/爆发分明细以可访问 aria-label 附带；休市显示最近一个交易时段）/ 现价+当日%（as-of）/ 缺口 / 量能节奏 / VWAP 位置 / **大盘**（v3：顺势/逆势/标缺）/ 波幅扩张(ATR) / **财报**（v3：回避窗内醒目「财报 N 天内 · 期权贵」badge）/ 期权异动（N 笔·偏向·最大单）/ 研究状态；默认排序＝服务端排名（盘中爆发分优先），列头可点做客户端排序（第三次点击回到服务端排名），行点击进入 `/regime/opportunity/:ticker` 即时扫描详情（不绑定 snapshotKey）。
+3. **日内扫描表**（核心）：`POST /api/v1/opportunities/intraday-top` 的盘中滚动 Top 5。列：标的 / **当前爆发**（首个数据列：爆发分 + 方向箭头 + 15 分钟推力%）/ **速度**（v3：加速/减速/持平/标缺）/ **今日波段**（如「2 波：09:40↓ · 15:15↑」，每波窗口/推力/爆发分明细以可访问 aria-label 附带；休市显示最近一个交易时段）/ **形态**（v4 styleMatch：S1/S2/S3 相似度徽标，见 §2.10）/ 现价+当日%（as-of）/ 缺口 / 量能节奏 / VWAP 位置 / **大盘**（v3：顺势/逆势/标缺）/ 波幅扩张(ATR) / **财报**（v3：回避窗内醒目「财报 N 天内 · 期权贵」badge）/ 期权异动（N 笔·偏向·最大单）/ 研究状态；默认排序＝服务端排名（盘中爆发分优先），列头可点做客户端排序（第三次点击回到服务端排名），行点击进入 `/regime/opportunity/:ticker` 即时扫描详情（不绑定 snapshotKey）。
 4. **期权异动 feed**：跨自选池、按时间倒序的最近异动成交（接口响应内有界 ≤20 条）：时间 · 标的 · Call/Put · 行权价/到期 · 金额 · Moomoo 情绪分类，底部固定标注「分类不证明开平仓方向」。
 
-`POST /api/v1/opportunities/intraday-top` 合同（`schema_version=intraday-top/1.0`，`signal_version=intraday_session_evidence_v3`）：
+`POST /api/v1/opportunities/intraday-top` 合同（`schema_version=intraday-top/1.0`，`signal_version=intraday_session_evidence_v4`）：
 
 - 请求：`symbols`（≤20，空数组回退服务端 `STOCK_LIST`）、`limit`（默认 5，1–10）、`refresh`。非美股期权 underlying 不参与扫描并在 `unsupported_symbols` 中如实列出。
 - 装配全部复用 G-2 机制：会话快照来自与期权墙相同的 Moomoo Quote-only `get_market_snapshot`；ATR14 / 20 日量能中位 / 上一日结构（前收、前 20 日高低、EMA8/13）来自与每日榜相同的完成日线加载器（15 分钟逐标的记忆）；期权异动逐标的复用 `option-events` 的 30 秒缓存 key（每标最近一页 ≤10 条，失败只降级该标的）。波段爆发的 5m K 线走与 `/stocks/{code}/history?period=5m` 相同的服务端加载器，逐标的只取当前 + 上一交易时段常规时段（有界线程池并发 + 逐标的 60 秒 TTL 缓存；单标的失败只把该标的的波段爆发显式 `unavailable`，绝不阻塞聚合证据）。响应级 60 秒 TTL + single-flight，`refresh` 只绕过已完成 TTL。
@@ -248,6 +248,26 @@ v2 聚合证据阈值（保留 v1 语义，退居次要排序因子；代码内�
 真实验收（2026-08-02 周日休市，TestClient 连本机 OpenD）：MU `max_dte=3` 返回 2026-08-03 / 2026-08-05 两个到期日、64/64 张全部观测报价（MU/NVDA 现有周一/周三/周五到期，周末 3 天窗口并不为空）；NVDA `max_dte=7` 三个到期日 96/96；0 失败批次、0 非标准合约排除。spot as-of 与逐合约报价 as-of 如实显示上一时段（周五 15:59 / 盘后 20:01 ET）、`open_interest_as_of=2026-07-31`。样本行同时覆盖窄点差（NVDA 08-07 ATM Call 3.1%）与将被标「流动性差」的宽点差深度 ITM/OTM 行（NVDA 08-03 P185000 33.3%）。该数值是当次环境证据，不是 SLA。
 
 诚实边界：本面板是快照读数，不是逐笔 NBBO；不提供期限结构、skew、bid/ask size 或可成交滑点；「流动性差」阈值与 ATM 标记都是展示辅助，不是合约质量结论；任何字段都不进入候选排名或统计。
+
+### 2.10 形态相似度 styleMatch v1（G-10：你的 setup 形状标注）
+
+用户的核心问题是「我的交易能根据你的推荐来操作吗」。诚实的回答：本系统不做推荐，但可以标注**当前时段的几何形状**与用户自己 Playbook 里三个 setup 的相似度——把「这波像不像我自己的打法」从主观扫盘变成显式标注。2026-08-02 起 `intraday-top` 升 `intraday_session_evidence_v4`，每个候选新增 `setup_match`（纯函数 `src/opportunities/intraday_setups.py`，`style_match_version=style_match_v1`）。设计规则与 v3 相同：**系统标注，用户过滤**——形态标签不参与排序、不隐藏行、不改变研究状态，也不是买卖信号。
+
+检测输入全部复用已有数据（**零新增请求**）：波段爆发通道已取回的同一批 5m K 线（逐标的 60 秒缓存现同时缓存原始 K 线）、G-2 会话快照派生字段（开/最低/现价/参考前收/VWAP 近似）、缺口证据的同一对阈值常量（0.75×ATR / 1.5%，单一真源迁至 `intraday_setups`，`intraday_top` 以原名别名导入）与 v3 大盘上下文的 SPY 会话 VWAP 位置。休市时段按最近一个交易时段的 K 线评估并以 `session_date_et` + `quote_session_scope=latest_prior_session` 如实标注（与波段爆发同口径）。
+
+三个 setup 的 v1 几何规则（每个恰好一个状态 `matched` / `partial` / `not_matched` / `unavailable`，一个候选可同时相似多个，全部状态都暴露；`matched_setups` / `partial_setups` 为顶层摘要）：
+
+| Setup | v1 检测（basis） | matched | partial | 显式不检查（写入 limitations） |
+|---|---|---|---|---|
+| S1 十五分钟低点抬高突破 | 5m 按 09:30 ET 栅格聚合 15m；swing low=低点严格低于左右邻居；尾部连续抬高的 swing low ≥2 个；结构高点=抬高区间内 15m 最高价 | 低点抬高 + 现价或其后 15m 收盘突破结构高点（证据：低点序列时间+价位、结构高点、突破窗口） | 低点抬高但未突破 | 5m/2m 回踩 8/13 EMA 企稳追进、2 分钟级加速度；<3 根 15m K 线时 unavailable |
+| S2 跳空高开托举 | 向上跳空达缺口证据同阈值（≥0.75×ATR 或 ≥1.5%）+ 最低价 > 参考前收（缺口未回补）+ 现价 ≥ 会话 VWAP | 三项全部成立 | 跳空成立但托举只有一半（另一半不成立或标缺，reason 写明是哪一半） | 第一根 5m/2m 下探托举、8/13 EMA 不破、二次确认轻仓/加仓纪律 |
+| S3 高开遇阻回落（做空 setup） | 向上跳空同阈值 + 现价跌破开盘价或 VWAP + 大盘走弱（SPY 处于会话 VWAP 下方） | 三项全部成立 | 形态成立但「形态似 S3 但大盘未走弱」（SPY 在 VWAP 上方/持平），或 SPY 状态标缺无法确认 | 阻力位识别、2m/1m 速度降级离场时机 |
+
+Playbook 只读对应：服务端从 journal_v2 Playbook 候选表读取标题以 `S1`/`S2`/`S3` 开头的最新候选（`_load_intraday_playbook_refs`，本地 SQLite 读取 + 5 分钟缓存），把 `candidate_key` + 状态（候选/已晋升）附在对应 setup 上，供徽标 tooltip 显示「对应 Playbook: S1（候选）」。严格只读：无任何写入或晋升逻辑，读取失败只让徽标缺少 Playbook 标注；Playbook 规则依旧不反哺任何评分、排序或提示词（与 C-2 合同一致）。
+
+前端：扫描表「今日波段」后新增「形态」列——matched 实底徽标（S1 低点抬高 / S2 跳空托举 / S3 高开遇阻）、partial 描边徽标加「· 似」后缀，tooltip（title + aria-label）展示原因、证据行（如「低点序列 10:15 745.20 → 10:45 747.80；突破 11:00 收 750.10 > 749.60」）与 Playbook 对应；无相似形态显示「—」，K 线/快照输入不足显示「标缺」。footer 固定附「形态相似度为 v1 几何检测（5m近似），不含你的进场确认帧（2m/1m 回踩8/13EMA），不是信号」。
+
+诚实边界（响应 `limitations` 固定携带）：5m 聚合到 15m 是近似帧，不是用户实际使用的 2m/1m 确认帧；三个 setup 都只检查形状几何，完全不含进场时机、托举细节与离场纪律；形态相似 ≠ 可交易；阈值与几何规则改动必须升 `signal_version`。
 
 ## 3. 数据语义修正
 

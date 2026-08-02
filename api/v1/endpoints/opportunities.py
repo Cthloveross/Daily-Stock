@@ -265,6 +265,7 @@ _scan_flight_generation = 0
 _intraday_daily_cache: dict[tuple[str, str], _ScanCacheEntry] = {}
 _intraday_burst_cache: dict[tuple[str, str, str], _ScanCacheEntry] = {}
 _intraday_earnings_cache: dict[str, _ScanCacheEntry] = {}
+_intraday_playbook_cache: dict[str, _ScanCacheEntry] = {}
 
 
 def _cache_now() -> float:
@@ -380,6 +381,7 @@ def _reset_scan_cache_for_tests() -> None:
         _intraday_daily_cache.clear()
         _intraday_burst_cache.clear()
         _intraday_earnings_cache.clear()
+        _intraday_playbook_cache.clear()
         for flight in _scan_flights.values():
             if flight.error is None:
                 flight.error = OpportunityScanTimeoutError(
@@ -1946,17 +1948,21 @@ def _load_intraday_burst_profiles(
     *,
     market_date_et: str,
     quote_session_scope: str,
-) -> dict[str, dict[str, Any]]:
+) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]]]:
     """Per-symbol rolling-burst profiles from bounded 5m history reads.
 
     每标的只取当前 + 上一交易时段的常规时段 5m K 线（跨周末多取的自然日在
     纯函数内裁掉）；逐标的 60 秒 TTL 缓存 + 有界线程池并发。任何单标的
     读取失败都只让该标的的波段爆发显式 unavailable，绝不阻塞聚合证据，
     也绝不让整个 Top 榜 500。
+
+    返回 ``(burst_profiles, raw_bars_by_symbol)``：同一批原始 5m K 线随
+    profile 一起缓存并返回，供 v4 styleMatch 形态检测复用（零新增请求）。
     """
 
     now = _cache_now()
     results: dict[str, dict[str, Any]] = {}
+    bars_by_symbol: dict[str, list[dict[str, Any]]] = {}
     missing: list[str] = []
     with _scan_cache_lock:
         _prune_intraday_burst_cache(now)
@@ -1965,13 +1971,15 @@ def _load_intraday_burst_profiles(
                 (symbol, market_date_et, quote_session_scope)
             )
             if entry is not None and entry.expires_at > now:
-                results[symbol] = copy.deepcopy(entry.result)
+                cached = copy.deepcopy(entry.result)
+                results[symbol] = cached.get("profile") or {}
+                bars_by_symbol[symbol] = cached.get("bars") or []
             else:
                 missing.append(symbol)
     if not missing:
-        return results
+        return results, bars_by_symbol
 
-    def load_one(symbol: str) -> dict[str, Any]:
+    def load_one(symbol: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         fetched_at = datetime.now(timezone.utc).isoformat()
         try:
             bars, source = _fetch_intraday_5m_bars(symbol)
@@ -1981,19 +1989,23 @@ def _load_intraday_burst_profiles(
                 symbol,
                 type(exc).__name__,
             )
-            return unavailable_burst_profile(
-                f"history_5m_unavailable:{type(exc).__name__}",
-                fetched_at=fetched_at,
+            return (
+                unavailable_burst_profile(
+                    f"history_5m_unavailable:{type(exc).__name__}",
+                    fetched_at=fetched_at,
+                ),
+                [],
             )
-        return compute_session_burst_profile(
+        profile = compute_session_burst_profile(
             bars,
             market_date_et=market_date_et,
             quote_session_scope=quote_session_scope,
             source=source,
             fetched_at=fetched_at,
         )
+        return profile, list(bars)
 
-    loaded: dict[str, dict[str, Any]] = {}
+    loaded: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]] = {}
     if len(missing) > 1:
         with ThreadPoolExecutor(
             max_workers=min(_INTRADAY_BURST_MAX_WORKERS, len(missing)),
@@ -2008,8 +2020,9 @@ def _load_intraday_burst_profiles(
         loaded = {symbol: load_one(symbol) for symbol in missing}
 
     completion_time = _cache_now()
-    for symbol, profile in loaded.items():
+    for symbol, (profile, raw_bars) in loaded.items():
         results[symbol] = profile
+        bars_by_symbol[symbol] = raw_bars
         # 失败/无 K 线的 profile 不落缓存：下一次（60 秒 TTL 内的）请求
         # 直接重试，而不是把失败冻结一个轮询周期。
         if profile.get("state") == "ready":
@@ -2019,9 +2032,67 @@ def _load_intraday_burst_profiles(
                     (symbol, market_date_et, quote_session_scope)
                 ] = _ScanCacheEntry(
                     expires_at=completion_time + _INTRADAY_BURST_CACHE_TTL_SECONDS,
-                    result=copy.deepcopy(profile),
+                    result=copy.deepcopy(
+                        {"profile": profile, "bars": raw_bars}
+                    ),
                 )
-    return results
+    return results, bars_by_symbol
+
+
+# v4 styleMatch：S1/S2/S3 的 Playbook 只读对应关系（本地 SQLite 读取），
+# 5 分钟 TTL；读取失败只让形态徽标缺少 Playbook 标注，不影响形态检测本身。
+_INTRADAY_PLAYBOOK_CACHE_TTL_SECONDS = 300.0
+_SETUP_TITLE_PATTERN = re.compile(r"^(S[123])\b")
+
+
+def _load_intraday_playbook_refs() -> dict[str, dict[str, Any]]:
+    """Read-only S1/S2/S3 playbook linkage for the intraday style match.
+
+    只读取 journal_v2 Playbook 候选表（newest first，取每个 setup key 最新
+    一条；``promoted`` 标记来自晋升规则的存在性）。绝不写入、绝不晋升，
+    Playbook 规则也不反哺任何评分或排序——这里只是给形态徽标补一行
+    「对应 Playbook: S1（候选/已晋升）」的展示信息。
+    """
+
+    now = _cache_now()
+    with _scan_cache_lock:
+        entry = _intraday_playbook_cache.get("default")
+        if entry is not None and entry.expires_at > now:
+            return copy.deepcopy(entry.result)
+
+    refs: dict[str, dict[str, Any]] = {}
+    try:
+        from src.journal.ledger.playbook_repository import (
+            list_playbook_candidates,
+        )
+
+        for candidate in list_playbook_candidates():
+            match = _SETUP_TITLE_PATTERN.match(str(candidate.title or "").strip())
+            if match is None:
+                continue
+            key = match.group(1)
+            if key in refs:
+                continue  # newest first：同 key 只保留最新候选。
+            refs[key] = {
+                "setup_key": key,
+                "candidate_key": candidate.candidate_key,
+                "status": "promoted" if candidate.promoted else "candidate",
+                "title": candidate.title,
+            }
+    except Exception as exc:  # noqa: BLE001 - playbook lane must not 500 the board
+        logger.debug(
+            "[opportunities] intraday playbook refs unavailable error_type=%s",
+            type(exc).__name__,
+        )
+        return {}
+
+    completion_time = _cache_now()
+    with _scan_cache_lock:
+        _intraday_playbook_cache["default"] = _ScanCacheEntry(
+            expires_at=completion_time + _INTRADAY_PLAYBOOK_CACHE_TTL_SECONDS,
+            result=copy.deepcopy(refs),
+        )
+    return refs
 
 
 def _fetch_earnings_calendar_rows(
@@ -2191,11 +2262,15 @@ def _execute_intraday_top(
     # 波段爆发（v2 主排序信号）：5m K 线与 Moomoo 开关无关，休市时段也读取
     # （附最近一个交易时段的波段供晚间复盘）；单标的失败显式 unavailable。
     burst_scope = "latest_prior_session" if session_state == "closed" else "current_session"
-    burst_profiles = _load_intraday_burst_profiles(
+    burst_profiles, setup_bars = _load_intraday_burst_profiles(
         supported,
         market_date_et=market_date_et,
         quote_session_scope=burst_scope,
     )
+
+    # v4 styleMatch：S1/S2/S3 Playbook 只读对应关系（本地读取 + 5 分钟缓存）；
+    # 失败只让形态徽标缺少 Playbook 标注，不阻断任何证据。
+    playbook_refs = _load_intraday_playbook_refs()
 
     # v3 财报临近：一次日历区间读取覆盖整个 universe，逐 ET 日期缓存；
     # 失败只让财报列显式标缺，绝不阻断其余证据。
@@ -2216,6 +2291,8 @@ def _execute_intraday_top(
         burst_profiles=burst_profiles,
         earnings_calendar=earnings_calendar,
         spy_quote=spy_quote,
+        setup_bars=setup_bars,
+        playbook_refs=playbook_refs,
     )
 
 

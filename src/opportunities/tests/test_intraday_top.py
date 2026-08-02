@@ -338,7 +338,7 @@ class TestRunAssembly:
         run = self._run()
         assert run["schema_version"] == "intraday-top/1.0"
         assert run["signal_version"] == INTRADAY_TOP_SIGNAL_VERSION
-        assert run["signal_version"] == "intraday_session_evidence_v3"
+        assert run["signal_version"] == "intraday_session_evidence_v4"
         # 盘中（current_session scope）＝爆发分优先；休市退回证据计数。
         assert run["ranking_method"] == RANKING_METHOD_BURST_FIRST
         assert self._run(session_state="closed")["ranking_method"] == (
@@ -551,6 +551,100 @@ class TestBurstRanking:
             "09:40",
             "15:15",
         ]
+
+
+class TestSetupMatchWiring:
+    """v4 styleMatch：候选行携带 setup_match，纯标注、不进计数、不改排序。"""
+
+    def test_candidate_carries_setup_match_without_changing_supports(self):
+        candidate = _candidate()
+        profile = candidate["setup_match"]
+        assert profile["style_match_version"] == "style_match_v1"
+        assert [row["setup_key"] for row in profile["setups"]] == ["S1", "S2", "S3"]
+        # 默认 quote：+2% 跳空（1.0×ATR）、最低 101.5 > 前收 100、
+        # 现价 103 ≥ VWAP 102.5 → S2 matched；无 5m K 线 → S1 unavailable。
+        assert profile["matched_setups"] == ["S2"]
+        s1 = next(row for row in profile["setups"] if row["setup_key"] == "S1")
+        assert s1["state"] == "unavailable"
+        # 形态标注绝不进入 supports 计数或研究状态。
+        assert candidate["supporting_evidence_count"] == 5
+        assert candidate["research_state"] == "active"
+
+    def test_setup_bars_flow_into_s1_detection(self):
+        bars = [
+            {
+                "date": f"2026-07-28T{time_text}:00-04:00",
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": 1_000.0,
+            }
+            for time_text, open_, high, low, close in (
+                ("09:30", 100.5, 101.0, 100.0, 100.6),
+                ("09:45", 100.4, 100.5, 99.0, 99.4),
+                ("10:00", 99.9, 100.8, 99.8, 100.6),
+                ("10:15", 100.5, 100.6, 99.5, 99.9),
+                ("10:30", 100.0, 100.7, 100.0, 100.5),
+                ("10:45", 100.6, 101.4, 100.4, 101.2),
+            )
+        ]
+        candidate = _candidate(setup_bars=bars, market_date_et="2026-07-28")
+        profile = candidate["setup_match"]
+        s1 = next(row for row in profile["setups"] if row["setup_key"] == "S1")
+        assert s1["state"] == "matched"
+        assert profile["matched_setups"] == ["S1", "S2"]
+        assert profile["bar_count_15m"] == 6
+
+    def test_run_passes_playbook_refs_into_each_candidate(self):
+        refs = {
+            "S2": {
+                "setup_key": "S2",
+                "candidate_key": "b" * 64,
+                "status": "candidate",
+                "title": "S2 · 跳空高开托举（轻仓试错，需二次确认）",
+            }
+        }
+        run = build_intraday_top_run(
+            symbols=["NVDA"],
+            unsupported_symbols=[],
+            quotes={"NVDA": _quote()},
+            dailies={"NVDA": _daily()},
+            option_event_items={},
+            as_of=_AS_OF,
+            market_date_et="2026-07-28",
+            session_state="regular",
+            session_state_basis="america_new_york_clock_v1",
+            limit=5,
+            moomoo_enabled=True,
+            playbook_refs=refs,
+        )
+        profile = run["candidates"][0]["setup_match"]
+        s2 = next(row for row in profile["setups"] if row["setup_key"] == "S2")
+        assert s2["state"] == "matched"
+        assert s2["playbook"]["status"] == "candidate"
+        s1 = next(row for row in profile["setups"] if row["setup_key"] == "S1")
+        assert s1["playbook"] is None
+        # v4 限制随响应携带：形态相似 ≠ 可交易，Playbook 不反哺评分。
+        assert any("形态相似 ≠ 可交易" in text for text in run["limitations"])
+        assert any("不反哺" in text for text in run["limitations"])
+
+    def test_closed_session_setup_match_keeps_as_of_scope(self):
+        run = build_intraday_top_run(
+            symbols=["NVDA"],
+            unsupported_symbols=[],
+            quotes={"NVDA": _quote()},
+            dailies={"NVDA": _daily()},
+            option_event_items={},
+            as_of=_AS_OF,
+            market_date_et="2026-07-28",
+            session_state="closed",
+            session_state_basis="america_new_york_clock_v1",
+            limit=5,
+            moomoo_enabled=True,
+        )
+        profile = run["candidates"][0]["setup_match"]
+        assert profile["quote_session_scope"] == "latest_prior_session"
 
 
 class TestDailyContext:

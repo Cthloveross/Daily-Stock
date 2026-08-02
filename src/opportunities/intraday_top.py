@@ -37,13 +37,22 @@ from src.opportunities.intraday_bursts import (
     BURST_SUPPORT_MIN,
     unavailable_burst_profile,
 )
+from src.opportunities.intraday_setups import (
+    SETUP_GAP_ATR_MULTIPLE_MIN,
+    SETUP_GAP_PERCENT_MIN,
+    compute_setup_match_profile,
+)
 
 # v2: 波段爆发（15 分钟推力×量比）成为盘中主排序信号；聚合证据退居次序。
 # v3: 新增四类「上下文信号」——时段上下文（用户历史纪律提示）、财报临近标记、
 # 大盘对齐（候选爆发方向 vs SPY VWAP 位置）、速度分级（相邻窗口爆发分之差）。
 # 全部是标注（labels），不参与排序、不隐藏行、不阻断任何操作：系统标注，
 # 用户过滤。
-INTRADAY_TOP_SIGNAL_VERSION = "intraday_session_evidence_v3"
+# v4: styleMatch v1（形态相似度）——把当前时段几何形状与用户自己的三个
+# Playbook setup（S1 低点抬高突破 / S2 跳空托举 / S3 高开遇阻）做纯形状对比，
+# 输出 matched/partial/not_matched/unavailable 四态标注（src/opportunities/
+# intraday_setups.py）。同样只是标注：不参与排序、不隐藏行、不是信号。
+INTRADAY_TOP_SIGNAL_VERSION = "intraday_session_evidence_v4"
 INTRADAY_TOP_SCHEMA_VERSION = "intraday-top/1.0"
 
 # ---------------------------------------------------------------------------
@@ -86,8 +95,10 @@ INTRADAY_STATISTICS_TRACK = "none_intraday_v1_unscored"
 VOLUME_PACE_SUPPORT_MIN = 1.5
 # 缺口：|开盘价 − 参考前收| ≥ 0.75 × ATR14（ATR 标准化幅度），
 # 或 |缺口百分比| ≥ 1.5%（ATR 不可用时的绝对回退口径）。
-GAP_ATR_MULTIPLE_SUPPORT_MIN = 0.75
-GAP_PERCENT_SUPPORT_MIN = 1.5
+# 单一真源在 intraday_setups（v4 styleMatch 的 S2/S3 复用同一阈值），
+# 此处保留原名别名，语义与数值不变。
+GAP_ATR_MULTIPLE_SUPPORT_MIN = SETUP_GAP_ATR_MULTIPLE_MIN
+GAP_PERCENT_SUPPORT_MIN = SETUP_GAP_PERCENT_MIN
 # 波幅扩张：当日 (session high − session low) ≥ 1.0 × ATR14，
 # 表示当日已走出不少于一个典型日波幅。
 RANGE_EXPANSION_SUPPORT_MIN = 1.0
@@ -130,6 +141,12 @@ INTRADAY_TOP_LIMITATIONS = (
     "非逐笔官方 VWAP，任一侧缺失即标缺。",
     "速度分级＝相邻两个 15 分钟窗口爆发分之差（5m K 线近似，非 1m/2m 秒级速度）；"
     "「减速」对应用户纪律 R1 的离场提示，不是系统信号。",
+    "v4 形态相似度（styleMatch v1）＝当前时段几何形状 vs 你自己的三个 Playbook "
+    "setup（S1 低点抬高突破 / S2 跳空托举 / S3 高开遇阻）的纯形状对比：5m K 线"
+    "聚合到 15m 近似 + 会话快照派生字段，非 2m/1m 确认帧，不含 8/13 EMA 托举与"
+    "回踩企稳细节；形态相似 ≠ 可交易，只是标注：不参与排序、不隐藏行、不是信号。",
+    "形态标签的 Playbook 对应关系（候选/已晋升）为只读展示；Playbook 规则不反哺"
+    "任何评分、排序或提示词。",
 )
 
 _RECENT_EVENT_FIELDS = (
@@ -585,10 +602,15 @@ def build_intraday_top_candidate(
     earnings_calendar: Optional[Mapping[str, Any]] = None,
     market_context: Optional[Mapping[str, Any]] = None,
     market_date_et: Optional[str] = None,
+    setup_bars: Optional[Sequence[Mapping[str, Any]]] = None,
+    playbook_refs: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> dict[str, Any]:
     """Build one intraday candidate with the board's evidence contract shape."""
 
     as_of_text = _iso(as_of)
+    resolved_market_date_et = (
+        market_date_et or as_of.astimezone(_NEW_YORK_TZ).date().isoformat()
+    )
     events = summarise_option_events(option_events)
     quote_source = quote.source if quote is not None else "moomoo_openapi"
     quote_fetched_at = _iso(quote.fetched_at) if quote is not None else None
@@ -965,6 +987,30 @@ def build_intraday_top_candidate(
         )
     )
 
+    # -- 9. v4 styleMatch v1（形态相似度）：纯标注，绝不进入 supports 计数 ----
+    # 复用同一批 5m K 线（波段爆发通道已取回，零新增请求）与本函数自己的
+    # 缺口/VWAP 派生值；SPY 侧只取 v3 大盘上下文的会话 VWAP 位置。
+    spy_vwap_position = (
+        str(market_context.get("vwap_position") or "") or None
+        if isinstance(market_context, Mapping)
+        and market_context.get("state") == "ready"
+        else None
+    )
+    setup_match = compute_setup_match_profile(
+        setup_bars,
+        market_date_et=resolved_market_date_et,
+        quote_session_scope=quote_session_scope,
+        last_price=last_price,
+        session_open=session_open,
+        session_low=session_low,
+        gap_percent=gap_percent,
+        gap_atr_multiple=gap_atr_multiple,
+        gap_reference_close=gap_reference_close,
+        vwap=vwap,
+        spy_vwap_position=spy_vwap_position,
+        playbook_refs=playbook_refs,
+    )
+
     supporting_count = sum(
         1
         for item in evidence
@@ -1026,12 +1072,11 @@ def build_intraday_top_candidate(
         "earnings_proximity": compute_earnings_proximity(
             ticker,
             earnings_calendar,
-            market_date_et=(
-                market_date_et
-                or as_of.astimezone(_NEW_YORK_TZ).date().isoformat()
-            ),
+            market_date_et=resolved_market_date_et,
         ),
         "market_alignment": compute_market_alignment(bursts, market_context),
+        # v4 styleMatch v1：与你的 S1/S2/S3 setup 的形状相似度，仅作标注。
+        "setup_match": setup_match,
         "option_activity": {
             "state": events["state"],
             "count": events["count"],
@@ -1148,6 +1193,8 @@ def build_intraday_top_run(
     burst_profiles: Optional[Mapping[str, Mapping[str, Any]]] = None,
     earnings_calendar: Optional[Mapping[str, Any]] = None,
     spy_quote: Optional[IntradayQuoteInput] = None,
+    setup_bars: Optional[Mapping[str, Sequence[Mapping[str, Any]]]] = None,
+    playbook_refs: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> dict[str, Any]:
     """Assemble the deterministic intraday Top-N research run."""
 
@@ -1180,6 +1227,8 @@ def build_intraday_top_run(
             earnings_calendar=earnings_calendar,
             market_context=market_context,
             market_date_et=market_date_et,
+            setup_bars=(setup_bars or {}).get(ticker),
+            playbook_refs=playbook_refs,
         )
         for ticker in symbols
     ]
