@@ -880,13 +880,13 @@ describe('JournalEpisodeReviewPage', () => {
     expect(screen.getByRole('button', { name: '追高进场' })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByLabelText('错误类型')).toHaveValue('追高进场');
 
-    fireEvent.click(screen.getByRole('button', { name: '突破' }));
-    expect(screen.getByRole('button', { name: '突破' })).toHaveAttribute('aria-pressed', 'true');
-    expect(screen.getByLabelText('复盘标签')).toHaveValue('突破');
+    fireEvent.click(screen.getByRole('button', { name: '跳空托举' }));
+    expect(screen.getByRole('button', { name: '跳空托举' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByLabelText('复盘标签')).toHaveValue('跳空托举');
 
     const stored = window.localStorage.getItem(episodeReviewDraftStorageKey(9, 41));
     expect(stored).toContain('追高进场');
-    expect(stored).toContain('突破');
+    expect(stored).toContain('跳空托举');
 
     // 自由文本与 chip 共用同一字段：手输保留，chip 再点一次只移除自己。
     fireEvent.change(screen.getByLabelText('错误类型'), {
