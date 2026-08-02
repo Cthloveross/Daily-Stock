@@ -152,6 +152,14 @@ test.describe('web smoke (isolated empty-DB backend)', () => {
       page.locator('section[aria-label="市场脉搏"]').getByText('未配置').first(),
     ).toBeVisible({ timeout: 20_000 });
 
+    // v3 时段上下文与 Moomoo 无关（纯 ET 时钟）：标签必须始终在场且非空。
+    // 具体时段随运行时刻变化，只断言存在与文案属于已知集合。
+    await expect(
+      page.locator('section[aria-label="市场脉搏"]').getByLabel('时段上下文'),
+    ).toHaveText(/盘前|开盘试错|主战场|午前过渡|午间震荡|午后酝酿|尾盘趋势|盘后|休市/, {
+      timeout: 20_000,
+    });
+
     // 空库无冻结盘前计划：今日计划区必须给诚实空态而不是空白。
     await expect(page.getByText(/今日尚无已发布的冻结盘前计划|盘前计划状态读取失败|今日官方盘前版本没有可对照的候选/)).toBeVisible({ timeout: 30_000 });
   });

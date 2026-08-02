@@ -14,6 +14,8 @@ import pytest
 from src.opportunities.intraday_bursts import BURST_SUPPORT_MIN
 from src.opportunities.intraday_top import (
     ACTIVE_SUPPORT_MIN,
+    EARNINGS_BLACKOUT_DAYS,
+    EARNINGS_WINDOW_DAYS,
     GAP_BASIS_DAILY_LOADER,
     GAP_BASIS_SNAPSHOT_PREV_CLOSE,
     INTRADAY_STATISTICS_TRACK,
@@ -25,7 +27,10 @@ from src.opportunities.intraday_top import (
     build_intraday_top_candidate,
     build_intraday_top_run,
     collect_recent_option_events,
+    compute_earnings_proximity,
     compute_intraday_daily_context,
+    compute_market_alignment,
+    compute_market_context,
     summarise_option_events,
 )
 
@@ -309,6 +314,8 @@ class TestRunAssembly:
         quotes=None,
         symbols=("NVDA", "TSLA"),
         burst_profiles=None,
+        earnings_calendar=None,
+        spy_quote=None,
     ):
         return build_intraday_top_run(
             symbols=list(symbols),
@@ -323,13 +330,15 @@ class TestRunAssembly:
             limit=5,
             moomoo_enabled=True,
             burst_profiles=burst_profiles,
+            earnings_calendar=earnings_calendar,
+            spy_quote=spy_quote,
         )
 
     def test_run_contract_and_statistics_track(self):
         run = self._run()
         assert run["schema_version"] == "intraday-top/1.0"
         assert run["signal_version"] == INTRADAY_TOP_SIGNAL_VERSION
-        assert run["signal_version"] == "intraday_session_evidence_v2"
+        assert run["signal_version"] == "intraday_session_evidence_v3"
         # 盘中（current_session scope）＝爆发分优先；休市退回证据计数。
         assert run["ranking_method"] == RANKING_METHOD_BURST_FIRST
         assert self._run(session_state="closed")["ranking_method"] == (
@@ -340,6 +349,54 @@ class TestRunAssembly:
         assert any("不冻结" in text for text in run["limitations"])
         assert any("不推断开平仓" in text for text in run["limitations"])
         assert any("波段爆发" in text for text in run["limitations"])
+        # v3 设计规则随响应携带：系统标注，用户过滤。
+        assert any("系统标注，用户过滤" in text for text in run["limitations"])
+
+    def test_run_session_phase_from_as_of_clock(self):
+        # _AS_OF = 2026-07-28（周二）14:30 UTC = 10:30 ET → prime（主战场）。
+        run = self._run()
+        assert run["session_phase"] == "prime"
+        assert "主战场" in run["session_phase_label"]
+        assert run["session_phase_hint_basis"] == "user_trading_history_hardcoded_v1"
+        # 周六休市：时段标签同样诚实为休市/复盘。
+        saturday = build_intraday_top_run(
+            symbols=["NVDA"],
+            unsupported_symbols=[],
+            quotes={},
+            dailies={},
+            option_event_items={},
+            as_of=datetime(2026, 7, 25, 14, 30, tzinfo=timezone.utc),
+            market_date_et="2026-07-25",
+            session_state="closed",
+            session_state_basis="america_new_york_clock_v1",
+            limit=5,
+            moomoo_enabled=False,
+        )
+        assert saturday["session_phase"] == "closed"
+        assert "休市" in saturday["session_phase_label"]
+
+    def test_run_market_context_and_candidate_alignment(self):
+        spy = _quote(
+            last_price=500.0,
+            session_volume=1_000.0,
+            session_turnover=499_000.0,  # SPY VWAP 499 < last 500 → above
+        )
+        run = self._run(
+            burst_profiles={"NVDA": _burst_profile(9.0)},
+            spy_quote=spy,
+        )
+        assert run["market_context"]["state"] == "ready"
+        assert run["market_context"]["vwap_position"] == "above"
+        nvda = next(item for item in run["candidates"] if item["ticker"] == "NVDA")
+        # 爆发方向 up + SPY VWAP 上方 → 顺势；仅作标注，不改 supports 计数。
+        assert nvda["market_alignment"]["state"] == "aligned"
+
+    def test_run_without_spy_quote_keeps_alignment_unknown(self):
+        run = self._run(burst_profiles={"NVDA": _burst_profile(9.0)})
+        assert run["market_context"]["state"] == "unavailable"
+        nvda = next(item for item in run["candidates"] if item["ticker"] == "NVDA")
+        assert nvda["market_alignment"]["state"] == "unknown"
+        assert nvda["market_alignment"]["unavailable_reason"] == "spy_quote_unavailable"
 
     def test_ordering_active_before_watch_before_insufficient(self):
         run = self._run(symbols=("TSLA", "NVDA"))
@@ -537,3 +594,180 @@ class TestDailyContext:
     def test_empty_bars_all_none(self):
         context = compute_intraday_daily_context([])
         assert all(value is None for value in context.values())
+
+
+def _earnings_calendar(dates_by_symbol, *, state="ready", reason=None):
+    return {
+        "state": state,
+        "dates_by_symbol": dates_by_symbol,
+        "window_start": "2026-07-28",
+        "window_end": "2026-08-02",
+        "window_days": EARNINGS_WINDOW_DAYS,
+        "source": "finnhub_earnings_calendar",
+        "fetched_at": "2026-07-28T14:30:05+00:00",
+        "unavailable_reason": reason,
+    }
+
+
+class TestEarningsProximity:
+    """v3 财报临近：0..5 天窗口、3 天回避阈值、不可得时的诚实标缺。"""
+
+    def test_earnings_today_is_zero_days_within_blackout(self):
+        proximity = compute_earnings_proximity(
+            "NVDA",
+            _earnings_calendar({"NVDA": ["2026-07-28"]}),
+            market_date_et="2026-07-28",
+        )
+        assert proximity["state"] == "ready"
+        assert proximity["days_to_earnings"] == 0
+        assert proximity["earnings_date"] == "2026-07-28"
+        assert proximity["within_blackout"] is True
+        assert proximity["blackout_days"] == EARNINGS_BLACKOUT_DAYS == 3
+
+    def test_blackout_boundary_three_in_four_out(self):
+        at_boundary = compute_earnings_proximity(
+            "NVDA",
+            _earnings_calendar({"NVDA": ["2026-07-31"]}),
+            market_date_et="2026-07-28",
+        )
+        outside = compute_earnings_proximity(
+            "NVDA",
+            _earnings_calendar({"NVDA": ["2026-08-01"]}),
+            market_date_et="2026-07-28",
+        )
+        assert at_boundary["days_to_earnings"] == 3
+        assert at_boundary["within_blackout"] is True
+        assert outside["days_to_earnings"] == 4
+        assert outside["within_blackout"] is False
+
+    def test_earliest_in_window_wins_and_beyond_window_is_excluded(self):
+        proximity = compute_earnings_proximity(
+            "NVDA",
+            _earnings_calendar({"NVDA": ["2026-08-10", "2026-07-30", "2026-08-01"]}),
+            market_date_et="2026-07-28",
+        )
+        assert proximity["earnings_date"] == "2026-07-30"
+        assert proximity["days_to_earnings"] == 2
+        # 窗口外（+5 天以后）的日期不参与；过去的日期也不参与。
+        stale = compute_earnings_proximity(
+            "NVDA",
+            _earnings_calendar({"NVDA": ["2026-07-27", "2026-08-10"]}),
+            market_date_et="2026-07-28",
+        )
+        assert stale["state"] == "ready"
+        assert stale["earnings_date"] is None
+        assert stale["within_blackout"] is False
+
+    def test_ready_with_no_earnings_is_honest_false_not_missing(self):
+        proximity = compute_earnings_proximity(
+            "NVDA", _earnings_calendar({}), market_date_et="2026-07-28"
+        )
+        assert proximity["state"] == "ready"
+        assert proximity["days_to_earnings"] is None
+        assert proximity["within_blackout"] is False
+
+    def test_unavailable_calendar_never_fakes_safe(self):
+        missing = compute_earnings_proximity(
+            "NVDA", None, market_date_et="2026-07-28"
+        )
+        failed = compute_earnings_proximity(
+            "NVDA",
+            _earnings_calendar(
+                {}, state="unavailable", reason="finnhub_not_configured"
+            ),
+            market_date_et="2026-07-28",
+        )
+        for proximity, reason in (
+            (missing, "earnings_calendar_missing"),
+            (failed, "finnhub_not_configured"),
+        ):
+            assert proximity["state"] == "unavailable"
+            # within_blackout 保持 None（未知），绝不以 False 冒充「安全」。
+            assert proximity["within_blackout"] is None
+            assert proximity["days_to_earnings"] is None
+            assert proximity["unavailable_reason"] == reason
+
+
+class TestMarketAlignment:
+    """v3 大盘对齐矩阵：up/above=顺势、down/below=顺势、反向=逆势、其余标缺。"""
+
+    def _context(self, position: str = "above"):
+        return {
+            "ticker": "SPY",
+            "state": "ready",
+            "vwap_position": position,
+            "unavailable_reason": None,
+        }
+
+    def _bursts(self, direction: str = "up"):
+        profile = _burst_profile(9.0)
+        profile["current"]["direction"] = direction
+        return profile
+
+    @pytest.mark.parametrize(
+        ("direction", "position", "expected"),
+        [
+            ("up", "above", "aligned"),
+            ("down", "below", "aligned"),
+            ("up", "below", "against"),
+            ("down", "above", "against"),
+        ],
+    )
+    def test_alignment_matrix(self, direction, position, expected):
+        alignment = compute_market_alignment(
+            self._bursts(direction), self._context(position)
+        )
+        assert alignment["state"] == expected
+        assert alignment["burst_direction"] == direction
+        assert alignment["spy_vwap_position"] == position
+
+    def test_flat_sides_are_unknown_not_a_direction(self):
+        flat_burst = compute_market_alignment(
+            self._bursts("flat"), self._context("above")
+        )
+        flat_spy = compute_market_alignment(
+            self._bursts("up"), self._context("flat")
+        )
+        assert flat_burst["state"] == "unknown"
+        assert flat_spy["state"] == "unknown"
+        assert flat_spy["unavailable_reason"] == "flat_side_has_no_direction"
+
+    def test_missing_burst_or_spy_side_is_unknown_with_reason(self):
+        no_burst = compute_market_alignment(None, self._context("above"))
+        assert no_burst["state"] == "unknown"
+        assert no_burst["unavailable_reason"] == "burst_direction_unavailable"
+        unavailable_burst = compute_market_alignment(
+            _burst_profile(None, state="unavailable"), self._context("above")
+        )
+        assert unavailable_burst["state"] == "unknown"
+        no_spy = compute_market_alignment(self._bursts("up"), None)
+        assert no_spy["state"] == "unknown"
+        assert no_spy["unavailable_reason"] == "spy_vwap_position_unavailable"
+
+    def test_market_context_from_quote_and_fail_closed_paths(self):
+        ready = compute_market_context(
+            _quote(
+                last_price=500.0,
+                session_volume=1_000.0,
+                session_turnover=501_000.0,
+            ),
+            moomoo_enabled=True,
+        )
+        assert ready["state"] == "ready"
+        assert ready["vwap"] == 501.0
+        assert ready["vwap_position"] == "below"
+
+        disabled = compute_market_context(_quote(), moomoo_enabled=False)
+        assert disabled["state"] == "not_configured"
+        assert disabled["unavailable_reason"] == "moomoo_not_configured"
+
+        missing_quote = compute_market_context(None, moomoo_enabled=True)
+        assert missing_quote["state"] == "unavailable"
+        assert missing_quote["unavailable_reason"] == "spy_quote_unavailable"
+
+        missing_volume = compute_market_context(
+            _quote(session_volume=None), moomoo_enabled=True
+        )
+        assert missing_volume["state"] == "unavailable"
+        assert missing_volume["vwap_position"] == "unknown"
+        assert missing_volume["unavailable_reason"] == "missing_or_nonpositive_volume"

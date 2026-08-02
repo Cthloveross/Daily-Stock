@@ -64,6 +64,7 @@ from src.opportunities.engine import (
 from src.opportunities.intraday import (
     ATR14_METHOD,
     INTRADAY_TRACKING_VERSION,
+    SESSION_PHASE_HINT_BASIS,
     SESSION_STATE_BASIS,
     VOLUME_PACE_BASIS,
     VWAP_BASIS_SESSION_TURNOVER_OVER_VOLUME,
@@ -71,14 +72,18 @@ from src.opportunities.intraday import (
     compute_prior_full_day_median_volume,
     compute_session_vwap,
     compute_volume_pace,
+    market_session_phase,
     market_session_state,
+    session_phase_label,
 )
 from src.opportunities.intraday_bursts import (
     compute_session_burst_profile,
     unavailable_burst_profile,
 )
 from src.opportunities.intraday_top import (
+    EARNINGS_WINDOW_DAYS,
     INTRADAY_TOP_SIGNAL_VERSION,
+    MARKET_CONTEXT_TICKER,
     IntradayDailyContext,
     IntradayQuoteInput,
     build_intraday_top_run,
@@ -175,8 +180,17 @@ _INTRADAY_PULSE_OPTIONAL_SYMBOLS = ("VIX",)
 _INTRADAY_PULSE_LIMITATIONS = (
     "市场脉搏为 Moomoo 快照读数：涨跌以快照自带前收为基准，休市时段显示最近一个交易时段。",
     "VIX 若供应商快照不可得则显式标缺，不用其他来源或旧值冒充。",
+    "VWAP 位置为当日累计成交额 ÷ 累计成交量的近似值，非逐笔官方 VWAP；缺任一输入即显式标缺。",
+    "时段标签由 America/New_York 时钟判定（未接入交易所假日日历）；时段提示为用户自身历史交易统计"
+    "的硬编码 v1 文案，不是市场统计或买卖信号——系统标注，用户过滤。",
     "仅作盘中背景，不是信号，不进入任何统计。",
 )
+# v3 财报日历：每个 ET 交易日一次 Finnhub 区间调用（当日 → +5 天），缓存
+# ≥1 小时供全 universe 复用；失败结果只短缓存 10 分钟（60 秒轮询不至于打爆
+# Finnhub，也不把一次失败冻结一整天）。日历不可得时逐候选显式标缺。
+_INTRADAY_EARNINGS_CACHE_TTL_SECONDS = 3600.0
+_INTRADAY_EARNINGS_FAILURE_TTL_SECONDS = 600.0
+_INTRADAY_EARNINGS_SOURCE = "finnhub_earnings_calendar"
 # Completed daily bars only change once per session; memoise the derived
 # ATR14 / 20-session median inputs so a 60s polling panel does not re-run the
 # daily-history providers on every tick.  Live quote fields are never cached
@@ -250,6 +264,7 @@ _scan_flights: dict[tuple[Any, ...], _ScanFlight] = {}
 _scan_flight_generation = 0
 _intraday_daily_cache: dict[tuple[str, str], _ScanCacheEntry] = {}
 _intraday_burst_cache: dict[tuple[str, str, str], _ScanCacheEntry] = {}
+_intraday_earnings_cache: dict[str, _ScanCacheEntry] = {}
 
 
 def _cache_now() -> float:
@@ -364,6 +379,7 @@ def _reset_scan_cache_for_tests() -> None:
         _scan_cache.clear()
         _intraday_daily_cache.clear()
         _intraday_burst_cache.clear()
+        _intraday_earnings_cache.clear()
         for flight in _scan_flights.values():
             if flight.error is None:
                 flight.error = OpportunityScanTimeoutError(
@@ -2008,6 +2024,97 @@ def _load_intraday_burst_profiles(
     return results
 
 
+def _fetch_earnings_calendar_rows(
+    from_date: date, to_date: date
+) -> tuple[Optional[list[dict[str, Any]]], Optional[str]]:
+    """One bounded Finnhub earnings-calendar range read, isolated for tests.
+
+    Returns ``(rows, unavailable_reason)``.  ``rows=None`` means the calendar
+    could not be observed（未配置或请求失败）——绝不以空列表冒充「无财报」。
+    """
+
+    from data_provider.finnhub_fetcher import FinnhubFetcher
+
+    fetcher = FinnhubFetcher()
+    if not fetcher.configured:
+        return None, "finnhub_not_configured"
+    rows = fetcher.get_earnings_calendar(from_date, to_date)
+    if fetcher.request_succeeded("earnings_calendar") is not True:
+        return None, "finnhub_request_failed"
+    return list(rows), None
+
+
+def _load_intraday_earnings_calendar(market_date_et: str) -> dict[str, Any]:
+    """Shared per-ET-date earnings snapshot with a bounded range call.
+
+    一次区间调用覆盖整个 universe（当日 → +EARNINGS_WINDOW_DAYS 天），按 ET
+    日期缓存：成功 1 小时、失败 10 分钟。任何异常都只让财报上下文显式
+    unavailable，绝不拖垮日内 Top 榜。
+    """
+
+    now = _cache_now()
+    with _scan_cache_lock:
+        entry = _intraday_earnings_cache.get(market_date_et)
+        if entry is not None and entry.expires_at > now:
+            return copy.deepcopy(entry.result)
+
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    result: dict[str, Any] = {
+        "state": "unavailable",
+        "dates_by_symbol": {},
+        "window_start": market_date_et,
+        "window_end": None,
+        "window_days": EARNINGS_WINDOW_DAYS,
+        "source": _INTRADAY_EARNINGS_SOURCE,
+        "fetched_at": fetched_at,
+        "unavailable_reason": None,
+    }
+    try:
+        from_date = date.fromisoformat(market_date_et)
+    except ValueError:
+        result["unavailable_reason"] = "invalid_market_date"
+        return result
+    to_date = from_date + timedelta(days=EARNINGS_WINDOW_DAYS)
+    result["window_end"] = to_date.isoformat()
+    try:
+        rows, reason = _fetch_earnings_calendar_rows(from_date, to_date)
+    except Exception as exc:  # noqa: BLE001 - earnings lane must not 500 the board
+        logger.debug(
+            "[opportunities] intraday earnings calendar unavailable error_type=%s",
+            type(exc).__name__,
+        )
+        rows, reason = None, f"finnhub_error:{type(exc).__name__}"
+    if rows is None:
+        result["unavailable_reason"] = reason or "finnhub_request_failed"
+        ttl = _INTRADAY_EARNINGS_FAILURE_TTL_SECONDS
+    else:
+        dates_by_symbol: dict[str, list[str]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("symbol") or "").strip().upper()
+            raw_date = str(row.get("date") or "")[:10]
+            if not symbol or not raw_date:
+                continue
+            bucket = dates_by_symbol.setdefault(symbol, [])
+            if raw_date not in bucket:
+                bucket.append(raw_date)
+        result["state"] = "ready"
+        result["dates_by_symbol"] = dates_by_symbol
+        ttl = _INTRADAY_EARNINGS_CACHE_TTL_SECONDS
+
+    completion_time = _cache_now()
+    with _scan_cache_lock:
+        _intraday_earnings_cache[market_date_et] = _ScanCacheEntry(
+            expires_at=completion_time + ttl,
+            result=copy.deepcopy(result),
+        )
+        # 一天只需要一个 key；顺手清掉旧 ET 日期，缓存永远只有个位数条目。
+        for key in [k for k in _intraday_earnings_cache if k != market_date_et]:
+            _intraday_earnings_cache.pop(key, None)
+    return result
+
+
 def _execute_intraday_top(
     symbols: list[str], limit: int, *, enabled: bool
 ) -> dict[str, Any]:
@@ -2051,9 +2158,15 @@ def _execute_intraday_top(
     }
 
     quotes: dict[str, IntradayQuoteInput] = {}
+    spy_quote: Optional[IntradayQuoteInput] = None
     if enabled and supported:
+        # v3 大盘对齐：SPY 并入同一批快照（同一 as-of，不新增请求次数）；
+        # SPY 本身在 universe 里时不重复。
+        quote_symbols = list(supported)
+        if MARKET_CONTEXT_TICKER not in quote_symbols:
+            quote_symbols.append(MARKET_CONTEXT_TICKER)
         try:
-            raw_quotes = _fetch_underlying_session_quotes(supported) or {}
+            raw_quotes = _fetch_underlying_session_quotes(quote_symbols) or {}
         except Exception as exc:  # noqa: BLE001 - fail the batch closed per symbol
             logger.debug(
                 "[opportunities] intraday top session quotes unavailable: %s", exc
@@ -2062,7 +2175,12 @@ def _execute_intraday_top(
         quotes = {
             symbol: _quote_to_intraday_input(quote)
             for symbol, quote in raw_quotes.items()
+            if symbol in supported
         }
+        spy_raw = raw_quotes.get(MARKET_CONTEXT_TICKER)
+        spy_quote = (
+            _quote_to_intraday_input(spy_raw) if spy_raw is not None else None
+        )
 
     option_event_items = _load_intraday_option_event_items(
         supported,
@@ -2079,6 +2197,10 @@ def _execute_intraday_top(
         quote_session_scope=burst_scope,
     )
 
+    # v3 财报临近：一次日历区间读取覆盖整个 universe，逐 ET 日期缓存；
+    # 失败只让财报列显式标缺，绝不阻断其余证据。
+    earnings_calendar = _load_intraday_earnings_calendar(market_date_et)
+
     return build_intraday_top_run(
         symbols=supported,
         unsupported_symbols=unsupported,
@@ -2092,6 +2214,8 @@ def _execute_intraday_top(
         limit=limit,
         moomoo_enabled=enabled,
         burst_profiles=burst_profiles,
+        earnings_calendar=earnings_calendar,
+        spy_quote=spy_quote,
     )
 
 
@@ -2109,6 +2233,10 @@ def _intraday_pulse_item(
         "prev_close": None,
         "change_percent": None,
         "change_basis": "moomoo_snapshot_prev_close",
+        "vwap": None,
+        "vwap_position": "unknown",
+        "vwap_basis": VWAP_BASIS_SESSION_TURNOVER_OVER_VOLUME,
+        "vwap_unavailable_reason": None,
         "quote_as_of": None,
         "fetched_at": fetched_at.isoformat(),
         "source": _INTRADAY_TRACKING_SOURCE,
@@ -2118,11 +2246,13 @@ def _intraday_pulse_item(
     if not enabled:
         item.update(
             state="not_configured",
+            vwap_unavailable_reason="moomoo_not_configured",
             message="MOOMOO_OPEND_ENABLED 未启用；未读取快照。",
         )
         return item
     if quote is None:
         item.update(
+            vwap_unavailable_reason="quote_unavailable",
             message="Moomoo 未返回该代码的快照；显式标缺，不以 0 或旧值冒充。",
         )
         return item
@@ -2138,10 +2268,27 @@ def _intraday_pulse_item(
         and math.isfinite(prev_close)
     ):
         change_percent = round((last_price / prev_close - 1.0) * 100.0, 6)
+    # v3 大盘对齐输入：会话 VWAP 近似（累计额 ÷ 累计量），任一输入缺失
+    # 即显式标缺；VIX 等指数没有成交额属正常标缺，不是错误。
+    vwap = compute_session_vwap(
+        getattr(quote, "turnover", None),
+        getattr(quote, "volume", None),
+    )
+    vwap_position = "unknown"
+    if vwap.value is not None and last_price is not None and math.isfinite(last_price):
+        if last_price > vwap.value:
+            vwap_position = "above"
+        elif last_price < vwap.value:
+            vwap_position = "below"
+        else:
+            vwap_position = "flat"
     item.update(
         last_price=last_price,
         prev_close=prev_close,
         change_percent=change_percent,
+        vwap=vwap.value,
+        vwap_position=vwap_position,
+        vwap_unavailable_reason=vwap.unavailable_reason,
         quote_as_of=getattr(quote, "update_time", None),
         fetched_at=(
             quote_fetched_at.isoformat()
@@ -2201,12 +2348,16 @@ def _execute_intraday_pulse(*, enabled: bool) -> dict[str, Any]:
         )
         for ticker in (*_INTRADAY_PULSE_CORE_SYMBOLS, *_INTRADAY_PULSE_OPTIONAL_SYMBOLS)
     ]
+    session_phase = market_session_phase(requested_at)
     return {
         "schema_version": _INTRADAY_PULSE_SCHEMA,
         "generated_at": requested_at.isoformat(),
         "market_date_et": market_date_et,
         "session_state": session_state,
         "session_state_basis": SESSION_STATE_BASIS,
+        "session_phase": session_phase,
+        "session_phase_label": session_phase_label(session_phase),
+        "session_phase_hint_basis": SESSION_PHASE_HINT_BASIS,
         "items": items,
         "limitations": list(_INTRADAY_PULSE_LIMITATIONS),
     }

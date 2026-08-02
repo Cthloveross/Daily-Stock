@@ -1009,6 +1009,20 @@ class IntradayTopPriorDayContext(BaseModel):
     ema_alignment: Optional[Literal["bullish", "bearish", "mixed"]] = None
 
 
+# v3 时段上下文：常规时段按用户自身历史纪律再切分（提示文案为硬编码 v1）。
+IntradaySessionPhase = Literal[
+    "premarket",
+    "opening_probe",
+    "prime",
+    "midday",
+    "noise",
+    "afternoon",
+    "power_hour",
+    "afterhours",
+    "closed",
+]
+
+
 class IntradayBurstWindow(BaseModel):
     """一个 15 分钟滚动窗口的爆发读数：推力、量比与两者乘积的爆发分。"""
 
@@ -1019,6 +1033,67 @@ class IntradayBurstWindow(BaseModel):
     vol_norm: Optional[float] = Field(default=None, ge=0)
     score: Optional[float] = Field(default=None, ge=0)
     direction: Literal["up", "down", "flat"]
+
+
+class IntradayBurstSpeed(BaseModel):
+    """v3 速度分级：相邻两个滚动 15 分钟窗口爆发分之差（5m K 线近似）。
+
+    「减速」对应用户纪律 R1 的离场提示，不是系统信号；窗口不足或缺分数时
+    显式 unknown + reason，绝不以「持平」冒充观测值。
+    """
+
+    state: Literal["accelerating", "decelerating", "flat", "unknown"]
+    current_score: Optional[float] = Field(default=None, ge=0)
+    previous_score: Optional[float] = Field(default=None, ge=0)
+    delta: Optional[float] = None
+    basis: Literal["consecutive_rolling_15m_window_burst_score_delta_5m_bars"]
+    unavailable_reason: Optional[str] = None
+
+
+class IntradayEarningsProximity(BaseModel):
+    """v3 财报临近标记：前向 5 天窗口内最近财报日；不可得时显式标缺。
+
+    within_blackout=None 表示日历不可得（诚实未知），不是「安全」。
+    ≤3 天的「期权贵」阈值是用户自身回避规则的 v1 启发式。
+    """
+
+    state: Literal["ready", "unavailable"]
+    days_to_earnings: Optional[int] = Field(default=None, ge=0)
+    earnings_date: Optional[str] = None
+    within_blackout: Optional[bool] = None
+    blackout_days: int = Field(ge=0)
+    window_days: int = Field(ge=1)
+    basis: Literal["finnhub_earnings_calendar_forward_window"]
+    source: str
+    fetched_at: Optional[str] = None
+    unavailable_reason: Optional[str] = None
+
+
+class IntradayMarketAlignment(BaseModel):
+    """v3 大盘对齐：候选当前爆发方向 vs SPY 会话 VWAP 位置，仅作标注。"""
+
+    state: Literal["aligned", "against", "unknown"]
+    burst_direction: Optional[Literal["up", "down", "flat"]] = None
+    spy_vwap_position: Optional[Literal["above", "below", "flat"]] = None
+    basis: Literal[
+        "candidate_current_burst_direction_vs_spy_session_vwap_position"
+    ]
+    unavailable_reason: Optional[str] = None
+
+
+class IntradayMarketContext(BaseModel):
+    """v3 SPY 大盘上下文：会话 VWAP 位置（累计额/量近似）+ 明确 provenance。"""
+
+    ticker: str
+    state: Literal["ready", "not_configured", "unavailable"]
+    last_price: Optional[float] = Field(default=None, gt=0)
+    vwap: Optional[float] = Field(default=None, gt=0)
+    vwap_position: Literal["above", "below", "flat", "unknown"]
+    vwap_basis: Literal["session_turnover_over_volume"]
+    quote_as_of: Optional[str] = None
+    fetched_at: Optional[str] = None
+    source: str
+    unavailable_reason: Optional[str] = None
 
 
 class IntradaySessionBursts(BaseModel):
@@ -1038,6 +1113,7 @@ class IntradaySessionBursts(BaseModel):
     window_minutes: int = Field(15, ge=1)
     current: Optional[IntradayBurstWindow] = None
     legs: list[IntradayBurstWindow] = Field(default_factory=list)
+    speed: IntradayBurstSpeed
     unavailable_reason: Optional[str] = None
     source: Optional[str] = None
     fetched_at: Optional[str] = None
@@ -1082,6 +1158,8 @@ class IntradayTopCandidate(BaseModel):
     atr_range_expansion: Optional[float] = Field(default=None, ge=0)
     range_expansion_unavailable_reason: Optional[str] = None
     session_bursts: IntradaySessionBursts
+    earnings_proximity: IntradayEarningsProximity
+    market_alignment: IntradayMarketAlignment
     option_activity: IntradayTopOptionActivity
     prior_day_context: IntradayTopPriorDayContext
     evidence: list[EvidenceItem] = Field(default_factory=list)
@@ -1119,9 +1197,13 @@ class IntradayTopResponse(BaseModel):
     market_date_et: str
     session_state: Literal["premarket", "regular", "afterhours", "closed"]
     session_state_basis: Literal["america_new_york_clock_v1"]
+    session_phase: IntradaySessionPhase
+    session_phase_label: str
+    session_phase_hint_basis: Literal["user_trading_history_hardcoded_v1"]
     quote_session_scope: Literal["current_session", "latest_prior_session"]
     quote_session_label: str
-    signal_version: Literal["intraday_session_evidence_v2"]
+    market_context: IntradayMarketContext
+    signal_version: Literal["intraday_session_evidence_v3"]
     ranking_method: Literal[
         "burst_score_first_then_evidence_count",
         "rule_based_evidence_count",
@@ -1148,6 +1230,12 @@ class IntradayPulseItem(BaseModel):
     prev_close: Optional[float] = Field(default=None, gt=0)
     change_percent: Optional[float] = None
     change_basis: Literal["moomoo_snapshot_prev_close"]
+    vwap: Optional[float] = Field(default=None, gt=0)
+    vwap_position: Literal["above", "below", "flat", "unknown"] = "unknown"
+    vwap_basis: Literal["session_turnover_over_volume"] = (
+        "session_turnover_over_volume"
+    )
+    vwap_unavailable_reason: Optional[str] = None
     quote_as_of: Optional[str] = None
     fetched_at: str
     source: str
@@ -1161,5 +1249,8 @@ class IntradayPulseResponse(BaseModel):
     market_date_et: str
     session_state: Literal["premarket", "regular", "afterhours", "closed"]
     session_state_basis: Literal["america_new_york_clock_v1"]
+    session_phase: IntradaySessionPhase
+    session_phase_label: str
+    session_phase_hint_basis: Literal["user_trading_history_hardcoded_v1"]
     items: list[IntradayPulseItem] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)

@@ -19,13 +19,17 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping, Optional, Sequence
+from zoneinfo import ZoneInfo
 
 from src.opportunities.engine import _ema_last
 from src.opportunities.intraday import (
+    SESSION_PHASE_HINT_BASIS,
     VOLUME_PACE_BASIS,
     VWAP_BASIS_SESSION_TURNOVER_OVER_VOLUME,
+    market_session_phase,
+    session_phase_label,
 )
 from src.opportunities.intraday_bursts import (
     BURST_BASIS,
@@ -35,8 +39,29 @@ from src.opportunities.intraday_bursts import (
 )
 
 # v2: 波段爆发（15 分钟推力×量比）成为盘中主排序信号；聚合证据退居次序。
-INTRADAY_TOP_SIGNAL_VERSION = "intraday_session_evidence_v2"
+# v3: 新增四类「上下文信号」——时段上下文（用户历史纪律提示）、财报临近标记、
+# 大盘对齐（候选爆发方向 vs SPY VWAP 位置）、速度分级（相邻窗口爆发分之差）。
+# 全部是标注（labels），不参与排序、不隐藏行、不阻断任何操作：系统标注，
+# 用户过滤。
+INTRADAY_TOP_SIGNAL_VERSION = "intraday_session_evidence_v3"
 INTRADAY_TOP_SCHEMA_VERSION = "intraday-top/1.0"
+
+# ---------------------------------------------------------------------------
+# v3 财报临近（earnings proximity）。用户纪律：财报日及临近数日不交易（权利金
+# 过贵）。3 天阈值是按该规则硬编码的 v1 启发式；5 天窗口给「临近但未进入
+# 回避窗」留出可见提前量。日历不可得时显式 unavailable，绝不以「无财报」冒充。
+# ---------------------------------------------------------------------------
+EARNINGS_BLACKOUT_DAYS = 3
+EARNINGS_WINDOW_DAYS = 5
+EARNINGS_PROXIMITY_BASIS = "finnhub_earnings_calendar_forward_window"
+
+# v3 大盘对齐：候选当前爆发方向 vs SPY 会话 VWAP 位置（累计额/量近似）。
+# 用户纪律：setup 显式依赖大盘情绪（SPY 方向 / VWAP）。
+MARKET_ALIGNMENT_BASIS = (
+    "candidate_current_burst_direction_vs_spy_session_vwap_position"
+)
+MARKET_CONTEXT_TICKER = "SPY"
+_NEW_YORK_TZ = ZoneInfo("America/New_York")
 
 # 盘中（盘前/盘中/盘后，quote_session_scope=current_session）：按当前爆发分
 # 优先排序；休市（closed）：退回 v1 证据计数排序，但仍附带最近一个交易时段
@@ -96,6 +121,15 @@ INTRADAY_TOP_LIMITATIONS = (
     "盘中排序以 15 分钟波段爆发分（推力×量比，v2 启发式阈值按 2026-07-31 标注样本校准）优先，"
     "证据计数次之；休市退回证据计数排序。两者都不是胜率或预期收益模型，不是买卖信号。",
     "量能节奏对比 20 个交易日全日中位数，未按盘中时点折算；VWAP 为累计额/量近似。",
+    "v3 上下文信号（时段/财报/大盘/速度）只是标注，不参与排序、不隐藏行、不阻断操作：系统标注，用户过滤。",
+    "时段提示为用户自身 1,653 笔已平仓交易统计的硬编码 v1 文案（Playbook 候选 R1/R3），不是市场统计或买卖信号；"
+    "时段由 America/New_York 时钟判定，未接入交易所假日日历。",
+    f"财报临近＝Finnhub 财报日历前向 {EARNINGS_WINDOW_DAYS} 天窗口；≤{EARNINGS_BLACKOUT_DAYS} 天标注"
+    "「期权贵」是用户自身回避规则的 v1 启发式；日历不可得时显式标缺，绝不以「无财报」冒充。",
+    "大盘对齐＝候选当前爆发方向 vs SPY 会话 VWAP 位置；SPY VWAP 为累计成交额 ÷ 累计成交量近似，"
+    "非逐笔官方 VWAP，任一侧缺失即标缺。",
+    "速度分级＝相邻两个 15 分钟窗口爆发分之差（5m K 线近似，非 1m/2m 秒级速度）；"
+    "「减速」对应用户纪律 R1 的离场提示，不是系统信号。",
 )
 
 _RECENT_EVENT_FIELDS = (
@@ -210,6 +244,199 @@ def compute_intraday_daily_context(
         "ema8": _ema_last(closes, 8),
         "ema13": _ema_last(closes, 13),
     }
+
+
+def _parse_iso_date(value: Any) -> Optional[date]:
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def compute_earnings_proximity(
+    ticker: str,
+    calendar: Optional[Mapping[str, Any]],
+    *,
+    market_date_et: str,
+) -> dict[str, Any]:
+    """v3 earnings-proximity context label for one candidate, fail-closed.
+
+    ``calendar`` is the shared per-ET-date earnings snapshot
+    (``state`` + ``dates_by_symbol`` + provenance).  Semantics:
+
+    - ``state=ready`` + ``earnings_date`` set: the earliest earnings date in
+      the forward :data:`EARNINGS_WINDOW_DAYS`-day window (0 = today);
+      ``within_blackout`` is True when ``days_to_earnings ≤ 3``（用户回避规则，
+      v1 启发式：财报临近权利金过贵）。
+    - ``state=ready`` + ``earnings_date=None``: the calendar was fetched and
+      shows no earnings inside the window（诚实的「窗口内无财报」）。
+    - ``state=unavailable``: the calendar could not be fetched;
+      ``within_blackout`` stays ``None`` — never a fake "safe".
+    """
+
+    base: dict[str, Any] = {
+        "state": "unavailable",
+        "days_to_earnings": None,
+        "earnings_date": None,
+        "within_blackout": None,
+        "blackout_days": EARNINGS_BLACKOUT_DAYS,
+        "window_days": EARNINGS_WINDOW_DAYS,
+        "basis": EARNINGS_PROXIMITY_BASIS,
+        "source": (calendar or {}).get("source") or "finnhub",
+        "fetched_at": (calendar or {}).get("fetched_at"),
+        "unavailable_reason": None,
+    }
+    if calendar is None:
+        base["unavailable_reason"] = "earnings_calendar_missing"
+        return base
+    if calendar.get("state") != "ready":
+        base["unavailable_reason"] = (
+            calendar.get("unavailable_reason") or "earnings_calendar_unavailable"
+        )
+        return base
+    market_date = _parse_iso_date(market_date_et)
+    if market_date is None:
+        base["unavailable_reason"] = "invalid_market_date"
+        return base
+
+    dates_by_symbol = calendar.get("dates_by_symbol") or {}
+    window_end = market_date + timedelta(days=EARNINGS_WINDOW_DAYS)
+    in_window = sorted(
+        parsed
+        for raw in (dates_by_symbol.get(ticker) or ())
+        if (parsed := _parse_iso_date(raw)) is not None
+        and market_date <= parsed <= window_end
+    )
+    base["state"] = "ready"
+    if not in_window:
+        base["within_blackout"] = False
+        return base
+    earliest = in_window[0]
+    days = (earliest - market_date).days
+    base["days_to_earnings"] = days
+    base["earnings_date"] = earliest.isoformat()
+    base["within_blackout"] = days <= EARNINGS_BLACKOUT_DAYS
+    return base
+
+
+def compute_market_context(
+    spy_quote: Optional[IntradayQuoteInput],
+    *,
+    moomoo_enabled: bool,
+) -> dict[str, Any]:
+    """v3 SPY market context: session VWAP position from one quote snapshot.
+
+    VWAP is the same honest approximation as every other panel（累计成交额 ÷
+    累计成交量），explicitly labelled; any missing input keeps the context
+    ``unavailable`` with a reason instead of guessing the market's side.
+    """
+
+    base: dict[str, Any] = {
+        "ticker": MARKET_CONTEXT_TICKER,
+        "state": "unavailable",
+        "last_price": None,
+        "vwap": None,
+        "vwap_position": "unknown",
+        "vwap_basis": VWAP_BASIS_SESSION_TURNOVER_OVER_VOLUME,
+        "quote_as_of": None,
+        "fetched_at": None,
+        "source": "moomoo_openapi",
+        "unavailable_reason": None,
+    }
+    if not moomoo_enabled:
+        base["state"] = "not_configured"
+        base["unavailable_reason"] = "moomoo_not_configured"
+        return base
+    if spy_quote is None:
+        base["unavailable_reason"] = "spy_quote_unavailable"
+        return base
+    base["quote_as_of"] = spy_quote.quote_as_of
+    base["fetched_at"] = _iso(spy_quote.fetched_at)
+    base["source"] = spy_quote.source or "moomoo_openapi"
+    last_price = _finite_positive(spy_quote.last_price)
+    base["last_price"] = last_price
+    turnover = _finite_positive(spy_quote.session_turnover)
+    volume = _finite_positive(spy_quote.session_volume)
+    if turnover is None or volume is None:
+        base["unavailable_reason"] = (
+            "missing_or_nonpositive_turnover"
+            if volume is not None
+            else "missing_or_nonpositive_volume"
+            if turnover is not None
+            else "missing_turnover_and_volume"
+        )
+        return base
+    vwap = round(turnover / volume, 6)
+    base["vwap"] = vwap
+    if last_price is None:
+        base["unavailable_reason"] = "missing_spy_last_price"
+        return base
+    if last_price > vwap:
+        base["vwap_position"] = "above"
+    elif last_price < vwap:
+        base["vwap_position"] = "below"
+    else:
+        base["vwap_position"] = "flat"
+    base["state"] = "ready"
+    return base
+
+
+def compute_market_alignment(
+    burst_profile: Optional[Mapping[str, Any]],
+    market_context: Optional[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """v3 alignment label: candidate burst direction vs SPY VWAP position.
+
+    - burst ``up``  + SPY above VWAP → ``aligned``（顺势）
+    - burst ``down`` + SPY below VWAP → ``aligned``
+    - opposite pairing → ``against``（逆势）
+    - any flat / unknown / missing side → ``unknown``（标缺）with a reason.
+
+    A pure context label（用户纪律：setup 依赖大盘情绪）——it never enters the
+    ranking keys and never hides a row.
+    """
+
+    base: dict[str, Any] = {
+        "state": "unknown",
+        "burst_direction": None,
+        "spy_vwap_position": None,
+        "basis": MARKET_ALIGNMENT_BASIS,
+        "unavailable_reason": None,
+    }
+    current = (
+        burst_profile.get("current")
+        if isinstance(burst_profile, Mapping)
+        and burst_profile.get("state") == "ready"
+        else None
+    )
+    direction = (
+        str(current.get("direction") or "") if isinstance(current, Mapping) else ""
+    )
+    if direction not in {"up", "down", "flat"}:
+        base["unavailable_reason"] = "burst_direction_unavailable"
+        return base
+    base["burst_direction"] = direction
+    spy_position = (
+        str(market_context.get("vwap_position") or "")
+        if isinstance(market_context, Mapping)
+        and market_context.get("state") == "ready"
+        else ""
+    )
+    if spy_position not in {"above", "below", "flat"}:
+        base["unavailable_reason"] = (
+            str((market_context or {}).get("unavailable_reason") or "")
+            or "spy_vwap_position_unavailable"
+        )
+        return base
+    base["spy_vwap_position"] = spy_position
+    if direction == "flat" or spy_position == "flat":
+        base["unavailable_reason"] = "flat_side_has_no_direction"
+        return base
+    aligned = (direction == "up" and spy_position == "above") or (
+        direction == "down" and spy_position == "below"
+    )
+    base["state"] = "aligned" if aligned else "against"
+    return base
 
 
 def summarise_option_events(item: Optional[Mapping[str, Any]]) -> dict[str, Any]:
@@ -355,6 +582,9 @@ def build_intraday_top_candidate(
     quote_session_scope: str,
     moomoo_enabled: bool,
     burst_profile: Optional[Mapping[str, Any]] = None,
+    earnings_calendar: Optional[Mapping[str, Any]] = None,
+    market_context: Optional[Mapping[str, Any]] = None,
+    market_date_et: Optional[str] = None,
 ) -> dict[str, Any]:
     """Build one intraday candidate with the board's evidence contract shape."""
 
@@ -792,6 +1022,16 @@ def build_intraday_top_candidate(
         "atr_range_expansion": atr_range_expansion,
         "range_expansion_unavailable_reason": range_expansion_unavailable_reason,
         "session_bursts": bursts,
+        # v3 上下文信号：只是标注，不参与 supporting_evidence_count 或排序。
+        "earnings_proximity": compute_earnings_proximity(
+            ticker,
+            earnings_calendar,
+            market_date_et=(
+                market_date_et
+                or as_of.astimezone(_NEW_YORK_TZ).date().isoformat()
+            ),
+        ),
+        "market_alignment": compute_market_alignment(bursts, market_context),
         "option_activity": {
             "state": events["state"],
             "count": events["count"],
@@ -906,6 +1146,8 @@ def build_intraday_top_run(
     limit: int,
     moomoo_enabled: bool,
     burst_profiles: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    earnings_calendar: Optional[Mapping[str, Any]] = None,
+    spy_quote: Optional[IntradayQuoteInput] = None,
 ) -> dict[str, Any]:
     """Assemble the deterministic intraday Top-N research run."""
 
@@ -919,6 +1161,12 @@ def build_intraday_top_run(
         "最近一个交易时段" if quote_session_scope == QUOTE_SCOPE_LATEST_PRIOR else "当前交易时段"
     )
 
+    # v3 上下文：SPY 大盘上下文与时段标签都在这里统一派生一次。
+    market_context = compute_market_context(
+        spy_quote, moomoo_enabled=moomoo_enabled
+    )
+    session_phase = market_session_phase(as_of)
+
     candidates = [
         build_intraday_top_candidate(
             ticker,
@@ -929,6 +1177,9 @@ def build_intraday_top_run(
             quote_session_scope=quote_session_scope,
             moomoo_enabled=moomoo_enabled,
             burst_profile=(burst_profiles or {}).get(ticker),
+            earnings_calendar=earnings_calendar,
+            market_context=market_context,
+            market_date_et=market_date_et,
         )
         for ticker in symbols
     ]
@@ -958,8 +1209,12 @@ def build_intraday_top_run(
         "market_date_et": market_date_et,
         "session_state": session_state,
         "session_state_basis": session_state_basis,
+        "session_phase": session_phase,
+        "session_phase_label": session_phase_label(session_phase),
+        "session_phase_hint_basis": SESSION_PHASE_HINT_BASIS,
         "quote_session_scope": quote_session_scope,
         "quote_session_label": quote_session_label,
+        "market_context": market_context,
         "signal_version": INTRADAY_TOP_SIGNAL_VERSION,
         "ranking_method": ranking_method,
         "statistics_track": INTRADAY_STATISTICS_TRACK,

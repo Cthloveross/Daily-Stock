@@ -35,12 +35,18 @@ vi.mock('../../stores/userWatchlistStore', () => ({
 }));
 
 function pulse(sessionState: IntradaySessionState = 'regular'): IntradayPulseResponse {
+  const closed = sessionState === 'closed';
   return {
     schemaVersion: 'intraday-pulse/1.0',
     generatedAt: '2026-07-28T14:30:05+00:00',
     marketDateEt: '2026-07-28',
     sessionState,
     sessionStateBasis: 'america_new_york_clock_v1',
+    sessionPhase: closed ? 'closed' : 'prime',
+    sessionPhaseLabel: closed
+      ? '休市 · 复盘时段'
+      : '主战场 · 你的历史最大净盈利时段',
+    sessionPhaseHintBasis: 'user_trading_history_hardcoded_v1',
     items: [
       {
         ticker: 'SPY',
@@ -49,6 +55,10 @@ function pulse(sessionState: IntradaySessionState = 'regular'): IntradayPulseRes
         prevClose: 490.0,
         changePercent: 2.040816,
         changeBasis: 'moomoo_snapshot_prev_close',
+        vwap: 499.0,
+        vwapPosition: 'above',
+        vwapBasis: 'session_turnover_over_volume',
+        vwapUnavailableReason: null,
         quoteAsOf: '2026-07-28 10:30:04',
         fetchedAt: '2026-07-28T14:30:05+00:00',
         source: 'moomoo_openapi',
@@ -62,6 +72,10 @@ function pulse(sessionState: IntradaySessionState = 'regular'): IntradayPulseRes
         prevClose: 433.0,
         changePercent: -0.69284,
         changeBasis: 'moomoo_snapshot_prev_close',
+        vwap: 431.0,
+        vwapPosition: 'below',
+        vwapBasis: 'session_turnover_over_volume',
+        vwapUnavailableReason: null,
         quoteAsOf: '2026-07-28 10:30:04',
         fetchedAt: '2026-07-28T14:30:05+00:00',
         source: 'moomoo_openapi',
@@ -75,6 +89,10 @@ function pulse(sessionState: IntradaySessionState = 'regular'): IntradayPulseRes
         prevClose: null,
         changePercent: null,
         changeBasis: 'moomoo_snapshot_prev_close',
+        vwap: null,
+        vwapPosition: 'unknown',
+        vwapBasis: 'session_turnover_over_volume',
+        vwapUnavailableReason: 'quote_unavailable',
         quoteAsOf: null,
         fetchedAt: '2026-07-28T14:30:05+00:00',
         source: 'moomoo_openapi',
@@ -153,11 +171,38 @@ function topCandidate(overrides: Partial<IntradayTopCandidate> = {}): IntradayTo
           direction: 'up',
         },
       ],
+      speed: {
+        state: 'accelerating',
+        currentScore: 8.6,
+        previousScore: 5.1,
+        delta: 3.5,
+        basis: 'consecutive_rolling_15m_window_burst_score_delta_5m_bars',
+        unavailableReason: null,
+      },
       unavailableReason: null,
       source: 'fixture_5m',
       fetchedAt: '2026-07-28T14:30:06+00:00',
       basis: 'rolling_15m_thrust_over_median_range_times_volume_ratio',
       limitations: [],
+    },
+    earningsProximity: {
+      state: 'ready',
+      daysToEarnings: 2,
+      earningsDate: '2026-07-30',
+      withinBlackout: true,
+      blackoutDays: 3,
+      windowDays: 5,
+      basis: 'finnhub_earnings_calendar_forward_window',
+      source: 'finnhub_earnings_calendar',
+      fetchedAt: '2026-07-28T14:30:05+00:00',
+      unavailableReason: null,
+    },
+    marketAlignment: {
+      state: 'aligned',
+      burstDirection: 'up',
+      spyVwapPosition: 'above',
+      basis: 'candidate_current_burst_direction_vs_spy_session_vwap_position',
+      unavailableReason: null,
     },
     optionActivity: {
       state: 'ready',
@@ -209,11 +254,38 @@ function topResponse(
         windowMinutes: 15,
         current: null,
         legs: [],
+        speed: {
+          state: 'unknown',
+          currentScore: null,
+          previousScore: null,
+          delta: null,
+          basis: 'consecutive_rolling_15m_window_burst_score_delta_5m_bars',
+          unavailableReason: 'fewer_than_2_windows',
+        },
         unavailableReason: 'history_5m_unavailable:RuntimeError',
         source: null,
         fetchedAt: null,
         basis: 'rolling_15m_thrust_over_median_range_times_volume_ratio',
         limitations: [],
+      },
+      earningsProximity: {
+        state: 'unavailable',
+        daysToEarnings: null,
+        earningsDate: null,
+        withinBlackout: null,
+        blackoutDays: 3,
+        windowDays: 5,
+        basis: 'finnhub_earnings_calendar_forward_window',
+        source: 'finnhub_earnings_calendar',
+        fetchedAt: null,
+        unavailableReason: 'finnhub_not_configured',
+      },
+      marketAlignment: {
+        state: 'unknown',
+        burstDirection: null,
+        spyVwapPosition: null,
+        basis: 'candidate_current_burst_direction_vs_spy_session_vwap_position',
+        unavailableReason: 'burst_direction_unavailable',
       },
       optionActivity: {
         state: 'empty',
@@ -241,9 +313,25 @@ function topResponse(
     marketDateEt: '2026-07-28',
     sessionState,
     sessionStateBasis: 'america_new_york_clock_v1',
+    sessionPhase: sessionState === 'closed' ? 'closed' : 'prime',
+    sessionPhaseLabel:
+      sessionState === 'closed' ? '休市 · 复盘时段' : '主战场 · 你的历史最大净盈利时段',
+    sessionPhaseHintBasis: 'user_trading_history_hardcoded_v1',
     quoteSessionScope: sessionState === 'closed' ? 'latest_prior_session' : 'current_session',
     quoteSessionLabel: sessionState === 'closed' ? '最近一个交易时段' : '当前交易时段',
-    signalVersion: 'intraday_session_evidence_v2',
+    marketContext: {
+      ticker: 'SPY',
+      state: 'ready',
+      lastPrice: 500.0,
+      vwap: 499.0,
+      vwapPosition: 'above',
+      vwapBasis: 'session_turnover_over_volume',
+      quoteAsOf: '2026-07-28 10:30:04',
+      fetchedAt: '2026-07-28T14:30:05+00:00',
+      source: 'moomoo_openapi',
+      unavailableReason: null,
+    },
+    signalVersion: 'intraday_session_evidence_v3',
     rankingMethod:
       sessionState === 'closed'
         ? 'rule_based_evidence_count'
@@ -329,6 +417,12 @@ describe('IntradayPage', () => {
     expect(within(pulseSection).getByText('SPY')).toBeInTheDocument();
     expect(within(pulseSection).getByText('VIX')).toBeInTheDocument();
     expect(within(pulseSection).getByText('标缺')).toBeInTheDocument();
+    // v3 时段上下文醒目展示：用户历史纪律提示（硬编码 v1 文案）。
+    expect(within(pulseSection).getByLabelText('时段上下文')).toHaveTextContent(
+      '主战场 · 你的历史最大净盈利时段',
+    );
+    // SPY 会话 VWAP 位置（累计额/量近似）。
+    expect(within(pulseSection).getByText('VWAP 上方')).toBeInTheDocument();
 
     // 今日计划：无冻结计划时的诚实空态。
     expect(screen.getByText('今日计划 · 盘前冻结对照')).toBeInTheDocument();
@@ -336,7 +430,7 @@ describe('IntradayPage', () => {
       await screen.findByText(/今日尚无已发布的冻结盘前计划/),
     ).toBeInTheDocument();
 
-    // 日内扫描表：全部列头 + as-of；「当前爆发」为首个数据列。
+    // 日内扫描表：全部列头 + as-of；「当前爆发」为首个数据列，随后是速度列。
     const table = await screen.findByRole('table', { name: '日内扫描表' });
     for (const header of ['标的', '今日波段', 'VWAP', '研究状态']) {
       expect(within(table).getByText(header)).toBeInTheDocument();
@@ -344,12 +438,19 @@ describe('IntradayPage', () => {
     expect(within(table).getByText('当前爆发')).toBeInTheDocument();
     const headerCells = within(table).getAllByRole('columnheader');
     expect(headerCells[1].textContent).toContain('当前爆发');
-    expect(headerCells[2].textContent).toContain('今日波段');
+    expect(headerCells[2].textContent).toContain('速度');
+    expect(headerCells[3].textContent).toContain('今日波段');
     expect(within(table).getByText('现价 / 当日')).toBeInTheDocument();
     expect(within(table).getByText('缺口')).toBeInTheDocument();
     expect(within(table).getByText('量能节奏')).toBeInTheDocument();
     expect(within(table).getByText('波幅扩张(ATR)')).toBeInTheDocument();
     expect(within(table).getByText('期权异动')).toBeInTheDocument();
+    // v3 上下文列：大盘 / 财报（NVDA 顺势 + 回避窗 badge；TSLA 标缺）。
+    expect(within(table).getByText('大盘')).toBeInTheDocument();
+    expect(within(table).getByText('财报')).toBeInTheDocument();
+    expect(within(table).getByText('顺势')).toBeInTheDocument();
+    expect(within(table).getByText('财报 2 天内 · 期权贵')).toBeInTheDocument();
+    expect(within(table).getByText('加速')).toBeInTheDocument();
     expect(within(table).getAllByText('10:30:04 ET').length).toBeGreaterThan(0);
     expect(within(table).getByText('盘中活跃')).toBeInTheDocument();
     expect(within(table).getByText('3 笔 · 偏多 · 最大单 $250K')).toBeInTheDocument();
@@ -361,9 +462,9 @@ describe('IntradayPage', () => {
     const tslaRow = within(table).getByLabelText('打开 TSLA 即时扫描详情');
     expect(within(tslaRow).getAllByText('标缺').length).toBeGreaterThan(0);
 
-    // 页头副标题：爆发分优先排名 + v2 版本号。
+    // 页头副标题：爆发分优先排名 + v3 版本号。
     expect(screen.getByText(/波段爆发优先排名/)).toBeInTheDocument();
-    expect(screen.getByText(/intraday_session_evidence_v2/)).toBeInTheDocument();
+    expect(screen.getByText(/intraday_session_evidence_v3/)).toBeInTheDocument();
 
     // 期权异动 feed + 诚实边界文案。
     const feed = screen.getByLabelText('期权异动');
@@ -457,6 +558,8 @@ describe('IntradayPage', () => {
     });
     expect(fetchIntradayTop).toHaveBeenCalledTimes(1);
     expect(screen.getAllByText(/最近一个交易时段/).length).toBeGreaterThan(0);
+    // 休市时段上下文如实标注，不冒充任何盘中时段。
+    expect(screen.getByLabelText('时段上下文')).toHaveTextContent('休市 · 复盘时段');
     expect(
       screen.getByText('自动刷新暂停（仅页面可见且盘前/盘中）'),
     ).toBeInTheDocument();

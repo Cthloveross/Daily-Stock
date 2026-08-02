@@ -74,13 +74,69 @@ BURST_BASIS = "rolling_15m_thrust_over_median_range_times_volume_ratio"
 MEDIAN_BASIS_CURRENT = "current_session_bars_so_far"
 MEDIAN_BASIS_PRIOR = "prior_session_fallback"
 
+# v3 速度分级：相邻两个滚动 15 分钟窗口的爆发分之差。用户纪律（Playbook
+# 候选 R1）是「日内只交易加速；2 分钟级速度的波在 1 分钟速度熄火时离场」——
+# 本仓库的 K 线是 5 分钟粒度，诚实 v1 只能给出 5m 窗口级的加速/减速近似，
+# 不是 1m/2m 秒级速度；减速标签是用户自己的离场提示，不是系统信号。
+SPEED_BASIS = "consecutive_rolling_15m_window_burst_score_delta_5m_bars"
+
 BURST_LIMITATIONS = (
     "波段爆发＝15 分钟推力（|收−开| ÷ 当日 5 分钟 K 线波幅中位数）×量比"
     "（窗口量 ÷ 3×5 分钟量中位数）；阈值按 2026-07-31 用户标注样本校准，"
     "是确定性研究度量，不是买卖信号。",
     "仅统计正股 09:30–16:00 ET 常规时段 5 分钟 K 线；盘前盘后不参与。",
     "开盘前 30 分钟（当日不足 6 根 K 线）中位数基准回退上一交易时段并显式标注。",
+    "速度分级＝相邻两个 15 分钟窗口爆发分之差（5m K 线近似，非 1m/2m 秒级速度）；"
+    "「减速」对应用户自身纪律 R1 的离场提示，不是系统买卖信号。",
 )
+
+
+def compute_speed_state(
+    windows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """v3 speed grade from the last two rolling windows, fail-closed.
+
+    ``accelerating`` = latest window score > previous window score,
+    ``decelerating`` = latest < previous, ``flat`` = equal.  Fewer than two
+    windows or a missing score on either side is ``unknown`` with an explicit
+    reason — never a fabricated ``flat``.
+    """
+
+    if len(windows) < 2:
+        return {
+            "state": "unknown",
+            "current_score": None,
+            "previous_score": None,
+            "delta": None,
+            "basis": SPEED_BASIS,
+            "unavailable_reason": "fewer_than_2_windows",
+        }
+    current = _finite(windows[-1].get("score"))
+    previous = _finite(windows[-2].get("score"))
+    if current is None or previous is None:
+        return {
+            "state": "unknown",
+            "current_score": current,
+            "previous_score": previous,
+            "delta": None,
+            "basis": SPEED_BASIS,
+            "unavailable_reason": "missing_window_score",
+        }
+    delta = round(current - previous, 6)
+    if delta > 0:
+        state = "accelerating"
+    elif delta < 0:
+        state = "decelerating"
+    else:
+        state = "flat"
+    return {
+        "state": state,
+        "current_score": current,
+        "previous_score": previous,
+        "delta": delta,
+        "basis": SPEED_BASIS,
+        "unavailable_reason": None,
+    }
 
 
 def _finite(value: Any) -> Optional[float]:
@@ -334,6 +390,8 @@ def unavailable_burst_profile(
         "window_minutes": BURST_WINDOW_MINUTES,
         "current": None,
         "legs": [],
+        # 无 K 线时速度同样未知：绝不以「持平」冒充观测值。
+        "speed": compute_speed_state(()),
         "unavailable_reason": reason,
         "source": source,
         "fetched_at": fetched_at,
@@ -400,4 +458,5 @@ def compute_session_burst_profile(
     base["unavailable_reason"] = None
     base["current"] = _public_window(windows[-1])
     base["legs"] = select_distinct_legs(windows)
+    base["speed"] = compute_speed_state(windows)
     return base

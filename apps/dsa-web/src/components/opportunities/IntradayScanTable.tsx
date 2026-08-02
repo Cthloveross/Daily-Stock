@@ -35,13 +35,36 @@ const VWAP_LABELS: Record<IntradayTopCandidate['vwapPosition'], string> = {
   unknown: '标缺',
 };
 
+/** v3 大盘对齐：顺势/逆势/标缺——仅作标注，不隐藏行、不改变排序。 */
+const ALIGNMENT_LABELS: Record<IntradayTopCandidate['marketAlignment']['state'], string> = {
+  aligned: '顺势',
+  against: '逆势',
+  unknown: '标缺',
+};
+
+/** v3 速度分级：加速/减速/持平/标缺（5m 窗口近似，减速＝用户 R1 离场提示）。 */
+const SPEED_LABELS: Record<IntradayTopCandidate['sessionBursts']['speed']['state'], string> = {
+  accelerating: '加速',
+  decelerating: '减速',
+  flat: '持平',
+  unknown: '标缺',
+};
+
+const SPEED_STYLES: Record<IntradayTopCandidate['sessionBursts']['speed']['state'], string> = {
+  accelerating: 'text-up-strong',
+  decelerating: 'text-down-strong',
+  flat: 'text-text-2',
+  unknown: 'text-text-3',
+};
+
 export type IntradaySortKey =
   | 'burst'
   | 'change'
   | 'gap'
   | 'pace'
   | 'expansion'
-  | 'events';
+  | 'events'
+  | 'earnings';
 
 interface SortState {
   key: IntradaySortKey;
@@ -82,6 +105,11 @@ function sortValue(item: IntradayTopCandidate, key: IntradaySortKey): number | n
       return item.atrRangeExpansion;
     case 'events':
       return item.optionActivity.count;
+    case 'earnings':
+      // 数值排序按距财报天数；日历标缺或窗口内无财报的行落到最后。
+      return item.earningsProximity.state === 'ready'
+        ? item.earningsProximity.daysToEarnings
+        : null;
     default:
       return null;
   }
@@ -129,6 +157,66 @@ function optionActivityLabel(item: IntradayTopCandidate): string {
   if (activity.count === 0) return '0 笔';
   const sentiment = SENTIMENT_LABELS[activity.dominantSentiment] ?? activity.dominantSentiment;
   return `${activity.count} 笔 · ${sentiment} · 最大单 ${formatCompactUsd(activity.maxSingleTurnover)}`;
+}
+
+/** v3 财报列：回避窗内醒目标注「财报 N 天内 · 期权贵」；标缺绝不冒充安全。 */
+function earningsLabel(item: IntradayTopCandidate): {
+  text: string;
+  emphasized: boolean;
+  caption: string;
+} {
+  const proximity = item.earningsProximity;
+  if (proximity.state !== 'ready') {
+    return { text: '标缺', emphasized: false, caption: '财报日历不可得 · 未知≠安全' };
+  }
+  if (proximity.daysToEarnings === null) {
+    return {
+      text: `${proximity.windowDays} 天内无`,
+      emphasized: false,
+      caption: 'Finnhub 前向窗口',
+    };
+  }
+  if (proximity.withinBlackout) {
+    return {
+      text: proximity.daysToEarnings === 0
+        ? '今日财报 · 期权贵'
+        : `财报 ${proximity.daysToEarnings} 天内 · 期权贵`,
+      emphasized: true,
+      caption: `${proximity.earningsDate ?? ''} · 你的回避规则（≤${proximity.blackoutDays} 天）`,
+    };
+  }
+  return {
+    text: `${proximity.daysToEarnings} 天后财报`,
+    emphasized: false,
+    caption: proximity.earningsDate ?? '',
+  };
+}
+
+const ALIGNMENT_DIRECTION_LABELS: Record<string, string> = {
+  up: '爆发↑',
+  down: '爆发↓',
+  flat: '爆发·',
+};
+
+const ALIGNMENT_SPY_LABELS: Record<string, string> = {
+  above: 'SPY VWAP上',
+  below: 'SPY VWAP下',
+  flat: 'SPY VWAP平',
+};
+
+function alignmentCaption(item: IntradayTopCandidate): string {
+  const alignment = item.marketAlignment;
+  if (alignment.state === 'unknown') return 'SPY 或爆发方向标缺';
+  return `${ALIGNMENT_DIRECTION_LABELS[alignment.burstDirection ?? ''] ?? ''} · ${
+    ALIGNMENT_SPY_LABELS[alignment.spyVwapPosition ?? ''] ?? ''
+  }`;
+}
+
+function speedCaption(item: IntradayTopCandidate): string {
+  const speed = item.sessionBursts.speed;
+  if (speed.state === 'unknown' || speed.delta === null) return '相邻 15 分钟窗口';
+  const sign = speed.delta > 0 ? '+' : speed.delta < 0 ? '−' : '';
+  return `Δ ${sign}${Math.abs(speed.delta).toFixed(1)}`;
 }
 
 /**
@@ -200,7 +288,7 @@ export function IntradayScanTable({
             {data?.quoteSessionScope === 'latest_prior_session'
               ? '休市 · 按最近交易时段最强波段排序'
               : '波段爆发优先排名'}
-            （{data?.signalVersion ?? 'intraday_session_evidence_v2'}）· 不冻结 · 不入统计
+            （{data?.signalVersion ?? 'intraday_session_evidence_v3'}）· 不冻结 · 不入统计
           </span>
         </div>
         {data && (
@@ -232,17 +320,20 @@ export function IntradayScanTable({
         </div>
       ) : (
         <div className="overflow-auto">
-          <table className="w-full min-w-[1180px] border-collapse" aria-label="日内扫描表">
+          <table className="w-full min-w-[1420px] border-collapse" aria-label="日内扫描表">
             <thead>
               <tr className="border-b border-subtle text-left text-caption text-text-3">
                 <th className="px-3 py-2 font-medium">标的</th>
                 <th className="px-3 py-2 text-right">{sortableHeader('burst', '当前爆发')}</th>
+                <th className="px-3 py-2 font-medium">速度</th>
                 <th className="px-3 py-2 font-medium">今日波段</th>
                 <th className="px-3 py-2 text-right">{sortableHeader('change', '现价 / 当日')}</th>
                 <th className="px-3 py-2 text-right">{sortableHeader('gap', '缺口')}</th>
                 <th className="px-3 py-2 text-right">{sortableHeader('pace', '量能节奏')}</th>
                 <th className="px-3 py-2 font-medium">VWAP</th>
+                <th className="px-3 py-2 font-medium">大盘</th>
                 <th className="px-3 py-2 text-right">{sortableHeader('expansion', '波幅扩张(ATR)')}</th>
+                <th className="px-3 py-2">{sortableHeader('earnings', '财报')}</th>
                 <th className="px-3 py-2">{sortableHeader('events', '期权异动')}</th>
                 <th className="px-3 py-2 font-medium">研究状态</th>
                 <th className="px-3 py-2 font-medium">合约</th>
@@ -294,6 +385,12 @@ export function IntradayScanTable({
                     )}
                   </td>
                   <td className="px-3 py-2.5">
+                    <div className={`text-body-sm font-medium ${SPEED_STYLES[item.sessionBursts.speed.state]}`}>
+                      {SPEED_LABELS[item.sessionBursts.speed.state]}
+                    </div>
+                    <div className="mt-0.5 text-caption text-text-3">{speedCaption(item)}</div>
+                  </td>
+                  <td className="px-3 py-2.5">
                     <div className="text-body-sm text-text-1" aria-label={legsDetailLabel(item)}>
                       {legsSummary(item) ?? '标缺'}
                     </div>
@@ -343,9 +440,34 @@ export function IntradayScanTable({
                       {item.vwap !== null ? `≈ ${formatPrice(item.vwap)} · 额/量近似` : '额/量近似'}
                     </div>
                   </td>
+                  <td className="px-3 py-2.5">
+                    <div className={`text-body-sm ${item.marketAlignment.state === 'unknown' ? 'text-text-3' : 'text-text-1'}`}>
+                      {ALIGNMENT_LABELS[item.marketAlignment.state]}
+                    </div>
+                    <div className="mt-0.5 text-caption text-text-3">{alignmentCaption(item)}</div>
+                  </td>
                   <td className="px-3 py-2.5 text-right">
                     <div className="font-mono text-mono-xs text-text-1">{formatRatio(item.atrRangeExpansion)}</div>
                     <div className="mt-0.5 text-caption text-text-3">当日高低 ÷ ATR14</div>
+                  </td>
+                  <td className="px-3 py-2.5">
+                    {(() => {
+                      const earnings = earningsLabel(item);
+                      return (
+                        <>
+                          <div
+                            className={
+                              earnings.emphasized
+                                ? 'inline-block rounded-ds-sm border border-[color:var(--warn-muted)] bg-bg-0 px-1.5 py-0.5 text-caption font-medium text-warning'
+                                : 'text-body-sm text-text-2'
+                            }
+                          >
+                            {earnings.text}
+                          </div>
+                          <div className="mt-0.5 text-caption text-text-3">{earnings.caption}</div>
+                        </>
+                      );
+                    })()}
                   </td>
                   <td className="px-3 py-2.5">
                     <div
@@ -386,7 +508,7 @@ export function IntradayScanTable({
                 </tr>
                 {expandedTicker === item.ticker && (
                   <tr className="border-b border-subtle last:border-b-0">
-                    <td colSpan={11} className="bg-bg-0 px-3 py-3">
+                    <td colSpan={14} className="bg-bg-0 px-3 py-3">
                       <NearExpiryContractPanel symbol={item.ticker} />
                     </td>
                   </tr>
@@ -399,7 +521,7 @@ export function IntradayScanTable({
       )}
 
       <div className="border-t border-subtle bg-bg-0 px-4 py-2 text-caption text-text-3">
-        当前爆发＝最近 15 分钟（3 根 5m K 线）|收−开| ÷ 当日 5m 波幅中位 × 窗口量比（阈值按 2026-07-31 标注样本校准，盘中排序优先，不是信号）；今日波段＝爆发分 ≥ 8 且起点相隔 ≥30 分钟的独立窗口（≤4 个，休市显示最近一个交易时段）；缺口＝开盘价对参考前收（休市时段改用快照前收并标注）；量能节奏＝当日累计 vs 20 日全日中位（未按时点折算）；波幅扩张＝当日高低价差 ÷ ATR14；期权异动＝最近一页 Moomoo 分类计数，不推断开平仓。缺失字段显式标缺，不以 0 冒充。
+        当前爆发＝最近 15 分钟（3 根 5m K 线）|收−开| ÷ 当日 5m 波幅中位 × 窗口量比（阈值按 2026-07-31 标注样本校准，盘中排序优先，不是信号）；速度＝相邻两个 15 分钟窗口爆发分之差（5m 近似，非 1m/2m 秒级；减速=你的离场信号，R1）；今日波段＝爆发分 ≥ 8 且起点相隔 ≥30 分钟的独立窗口（≤4 个，休市显示最近一个交易时段）；缺口＝开盘价对参考前收（休市时段改用快照前收并标注）；量能节奏＝当日累计 vs 20 日全日中位（未按时点折算）；大盘＝候选爆发方向 vs SPY 会话 VWAP 位置（累计额/量近似）；波幅扩张＝当日高低价差 ÷ ATR14；财报＝Finnhub 前向 5 天窗口，≤3 天标「期权贵」（你的回避规则）；期权异动＝最近一页 Moomoo 分类计数，不推断开平仓。时段/财报/大盘/速度均为 v3 上下文标注——系统标注，用户过滤：不隐藏行、不阻断操作、不参与排序。缺失字段显式标缺，不以 0 冒充。
       </div>
     </section>
   );

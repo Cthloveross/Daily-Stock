@@ -184,12 +184,12 @@ TradingView 面向个人网站账户没有公开的自选列表 REST API；其�
 
 `/intraday` 页面自上而下：
 
-1. **市场脉搏**（sticky 顶栏）：SPY / QQQ / VIX 快照现价与当日涨跌（分母为快照自带前收，`change_basis=moomoo_snapshot_prev_close`）、盘段状态、ET 数据时点与自动刷新指示。数据来自 `GET /api/v1/opportunities/intraday-pulse`（60 秒 TTL + single-flight）；VIX 与 SPY/QQQ 隔离请求，供应商快照不可得时逐代码显式标缺，不用其他来源或旧值冒充。
+1. **市场脉搏**（sticky 顶栏）：**时段上下文标签**（v3，条首醒目位，见下）+ SPY / QQQ / VIX 快照现价与当日涨跌（分母为快照自带前收，`change_basis=moomoo_snapshot_prev_close`）+ SPY/QQQ 会话 VWAP 位置（v3，累计额/量近似）、盘段状态、ET 数据时点与自动刷新指示。数据来自 `GET /api/v1/opportunities/intraday-pulse`（60 秒 TTL + single-flight）；VIX 与 SPY/QQQ 隔离请求，供应商快照不可得时逐代码显式标缺，不用其他来源或旧值冒充。
 2. **今日计划**：冻结盘前 Top 5 的对照跟踪，直接复用 §2.7 的 `IntradayTrackingPanel`（该组件同时保留在 `/regime` 官方看板下方，行为不变；本页是它的主要使用场景）。今日没有已发布官方版本时显示诚实空态，不用预览榜冒充冻结计划。
-3. **日内扫描表**（核心）：`POST /api/v1/opportunities/intraday-top` 的盘中滚动 Top 5。列：标的 / **当前爆发**（首个数据列：爆发分 + 方向箭头 + 15 分钟推力%）/ **今日波段**（如「2 波：09:40↓ · 15:15↑」，每波窗口/推力/爆发分明细以可访问 aria-label 附带；休市显示最近一个交易时段）/ 现价+当日%（as-of）/ 缺口 / 量能节奏 / VWAP 位置 / 波幅扩张(ATR) / 期权异动（N 笔·偏向·最大单）/ 研究状态；默认排序＝服务端排名（盘中爆发分优先），列头可点做客户端排序（第三次点击回到服务端排名），行点击进入 `/regime/opportunity/:ticker` 即时扫描详情（不绑定 snapshotKey）。
+3. **日内扫描表**（核心）：`POST /api/v1/opportunities/intraday-top` 的盘中滚动 Top 5。列：标的 / **当前爆发**（首个数据列：爆发分 + 方向箭头 + 15 分钟推力%）/ **速度**（v3：加速/减速/持平/标缺）/ **今日波段**（如「2 波：09:40↓ · 15:15↑」，每波窗口/推力/爆发分明细以可访问 aria-label 附带；休市显示最近一个交易时段）/ 现价+当日%（as-of）/ 缺口 / 量能节奏 / VWAP 位置 / **大盘**（v3：顺势/逆势/标缺）/ 波幅扩张(ATR) / **财报**（v3：回避窗内醒目「财报 N 天内 · 期权贵」badge）/ 期权异动（N 笔·偏向·最大单）/ 研究状态；默认排序＝服务端排名（盘中爆发分优先），列头可点做客户端排序（第三次点击回到服务端排名），行点击进入 `/regime/opportunity/:ticker` 即时扫描详情（不绑定 snapshotKey）。
 4. **期权异动 feed**：跨自选池、按时间倒序的最近异动成交（接口响应内有界 ≤20 条）：时间 · 标的 · Call/Put · 行权价/到期 · 金额 · Moomoo 情绪分类，底部固定标注「分类不证明开平仓方向」。
 
-`POST /api/v1/opportunities/intraday-top` 合同（`schema_version=intraday-top/1.0`，`signal_version=intraday_session_evidence_v2`）：
+`POST /api/v1/opportunities/intraday-top` 合同（`schema_version=intraday-top/1.0`，`signal_version=intraday_session_evidence_v3`）：
 
 - 请求：`symbols`（≤20，空数组回退服务端 `STOCK_LIST`）、`limit`（默认 5，1–10）、`refresh`。非美股期权 underlying 不参与扫描并在 `unsupported_symbols` 中如实列出。
 - 装配全部复用 G-2 机制：会话快照来自与期权墙相同的 Moomoo Quote-only `get_market_snapshot`；ATR14 / 20 日量能中位 / 上一日结构（前收、前 20 日高低、EMA8/13）来自与每日榜相同的完成日线加载器（15 分钟逐标的记忆）；期权异动逐标的复用 `option-events` 的 30 秒缓存 key（每标最近一页 ≤10 条，失败只降级该标的）。波段爆发的 5m K 线走与 `/stocks/{code}/history?period=5m` 相同的服务端加载器，逐标的只取当前 + 上一交易时段常规时段（有界线程池并发 + 逐标的 60 秒 TTL 缓存；单标的失败只把该标的的波段爆发显式 `unavailable`，绝不阻塞聚合证据）。响应级 60 秒 TTL + single-flight，`refresh` 只绕过已完成 TTL。
@@ -211,6 +211,15 @@ v2 聚合证据阈值（保留 v1 语义，退居次要排序因子；代码内�
 | VWAP 位置 | 与缺口方向一致（缺口向上且价在 VWAP 上方，或反之） | VWAP＝累计额/量近似 |
 
 研究状态（`research_state`）：`active`（盘中活跃，≥2 项独立支持）/ `watch`（观察）/ `insufficient`（数据不足——缺可用现价快照时 fail-closed，无论其他证据如何）。上一日结构（前 20 日区间位置、EMA 排列）只作 `research_context` 证据，永不参与盘中排序计数。
+
+**v3 上下文信号（2026-08-02，`intraday_session_evidence_v3`）**：把用户自己的交易纪律（Playbook 候选 R1/R3，按其 1,653 笔已平仓交易统计数据核验）编码为四类诚实**上下文标注**。设计规则固定为「**系统标注，用户过滤**」：这些信号只加标签，绝不自动过滤行、绝不隐藏候选、绝不阻断任何操作，也不参与排序键或 supporting_evidence_count。
+
+1. **时段上下文**（`session_phase`，pulse 与 intraday-top 响应均携带）：常规时段按 ET 时钟再切分为 `opening_probe`（09:30–10:00）/ `prime`（10:00–11:00）/ `midday`（11:00–13:00）/ `noise`（13:00–14:00）/ `afternoon`（14:00–15:00）/ `power_hour`（15:00–16:00），盘前/盘后/休市沿用原盘段。每个 phase 带中文标签 + 用户历史统计提示（`session_phase_hint_basis=user_trading_history_hardcoded_v1`，硬编码 v1 文案）：开盘试错「仅轻仓 S2 · 你的历史此时段净亏」、主战场「你的历史最大净盈利时段」、午间震荡「你的历史净亏损时段 · 默认观望」、尾盘趋势「你的历史最高单笔均值时段」。标签在市场脉搏条首醒目展示；时钟口径与盘段相同（`america_new_york_clock_v1`，未接假日日历）。
+2. **财报临近标记**（`earnings_proximity`，逐候选）：Finnhub 财报日历一次**区间调用**（当日 → +5 天）覆盖整个 universe，按 ET 日期缓存（成功 1 小时 / 失败 10 分钟），从中取每个候选窗口内最近的财报日（`days_to_earnings`，0=今日）。`days_to_earnings ≤ 3`（`EARNINGS_BLACKOUT_DAYS=3`，用户「财报日及临近数日不交易、权利金过贵」规则的 v1 启发式）时前端醒目标注「财报 N 天内 · 期权贵」。日历不可得时 `state=unavailable`、`within_blackout=null`——显式标缺，绝不以「无财报」冒充安全；日历成功但窗口内无财报才是诚实的 `within_blackout=false`。
+3. **大盘对齐**（`market_alignment`，逐候选 + 响应级 `market_context`）：用户 setup 显式依赖大盘情绪，因此 SPY 并入 intraday-top 的同一批快照（不新增请求次数），由累计成交额 ÷ 累计成交量近似出 SPY 会话 VWAP 位置；候选**当前爆发方向** vs SPY VWAP 位置得出 `aligned`（顺势：up+above 或 down+below）/ `against`（逆势）/ `unknown`（任一侧 flat/缺失，附 reason）。列「大盘」显示 顺势/逆势/标缺；VWAP 近似口径显式标注（`session_turnover_over_volume`），不是逐笔官方 VWAP。
+4. **速度分级**（`session_bursts.speed`，逐候选）：用户纪律 R1「日内只交易加速；2 分钟级速度的波在 1 分钟速度熄火时离场」。本仓库 K 线为 5m 粒度，诚实 v1 只能给出 5m 窗口级近似：相邻两个滚动 15 分钟窗口的爆发分之差（`consecutive_rolling_15m_window_burst_score_delta_5m_bars`）→ `accelerating` / `decelerating` / `flat`；窗口不足或缺分数显式 `unknown`。列「速度」显示 加速/减速/持平/标缺，表格 footer 附「减速=你的离场信号（R1）」——这是用户自己的离场提示，不是系统信号。
+
+前端：扫描表新增「速度」（当前爆发旁）「大盘」（VWAP 旁）「财报」（期权异动前，按距财报天数可排序，标缺行恒排最后）三列，footer 公式行同步扩展并写明设计规则；市场脉搏条首展示时段标签（tooltip 说明其为用户历史统计的硬编码文案）。全部四类信号的口径与「硬编码用户历史提示、不是市场统计、不是信号」限制随响应 `limitations` 固定携带。
 
 诚实合同（响应 `limitations` 固定携带，页头同句展示）：盘中滚动、不冻结、不写快照/qualification/5D/20D 结果（`statistics_track=none_intraday_v1_unscored`）、期权异动不证明方向、盘中排序＝爆发分优先 + 证据计数次之（均为确定性研究度量而非胜率模型，不是买卖信号）。休市时段接口仍可用，但 `quote_session_scope=latest_prior_session`、证据口径标注「最近一个交易时段」、排序退回证据计数。前端自动刷新与 §2.7 相同：60 秒、仅页面可见且盘段为盘前/盘中。
 

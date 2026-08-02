@@ -9,6 +9,8 @@ import pytest
 
 from src.opportunities.intraday import (
     ATR14_METHOD,
+    SESSION_PHASE_HINT_BASIS,
+    SESSION_PHASE_LABELS,
     SESSION_STATE_BASIS,
     VOLUME_PACE_BASIS,
     VWAP_BASIS_SESSION_TURNOVER_OVER_VOLUME,
@@ -16,7 +18,9 @@ from src.opportunities.intraday import (
     compute_prior_full_day_median_volume,
     compute_session_vwap,
     compute_volume_pace,
+    market_session_phase,
     market_session_state,
+    session_phase_label,
 )
 
 _NEW_YORK = ZoneInfo("America/New_York")
@@ -174,3 +178,60 @@ class TestMarketSessionState:
 
     def test_basis_label_is_clock_only(self):
         assert SESSION_STATE_BASIS == "america_new_york_clock_v1"
+
+
+class TestMarketSessionPhase:
+    """v3 时段上下文：ET 时钟边界（含开盘/主战场/噪音/尾盘四个纪律时段）。"""
+
+    @pytest.mark.parametrize(
+        ("hour", "minute", "expected"),
+        [
+            (3, 59, "closed"),
+            (4, 0, "premarket"),
+            (9, 29, "premarket"),
+            (9, 30, "opening_probe"),
+            (9, 59, "opening_probe"),
+            (10, 0, "prime"),
+            (10, 59, "prime"),
+            (11, 0, "midday"),
+            (12, 59, "midday"),
+            (13, 0, "noise"),
+            (13, 59, "noise"),
+            (14, 0, "afternoon"),
+            (14, 59, "afternoon"),
+            (15, 0, "power_hour"),
+            (15, 59, "power_hour"),
+            (16, 0, "afterhours"),
+            (19, 59, "afterhours"),
+            (20, 0, "closed"),
+        ],
+    )
+    def test_weekday_clock_boundaries(self, hour, minute, expected):
+        # 2026-07-28 is a Tuesday.
+        now = datetime(2026, 7, 28, hour, minute, tzinfo=_NEW_YORK)
+        assert market_session_phase(now) == expected
+
+    def test_weekend_is_closed_even_at_prime_hours(self):
+        saturday = datetime(2026, 7, 25, 10, 30, tzinfo=_NEW_YORK)
+        assert market_session_phase(saturday) == "closed"
+
+    def test_utc_input_is_converted_to_new_york(self):
+        # 17:30 UTC on a Tuesday in July (EDT) = 13:30 ET → noise.
+        now = datetime(2026, 7, 28, 17, 30, tzinfo=timezone.utc)
+        assert market_session_phase(now) == "noise"
+
+    def test_naive_datetime_is_rejected(self):
+        with pytest.raises(ValueError):
+            market_session_phase(datetime(2026, 7, 28, 10, 0))
+
+    def test_discipline_hint_copy_is_present_for_every_phase(self):
+        # 硬编码 v1 文案：四个纪律时段的关键提示词必须在位。
+        assert "仅轻仓 S2" in session_phase_label("opening_probe")
+        assert "主战场" in session_phase_label("prime")
+        assert "默认观望" in session_phase_label("noise")
+        assert "最高单笔均值" in session_phase_label("power_hour")
+        # 每个 phase 都有非空标签；未知 phase 落到诚实的休市文案。
+        for phase, label in SESSION_PHASE_LABELS.items():
+            assert label and session_phase_label(phase) == label
+        assert session_phase_label("unexpected") == SESSION_PHASE_LABELS["closed"]
+        assert SESSION_PHASE_HINT_BASIS == "user_trading_history_hardcoded_v1"

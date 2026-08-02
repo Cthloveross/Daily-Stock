@@ -631,6 +631,18 @@ export interface OpportunityLearningSummaryResponse {
 
 export type IntradaySessionState = 'premarket' | 'regular' | 'afterhours' | 'closed';
 
+/** v3 时段上下文：常规时段按用户自身历史纪律再切分（提示文案为硬编码 v1）。 */
+export type IntradaySessionPhase =
+  | 'premarket'
+  | 'opening_probe'
+  | 'prime'
+  | 'midday'
+  | 'noise'
+  | 'afternoon'
+  | 'power_hour'
+  | 'afterhours'
+  | 'closed';
+
 export type IntradayTrackingItemState =
   | 'ready'
   | 'partial'
@@ -731,6 +743,53 @@ export interface IntradayBurstWindow {
   direction: 'up' | 'down' | 'flat';
 }
 
+/** v3 速度分级：相邻两个滚动 15 分钟窗口爆发分之差（5m K 线近似）。 */
+export interface IntradayBurstSpeed {
+  state: 'accelerating' | 'decelerating' | 'flat' | 'unknown';
+  currentScore: number | null;
+  previousScore: number | null;
+  delta: number | null;
+  basis: 'consecutive_rolling_15m_window_burst_score_delta_5m_bars';
+  unavailableReason: string | null;
+}
+
+/** v3 财报临近标记：前向 5 天窗口内最近财报日；within_blackout=null 表示未知。 */
+export interface IntradayEarningsProximity {
+  state: 'ready' | 'unavailable';
+  daysToEarnings: number | null;
+  earningsDate: string | null;
+  withinBlackout: boolean | null;
+  blackoutDays: number;
+  windowDays: number;
+  basis: 'finnhub_earnings_calendar_forward_window';
+  source: string;
+  fetchedAt: string | null;
+  unavailableReason: string | null;
+}
+
+/** v3 大盘对齐：候选当前爆发方向 vs SPY 会话 VWAP 位置，仅作标注。 */
+export interface IntradayMarketAlignment {
+  state: 'aligned' | 'against' | 'unknown';
+  burstDirection: 'up' | 'down' | 'flat' | null;
+  spyVwapPosition: 'above' | 'below' | 'flat' | null;
+  basis: 'candidate_current_burst_direction_vs_spy_session_vwap_position';
+  unavailableReason: string | null;
+}
+
+/** v3 SPY 大盘上下文：会话 VWAP 位置（累计额/量近似）+ 明确 provenance。 */
+export interface IntradayMarketContext {
+  ticker: string;
+  state: 'ready' | 'not_configured' | 'unavailable';
+  lastPrice: number | null;
+  vwap: number | null;
+  vwapPosition: 'above' | 'below' | 'flat' | 'unknown';
+  vwapBasis: 'session_turnover_over_volume';
+  quoteAsOf: string | null;
+  fetchedAt: string | null;
+  source: string;
+  unavailableReason: string | null;
+}
+
 /** 波段爆发（v2 主信号）：当前窗口 + 当日（或最近一个交易时段）波段列表。 */
 export interface IntradaySessionBursts {
   state: 'ready' | 'insufficient_bars' | 'unavailable';
@@ -742,6 +801,7 @@ export interface IntradaySessionBursts {
   windowMinutes: number;
   current: IntradayBurstWindow | null;
   legs: IntradayBurstWindow[];
+  speed: IntradayBurstSpeed;
   unavailableReason: string | null;
   source: string | null;
   fetchedAt: string | null;
@@ -782,6 +842,8 @@ export interface IntradayTopCandidate {
   atrRangeExpansion: number | null;
   rangeExpansionUnavailableReason: string | null;
   sessionBursts: IntradaySessionBursts;
+  earningsProximity: IntradayEarningsProximity;
+  marketAlignment: IntradayMarketAlignment;
   optionActivity: IntradayTopOptionActivity;
   priorDayContext: IntradayTopPriorDayContext;
   evidence: OpportunityEvidence[];
@@ -817,9 +879,13 @@ export interface IntradayTopResponse {
   marketDateEt: string;
   sessionState: IntradaySessionState;
   sessionStateBasis: 'america_new_york_clock_v1';
+  sessionPhase: IntradaySessionPhase;
+  sessionPhaseLabel: string;
+  sessionPhaseHintBasis: 'user_trading_history_hardcoded_v1';
   quoteSessionScope: 'current_session' | 'latest_prior_session';
   quoteSessionLabel: string;
-  signalVersion: 'intraday_session_evidence_v2';
+  marketContext: IntradayMarketContext;
+  signalVersion: 'intraday_session_evidence_v3';
   rankingMethod: 'burst_score_first_then_evidence_count' | 'rule_based_evidence_count';
   statisticsTrack: 'none_intraday_v1_unscored';
   moomooEnabled: boolean;
@@ -840,6 +906,10 @@ export interface IntradayPulseItem {
   prevClose: number | null;
   changePercent: number | null;
   changeBasis: 'moomoo_snapshot_prev_close';
+  vwap: number | null;
+  vwapPosition: 'above' | 'below' | 'flat' | 'unknown';
+  vwapBasis: 'session_turnover_over_volume';
+  vwapUnavailableReason: string | null;
   quoteAsOf: string | null;
   fetchedAt: string;
   source: string;
@@ -853,6 +923,9 @@ export interface IntradayPulseResponse {
   marketDateEt: string;
   sessionState: IntradaySessionState;
   sessionStateBasis: 'america_new_york_clock_v1';
+  sessionPhase: IntradaySessionPhase;
+  sessionPhaseLabel: string;
+  sessionPhaseHintBasis: 'user_trading_history_hardcoded_v1';
   items: IntradayPulseItem[];
   limitations: string[];
 }

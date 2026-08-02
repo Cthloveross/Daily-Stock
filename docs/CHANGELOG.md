@@ -413,6 +413,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] CSV 组合父单入账为 audit-only `BrokerExecutionGroupObservation`（组合 unit 语义）+ 组级费用观测：不分摊费用到腿、不推导合约乘数或腿级数量、不写腿/成交观测；canonical 选择将 CSV 组合父单显式排除（provenance `canonical_scope=excluded_csv_combo_parent`），腿级真相仍由 OpenAPI execution group 提供；preview 新增 `combo_parent_orders` 等 additive 计数并把含组合父单的 CSV 至少判为 `partial`，旧版 CSV↔readonly 对账将窗口内组合父单显式排除并输出警示。
 - [测试] 新增真实导出行文本的组合父单解析回归（unit 数量/成交摘要/组级费用尾列/价差符号/两条腿展示行、邻近普通单不受影响）、对账排除警示、账本组合父单 audit-only 入账与 canonical fail-closed 排除、preview/import API 组合计数与部分级别断言；既有 parser 与账本测试全部保持通过。
 - [文档] `New-docs/phase1/01_MOOMOO_EVIDENCE_LEDGER.md` 新增 §4.3 组合单父单解析与 canonical 排除语义；`New-docs/HANDOFF.md` §4.2 更新 parser 条目；根 README 未涉及该专题细节，故未改动。
+- [新功能] 日内扫描噪音过滤 v3（`intraday_session_evidence_v3`）：把用户自身交易纪律（Playbook 候选 R1/R3，1,653 笔已平仓交易统计核验）编码为四类诚实上下文标注——时段上下文（ET 时钟九段 + 硬编码 v1 纪律提示，pulse 与 intraday-top 双响应携带、脉搏条首醒目展示）、财报临近（Finnhub 一次区间调用覆盖全 universe，≤3 天醒目「财报 N 天内 · 期权贵」）、大盘对齐（SPY 并入同批快照，会话 VWAP 位置 vs 候选爆发方向 → 顺势/逆势/标缺）、速度分级（相邻 15 分钟窗口爆发分之差 → 加速/减速/持平/标缺）。设计规则固定「系统标注，用户过滤」：全部信号只加标签，不自动过滤行、不隐藏候选、不参与排序或证据计数。
+- [改进] 日内扫描表新增「速度」「大盘」「财报」三列（财报列可按距财报天数排序、标缺行恒排最后）并扩展 footer 公式行（含「减速=你的离场信号（R1）」与设计规则）；市场脉搏条新增时段标签（可访问 Tooltip 说明其为用户历史统计的硬编码文案）与 SPY/QQQ 会话 VWAP 位置。
+- [修复] v3 上下文全部 fail-closed：财报日历不可得时 `within_blackout=null` 显式标缺（绝不以「无财报」冒充安全，成功但窗口内无财报才是诚实 `false`）、SPY 或爆发方向任一侧缺失时大盘对齐标缺、速度窗口不足显式 unknown；日历失败只短缓存 10 分钟且不阻断其余证据。
+- [测试] 新增时段 ET 时钟边界（含 09:30/10:00/13:00/15:00 等 18 个断言点与周末/UTC 换算）、速度分级（加速/减速/持平/单窗口与缺分数 unknown）、财报临近（0/3/4 天回避窗边界、窗口外排除、unavailable 诚实）、大盘对齐矩阵（up/above=顺势等四象限 + flat/缺失标缺）、日历单次区间调用跨 refresh 与 universe 的按日缓存、SPY 并入同批快照零新增请求，以及前端列/badge/时段标签渲染与 E2E 时段标签断言；周日休市 TestClient 连本机 OpenD + 真实 Finnhub 验收（closed 诚实标注 + 最近交易时段速度状态 + MU 逆势样本）。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` §2.8 新增 v3 上下文信号小节（四类信号口径、财报额度成本、设计规则）；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` 新增 G-9 行；根 README 不承载日内列级细节，故未改动。
 
 ## [3.11.0] - 2026-03-27
 

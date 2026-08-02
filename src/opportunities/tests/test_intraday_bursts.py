@@ -26,7 +26,9 @@ from src.opportunities.intraday_bursts import (
     LEG_MIN_SCORE,
     MEDIAN_BASIS_CURRENT,
     MEDIAN_BASIS_PRIOR,
+    SPEED_BASIS,
     compute_session_burst_profile,
+    compute_speed_state,
     filter_regular_session_bars,
     select_distinct_legs,
     split_burst_session_bars,
@@ -360,3 +362,84 @@ class TestFailClosed:
         )
         assert profile["state"] == "insufficient_bars"
         assert profile["current"] is None
+
+
+class TestSpeedState:
+    """v3 速度分级：相邻两个滚动窗口爆发分之差；缺输入显式 unknown。"""
+
+    @staticmethod
+    def _window(score):
+        return {"start_et": "10:00", "end_et": "10:15", "score": score}
+
+    def test_accelerating_when_latest_window_score_rises(self):
+        speed = compute_speed_state([self._window(4.0), self._window(9.0)])
+        assert speed["state"] == "accelerating"
+        assert speed["current_score"] == 9.0
+        assert speed["previous_score"] == 4.0
+        assert speed["delta"] == 5.0
+        assert speed["basis"] == SPEED_BASIS
+        assert speed["unavailable_reason"] is None
+
+    def test_decelerating_when_latest_window_score_falls(self):
+        speed = compute_speed_state(
+            [self._window(2.0), self._window(9.0), self._window(3.5)]
+        )
+        assert speed["state"] == "decelerating"
+        assert speed["delta"] == -5.5
+
+    def test_flat_only_on_exact_equality(self):
+        speed = compute_speed_state([self._window(4.0), self._window(4.0)])
+        assert speed["state"] == "flat"
+        assert speed["delta"] == 0.0
+
+    def test_single_window_is_unknown_not_flat(self):
+        speed = compute_speed_state([self._window(9.0)])
+        assert speed["state"] == "unknown"
+        assert speed["unavailable_reason"] == "fewer_than_2_windows"
+
+    def test_missing_score_on_either_side_is_unknown(self):
+        missing_current = compute_speed_state(
+            [self._window(4.0), self._window(None)]
+        )
+        missing_previous = compute_speed_state(
+            [self._window(None), self._window(4.0)]
+        )
+        assert missing_current["state"] == "unknown"
+        assert missing_previous["state"] == "unknown"
+        assert missing_current["unavailable_reason"] == "missing_window_score"
+
+    def test_ready_profile_carries_speed_and_unavailable_profile_is_unknown(self):
+        # 四根平静 K 线 + 一根放量推力 K 线：末窗必须相对前窗加速。
+        bars = []
+        for index, (open_, close, volume) in enumerate(
+            [
+                (100.0, 100.2, 1_000.0),
+                (100.2, 100.0, 1_000.0),
+                (100.0, 100.3, 1_000.0),
+                (100.3, 100.1, 1_000.0),
+                (100.1, 103.0, 4_000.0),
+            ]
+        ):
+            minutes = 9 * 60 + 30 + index * 5
+            bars.append(
+                {
+                    "date": f"2026-07-28T{minutes // 60:02d}:{minutes % 60:02d}:00-04:00",
+                    "open": open_,
+                    "high": max(open_, close) + 0.1,
+                    "low": min(open_, close) - 0.1,
+                    "close": close,
+                    "volume": volume,
+                }
+            )
+        profile = compute_session_burst_profile(
+            bars,
+            market_date_et="2026-07-28",
+            quote_session_scope="current_session",
+        )
+        assert profile["state"] == "ready"
+        assert profile["speed"]["state"] == "accelerating"
+        assert profile["speed"]["current_score"] == profile["current"]["score"]
+
+        unavailable = unavailable_burst_profile("no_regular_session_bars")
+        assert unavailable["speed"]["state"] == "unknown"
+        assert unavailable["speed"]["unavailable_reason"] == "fewer_than_2_windows"

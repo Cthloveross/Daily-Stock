@@ -177,7 +177,26 @@ def _stub_daily_loader(monkeypatch, *, now: datetime = _FIXED_NOW) -> _FakeManag
     monkeypatch.setattr(opportunities, "_load_daily_history", load_history)
     monkeypatch.setattr(opportunities, "_intraday_now", lambda: now)
     monkeypatch.setattr(opportunities, "_fetch_intraday_5m_bars", _five_minute_bars)
+    # 默认：财报日历按未配置处理（显式 unavailable），单测绝不打真实 Finnhub。
+    monkeypatch.setattr(
+        opportunities,
+        "_fetch_earnings_calendar_rows",
+        lambda from_date, to_date: (None, "finnhub_not_configured"),
+    )
     return manager
+
+
+def _stub_earnings(monkeypatch, rows_by_call: list):
+    """Replace the earnings range fetch with a call-recording stub."""
+
+    calls: list[tuple[date, date]] = []
+
+    def fetch(from_date: date, to_date: date):
+        calls.append((from_date, to_date))
+        return rows_by_call, None
+
+    monkeypatch.setattr(opportunities, "_fetch_earnings_calendar_rows", fetch)
+    return calls
 
 
 def _stub_events(monkeypatch, sentiments_by_symbol: dict[str, list[str]]):
@@ -190,32 +209,54 @@ def _stub_events(monkeypatch, sentiments_by_symbol: dict[str, list[str]]):
 def test_contract_regular_session_full_row(monkeypatch):
     monkeypatch.setenv("MOOMOO_OPEND_ENABLED", "true")
     _stub_daily_loader(monkeypatch)
-    monkeypatch.setattr(
-        opportunities,
-        "_fetch_underlying_session_quotes",
-        lambda symbols: {"NVDA": _quote()},
-    )
+    quote_batches: list[tuple[str, ...]] = []
+
+    def quotes(symbols):
+        quote_batches.append(tuple(symbols))
+        return {
+            "NVDA": _quote(),
+            # SPY 并入同一批：vwap 499 < last 500 → above（供大盘对齐）。
+            "SPY": _quote(
+                "SPY",
+                last_price=500.0,
+                prev_close_price=490.0,
+                volume=1_000,
+                turnover=499_000.0,
+            ),
+        }
+
+    monkeypatch.setattr(opportunities, "_fetch_underlying_session_quotes", quotes)
     _stub_events(monkeypatch, {"NVDA": ["BULLISH", "BULLISH", "BULLISH"]})
+    _stub_earnings(
+        monkeypatch, [{"symbol": "NVDA", "date": "2026-07-30", "hour": "amc"}]
+    )
 
     response = _client().post(
         "/api/v1/opportunities/intraday-top",
         json={"symbols": ["us.nvda", "600519"], "limit": 5},
     )
+    # SPY 只是并入既有批次，不新增快照请求次数。
+    assert quote_batches == [("NVDA", "SPY")]
     assert response.status_code == 200
     body = response.json()
     assert body["schema_version"] == "intraday-top/1.0"
-    assert body["signal_version"] == "intraday_session_evidence_v2"
+    assert body["signal_version"] == "intraday_session_evidence_v3"
     # 盘中主排序 = 波段爆发分优先。
     assert body["ranking_method"] == "burst_score_first_then_evidence_count"
     # 不冻结、不入统计的显式标记。
     assert body["statistics_track"] == "none_intraday_v1_unscored"
     assert body["session_state"] == "regular"
+    # v3 时段上下文：10:30 ET = 主战场（用户历史纪律提示，硬编码 v1 文案）。
+    assert body["session_phase"] == "prime"
+    assert "主战场" in body["session_phase_label"]
+    assert body["session_phase_hint_basis"] == "user_trading_history_hardcoded_v1"
     assert body["quote_session_scope"] == "current_session"
     assert body["quote_session_label"] == "当前交易时段"
     assert body["universe"] == ["NVDA"]
     assert body["unsupported_symbols"] == ["600519"]
     assert any("不冻结" in text for text in body["limitations"])
     assert any("不推断开平仓" in text for text in body["limitations"])
+    assert any("系统标注，用户过滤" in text for text in body["limitations"])
 
     item = body["candidates"][0]
     assert item["ticker"] == "NVDA"
@@ -249,6 +290,20 @@ def test_contract_regular_session_full_row(monkeypatch):
     assert bursts["current"]["score"] == pytest.approx(9.0, abs=1e-6)
     assert bursts["current"]["direction"] == "up"
     assert [leg["start_et"] for leg in bursts["legs"]] == ["10:15"]
+    # v3 速度分级：末窗 9.0 > 前一窗（burst tail 前奏）→ 加速。
+    assert bursts["speed"]["state"] == "accelerating"
+    assert bursts["speed"]["current_score"] == pytest.approx(9.0, abs=1e-6)
+    assert bursts["speed"]["delta"] > 0
+    # v3 财报临近：07-30 距 07-28 两天 → 回避窗内（用户规则，仅标注）。
+    proximity = item["earnings_proximity"]
+    assert proximity["state"] == "ready"
+    assert proximity["days_to_earnings"] == 2
+    assert proximity["earnings_date"] == "2026-07-30"
+    assert proximity["within_blackout"] is True
+    # v3 大盘对齐：候选爆发 up + SPY VWAP 上方 → 顺势（标注，不参与排序）。
+    assert body["market_context"]["state"] == "ready"
+    assert body["market_context"]["vwap_position"] == "above"
+    assert item["market_alignment"]["state"] == "aligned"
     burst_evidence = next(
         entry
         for entry in item["evidence"]
@@ -331,6 +386,9 @@ def test_closed_session_labels_last_session_and_snapshot_gap_basis(monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert body["session_state"] == "closed"
+    # v3 时段上下文：周六休市如实标「休市 · 复盘时段」，不冒充任何盘中时段。
+    assert body["session_phase"] == "closed"
+    assert "休市" in body["session_phase_label"]
     assert body["quote_session_scope"] == "latest_prior_session"
     assert body["quote_session_label"] == "最近一个交易时段"
     # 休市：排序退回 v1 证据计数。
@@ -348,6 +406,13 @@ def test_closed_session_labels_last_session_and_snapshot_gap_basis(monkeypatch):
     assert bursts["state"] == "ready"
     assert bursts["session_date_et"] == "2026-07-24"
     assert [leg["start_et"] for leg in bursts["legs"]] == ["15:45"]
+    # v3 速度分级在休市同样描述最近一个交易时段的末两个窗口。
+    assert bursts["speed"]["state"] == "accelerating"
+    # 财报日历默认未配置：财报列显式标缺，within_blackout 保持 None（未知）。
+    proximity = item["earnings_proximity"]
+    assert proximity["state"] == "unavailable"
+    assert proximity["unavailable_reason"] == "finnhub_not_configured"
+    assert proximity["within_blackout"] is None
 
 
 def test_ttl_cache_shares_and_refresh_bypasses(monkeypatch):
@@ -530,6 +595,72 @@ def test_burst_bars_cached_per_symbol_across_refresh(monkeypatch):
     assert fetch_calls == ["NVDA"]
 
 
+def test_earnings_calendar_single_range_call_cached_for_the_day(monkeypatch):
+    monkeypatch.setenv("MOOMOO_OPEND_ENABLED", "true")
+    _stub_daily_loader(monkeypatch)
+    monkeypatch.setattr(
+        opportunities,
+        "_fetch_underlying_session_quotes",
+        lambda symbols: {"NVDA": _quote(), "TSLA": _quote("TSLA")},
+    )
+    _stub_events(monkeypatch, {})
+    calls = _stub_earnings(
+        monkeypatch, [{"symbol": "TSLA", "date": "2026-07-29"}]
+    )
+    client = _client()
+
+    first = client.post(
+        "/api/v1/opportunities/intraday-top", json={"symbols": ["NVDA", "TSLA"]}
+    )
+    refreshed = client.post(
+        "/api/v1/opportunities/intraday-top",
+        json={"symbols": ["NVDA", "TSLA"], "refresh": True},
+    )
+    other_universe = client.post(
+        "/api/v1/opportunities/intraday-top",
+        json={"symbols": ["NVDA"], "refresh": True},
+    )
+    assert first.status_code == refreshed.status_code == other_universe.status_code == 200
+    # 一天一次区间调用覆盖全部 universe：refresh 与不同标的集合都命中缓存。
+    assert len(calls) == 1
+    assert calls[0] == (date(2026, 7, 28), date(2026, 8, 2))
+    by_ticker = {
+        item["ticker"]: item for item in first.json()["candidates"]
+    }
+    assert by_ticker["TSLA"]["earnings_proximity"]["days_to_earnings"] == 1
+    assert by_ticker["TSLA"]["earnings_proximity"]["within_blackout"] is True
+    # 日历成功 + 窗口内无该标的财报＝诚实的 False，而不是标缺。
+    assert by_ticker["NVDA"]["earnings_proximity"]["state"] == "ready"
+    assert by_ticker["NVDA"]["earnings_proximity"]["within_blackout"] is False
+
+
+def test_earnings_calendar_failure_is_marked_never_faked_safe(monkeypatch):
+    monkeypatch.setenv("MOOMOO_OPEND_ENABLED", "true")
+    _stub_daily_loader(monkeypatch)
+    monkeypatch.setattr(
+        opportunities,
+        "_fetch_underlying_session_quotes",
+        lambda symbols: {"NVDA": _quote()},
+    )
+    _stub_events(monkeypatch, {})
+
+    def broken(from_date, to_date):
+        raise RuntimeError("finnhub down")
+
+    monkeypatch.setattr(opportunities, "_fetch_earnings_calendar_rows", broken)
+    response = _client().post(
+        "/api/v1/opportunities/intraday-top", json={"symbols": ["NVDA"]}
+    )
+    assert response.status_code == 200
+    item = response.json()["candidates"][0]
+    proximity = item["earnings_proximity"]
+    assert proximity["state"] == "unavailable"
+    assert proximity["unavailable_reason"] == "finnhub_error:RuntimeError"
+    assert proximity["within_blackout"] is None
+    # 财报失败不影响行情行与其余证据。
+    assert item["last_price"] == 130.5
+
+
 def test_empty_symbols_falls_back_to_server_stock_list(monkeypatch):
     monkeypatch.delenv("MOOMOO_OPEND_ENABLED", raising=False)
     _stub_daily_loader(monkeypatch)
@@ -572,9 +703,14 @@ def test_intraday_pulse_disabled_and_degraded_vix(monkeypatch):
     assert disabled.status_code == 200
     body = disabled.json()
     assert body["schema_version"] == "intraday-pulse/1.0"
+    # v3 时段上下文与 Moomoo 无关（纯 ET 时钟）：未配置时同样如实标注。
+    assert body["session_phase"] == "prime"
+    assert "主战场" in body["session_phase_label"]
+    assert body["session_phase_hint_basis"] == "user_trading_history_hardcoded_v1"
     assert [item["ticker"] for item in body["items"]] == ["SPY", "QQQ", "VIX"]
     assert all(item["state"] == "not_configured" for item in body["items"])
     assert all(item["last_price"] is None for item in body["items"])
+    assert all(item["vwap_position"] == "unknown" for item in body["items"])
 
     opportunities._reset_scan_cache_for_tests()
     monkeypatch.setenv("MOOMOO_OPEND_ENABLED", "true")
@@ -582,7 +718,13 @@ def test_intraday_pulse_disabled_and_degraded_vix(monkeypatch):
     def quotes(symbols):
         # VIX 不可得：隔离请求返回空，不影响 SPY/QQQ。
         return {
-            symbol: _quote(symbol, last_price=500.0, prev_close_price=490.0)
+            symbol: _quote(
+                symbol,
+                last_price=500.0,
+                prev_close_price=490.0,
+                volume=1_000,
+                turnover=499_000.0,  # vwap 499 < last 500 → above
+            )
             for symbol in symbols
             if symbol in {"SPY", "QQQ"}
         }
@@ -594,5 +736,25 @@ def test_intraday_pulse_disabled_and_degraded_vix(monkeypatch):
     assert items["SPY"]["state"] == "ready"
     assert items["SPY"]["change_percent"] == pytest.approx(2.040816, abs=1e-4)
     assert items["SPY"]["change_basis"] == "moomoo_snapshot_prev_close"
+    # v3：SPY 会话 VWAP 位置（累计额/量近似）供大盘情绪参照。
+    assert items["SPY"]["vwap"] == pytest.approx(499.0, abs=1e-6)
+    assert items["SPY"]["vwap_position"] == "above"
     assert items["VIX"]["state"] == "unavailable"
     assert items["VIX"]["last_price"] is None
+    assert items["VIX"]["vwap_position"] == "unknown"
+
+
+def test_intraday_pulse_session_phase_noise_window(monkeypatch):
+    # 2026-07-28 17:30 UTC = 13:30 ET → 噪音时段（用户历史净亏损，默认观望）。
+    monkeypatch.delenv("MOOMOO_OPEND_ENABLED", raising=False)
+    monkeypatch.setattr(
+        opportunities,
+        "_intraday_now",
+        lambda: datetime(2026, 7, 28, 17, 30, tzinfo=timezone.utc),
+    )
+    response = _client().get("/api/v1/opportunities/intraday-pulse")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["session_phase"] == "noise"
+    assert "默认观望" in body["session_phase_label"]
+    assert any("系统标注，用户过滤" in text for text in body["limitations"])
