@@ -6,6 +6,7 @@ import type {
   IntradaySetupKey,
   IntradaySetupMatch,
   IntradaySetupMatchProfile,
+  IntradaySnapshotOnlyRow,
   IntradayTopCandidate,
   IntradayTopResponse,
   NearExpiryContractResponse,
@@ -260,7 +261,7 @@ function nearExpiryEmpty(ticker: string): NearExpiryContractResponse {
   };
 }
 
-describe('IntradayScanTable v3 上下文列（财报/大盘/速度）', () => {
+describe('IntradayScanTable 默认 9 列网格（v3 上下文并入）', () => {
   beforeEach(() => {
     navigateMock.mockReset();
     vi.mocked(fetchNearExpiryContracts).mockReset();
@@ -318,39 +319,52 @@ describe('IntradayScanTable v3 上下文列（财报/大盘/速度）', () => {
     });
   }
 
-  it('renders columns, blackout badge, alignment and speed labels', () => {
+  it('renders the trading-critical default grid and keeps secondary metrics out of it', () => {
     const response = { ...topResponse(), candidates: [v3Candidate()], universe: ['NVDA'] };
     render(<IntradayScanTable data={response} loading={false} error={null} />);
 
     const table = screen.getByRole('table', { name: '日内扫描表' });
-    for (const header of ['速度', '大盘', '财报']) {
+    // 默认网格恰好 9 列交易关键读数。
+    const headers = ['排名', '标的', '涨跌%', '当前爆发', '今日波段', '速度', '形态', '波段vs大盘', '详情'];
+    for (const header of headers) {
       expect(within(table).getByText(header)).toBeInTheDocument();
     }
-    // 财报回避窗内：醒目「财报 N 天内 · 期权贵」badge + 用户回避规则口径。
-    expect(within(table).getByText('财报 2 天内 · 期权贵')).toBeInTheDocument();
-    expect(within(table).getByText(/你的回避规则（≤3 天）/)).toBeInTheDocument();
-    // 大盘对齐：顺势 + 明确的两侧口径。
+    expect(within(table).getAllByRole('columnheader').length).toBe(9);
+    // 次要指标移出默认网格（展开行「研究读数」一键可达，不是删除）。
+    for (const moved of ['缺口', '量能节奏', 'VWAP', '波幅扩张(ATR)', '财报', '期权异动', '研究状态']) {
+      expect(within(table).queryByText(moved)).not.toBeInTheDocument();
+    }
+    // 排名列显示服务端排名。
+    expect(within(table).getByText('#1')).toBeInTheDocument();
+    // 财报回避窗内：警示徽标并入标的格次行，回避规则口径随 aria-label 附带。
+    const blackoutBadge = within(table).getByText('财报 2 天内 · 期权贵');
+    expect(blackoutBadge.getAttribute('aria-label')).toContain('你的回避规则（≤3 天）');
+    // 波段vs大盘：顺势 + 明确的两侧口径；列头 tooltip 澄清「波段方向 vs SPY VWAP」。
     expect(within(table).getByText('顺势')).toBeInTheDocument();
     expect(within(table).getByText('爆发↑ · SPY VWAP上')).toBeInTheDocument();
-    // 速度：加速 + Δ 值；footer 携带 R1 离场提示与设计规则。
-    expect(within(table).getByText('加速')).toBeInTheDocument();
+    expect(
+      within(table).getByLabelText(/不是个股自身涨跌方向/),
+    ).toBeInTheDocument();
+    // 速度：加速↑ + Δ 值。
+    expect(within(table).getByText('加速↑')).toBeInTheDocument();
     expect(within(table).getByText('Δ +4.3')).toBeInTheDocument();
-    expect(screen.getByText(/减速=你的离场信号/)).toBeInTheDocument();
-    expect(screen.getByText(/系统标注，用户过滤/)).toBeInTheDocument();
   });
 
   it('keeps unavailable context honest: 标缺 never pretends safe or aligned', () => {
     render(<IntradayScanTable data={topResponse()} loading={false} error={null} />);
     const table = screen.getByRole('table', { name: '日内扫描表' });
-    // 默认 fixture：财报日历标缺 → 「未知≠安全」；大盘/速度同为标缺。
-    expect(within(table).getAllByText('财报日历不可得 · 未知≠安全').length).toBe(2);
+    // 默认 fixture：财报日历标缺 → 标的格次行显式「财报标缺」（未知≠安全），
+    // 绝不以无徽标冒充安全；大盘/速度同为标缺。
+    const missingBadges = within(table).getAllByText('财报标缺');
+    expect(missingBadges.length).toBe(2);
+    expect(missingBadges[0].getAttribute('aria-label')).toContain('未知≠安全');
     expect(within(table).getAllByText('SPY 或爆发方向标缺').length).toBe(2);
-    // 全部行仍在表中：v3 上下文绝不隐藏行。
+    // 全部行仍在表中：上下文标注绝不隐藏行。
     expect(within(table).getByLabelText('打开 NVDA 即时扫描详情')).toBeInTheDocument();
     expect(within(table).getByLabelText('打开 MU 即时扫描详情')).toBeInTheDocument();
   });
 
-  it('sorts by days-to-earnings with unavailable rows always last', () => {
+  it('sorts by current burst with unavailable rows always last and server rank unchanged', () => {
     const ready = v3Candidate();
     const response = {
       ...topResponse(),
@@ -359,16 +373,134 @@ describe('IntradayScanTable v3 上下文列（财报/大盘/速度）', () => {
     };
     render(<IntradayScanTable data={response} loading={false} error={null} />);
     const table = screen.getByRole('table', { name: '日内扫描表' });
-    fireEvent.click(within(table).getByRole('button', { name: '按财报排序' }));
+    fireEvent.click(within(table).getByRole('button', { name: '按当前爆发排序' }));
+    const bodyRows = () => within(table).getAllByRole('row').slice(1);
     const tickerOrder = () =>
-      within(table)
-        .getAllByRole('row')
-        .slice(1)
-        .map((row) => within(row).getAllByRole('cell')[0]?.textContent ?? '');
-    // desc：有数值的 NVDA 在前，标缺的 MU 永远最后。
+      bodyRows().map((row) => within(row).getAllByRole('cell')[1]?.textContent ?? '');
+    // desc：有爆发分的 NVDA 在前，标缺的 MU 永远最后。
     expect(tickerOrder()[0]).toContain('NVDA');
-    fireEvent.click(within(table).getByRole('button', { name: '按财报排序' }));
+    // 客户端排序不改写服务端排名：NVDA 仍是 #2。
+    expect(within(bodyRows()[0]).getAllByRole('cell')[0]?.textContent).toBe('#2');
+    fireEvent.click(within(table).getByRole('button', { name: '按当前爆发排序' }));
     expect(tickerOrder()[0]).toContain('NVDA');
+  });
+});
+
+describe('IntradayScanTable 今日波段分级 chips（signal v5 grade）', () => {
+  beforeEach(() => {
+    navigateMock.mockReset();
+    vi.mocked(fetchNearExpiryContracts).mockReset();
+    vi.mocked(fetchNearExpiryContracts).mockImplementation(
+      async (symbol: string) => nearExpiryEmpty(symbol),
+    );
+  });
+
+  function legsCandidate(
+    legs: IntradayTopCandidate['sessionBursts']['legs'],
+  ): IntradayTopCandidate {
+    return candidate({
+      sessionBursts: {
+        ...candidate().sessionBursts,
+        state: 'ready',
+        sessionDateEt: '2026-08-04',
+        barCount: 40,
+        medianBasis: 'current_session_bars_so_far',
+        current: {
+          startEt: '10:15',
+          endEt: '10:30',
+          thrustPercent: 1.2,
+          thrustNorm: 3.0,
+          volNorm: 3.0,
+          score: 9.0,
+          direction: 'up',
+        },
+        legs,
+        unavailableReason: null,
+      },
+    });
+  }
+
+  it('renders strong legs as solid warning chips and medium legs as outline chips', () => {
+    const response = {
+      ...topResponse(),
+      candidates: [
+        legsCandidate([
+          {
+            startEt: '09:45',
+            endEt: '10:00',
+            thrustPercent: -5.2,
+            thrustNorm: 5.0,
+            volNorm: 4.6,
+            score: 35.5,
+            direction: 'down',
+            grade: 'strong',
+          },
+          {
+            startEt: '10:30',
+            endEt: '10:45',
+            thrustPercent: 1.1,
+            thrustNorm: 2.0,
+            volNorm: 1.5,
+            score: 3.1,
+            direction: 'up',
+            grade: 'medium',
+          },
+        ]),
+      ],
+      universe: ['NVDA'],
+    };
+    render(<IntradayScanTable data={response} loading={false} error={null} />);
+    const table = screen.getByRole('table', { name: '日内扫描表' });
+    // 强波段＝实底警示 chip。
+    const strongChip = within(table).getByText('09:45↓ 强');
+    expect(strongChip).toHaveClass('text-warning');
+    expect(strongChip).toHaveClass('font-medium');
+    // 中波段＝描边 chip。
+    const mediumChip = within(table).getByText('10:30↑ 中');
+    expect(mediumChip).toHaveClass('border-subtle');
+    expect(mediumChip).not.toHaveClass('text-warning');
+    // 每波明细（含分级）以可访问 aria-label 附带。
+    const detail = within(table).getByLabelText(/波段明细：/);
+    expect(detail.getAttribute('aria-label')).toContain('爆发分 35.5（强波段）');
+    expect(detail.getAttribute('aria-label')).toContain('爆发分 3.1（中波段）');
+  });
+
+  it('renders ungraded legacy legs without inventing a grade', () => {
+    const response = {
+      ...topResponse(),
+      candidates: [
+        legsCandidate([
+          {
+            startEt: '09:40',
+            endEt: '09:55',
+            thrustPercent: 2.0,
+            thrustNorm: 3.0,
+            volNorm: 3.1,
+            score: 9.3,
+            direction: 'up',
+          },
+        ]),
+      ],
+      universe: ['NVDA'],
+    };
+    render(<IntradayScanTable data={response} loading={false} error={null} />);
+    const table = screen.getByRole('table', { name: '日内扫描表' });
+    const chip = within(table).getByText('09:40↑');
+    expect(chip).toHaveClass('border-subtle');
+    expect(chip.textContent).not.toContain('强');
+    expect(chip.textContent).not.toContain('中');
+  });
+
+  it('renders — for zero legs and 标缺 when bursts are unavailable', () => {
+    const response = {
+      ...topResponse(),
+      candidates: [legsCandidate([]), candidate({ ticker: 'MU' })],
+      universe: ['NVDA', 'MU'],
+    };
+    render(<IntradayScanTable data={response} loading={false} error={null} />);
+    const table = screen.getByRole('table', { name: '日内扫描表' });
+    expect(within(table).getByText('本时段无记录波段')).toBeInTheDocument();
+    expect(within(table).getByText('波段读数不可得')).toBeInTheDocument();
   });
 });
 
@@ -430,7 +562,8 @@ describe('IntradayScanTable v4 形态列（styleMatch v1）', () => {
     expect(partialBadge.getAttribute('aria-label')).toContain('形态似 S3 但大盘未走弱');
     // not_matched 的 S2 不渲染徽标。
     expect(within(table).queryByText('S2 跳空托举')).not.toBeInTheDocument();
-    // footer 诚实边界。
+    // 诚实边界原文收进「完整口径」，一键展开可见（隐藏 ≠ 删除）。
+    fireEvent.click(screen.getByRole('button', { name: '展开完整口径说明' }));
     expect(
       screen.getByText(/形态相似度为 v1 几何检测（5m近似），不含你的进场确认帧（2m\/1m 回踩8\/13EMA），不是信号/),
     ).toBeInTheDocument();
@@ -586,10 +719,57 @@ describe('IntradayScanTable watchlist 两层模式（universeScan）', () => {
     expect(within(section).getByText('TSLA')).toBeInTheDocument();
     expect(within(section).getByText('−1.05%')).toBeInTheDocument();
     expect(within(section).getByText('GLW')).toBeInTheDocument();
+    // ≤5 檔时无折叠切换（无可隐藏行）。
+    expect(within(section).queryByText(/展开全部/)).not.toBeInTheDocument();
     // 快照未解析标的显式列出，绝不静默消失。
     expect(
       within(section).getByText(/快照未解析 1 檔（供应商无返回行，显式标缺）：GLW/),
     ).toBeInTheDocument();
+  });
+
+  it('collapses the snapshot-only list to top 5 with an explicit expand toggle', () => {
+    const response = twoTierResponse();
+    const extraRow = (ticker: string, changePercent: number): IntradaySnapshotOnlyRow => ({
+      ticker,
+      state: 'ready',
+      lastPrice: 50.0,
+      changePercent,
+      changeBasis: 'moomoo_snapshot_prev_close',
+      sessionHigh: 51.0,
+      sessionLow: 49.0,
+      volume: 100_000,
+      turnover: 5_000_000,
+      quoteAsOf: '2026-08-04 10:30:04',
+      unavailableReason: null,
+    });
+    response.universeScan = {
+      ...response.universeScan!,
+      snapshotUnresolvedSymbols: [],
+      snapshotOnly: [
+        extraRow('AAPL', 5.1),
+        extraRow('TSLA', -4.2),
+        extraRow('AMD', 3.3),
+        extraRow('META', -2.4),
+        extraRow('AMZN', 1.5),
+        extraRow('GOOG', 0.6),
+        extraRow('NFLX', -0.3),
+      ],
+    };
+    render(<IntradayScanTable data={response} loading={false} error={null} />);
+    const section = screen.getByLabelText('仅快照标的');
+    // 收起态只显示前 5 檔；计数仍如实报告全量。
+    expect(within(section).getByText('仅快照 · 未做深度分析（7 檔）')).toBeInTheDocument();
+    expect(within(section).getByText('AMZN')).toBeInTheDocument();
+    expect(within(section).queryByText('GOOG')).not.toBeInTheDocument();
+    expect(within(section).queryByText('NFLX')).not.toBeInTheDocument();
+    // 一键展开全部（隐藏 ≠ 删除）。
+    const toggle = within(section).getByRole('button', { name: '展开全部 7 檔' });
+    fireEvent.click(toggle);
+    expect(within(section).getByText('GOOG')).toBeInTheDocument();
+    expect(within(section).getByText('NFLX')).toBeInTheDocument();
+    // 再次点击收起。
+    fireEvent.click(within(section).getByRole('button', { name: '收起 · 只显示前 5 檔' }));
+    expect(within(section).queryByText('GOOG')).not.toBeInTheDocument();
   });
 
   it('keeps the legacy single-tier rendering unchanged without universeScan', () => {
@@ -683,7 +863,7 @@ describe('IntradayScanTable watchlist 两层模式（universeScan）', () => {
   });
 });
 
-describe('IntradayScanTable 临期合约 row interaction', () => {
+describe('IntradayScanTable 展开行（研究读数 + 临期合约）', () => {
   beforeEach(() => {
     navigateMock.mockReset();
     vi.mocked(fetchNearExpiryContracts).mockReset();
@@ -700,10 +880,25 @@ describe('IntradayScanTable 临期合约 row interaction', () => {
     expect(navigateMock).toHaveBeenCalledWith('/regime/opportunity/NVDA');
   });
 
-  it('expands the near-expiry panel via the explicit button without navigating', async () => {
+  it('expands secondary metrics and the near-expiry panel via the explicit button', async () => {
     render(<IntradayScanTable data={topResponse()} loading={false} error={null} />);
 
-    fireEvent.click(screen.getByLabelText('展开 NVDA 临期合约'));
+    fireEvent.click(screen.getByLabelText('展开 NVDA 研究读数与临期合约'));
+
+    // 研究读数网格：从默认网格移出的次要指标一键可达。
+    const readouts = screen.getByLabelText('NVDA 研究读数');
+    expect(within(readouts).getByText('量能节奏')).toBeInTheDocument();
+    expect(within(readouts).getByText('2.5×')).toBeInTheDocument();
+    expect(within(readouts).getByText('vs 20日全日中位')).toBeInTheDocument();
+    expect(within(readouts).getByText('缺口')).toBeInTheDocument();
+    expect(within(readouts).getByText('+3.23%')).toBeInTheDocument();
+    expect(within(readouts).getByText('波幅扩张(ATR)')).toBeInTheDocument();
+    expect(within(readouts).getByText('VWAP 持平')).toBeInTheDocument();
+    expect(within(readouts).getByText('0 笔')).toBeInTheDocument();
+    // 财报标缺全文与研究状态也在读数网格中，标缺语义不变。
+    expect(within(readouts).getByText('财报日历不可得 · 未知≠安全')).toBeInTheDocument();
+    expect(within(readouts).getByText('盘中活跃')).toBeInTheDocument();
+    expect(within(readouts).getByText('3 项证据支持')).toBeInTheDocument();
 
     await waitFor(() => {
       expect(screen.getByLabelText('NVDA 临期合约')).toBeInTheDocument();
@@ -712,22 +907,57 @@ describe('IntradayScanTable 临期合约 row interaction', () => {
     expect(fetchNearExpiryContracts).toHaveBeenCalledWith('NVDA', 3, { refresh: false });
 
     // 再次点击收起。
-    fireEvent.click(screen.getByLabelText('展开 NVDA 临期合约'));
+    fireEvent.click(screen.getByLabelText('展开 NVDA 研究读数与临期合约'));
     expect(screen.queryByLabelText('NVDA 临期合约')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('NVDA 研究读数')).not.toBeInTheDocument();
   });
 
   it('keeps a single expanded row so the table stays usable', async () => {
     render(<IntradayScanTable data={topResponse()} loading={false} error={null} />);
 
-    fireEvent.click(screen.getByLabelText('展开 NVDA 临期合约'));
+    fireEvent.click(screen.getByLabelText('展开 NVDA 研究读数与临期合约'));
     await waitFor(() => {
       expect(screen.getByLabelText('NVDA 临期合约')).toBeInTheDocument();
     });
 
-    fireEvent.click(screen.getByLabelText('展开 MU 临期合约'));
+    fireEvent.click(screen.getByLabelText('展开 MU 研究读数与临期合约'));
     await waitFor(() => {
       expect(screen.getByLabelText('MU 临期合约')).toBeInTheDocument();
     });
     expect(screen.queryByLabelText('NVDA 临期合约')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('NVDA 研究读数')).not.toBeInTheDocument();
+  });
+});
+
+describe('IntradayScanTable footer 口径两级展示', () => {
+  beforeEach(() => {
+    navigateMock.mockReset();
+    vi.mocked(fetchNearExpiryContracts).mockReset();
+    vi.mocked(fetchNearExpiryContracts).mockImplementation(
+      async (symbol: string) => nearExpiryEmpty(symbol),
+    );
+  });
+
+  it('shows one short methodology line by default and the full text behind 完整口径', () => {
+    render(<IntradayScanTable data={topResponse()} loading={false} error={null} />);
+
+    // 默认只有一行简短口径说明（含 v5 波段分级图例），公式墙收起。
+    expect(screen.getByText(/排序与口径说明：盘中排序＝爆发分优先/)).toBeInTheDocument();
+    expect(screen.getByText(/强＝爆发分 ≥8 暴动 \/ 中＝≥2.5 持续推升/)).toBeInTheDocument();
+    expect(screen.queryByText(/当前爆发＝最近 15 分钟（3 根 5m K 线）/)).not.toBeInTheDocument();
+
+    // 一键展开完整口径：原文逐字可见（隐藏 ≠ 删除）。
+    const toggle = screen.getByRole('button', { name: '展开完整口径说明' });
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByText(/当前爆发＝最近 15 分钟（3 根 5m K 线）/)).toBeInTheDocument();
+    expect(screen.getByText(/减速=你的离场信号，R1/)).toBeInTheDocument();
+    expect(screen.getByText(/系统标注，用户过滤：不隐藏行、不阻断操作、不参与排序/)).toBeInTheDocument();
+    expect(screen.getByText(/期权异动＝最近一页 Moomoo 分类计数，不推断开平仓/)).toBeInTheDocument();
+
+    // 再次点击收起。
+    fireEvent.click(toggle);
+    expect(screen.queryByText(/当前爆发＝最近 15 分钟（3 根 5m K 线）/)).not.toBeInTheDocument();
   });
 });

@@ -435,6 +435,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] 日内两层扫描盘前时段（ET 04:00–09:30）改按真实盘前口径晋升与排序（`gate_basis=premarket_pre_price_change_then_pre_turnover_v1`：|pre_change_rate|（盘前价 vs 上一常规收盘，可为负）→ pre_turnover）：Moomoo 常规快照字段在盘前仍指向上一常规时段，原口径会把昨天的异动复现成今晨深度榜；缺盘前字段的行不可晋升且宽层恒排最后，整批无盘前字段时显式回退常规口径并在 `universe_scan.gate_warnings` 携带 `premarket_fields_unavailable_ranking_reflects_prior_session`；宽层行 additive 携带 `pre_change_percent`/`pre_turnover`（缺列＝null 绝不 0 回填）；前端盘前口径下页头/footer 附「盘前异动排序（盘前价 vs 前收 · 盘前成交额次序）」、仅快照行展示「盘前 ±x%」与盘前成交额（缺盘前字段显式「盘前标缺」）、回退时显示「盘前字段不可用 · 当前排序反映上一常规时段」警示。
 - [测试] 盘前闸门契约测试 +3（盘前口径按 |盘前涨跌|→盘前成交额 晋升且上一时段最大异动因缺盘前字段绝不晋升、整批无盘前字段显式回退+警示、常规时段无视盘前字段且口径与警示逐字节回归）+ Moomoo 快照解析器盘前字段单测（负 pre_change_rate 合法、pre_price 零/负与非法值/缺列一律 None）；前端 IntradayScanTable +3（盘前口径页头/footer 标注、盘前读数 chip 与盘前标缺行诚实渲染、回退警示 chip、常规时段无盘前标注回归）。
 - [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` §2.11 新增盘前口径小节（常规快照字段盘前指向上一常规时段的语义、pre_change_rate 相对上一常规收盘口径、回退警示诚实边界与前端标注）；根 README 不承载日内闸门细节，故未改动。
+- [改进] 日内扫描表改为两级布局：默认网格收敛为 9 列交易关键读数（排名/标的/涨跌%/当前爆发/今日波段/速度/形态/波段vs大盘/详情），深度位与财报警示徽标并入标的格次行（日历标缺显式「财报标缺 · 未知≠安全」），「大盘」列改名「波段vs大盘」并加列头 tooltip 澄清「当前波段方向 vs SPY VWAP 位置、非个股涨跌方向」；量能节奏/缺口/波幅扩张/VWAP/期权异动/财报全文/研究状态移入行内展开的「研究读数」网格（临期合约面板上方），仅快照列表默认只显示前 5 檔可一键展开，footer 收敛为一行口径说明 +「完整口径」切换（完整公式墙原文逐字保留）——重排可见性不删除任何读数，标缺语义与共享 Tooltip 无障碍标注不变。
+- [新功能] 日内扫描「今日波段」列接入 signal v5 波段分级：burst leg 类型新增 additive `grade` 字段（strong＝爆发分 ≥8 暴动 / medium＝≥2.5 持续推升），前端以「09:45↓ 强」实底警示 chip 与「10:00↑ 中」描边 chip 呈现，每波分级并入 aria-label 波段明细；缺 grade 的旧载荷渲染无分级 chip，绝不发明分级。
+- [测试] IntradayScanTable 测试更新至两级布局（20 例全过）：新增 9 列默认网格与次要指标不入首屏、强/中/无分级波段 chip 与空态/标缺、仅快照列表前 5 檔折叠与展开切换、展开行研究读数网格、footer 短行 + 完整口径切换、按当前爆发排序标缺行恒最后且服务端排名不改写等回归。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` §2.8 扫描表列清单更新为 9 列默认网格并注明两级布局与 v5 波段分级 chips；根 README 不承载日内列级细节，故未改动。
 
 ## [3.11.0] - 2026-03-27
 

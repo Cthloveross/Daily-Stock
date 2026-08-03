@@ -746,6 +746,11 @@ export interface IntradayBurstWindow {
   volNorm: number | null;
   score: number | null;
   direction: 'up' | 'down' | 'flat';
+  /**
+   * v5 波段分级（additive）：strong＝强波段（爆发分 ≥8 暴动）、
+   * medium＝中波段（≥2.5 持续推升）；旧载荷可省略，缺席时不发明分级。
+   */
+  grade?: 'strong' | 'medium';
 }
 
 /** v3 速度分级：相邻两个滚动 15 分钟窗口爆发分之差（5m K 线近似）。 */
