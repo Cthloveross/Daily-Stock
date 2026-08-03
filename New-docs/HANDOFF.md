@@ -94,7 +94,7 @@
 | GitHub | 分支 `codex/options-research-workbench` 已推送，PR #3 打开，远端 `main` 仍为基线 `4dc04fd` | 用户合并 PR #3 后 main 才含全部功能 |
 | 本地 Git | 工作树干净，HEAD 与远端分支同步（见 `git log --oneline -5`） | 每轮功能经双 gate + 真实页面验收后单独 commit+push（用户已授权本分支） |
 | CI | 本地 `./scripts/ci_gate.sh` 在 HEAD 全绿（2,861 passed）+ Node 22 web gate 全绿；PR #3 远端 CI 逐提交重跑 | 合并前以 PR 页最新提交的远端 CI 为准 |
-| 最大风险 | build #3 未激活（用户决策）、旧 moomoo-sync LaunchAgent 每 15 分钟空转报「已暂停」（F-1 清理待确认）、周一实战验证未发生 | 先完成实战验证，再谈下一批功能 |
+| 最大风险 | build #3 未激活（用户决策）、旧 moomoo-sync LaunchAgent 每 15 分钟空转报「已暂停」（F-1 清理待确认） | 2026-08-03 首个实战日全链路验证通过（62 波账本、G-12/13/14 实战驱动修复当日落地）；后续以用户复盘打标积累与用户门控项为主 |
 
 ### 1.1 “本地和 GitHub 都有了吗”的准确答案
 
