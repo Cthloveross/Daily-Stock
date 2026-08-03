@@ -1179,7 +1179,10 @@ class IntradayDeepLaneReason(BaseModel):
 
     promoted_by: Literal["plan_always_include", "mover_rank"]
     mover_rank: Optional[int] = Field(default=None, ge=1)
-    basis: Literal["abs_change_percent_then_turnover_v1"]
+    basis: Literal[
+        "abs_change_percent_then_turnover_v1",
+        "premarket_pre_price_change_then_pre_turnover_v1",
+    ]
 
 
 class IntradaySnapshotOnlyRow(BaseModel):
@@ -1199,6 +1202,10 @@ class IntradaySnapshotOnlyRow(BaseModel):
     turnover: Optional[float] = Field(default=None, ge=0)
     quote_as_of: Optional[str] = None
     unavailable_reason: Optional[str] = None
+    # 盘前专用读数（additive）：盘前时段常规字段仍指向上一常规时段，真实
+    # 盘前变动在 pre_*；快照缺列即 None（标缺），绝不 0 回填。
+    pre_change_percent: Optional[float] = None
+    pre_turnover: Optional[float] = Field(default=None, ge=0)
 
 
 class IntradayDeepLaneEntry(BaseModel):
@@ -1217,7 +1224,11 @@ class IntradayUniverseScan(BaseModel):
     """
 
     mode: Literal["watchlist_two_tier"]
-    gate_basis: Literal["abs_change_percent_then_turnover_v1"]
+    gate_basis: Literal[
+        "abs_change_percent_then_turnover_v1",
+        "premarket_pre_price_change_then_pre_turnover_v1",
+    ]
+    gate_warnings: list[str] = Field(default_factory=list)
     watchlist_total: int = Field(ge=0)
     watchlist_truncated: bool = False
     scanned_total: int = Field(ge=0)

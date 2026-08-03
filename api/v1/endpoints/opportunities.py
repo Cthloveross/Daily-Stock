@@ -217,6 +217,17 @@ _INTRADAY_WATCHLIST_MAX_SYMBOLS = 200
 _MOOMOO_SNAPSHOT_MAX_CODES_PER_REQUEST = 400  # 官方文档单次快照上限
 _INTRADAY_DEEP_DAILY_DISTINCT_CAP = 30
 _INTRADAY_TWO_TIER_GATE_BASIS = "abs_change_percent_then_turnover_v1"
+# 盘前时段（ET 04:00–09:30）：Moomoo 常规快照字段仍指向上一常规时段，
+# 真实盘前变动只在 pre_* 字段。盘前闸门按 |pre_change_rate|→pre_turnover
+# 排序；缺盘前字段的标的不可按盘前异动晋升（绝不以 0 冒充「平静」）。
+# 若整批快照都无盘前字段（权限缺失等），显式回退常规口径并携带警示，
+# 绝不静默假装在按盘前排序。
+_INTRADAY_TWO_TIER_PREMARKET_GATE_BASIS = (
+    "premarket_pre_price_change_then_pre_turnover_v1"
+)
+_INTRADAY_PREMARKET_FIELDS_UNAVAILABLE_WARNING = (
+    "premarket_fields_unavailable_ranking_reflects_prior_session"
+)
 # 今日冻结盘前计划标的（深度层钉选）只读缓存：计划盘前冻结后当日不变。
 _INTRADAY_PLAN_CACHE_TTL_SECONDS = 300.0
 _INTRADAY_TWO_TIER_LIMITATIONS = (
@@ -2459,6 +2470,10 @@ def _intraday_wide_snapshot_row(
         volume=getattr(quote, "volume", None),
         turnover=getattr(quote, "turnover", None),
         quote_as_of=getattr(quote, "update_time", None),
+        # 盘前专用读数（additive）：盘前时段常规字段仍指向上一常规时段，
+        # 真实盘前变动在 pre_* 字段；缺列 None，绝不 0 回填。
+        pre_change_percent=getattr(quote, "pre_change_rate", None),
+        pre_turnover=getattr(quote, "pre_turnover", None),
     )
     if last_price is None:
         row["unavailable_reason"] = "missing_last_price"
@@ -2471,23 +2486,31 @@ def _intraday_wide_snapshot_row(
 
 
 def _rank_intraday_movers(
-    wide_rows: list[dict[str, Any]], *, exclude: set[str]
+    wide_rows: list[dict[str, Any]],
+    *,
+    exclude: set[str],
+    premarket: bool = False,
 ) -> list[str]:
     """异动闸门 v1：|涨跌幅| 主序、成交额次序、代码字典序兜底（确定性）。
 
     缺 change_percent 的行（快照未解析/缺前收）不可按异动晋升——闸门绝不
     以 0 涨跌冒充「平静」，这些行留在宽层并显式标缺。
+
+    ``premarket=True`` 时改用盘前口径：|pre_change_percent| 主序、
+    pre_turnover 次序；缺盘前字段的行同样不可晋升（语义一致）。
     """
 
+    change_key = "pre_change_percent" if premarket else "change_percent"
+    turnover_key = "pre_turnover" if premarket else "turnover"
     ranked = [
         row
         for row in wide_rows
-        if row["ticker"] not in exclude and row.get("change_percent") is not None
+        if row["ticker"] not in exclude and row.get(change_key) is not None
     ]
     ranked.sort(
         key=lambda row: (
-            -abs(row["change_percent"]),
-            -(row["turnover"] if row.get("turnover") is not None else -1.0),
+            -abs(row[change_key]),
+            -(row[turnover_key] if row.get(turnover_key) is not None else -1.0),
             row["ticker"],
         )
     )
@@ -2559,8 +2582,25 @@ def _execute_intraday_top_two_tier(
     ]
 
     # -- 异动闸门（movers gate，v1 启发式）------------------------------------
+    # 盘前时段常规快照字段仍指向上一常规时段：若此时按 change_percent 排序，
+    # 深度榜会复现上一时段的异动而非今晨盘前的真实异动。盘前改用 pre_* 口径；
+    # 整批无盘前字段时显式回退 + 警示，绝不静默。
     plan_set = set(plan_tickers)
-    mover_order = _rank_intraday_movers(wide_rows, exclude=plan_set)
+    session_phase_now = market_session_phase(requested_at)
+    premarket_gate = session_phase_now == "premarket" and any(
+        row.get("pre_change_percent") is not None for row in wide_rows
+    )
+    gate_basis = (
+        _INTRADAY_TWO_TIER_PREMARKET_GATE_BASIS
+        if premarket_gate
+        else _INTRADAY_TWO_TIER_GATE_BASIS
+    )
+    gate_warnings: list[str] = []
+    if session_phase_now == "premarket" and not premarket_gate:
+        gate_warnings.append(_INTRADAY_PREMARKET_FIELDS_UNAVAILABLE_WARNING)
+    mover_order = _rank_intraday_movers(
+        wide_rows, exclude=plan_set, premarket=premarket_gate
+    )
     mover_rank_by_symbol = {
         symbol: rank for rank, symbol in enumerate(mover_order, start=1)
     }
@@ -2667,12 +2707,12 @@ def _execute_intraday_top_two_tier(
             return {
                 "promoted_by": "plan_always_include",
                 "mover_rank": None,
-                "basis": _INTRADAY_TWO_TIER_GATE_BASIS,
+                "basis": gate_basis,
             }
         return {
             "promoted_by": "mover_rank",
             "mover_rank": mover_rank_by_symbol.get(symbol),
-            "basis": _INTRADAY_TWO_TIER_GATE_BASIS,
+            "basis": gate_basis,
         }
 
     for candidate in run["candidates"]:
@@ -2681,12 +2721,13 @@ def _execute_intraday_top_two_tier(
             str(candidate.get("ticker") or "")
         )
 
-    # 宽层剩余标的：按 |涨跌幅| 降序（标缺行恒排最后），诚实可见。
+    # 宽层剩余标的：按闸门同口径降序（标缺行恒排最后），诚实可见。
+    _snapshot_sort_key = "pre_change_percent" if premarket_gate else "change_percent"
     snapshot_only = sorted(
         (row for row in wide_rows if row["ticker"] not in deep_set),
         key=lambda row: (
-            0 if row.get("change_percent") is not None else 1,
-            -abs(row.get("change_percent") or 0.0),
+            0 if row.get(_snapshot_sort_key) is not None else 1,
+            -abs(row.get(_snapshot_sort_key) or 0.0),
             row["ticker"],
         ),
     )
@@ -2695,7 +2736,8 @@ def _execute_intraday_top_two_tier(
     run["universe"] = list(supported)
     run["universe_scan"] = {
         "mode": "watchlist_two_tier",
-        "gate_basis": _INTRADAY_TWO_TIER_GATE_BASIS,
+        "gate_basis": gate_basis,
+        "gate_warnings": gate_warnings,
         "watchlist_total": watchlist_configured_total,
         "watchlist_truncated": watchlist_configured_total > len(watchlist),
         "scanned_total": len(supported),

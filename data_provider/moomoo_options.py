@@ -363,6 +363,13 @@ class MoomooUnderlyingSessionQuote:
     volume: Optional[int]
     turnover: Optional[float]
     update_time: Optional[str]
+    # 美股盘前专用字段（additive）：盘前时段常规字段仍指向上一常规时段，
+    # 真实盘前变动只在 pre_* 字段里（pre_change_rate 为相对上一常规收盘的
+    # 百分比，可为负）。快照缺列或值非法一律 None，绝不 0 回填。
+    pre_price: Optional[float] = None
+    pre_change_rate: Optional[float] = None
+    pre_volume: Optional[int] = None
+    pre_turnover: Optional[float] = None
 
 
 def fetch_underlying_session_quotes_moomoo(
@@ -439,6 +446,10 @@ def fetch_underlying_session_quotes_moomoo(
             volume=_valid_nonnegative_int(item.get("volume")),
             turnover=_valid_nonnegative_float(item.get("turnover")),
             update_time=_safe_text(item.get("update_time")),
+            pre_price=_valid_positive_float(item.get("pre_price")),
+            pre_change_rate=_safe_float(item.get("pre_change_rate")),
+            pre_volume=_valid_nonnegative_int(item.get("pre_volume")),
+            pre_turnover=_valid_nonnegative_float(item.get("pre_turnover")),
         )
     return result
 
