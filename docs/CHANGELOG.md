@@ -428,6 +428,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [测试] `test_near_expiry_contracts_endpoint.py` +5（回避窗内 3/5/basis 断言、窗外 ready 不标注且不串其他标的、日历 unavailable 诚实、Moomoo 禁用仍带字段、扫描车道已加载日历时临期面板零第二次区间调用）+ autouse Finnhub 日历桩（既有用例绝不打真实 Finnhub）；前端面板 +5（回避窗徽标、今日财报文案、窗外零标注、标缺小字、旧载荷缺字段按标缺）；真实 TestClient 验收：SNDK 财报 2026-08-05（3 天内 → within_blackout=true）、AAPL 窗口内无财报（false），两标的共享一次日历区间调用。
 - [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` §2.9 前端小节新增财报临近一行（字段形状、复用口径、三种渲染状态）；根 README 不承载面板级细节，故未改动。
 - [文档] `New-docs/HANDOFF.md` §1「一屏结论」与 §1.1 同步 2026-08-02 真实状态（分支已推送 + PR #3、canonical set #2 与 build #3 未激活、日内工作台 G-1..G-10、周内榜 21:12 自动发布就绪、moomoo-sync 旧 LaunchAgent 待 F-1 清理），§1.2 浏览器核对清单新增 `/intraday` 交易日主屏。
+- [新功能] 日内扫描新增 watchlist v1 两层 universe（`INTRADAY_WATCHLIST` + `INTRADAY_DEEP_LANE_MAX`，默认不配置＝行为与现状逐字节一致）：宽层每 60 秒仅 1 次 Moomoo 批量快照覆盖全清单（≤200 档，官方单次上限 400），异动闸门按 |当日涨跌幅|→成交额 晋升前 K 档（默认 12，1..20）进入既有 v4 深度管线，当日冻结盘前计划标的始终占深度位不占 K 名额；响应新增 additive `universe_scan` 块与逐候选 `scan_tier`/`deep_lane_reason`，宽层行只有快照字段、深度读数缺席即缺席。
+- [改进] 深度层 5m K 线额度按 Moomoo `request_history_kline` 真实配额语义设计（30 天滚动窗口去重标的数、账户档位 100 起、同标的重复请求不扣额）：晋升去重上界＝清单长度，另设每 ET 日新晋升去重标的数护栏 30 档（内部常量），触顶如实标注 `day_promotion_cap_reached`；前端页头/footer 改为「全清单 N 檔快照 · 深度分析前 K 檔 · 其余仅快照」，表下新增「仅快照 · 未做深度分析」紧凑列表（含快照未解析点名与截断警示），深度行附「计划钉选/异动 #n」徽标。
+- [测试] 新增 `api/v1/tests/test_intraday_top_two_tier.py`（8：未配置清单回归锁定、显式 symbols 绕过两层、单快照批次+闸门排序+宽层无深度字段、计划钉选去重不占 K、日晋升护栏、Moomoo 禁用诚实降级、清单显式截断、K 值钳制）；既有空 symbols 回归用例固定清单未配置；前端 IntradayScanTable +4（两层页头/footer/徽标、仅快照列表与未解析点名、无 universeScan 单层渲染回归、日护栏警示行）。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` 新增 §2.11 两层扫描（启用条件与回滚＝取消 `INTRADAY_WATCHLIST`、闸门口径、K 线配额语义、每周期请求预算、additive 响应合同）；`.env.example` 新增两键中文说明与用户实际 69 档清单示例值；根 README 不承载日内 universe 细节，故未改动。
 
 ## [3.11.0] - 2026-03-27
 

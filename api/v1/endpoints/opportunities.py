@@ -198,6 +198,38 @@ _INTRADAY_EARNINGS_SOURCE = "finnhub_earnings_calendar"
 # here — they go through the shared 30s scan cache only.
 _INTRADAY_DAILY_CACHE_TTL_SECONDS = 900.0
 _INTRADAY_DAILY_CACHE_MAX_ENTRIES = 64
+# --- watchlist v1 两层扫描（INTRADAY_WATCHLIST 配置后启用；未配置零改动）---
+# 宽层（tier-1）：整个清单每个 60 秒轮询周期只发 1 次 Moomoo
+# ``get_market_snapshot`` 批量快照（官方单次上限 400 个代码）。清单上限 200
+# （含 SPY 与计划钉选后仍 << 400），因此永远单请求、无需分片；超出部分显式
+# 截断并在 universe_scan 中如实标注 watchlist_truncated，绝不无声丢弃。
+# 深度层（tier-2）：仅晋升标的走既有 v4 管线。其中 5m K 线经
+# StockService.get_history_data → DataFetcherManager.get_intraday_data 优先命中
+# Moomoo ``request_history_kline``（失败回退 yfinance）。Moomoo 历史 K 线额度
+# 语义（官方 API Limits）：**30 天滚动窗口内的去重标的数**配额，账户档位
+# 100/300/1000/2000；同一标的 30 天内重复请求不再扣额，同一标的的日线 / 5m
+# 等不同周期只记 1 个额度。因此深度层的真实约束是「30 天内晋升过的去重标的
+# 数」，其上界＝清单长度（晋升只会从清单 + 当日计划中产生）；为防单日异常
+# 轮换（movers 高频换血）另设每 ET 日新晋升去重标的数上限（内部常量，非
+# 环境变量）。触顶后新标的当日只保留宽层快照行并在 universe_scan 标注
+# day_promotion_cap_reached，绝不静默丢弃。
+_INTRADAY_WATCHLIST_MAX_SYMBOLS = 200
+_MOOMOO_SNAPSHOT_MAX_CODES_PER_REQUEST = 400  # 官方文档单次快照上限
+_INTRADAY_DEEP_DAILY_DISTINCT_CAP = 30
+_INTRADAY_TWO_TIER_GATE_BASIS = "abs_change_percent_then_turnover_v1"
+# 今日冻结盘前计划标的（深度层钉选）只读缓存：计划盘前冻结后当日不变。
+_INTRADAY_PLAN_CACHE_TTL_SECONDS = 300.0
+_INTRADAY_TWO_TIER_LIMITATIONS = (
+    "两层扫描：全清单每轮仅一次批量快照；只有异动闸门晋升的标的做深度分析"
+    "（波段爆发/形态/速度/异动/财报），其余标的仅快照、对应字段一律缺席，"
+    "绝不虚构。",
+    "异动闸门为 v1 启发式：按 |当日涨跌幅| 主序、成交额次序晋升前 K 档；"
+    "当日冻结盘前计划标的始终占深度位，不占 K 名额。闸门不是信号，"
+    "晋升不代表方向或质量结论。",
+    "深度层 5m K 线走 Moomoo request_history_kline（30 天滚动去重标的数配额，"
+    "账户档位 100 起）；每 ET 日新晋升去重标的数另设内部上限，触顶后新标的"
+    "当日仅保留快照行并显式标注。",
+)
 _INTRADAY_TRACKING_LIMITATIONS = (
     "盘中跟踪只对照已冻结的盘前计划，不重新排序，不生成买卖信号。",
     "VWAP 为当日累计成交额 ÷ 累计成交量的近似值，不是逐笔加权的官方 VWAP。",
@@ -267,6 +299,9 @@ _intraday_daily_cache: dict[tuple[str, str], _ScanCacheEntry] = {}
 _intraday_burst_cache: dict[tuple[str, str, str], _ScanCacheEntry] = {}
 _intraday_earnings_cache: dict[str, _ScanCacheEntry] = {}
 _intraday_playbook_cache: dict[str, _ScanCacheEntry] = {}
+_intraday_plan_cache: dict[str, _ScanCacheEntry] = {}
+# 每 ET 日已进入深度层的去重标的集合（额度护栏，语义见上方常量注释）。
+_intraday_deep_promotion_log: dict[str, set[str]] = {}
 
 
 def _cache_now() -> float:
@@ -383,6 +418,8 @@ def _reset_scan_cache_for_tests() -> None:
         _intraday_burst_cache.clear()
         _intraday_earnings_cache.clear()
         _intraday_playbook_cache.clear()
+        _intraday_plan_cache.clear()
+        _intraday_deep_promotion_log.clear()
         for flight in _scan_flights.values():
             if flight.error is None:
                 flight.error = OpportunityScanTimeoutError(
@@ -526,6 +563,32 @@ def _configured_symbols() -> list[str]:
     if isinstance(configured, str):
         configured = configured.split(",")
     return normalize_symbols([str(item) for item in configured])[:20]
+
+
+def _configured_intraday_watchlist() -> list[str]:
+    """Read the two-tier wide-lane watchlist; empty = feature off (现状不变)."""
+
+    from src.config import get_config
+
+    configured = getattr(get_config(), "intraday_watchlist", None) or []
+    if isinstance(configured, str):
+        configured = configured.split(",")
+    return normalize_symbols([str(item) for item in configured])
+
+
+def _configured_deep_lane_max() -> int:
+    """INTRADAY_DEEP_LANE_MAX，双重钳制 1..20（config 解析已钳，此处兜底）。"""
+
+    from src.config import get_config
+
+    raw = getattr(get_config(), "intraday_deep_lane_max", 12)
+    if raw is None:
+        return 12
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 12
+    return max(1, min(20, value))
 
 
 def _premarket_scheduler_enabled() -> bool:
@@ -2307,6 +2370,357 @@ def _execute_intraday_top(
     )
 
 
+def _todays_plan_tickers(market_date_et: str) -> list[str]:
+    """今日已冻结盘前计划的标的（只读，深度层永远钉选）。
+
+    计划盘前冻结后当日不再变化，按 ET 日期缓存 5 分钟；读取失败只让钉选
+    集合为空（深度层退化为纯 movers），绝不 500 日内榜、绝不写入任何数据。
+    """
+
+    now = _cache_now()
+    with _scan_cache_lock:
+        entry = _intraday_plan_cache.get(market_date_et)
+        if entry is not None and entry.expires_at > now:
+            return list(entry.result.get("tickers") or [])
+
+    tickers: list[str] = []
+    try:
+        from src.opportunities.repository import list_snapshots
+
+        for snapshot in list_snapshots(limit=10):
+            if snapshot.market_date_et.isoformat() != market_date_et:
+                continue
+            for candidate in snapshot.candidates:
+                symbol = str(candidate.ticker or "").strip().upper()
+                if symbol and symbol not in tickers:
+                    tickers.append(symbol)
+    except Exception as exc:  # noqa: BLE001 - plan pinning must not 500 the board
+        logger.debug(
+            "[opportunities] intraday plan tickers unavailable error_type=%s",
+            type(exc).__name__,
+        )
+        return []
+
+    completion_time = _cache_now()
+    with _scan_cache_lock:
+        _intraday_plan_cache[market_date_et] = _ScanCacheEntry(
+            expires_at=completion_time + _INTRADAY_PLAN_CACHE_TTL_SECONDS,
+            result={"tickers": list(tickers)},
+        )
+        for key in [k for k in _intraday_plan_cache if k != market_date_et]:
+            _intraday_plan_cache.pop(key, None)
+    return tickers
+
+
+def _intraday_wide_snapshot_row(
+    symbol: str, quote: Any, *, enabled: bool
+) -> dict[str, Any]:
+    """宽层（仅快照）单行：只有快照可得字段，绝不虚构深度层读数。
+
+    行内没有任何爆发/形态/速度/异动字段——那些属于深度层；缺失即缺席，
+    不以 null 占位冒充「已分析但为空」。
+    """
+
+    row: dict[str, Any] = {
+        "ticker": symbol,
+        "state": "unavailable",
+        "last_price": None,
+        "change_percent": None,
+        "change_basis": "moomoo_snapshot_prev_close",
+        "session_high": None,
+        "session_low": None,
+        "volume": None,
+        "turnover": None,
+        "quote_as_of": None,
+        "unavailable_reason": None,
+    }
+    if not enabled:
+        row["unavailable_reason"] = "moomoo_not_configured"
+        return row
+    if quote is None:
+        row["unavailable_reason"] = "snapshot_missing"
+        return row
+    last_price = getattr(quote, "last_price", None)
+    prev_close = getattr(quote, "prev_close_price", None)
+    change_percent: Optional[float] = None
+    if (
+        last_price is not None
+        and prev_close is not None
+        and prev_close > 0
+        and math.isfinite(last_price)
+        and math.isfinite(prev_close)
+    ):
+        change_percent = round((last_price / prev_close - 1.0) * 100.0, 6)
+    row.update(
+        last_price=last_price,
+        change_percent=change_percent,
+        session_high=getattr(quote, "high_price", None),
+        session_low=getattr(quote, "low_price", None),
+        volume=getattr(quote, "volume", None),
+        turnover=getattr(quote, "turnover", None),
+        quote_as_of=getattr(quote, "update_time", None),
+    )
+    if last_price is None:
+        row["unavailable_reason"] = "missing_last_price"
+    elif change_percent is None:
+        row["state"] = "partial"
+        row["unavailable_reason"] = "missing_snapshot_prev_close"
+    else:
+        row["state"] = "ready"
+    return row
+
+
+def _rank_intraday_movers(
+    wide_rows: list[dict[str, Any]], *, exclude: set[str]
+) -> list[str]:
+    """异动闸门 v1：|涨跌幅| 主序、成交额次序、代码字典序兜底（确定性）。
+
+    缺 change_percent 的行（快照未解析/缺前收）不可按异动晋升——闸门绝不
+    以 0 涨跌冒充「平静」，这些行留在宽层并显式标缺。
+    """
+
+    ranked = [
+        row
+        for row in wide_rows
+        if row["ticker"] not in exclude and row.get("change_percent") is not None
+    ]
+    ranked.sort(
+        key=lambda row: (
+            -abs(row["change_percent"]),
+            -(row["turnover"] if row.get("turnover") is not None else -1.0),
+            row["ticker"],
+        )
+    )
+    return [row["ticker"] for row in ranked]
+
+
+def _execute_intraday_top_two_tier(
+    watchlist: list[str],
+    limit: int,
+    *,
+    enabled: bool,
+    deep_lane_max: int,
+    watchlist_configured_total: int,
+) -> dict[str, Any]:
+    """watchlist v1 两层扫描：一次批量快照的宽层 + 异动闸门晋升的深度层。
+
+    宽层每轮只发 1 次 ``get_market_snapshot``（清单 + 计划钉选 + SPY 并入
+    同一批；单次官方上限 400，本清单有界 200 恒为单请求）。深度层完全复用
+    单层模式的 v4 管线（爆发/形态/速度/异动/财报/合约面板资格），只对晋升
+    标的执行；宽层其余标的仅保留快照行，深度字段一律缺席。额度语义与每日
+    晋升护栏见模块常量 ``_INTRADAY_DEEP_DAILY_DISTINCT_CAP`` 注释。
+    """
+
+    requested_at = _intraday_now()
+    market_date_et = requested_at.astimezone(_NEW_YORK).date().isoformat()
+    session_state = market_session_state(requested_at)
+
+    plan_tickers_all = _todays_plan_tickers(market_date_et)
+    # 扫描 universe = 清单 ∪ 今日计划：计划标的并入同一批快照（仍 1 次请求），
+    # 即使不在清单里也能拿到深度层所需的会话快照。
+    scan_symbols = normalize_symbols([*watchlist, *plan_tickers_all])
+    supported = [
+        symbol for symbol in scan_symbols if is_supported_us_option_underlying(symbol)
+    ]
+    unsupported = [
+        symbol
+        for symbol in scan_symbols
+        if not is_supported_us_option_underlying(symbol)
+    ]
+    supported_set = set(supported)
+    plan_tickers = [
+        symbol for symbol in plan_tickers_all if symbol in supported_set
+    ]
+
+    # -- Tier 1：一次批量快照（SPY 并入，不新增请求次数）---------------------
+    raw_quotes: dict[str, Any] = {}
+    if enabled and supported:
+        quote_symbols = list(supported)
+        if MARKET_CONTEXT_TICKER not in quote_symbols:
+            quote_symbols.append(MARKET_CONTEXT_TICKER)
+        try:
+            raw_quotes = _fetch_underlying_session_quotes(quote_symbols) or {}
+        except Exception as exc:  # noqa: BLE001 - fail the batch closed per symbol
+            logger.debug(
+                "[opportunities] intraday two-tier snapshot unavailable: %s", exc
+            )
+            raw_quotes = {}
+    spy_raw = raw_quotes.get(MARKET_CONTEXT_TICKER)
+    spy_quote = _quote_to_intraday_input(spy_raw) if spy_raw is not None else None
+
+    wide_rows = [
+        _intraday_wide_snapshot_row(symbol, raw_quotes.get(symbol), enabled=enabled)
+        for symbol in supported
+    ]
+    snapshot_unresolved = [
+        symbol
+        for symbol in supported
+        if enabled and raw_quotes.get(symbol) is None
+    ]
+
+    # -- 异动闸门（movers gate，v1 启发式）------------------------------------
+    plan_set = set(plan_tickers)
+    mover_order = _rank_intraday_movers(wide_rows, exclude=plan_set)
+    mover_rank_by_symbol = {
+        symbol: rank for rank, symbol in enumerate(mover_order, start=1)
+    }
+
+    promoted_movers: list[str] = []
+    day_cap_reached = False
+    with _scan_cache_lock:
+        promoted_today = _intraday_deep_promotion_log.setdefault(
+            market_date_et, set()
+        )
+        for key in [k for k in _intraday_deep_promotion_log if k != market_date_et]:
+            _intraday_deep_promotion_log.pop(key, None)
+        # 计划钉选不受日上限约束，但计入当日去重集合（额度语义一致）。
+        promoted_today.update(plan_tickers)
+        for symbol in mover_order:
+            if len(promoted_movers) >= deep_lane_max:
+                break
+            if symbol in promoted_today:
+                promoted_movers.append(symbol)
+                continue
+            if len(promoted_today) >= _INTRADAY_DEEP_DAILY_DISTINCT_CAP:
+                # 日上限触顶：该标的当日只保留宽层快照行（显式标注，不静默）。
+                day_cap_reached = True
+                continue
+            promoted_today.add(symbol)
+            promoted_movers.append(symbol)
+
+    deep_symbols = [
+        *plan_tickers,
+        *[symbol for symbol in promoted_movers if symbol not in plan_set],
+    ]
+    deep_set = set(deep_symbols)
+
+    # -- Tier 2：既有 v4 管线，仅深度层标的 -----------------------------------
+    daily_raw = _intraday_daily_inputs(
+        deep_symbols,
+        as_of=requested_at,
+        market_date_et=market_date_et,
+    )
+    dailies = {
+        symbol: IntradayDailyContext(
+            atr14=payload.get("atr14"),
+            atr14_last_bar_date=payload.get("atr14_last_bar_date"),
+            atr14_unavailable_reason=payload.get("atr14_unavailable_reason"),
+            prior_median_volume=payload.get("prior_20d_median_volume"),
+            median_unavailable_reason=payload.get("median_unavailable_reason"),
+            prior_close=payload.get("prior_close"),
+            prior_close_date=payload.get("prior_close_date"),
+            prior_high_20d=payload.get("prior_high_20d"),
+            prior_low_20d=payload.get("prior_low_20d"),
+            ema8=payload.get("ema8"),
+            ema13=payload.get("ema13"),
+            source=payload.get("source"),
+        )
+        for symbol, payload in daily_raw.items()
+    }
+    quotes = {
+        symbol: _quote_to_intraday_input(raw_quotes[symbol])
+        for symbol in deep_symbols
+        if raw_quotes.get(symbol) is not None
+    }
+
+    option_event_items = _load_intraday_option_event_items(
+        deep_symbols,
+        enabled=enabled,
+        market_date_et=market_date_et,
+    )
+    burst_scope = (
+        "latest_prior_session" if session_state == "closed" else "current_session"
+    )
+    burst_profiles, setup_bars = _load_intraday_burst_profiles(
+        deep_symbols,
+        market_date_et=market_date_et,
+        quote_session_scope=burst_scope,
+    )
+    playbook_refs = _load_intraday_playbook_refs()
+    earnings_calendar = _load_intraday_earnings_calendar(market_date_et)
+
+    run = build_intraday_top_run(
+        symbols=deep_symbols,
+        unsupported_symbols=unsupported,
+        quotes=quotes,
+        dailies=dailies,
+        option_event_items=option_event_items,
+        as_of=requested_at,
+        market_date_et=market_date_et,
+        session_state=session_state,
+        session_state_basis=SESSION_STATE_BASIS,
+        limit=limit,
+        moomoo_enabled=enabled,
+        burst_profiles=burst_profiles,
+        earnings_calendar=earnings_calendar,
+        spy_quote=spy_quote,
+        setup_bars=setup_bars,
+        playbook_refs=playbook_refs,
+        # 深度层名单已由闸门有界：全部返回，不再按 limit 二次截断
+        # （否则「已深度分析却无声消失」）。requested_limit 仍如实回显。
+        include_all_candidates=True,
+    )
+
+    # 每个深度候选标注进入深度层的原因（additive；单层模式无此字段）。
+    def _deep_lane_reason(symbol: str) -> dict[str, Any]:
+        if symbol in plan_set:
+            return {
+                "promoted_by": "plan_always_include",
+                "mover_rank": None,
+                "basis": _INTRADAY_TWO_TIER_GATE_BASIS,
+            }
+        return {
+            "promoted_by": "mover_rank",
+            "mover_rank": mover_rank_by_symbol.get(symbol),
+            "basis": _INTRADAY_TWO_TIER_GATE_BASIS,
+        }
+
+    for candidate in run["candidates"]:
+        candidate["scan_tier"] = "deep"
+        candidate["deep_lane_reason"] = _deep_lane_reason(
+            str(candidate.get("ticker") or "")
+        )
+
+    # 宽层剩余标的：按 |涨跌幅| 降序（标缺行恒排最后），诚实可见。
+    snapshot_only = sorted(
+        (row for row in wide_rows if row["ticker"] not in deep_set),
+        key=lambda row: (
+            0 if row.get("change_percent") is not None else 1,
+            -abs(row.get("change_percent") or 0.0),
+            row["ticker"],
+        ),
+    )
+
+    # universe＝宽层实际扫描的全部标的（快照层面全部覆盖），候选＝深度层。
+    run["universe"] = list(supported)
+    run["universe_scan"] = {
+        "mode": "watchlist_two_tier",
+        "gate_basis": _INTRADAY_TWO_TIER_GATE_BASIS,
+        "watchlist_total": watchlist_configured_total,
+        "watchlist_truncated": watchlist_configured_total > len(watchlist),
+        "scanned_total": len(supported),
+        "deep_lane_count": len(deep_symbols),
+        "deep_lane_max": deep_lane_max,
+        "deep_lane": [
+            {
+                "ticker": symbol,
+                "promoted_by": _deep_lane_reason(symbol)["promoted_by"],
+                "mover_rank": _deep_lane_reason(symbol)["mover_rank"],
+            }
+            for symbol in deep_symbols
+        ],
+        "plan_always_include": list(plan_tickers),
+        "gated_out_count": len(supported) - len(deep_symbols),
+        "snapshot_unresolved_symbols": snapshot_unresolved,
+        "day_promotion_cap": _INTRADAY_DEEP_DAILY_DISTINCT_CAP,
+        "day_promotion_cap_reached": day_cap_reached,
+        "snapshot_only": snapshot_only,
+        "limitations": list(_INTRADAY_TWO_TIER_LIMITATIONS),
+    }
+    run["limitations"] = [*run["limitations"], *_INTRADAY_TWO_TIER_LIMITATIONS]
+    return run
+
+
 def _intraday_pulse_item(
     ticker: str,
     quote: Any,
@@ -3051,33 +3465,67 @@ def intraday_top(payload: IntradayTopRequest) -> IntradayTopResponse:
     + 上一交易时段有界读取）；聚合证据（缺口/量能节奏/VWAP/波幅扩张 + 有界
     Moomoo 异动计数）退居次序。异动是供应商分类，不推断开平仓或真实主动
     方向。休市时段仍可读取：排序退回证据计数，但附最近一个交易时段的波段。
+
+    universe 解析：显式 ``symbols``（≤20）优先；空 symbols 时若配置了
+    ``INTRADAY_WATCHLIST`` 走两层扫描（宽层批量快照 → 异动闸门 → 深度层，
+    响应附 ``universe_scan``），否则回退 ``STOCK_LIST``（与既有行为一致）。
     """
 
-    symbols = payload.symbols or _configured_symbols()
-    symbols = normalize_symbols(symbols)[:20]
-    if not symbols:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "error": "empty_universe",
-                "message": "symbols 为空且服务端 STOCK_LIST 未配置。",
-            },
-        )
     enabled = _moomoo_opend_enabled()
     requested_at = _intraday_now()
     market_date_et = requested_at.astimezone(_NEW_YORK).date().isoformat()
-    key = (
-        "intraday_top",
-        INTRADAY_TOP_SIGNAL_VERSION,
-        enabled,
-        tuple(symbols),
-        int(payload.limit),
-        market_date_et,
+
+    # 两层模式仅在「客户端未显式传 symbols 且 INTRADAY_WATCHLIST 已配置」时
+    # 启用；显式 symbols（≤20）与未配置清单的路径与既有行为逐字节一致。
+    watchlist_configured = (
+        _configured_intraday_watchlist() if not payload.symbols else []
     )
+    if not payload.symbols and watchlist_configured:
+        watchlist = watchlist_configured[:_INTRADAY_WATCHLIST_MAX_SYMBOLS]
+        deep_lane_max = _configured_deep_lane_max()
+        key = (
+            "intraday_top",
+            INTRADAY_TOP_SIGNAL_VERSION,
+            enabled,
+            ("watchlist_two_tier", tuple(watchlist), deep_lane_max),
+            int(payload.limit),
+            market_date_et,
+        )
+        factory: Callable[[], dict[str, Any]] = (
+            lambda: _execute_intraday_top_two_tier(
+                watchlist,
+                payload.limit,
+                enabled=enabled,
+                deep_lane_max=deep_lane_max,
+                watchlist_configured_total=len(watchlist_configured),
+            )
+        )
+    else:
+        symbols = payload.symbols or _configured_symbols()
+        symbols = normalize_symbols(symbols)[:20]
+        if not symbols:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "empty_universe",
+                    "message": "symbols 为空且服务端 STOCK_LIST 未配置。",
+                },
+            )
+        key = (
+            "intraday_top",
+            INTRADAY_TOP_SIGNAL_VERSION,
+            enabled,
+            tuple(symbols),
+            int(payload.limit),
+            market_date_et,
+        )
+        factory = lambda: _execute_intraday_top(  # noqa: E731 - mirrors two-tier arm
+            symbols, payload.limit, enabled=enabled
+        )
     try:
         result = _get_or_compute_scan(
             key,
-            lambda: _execute_intraday_top(symbols, payload.limit, enabled=enabled),
+            factory,
             bypass_cache=payload.refresh,
             ttl_seconds=_INTRADAY_TOP_CACHE_TTL_SECONDS,
             lease_seconds=_INTRADAY_TOP_LEASE_SECONDS,

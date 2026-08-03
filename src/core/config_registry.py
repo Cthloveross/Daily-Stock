@@ -86,6 +86,41 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "validation": {"min_items": 1},
         "display_order": 10,
     },
+    "INTRADAY_WATCHLIST": {
+        "title": "Intraday Watchlist (two-tier scan)",
+        "description": (
+            "日内 Top 扫描的宽层清单（逗号分隔美股代码）。留空＝保持现状"
+            "（STOCK_LIST 回退，单层扫描）；配置后启用两层模式：全清单每轮一次"
+            "批量快照，按 |涨跌幅|→成交额 晋升 Top K 进入深度层。"
+        ),
+        "category": "base",
+        "data_type": "array",
+        "ui_control": "textarea",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "",
+        "options": [],
+        "validation": {},
+        "display_order": 11,
+    },
+    "INTRADAY_DEEP_LANE_MAX": {
+        "title": "Intraday Deep Lane Max (K)",
+        "description": (
+            "两层模式下异动闸门每轮晋升到深度层的标的数上限（1..20，默认 12）。"
+            "仅约束按异动排名晋升的名额；当日冻结盘前计划标的始终占深度位。"
+        ),
+        "category": "base",
+        "data_type": "number",
+        "ui_control": "number",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "12",
+        "options": [],
+        "validation": {"min": 1, "max": 20},
+        "display_order": 12,
+    },
     # ------------------------------------------------------------------
     # AI Model – LiteLLM unified config
     # ------------------------------------------------------------------

@@ -270,6 +270,28 @@ Playbook 只读对应：服务端从 journal_v2 Playbook 候选表读取标题�
 
 诚实边界（响应 `limitations` 固定携带）：5m 聚合到 15m 是近似帧，不是用户实际使用的 2m/1m 确认帧；三个 setup 都只检查形状几何，完全不含进场时机、托举细节与离场纪律；形态相似 ≠ 可交易；阈值与几何规则改动必须升 `signal_version`。
 
+### 2.11 watchlist v1 两层扫描（宽层快照 → 异动闸门 → 深度层）
+
+用户的完整 TradingView 清单约 69 档美股（equities/ETF），远超日内扫描原有 ≤20 档单层 universe；把 69 档全部塞进深度管线会同时打爆 5m K 线额度与 60 秒轮询节奏。2026-08 起采用专业扫描器的标准分层：**宽而便宜的快照层 → 异动闸门 → 窄而昂贵的深度层**。
+
+**启用条件（回滚 = 取消设置 `INTRADAY_WATCHLIST`）**：仅当服务端配置了 `INTRADAY_WATCHLIST`（逗号分隔清单，服务端上限 200 档，超出显式截断并标注 `watchlist_truncated`）且客户端 `symbols` 为空时启用；显式 `symbols`（≤20）或未配置清单时行为与既有单层扫描逐字节一致（`universe_scan` 恒为 null，候选无 `scan_tier` / `deep_lane_reason`——由回归测试锁定）。`INTRADAY_DEEP_LANE_MAX`（默认 12，1..20 双端钳制）只约束异动晋升名额。
+
+**宽层（tier-1）**：整个清单 + 当日冻结盘前计划标的 + SPY 并入**每 60 秒周期仅 1 次** Moomoo `get_market_snapshot` 批量快照（官方单次上限 400 个代码；清单有界 200，恒为单请求，无需分片）。宽层只产出快照可得字段：现价 / 当日涨跌%（快照前收口径）/ 当日高低 / 量 / 额 / as-of。宽层行**没有**爆发、形态、速度、异动、财报字段——缺席即缺席，不以 null 占位冒充「已分析」。
+
+**异动闸门（documented v1 heuristic，`gate_basis=abs_change_percent_then_turnover_v1`）**：按 `|当日涨跌幅|` 主序、成交额次序、代码字典序兜底晋升前 K 档进入深度层。缺涨跌幅（快照未解析/缺前收）的行不可晋升——闸门绝不以 0 涨跌冒充平静。**计划钉选**：当日已冻结盘前计划的标的始终占深度位、不占 K 名额（不在清单里也会并入同一批快照）；计划标的不重复参与异动排名。闸门不是信号：晋升只决定「谁被深度分析」，不代表方向或质量结论。
+
+**深度层（tier-2）**：完全复用 §2.8–§2.10 的既有 v4 管线（会话快照字段直接复用宽层同一批快照，零新增快照请求；5m 波段爆发 / styleMatch / 速度 / 期权异动 / 财报 / 临期合约资格照旧）。深度层名单已由闸门有界（K + 计划钉选），因此候选**全部返回**、不再按 `limit` 二次截断（`include_all_candidates`，否则「已深度分析却无声消失」）；`requested_limit` 仍如实回显。
+
+**K 线额度语义（本设计的正确性支点，实测自 Moomoo 官方 API Limits）**：深度层 5m K 线经 `StockService.get_history_data` → `DataFetcherManager.get_intraday_data` 优先命中 Moomoo `request_history_kline`（失败回退 yfinance）。该接口的配额是 **30 天滚动窗口内的去重标的数**（账户档位 100/300/1000/2000；同一标的 30 天内重复请求不再扣额；同一标的的日线/5m 等不同周期只记 1 个额度）。因此真实约束是「30 天内晋升过的去重标的数」，其上界＝清单长度（69 档清单 < 最低档位 100）；为防单日 movers 高频换血，另设**每 ET 日新晋升去重标的数上限 30**（内部常量 `_INTRADAY_DEEP_DAILY_DISTINCT_CAP`，非环境变量）。触顶后新标的当日只保留宽层快照行，响应显式标注 `day_promotion_cap_reached`，前端给出警示行——绝不静默丢弃。财报日历仍是一次 Finnhub 区间调用覆盖任意大小 universe（逐标的匹配为字典查找）。
+
+**每周期请求预算（两层模式，缓存全冷）**：1 次批量快照（≤清单+计划+SPY ≤ 206 codes，单请求）+ 深度层每档 1 次 5m K 线（60 秒逐标的 TTL，≤4 并发）+ 深度层每档 1 次有界异动页（30 秒 TTL 与 option-events 端点共用）+ 日线派生每档 900 秒记忆 + 财报 1 次/小时。宽层非晋升标的零 K 线、零日线加载。
+
+**响应合同（additive）**：`universe` 仍为 `list[str]`（= 宽层实际扫描的全部标的，类型不变——设计说明：原要求把 mode 等放进 `universe` 字段，但该字段既有类型为列表，改型即破坏合同，故新增 `universe_scan` 块）。`universe_scan`：`mode` / `gate_basis` / `watchlist_total` / `watchlist_truncated` / `scanned_total` / `deep_lane_count` / `deep_lane_max` / `deep_lane[]`（含晋升原因与异动名次，深度层名单本身绝不无声截断）/ `plan_always_include` / `gated_out_count` / `snapshot_unresolved_symbols`（供应商无返回行的标的，如实点名）/ `day_promotion_cap(_reached)` / `snapshot_only[]`（宽层行，按 |涨跌| 降序、标缺行恒最后）。每个深度候选带 `scan_tier="deep"` + `deep_lane_reason`（计划钉选 or 异动 #n）。
+
+**前端**：页头计数改为「全清单 N 檔快照 · 深度分析 K 檔」；深度行标的格附「计划钉选」/「异动 #n」徽标；表格下方新增「仅快照 · 未做深度分析（N 檔）」紧凑列表（ticker + 涨跌% + 成交额，快照未解析与日上限触顶各有显式警示行）；footer 固定附「全清单 N 檔快照 · 深度分析前 K 檔（|涨跌|→成交额）· 其余仅快照」。单层模式渲染完全不变。
+
+**诚实边界（响应 `limitations` 固定携带）**：两层扫描只有晋升标的做深度分析，其余仅快照、深度字段一律缺席；闸门为 v1 启发式（|涨跌幅|→成交额），不是信号，晋升不代表方向或质量结论；K 线额度为 30 天滚动去重标的数配额，日晋升护栏触顶如实标注。周内看板、市场脉搏与既有单层扫描不受任何影响。
+
 ## 3. 数据语义修正
 
 Moomoo 官方明确说明 [`get_option_chain`](https://openapi.moomoo.com/moomoo-api-doc/en/quote/get-option-chain.html) 只返回静态合约资料。动态 bid/ask、成交量、OI、IV 和 Greeks 必须用合约 code 再调用 [`get_market_snapshot`](https://openapi.moomoo.com/moomoo-api-doc/en/quote/get-market-snapshot.html)。当前适配器已改为分批（每批最多 400 个 code）合并快照；严格检查 `option_valid` 和有限数，缺任一必要动态字段就省略该合约，不再把静态行或缺失值伪装成全 0 实时行情。最近到期 ATM Call IV 仍先用静态链与 spot 锁定单一合约再读取快照；它不是 IV Rank/Percentile，也不代表异常期权大单或买卖方向。

@@ -465,6 +465,155 @@ describe('IntradayScanTable v4 形态列（styleMatch v1）', () => {
   });
 });
 
+describe('IntradayScanTable watchlist 两层模式（universeScan）', () => {
+  beforeEach(() => {
+    navigateMock.mockReset();
+    vi.mocked(fetchNearExpiryContracts).mockReset();
+    vi.mocked(fetchNearExpiryContracts).mockImplementation(
+      async (symbol: string) => nearExpiryEmpty(symbol),
+    );
+  });
+
+  function twoTierResponse(): IntradayTopResponse {
+    return {
+      ...topResponse(),
+      universe: ['NVDA', 'MU', 'AAPL', 'TSLA', 'GLW'],
+      candidates: [
+        candidate({
+          scanTier: 'deep',
+          deepLaneReason: {
+            promotedBy: 'plan_always_include',
+            moverRank: null,
+            basis: 'abs_change_percent_then_turnover_v1',
+          },
+        }),
+        candidate({
+          ticker: 'MU',
+          lastPrice: 100.5,
+          scanTier: 'deep',
+          deepLaneReason: {
+            promotedBy: 'mover_rank',
+            moverRank: 1,
+            basis: 'abs_change_percent_then_turnover_v1',
+          },
+        }),
+      ],
+      universeScan: {
+        mode: 'watchlist_two_tier',
+        gateBasis: 'abs_change_percent_then_turnover_v1',
+        watchlistTotal: 5,
+        watchlistTruncated: false,
+        scannedTotal: 5,
+        deepLaneCount: 2,
+        deepLaneMax: 12,
+        deepLane: [
+          { ticker: 'NVDA', promotedBy: 'plan_always_include', moverRank: null },
+          { ticker: 'MU', promotedBy: 'mover_rank', moverRank: 1 },
+        ],
+        planAlwaysInclude: ['NVDA'],
+        gatedOutCount: 3,
+        snapshotUnresolvedSymbols: ['GLW'],
+        dayPromotionCap: 30,
+        dayPromotionCapReached: false,
+        snapshotOnly: [
+          {
+            ticker: 'AAPL',
+            state: 'ready',
+            lastPrice: 210.1,
+            changePercent: 2.31,
+            changeBasis: 'moomoo_snapshot_prev_close',
+            sessionHigh: 211.0,
+            sessionLow: 205.2,
+            volume: 1_000_000,
+            turnover: 210_000_000,
+            quoteAsOf: '2026-08-04 10:30:04',
+            unavailableReason: null,
+          },
+          {
+            ticker: 'TSLA',
+            state: 'ready',
+            lastPrice: 300.0,
+            changePercent: -1.05,
+            changeBasis: 'moomoo_snapshot_prev_close',
+            sessionHigh: 305.0,
+            sessionLow: 298.0,
+            volume: 500_000,
+            turnover: 150_000_000,
+            quoteAsOf: '2026-08-04 10:30:04',
+            unavailableReason: null,
+          },
+          {
+            ticker: 'GLW',
+            state: 'unavailable',
+            lastPrice: null,
+            changePercent: null,
+            changeBasis: 'moomoo_snapshot_prev_close',
+            sessionHigh: null,
+            sessionLow: null,
+            volume: null,
+            turnover: null,
+            quoteAsOf: null,
+            unavailableReason: 'snapshot_missing',
+          },
+        ],
+        limitations: ['两层扫描：仅晋升标的做深度分析。'],
+      },
+    };
+  }
+
+  it('renders deep-lane reason badges, two-tier header and honest footer', () => {
+    render(<IntradayScanTable data={twoTierResponse()} loading={false} error={null} />);
+    // 页头与 footer 均如实描述两层口径。
+    expect(screen.getByText(/全清单 5 檔快照 · 深度分析 2 檔/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/全清单 5 檔快照 · 深度分析前 12 檔（\|涨跌\|→成交额）· 其余仅快照/),
+    ).toBeInTheDocument();
+    // 深度位徽标：计划钉选 / 异动排名。
+    const table = screen.getByRole('table', { name: '日内扫描表' });
+    expect(within(table).getByText('计划钉选')).toBeInTheDocument();
+    expect(within(table).getByText('异动 #1')).toBeInTheDocument();
+  });
+
+  it('renders the snapshot-only secondary list with 仅快照 caption', () => {
+    render(<IntradayScanTable data={twoTierResponse()} loading={false} error={null} />);
+    const section = screen.getByLabelText('仅快照标的');
+    expect(
+      within(section).getByText('仅快照 · 未做深度分析（3 檔）'),
+    ).toBeInTheDocument();
+    // 行内容：ticker + 涨跌% + 成交额；标缺行显式「标缺」。
+    expect(within(section).getByText('AAPL')).toBeInTheDocument();
+    expect(within(section).getByText('+2.31%')).toBeInTheDocument();
+    expect(within(section).getByText('TSLA')).toBeInTheDocument();
+    expect(within(section).getByText('−1.05%')).toBeInTheDocument();
+    expect(within(section).getByText('GLW')).toBeInTheDocument();
+    // 快照未解析标的显式列出，绝不静默消失。
+    expect(
+      within(section).getByText(/快照未解析 1 檔（供应商无返回行，显式标缺）：GLW/),
+    ).toBeInTheDocument();
+  });
+
+  it('keeps the legacy single-tier rendering unchanged without universeScan', () => {
+    render(<IntradayScanTable data={topResponse()} loading={false} error={null} />);
+    expect(screen.getByText(/扫描 2 个标的/)).toBeInTheDocument();
+    expect(screen.queryByLabelText('仅快照标的')).not.toBeInTheDocument();
+    expect(screen.queryByText(/其余仅快照/)).not.toBeInTheDocument();
+    const table = screen.getByRole('table', { name: '日内扫描表' });
+    expect(within(table).queryByText('计划钉选')).not.toBeInTheDocument();
+  });
+
+  it('surfaces the day promotion cap warning when the quota guard trips', () => {
+    const response = twoTierResponse();
+    response.universeScan = {
+      ...response.universeScan!,
+      dayPromotionCapReached: true,
+    };
+    render(<IntradayScanTable data={response} loading={false} error={null} />);
+    expect(
+      screen.getByText(/今日新晋升深度位已达上限（30 檔 · K 线额度护栏）/),
+    ).toBeInTheDocument();
+  });
+});
+
 describe('IntradayScanTable 临期合约 row interaction', () => {
   beforeEach(() => {
     navigateMock.mockReset();

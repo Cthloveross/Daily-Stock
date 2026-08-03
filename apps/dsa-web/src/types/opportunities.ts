@@ -856,6 +856,54 @@ export interface IntradaySessionBursts {
   limitations: string[];
 }
 
+/** 两层模式下该候选进入深度层的原因：计划钉选或异动排名（v1 闸门，非信号）。 */
+export interface IntradayDeepLaneReason {
+  promotedBy: 'plan_always_include' | 'mover_rank';
+  moverRank: number | null;
+  basis: 'abs_change_percent_then_turnover_v1';
+}
+
+/** 宽层（仅快照）单行：只有快照可得字段，绝不虚构深度层读数。 */
+export interface IntradaySnapshotOnlyRow {
+  ticker: string;
+  state: 'ready' | 'partial' | 'unavailable';
+  lastPrice: number | null;
+  changePercent: number | null;
+  changeBasis: 'moomoo_snapshot_prev_close';
+  sessionHigh: number | null;
+  sessionLow: number | null;
+  volume: number | null;
+  turnover: number | null;
+  quoteAsOf: string | null;
+  unavailableReason: string | null;
+}
+
+/** 深度层名单单行（含未上榜候选，名单本身绝不无声截断）。 */
+export interface IntradayDeepLaneEntry {
+  ticker: string;
+  promotedBy: 'plan_always_include' | 'mover_rank';
+  moverRank: number | null;
+}
+
+/** watchlist 两层模式的诚实 universe 概览；单层（现状）模式恒为 null。 */
+export interface IntradayUniverseScan {
+  mode: 'watchlist_two_tier';
+  gateBasis: 'abs_change_percent_then_turnover_v1';
+  watchlistTotal: number;
+  watchlistTruncated: boolean;
+  scannedTotal: number;
+  deepLaneCount: number;
+  deepLaneMax: number;
+  deepLane: IntradayDeepLaneEntry[];
+  planAlwaysInclude: string[];
+  gatedOutCount: number;
+  snapshotUnresolvedSymbols: string[];
+  dayPromotionCap: number;
+  dayPromotionCapReached: boolean;
+  snapshotOnly: IntradaySnapshotOnlyRow[];
+  limitations: string[];
+}
+
 /** 日内 Top 候选行：每个指标要么有值+口径，要么显式标缺原因。 */
 export interface IntradayTopCandidate {
   ticker: string;
@@ -897,6 +945,9 @@ export interface IntradayTopCandidate {
   evidence: OpportunityEvidence[];
   message: string;
   limitations: string[];
+  /** watchlist 两层模式（additive）：单层模式下缺席/为 null。 */
+  scanTier?: 'deep' | null;
+  deepLaneReason?: IntradayDeepLaneReason | null;
 }
 
 /** 跨标的异动 feed 单行；供应商分类原样透传，不改写为方向结论。 */
@@ -938,6 +989,8 @@ export interface IntradayTopResponse {
   statisticsTrack: 'none_intraday_v1_unscored';
   moomooEnabled: boolean;
   universe: string[];
+  /** watchlist 两层模式（additive）：单层（现状）模式恒为 null/缺席。 */
+  universeScan?: IntradayUniverseScan | null;
   unsupportedSymbols: string[];
   requestedLimit: number;
   candidateCount: number;

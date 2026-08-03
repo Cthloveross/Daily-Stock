@@ -152,6 +152,14 @@ function legsDetailLabel(item: IntradayTopCandidate): string | undefined {
     .join('；')}`;
 }
 
+/** 两层模式深度位徽标：计划钉选 or 异动排名（闸门标注，非信号）。 */
+function deepLaneBadge(item: IntradayTopCandidate): string | null {
+  const reason = item.deepLaneReason;
+  if (!reason) return null;
+  if (reason.promotedBy === 'plan_always_include') return '计划钉选';
+  return reason.moverRank !== null ? `异动 #${reason.moverRank}` : '异动晋升';
+}
+
 function optionActivityLabel(item: IntradayTopCandidate): string {
   const activity = item.optionActivity;
   if (activity.state === 'not_configured') return '未配置';
@@ -364,7 +372,10 @@ export function IntradayScanTable({
         </div>
         {data && (
           <span className="text-caption text-text-3">
-            {data.quoteSessionLabel} · 扫描 {data.universe.length} 个标的
+            {data.quoteSessionLabel}
+            {data.universeScan
+              ? ` · 全清单 ${data.universeScan.scannedTotal} 檔快照 · 深度分析 ${data.universeScan.deepLaneCount} 檔`
+              : ` · 扫描 ${data.universe.length} 个标的`}
             {data.unsupportedSymbols.length > 0
               ? ` · ${data.unsupportedSymbols.length} 个非美股期权标的未纳入`
               : ''}
@@ -424,6 +435,19 @@ export function IntradayScanTable({
                     <div className="mt-0.5 text-caption text-text-3">
                       {item.supportingEvidenceCount} 项证据支持
                     </div>
+                    {(() => {
+                      const badge = deepLaneBadge(item);
+                      return badge ? (
+                        <div className="mt-0.5">
+                          <span
+                            className="inline-block whitespace-nowrap rounded-ds-sm border border-subtle px-1.5 py-0.5 text-caption text-text-2"
+                            aria-label={`深度位原因：${badge}（闸门标注，非信号）`}
+                          >
+                            {badge}
+                          </span>
+                        </div>
+                      ) : null;
+                    })()}
                   </td>
                   <td className="px-3 py-2.5 text-right">
                     {item.sessionBursts.state === 'ready' && item.sessionBursts.current ? (
@@ -590,6 +614,75 @@ export function IntradayScanTable({
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {data?.universeScan && (
+        <div
+          aria-label="仅快照标的"
+          className="border-t border-subtle bg-bg-0 px-4 py-3"
+        >
+          <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+            <span className="text-body-sm font-medium text-text-2">
+              仅快照 · 未做深度分析（{data.universeScan.snapshotOnly.length} 檔）
+            </span>
+            <span className="text-caption text-text-3">
+              按 |涨跌幅| 排序 · 闸门之外无爆发/形态/速度读数——缺席即缺席，不以 0 冒充
+            </span>
+          </div>
+          {data.universeScan.snapshotOnly.length > 0 && (
+            <ul className="mt-2 flex flex-wrap gap-1.5">
+              {data.universeScan.snapshotOnly.map((row) => (
+                <li
+                  key={row.ticker}
+                  className="inline-flex items-baseline gap-1.5 rounded-ds-sm border border-subtle bg-bg-1 px-2 py-1"
+                >
+                  <span className="font-mono text-mono-xs font-medium text-text-1">{row.ticker}</span>
+                  <span
+                    className={`font-mono text-mono-xs ${
+                      row.changePercent === null
+                        ? 'text-text-3'
+                        : row.changePercent > 0
+                          ? 'text-up-strong'
+                          : row.changePercent < 0
+                            ? 'text-down-strong'
+                            : 'text-text-3'
+                    }`}
+                  >
+                    {formatSignedPercent(row.changePercent)}
+                  </span>
+                  <span className="font-mono text-mono-xs text-text-3">
+                    {row.turnover !== null ? formatCompactUsd(row.turnover) : '标缺'}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+          {data.universeScan.snapshotUnresolvedSymbols.length > 0 && (
+            <div className="mt-2 text-caption text-warning">
+              快照未解析 {data.universeScan.snapshotUnresolvedSymbols.length} 檔（供应商无返回行，显式标缺）：
+              {data.universeScan.snapshotUnresolvedSymbols.join('、')}
+            </div>
+          )}
+          {data.universeScan.dayPromotionCapReached && (
+            <div className="mt-1 text-caption text-warning">
+              今日新晋升深度位已达上限（{data.universeScan.dayPromotionCap} 檔 · K 线额度护栏）：
+              新异动标的今日仅保留快照行。
+            </div>
+          )}
+          {data.universeScan.watchlistTruncated && (
+            <div className="mt-1 text-caption text-warning">
+              清单超出服务端上限，超出部分未纳入扫描（配置 {data.universeScan.watchlistTotal} 檔）。
+            </div>
+          )}
+        </div>
+      )}
+
+      {data?.universeScan && (
+        <div className="border-t border-subtle bg-bg-0 px-4 py-2 text-caption text-text-3">
+          全清单 {data.universeScan.scannedTotal} 檔快照 · 深度分析前 {data.universeScan.deepLaneMax} 檔（|涨跌|→成交额）· 其余仅快照；
+          计划钉选 {data.universeScan.planAlwaysInclude.length} 檔始终占深度位（不占 K 名额）。
+          闸门为 v1 启发式，晋升不代表方向或质量结论。
         </div>
       )}
 

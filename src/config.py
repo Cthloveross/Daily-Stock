@@ -502,6 +502,16 @@ class Config:
     # === 自选股配置 ===
     stock_list: List[str] = field(default_factory=list)
 
+    # === 日内扫描两层清单（watchlist v1）===
+    # INTRADAY_WATCHLIST：日内 Top 扫描的宽层清单（逗号分隔美股代码）。
+    # 未配置时日内扫描 universe 完全等同现状（STOCK_LIST 回退）；配置后启用
+    # 「全清单一次批量快照 → 异动闸门 → 深度层」两层模式（见
+    # api/v1/endpoints/opportunities.py 与 New-docs/phase1/06 §2.11）。
+    intraday_watchlist: List[str] = field(default_factory=list)
+    # INTRADAY_DEEP_LANE_MAX：异动闸门每轮晋升到深度层的标的数上限（1..20）。
+    # 只约束按 |涨跌幅|→成交额 晋升的名额；当日冻结盘前计划标的始终占深度位。
+    intraday_deep_lane_max: int = 12
+
     # === 飞书云文档配置 ===
     feishu_app_id: Optional[str] = None
     feishu_app_secret: Optional[str] = None
@@ -982,6 +992,21 @@ class Config:
         # 如果没有配置，使用默认的示例股票
         if not stock_list:
             stock_list = ['600519', '000001', '300750']
+
+        # 日内扫描宽层清单（watchlist v1）：未配置＝空列表＝保持现状，
+        # 不设默认值——两层模式必须由用户显式开启。
+        intraday_watchlist = [
+            (c or "").strip().upper()
+            for c in os.getenv('INTRADAY_WATCHLIST', '').split(',')
+            if (c or "").strip()
+        ]
+        intraday_deep_lane_max = parse_env_int(
+            os.getenv('INTRADAY_DEEP_LANE_MAX'),
+            12,
+            field_name='INTRADAY_DEEP_LANE_MAX',
+            minimum=1,
+            maximum=20,
+        )
         
         # === LiteLLM multi-key parsing ===
         # GEMINI_API_KEYS (comma-separated) > GEMINI_API_KEY (single)
@@ -1207,6 +1232,8 @@ class Config:
         
         return cls(
             stock_list=stock_list,
+            intraday_watchlist=intraday_watchlist,
+            intraday_deep_lane_max=intraday_deep_lane_max,
             feishu_app_id=os.getenv('FEISHU_APP_ID'),
             feishu_app_secret=os.getenv('FEISHU_APP_SECRET'),
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),

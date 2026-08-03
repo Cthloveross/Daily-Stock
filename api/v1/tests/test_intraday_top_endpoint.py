@@ -734,6 +734,9 @@ def test_earnings_calendar_failure_is_marked_never_faked_safe(monkeypatch):
 def test_empty_symbols_falls_back_to_server_stock_list(monkeypatch):
     monkeypatch.delenv("MOOMOO_OPEND_ENABLED", raising=False)
     _stub_daily_loader(monkeypatch)
+    # 固定「清单未配置」：本测试锁定的是 STOCK_LIST 回退路径本身，
+    # 不能被运行机器 .env 里的 INTRADAY_WATCHLIST 干扰。
+    monkeypatch.setattr(opportunities, "_configured_intraday_watchlist", lambda: [])
     monkeypatch.setattr(opportunities, "_configured_symbols", lambda: ["NVDA", "AAPL"])
 
     response = _client().post(
@@ -744,6 +747,7 @@ def test_empty_symbols_falls_back_to_server_stock_list(monkeypatch):
 
 
 def test_empty_symbols_without_stock_list_is_422(monkeypatch):
+    monkeypatch.setattr(opportunities, "_configured_intraday_watchlist", lambda: [])
     monkeypatch.setattr(opportunities, "_configured_symbols", lambda: [])
     response = _client().post(
         "/api/v1/opportunities/intraday-top", json={"symbols": []}

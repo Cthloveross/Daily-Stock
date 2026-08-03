@@ -1195,8 +1195,15 @@ def build_intraday_top_run(
     spy_quote: Optional[IntradayQuoteInput] = None,
     setup_bars: Optional[Mapping[str, Sequence[Mapping[str, Any]]]] = None,
     playbook_refs: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    include_all_candidates: bool = False,
 ) -> dict[str, Any]:
-    """Assemble the deterministic intraday Top-N research run."""
+    """Assemble the deterministic intraday Top-N research run.
+
+    ``include_all_candidates=True``（watchlist 两层模式的深度层使用）返回全部
+    已排序候选而不按 ``limit`` 截断：深度层名单本身已由异动闸门有界（K +
+    计划钉选），再按 ``limit`` 截断会造成「已做深度分析却无声消失」的不诚实
+    截断。``requested_limit`` 仍如实回显请求值。默认 ``False`` 保持既有合同。
+    """
 
     if not 1 <= limit <= 10:
         raise ValueError("limit must be between 1 and 10")
@@ -1271,8 +1278,12 @@ def build_intraday_top_run(
         "universe": list(symbols),
         "unsupported_symbols": list(unsupported_symbols),
         "requested_limit": limit,
-        "candidate_count": min(len(candidates), limit),
-        "candidates": candidates[:limit],
+        "candidate_count": (
+            len(candidates) if include_all_candidates else min(len(candidates), limit)
+        ),
+        "candidates": (
+            list(candidates) if include_all_candidates else candidates[:limit]
+        ),
         "recent_option_events": collect_recent_option_events(option_event_items),
         "limitations": list(INTRADAY_TOP_LIMITATIONS),
     }

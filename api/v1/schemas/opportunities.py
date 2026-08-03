@@ -1171,6 +1171,68 @@ class IntradaySetupMatchProfile(BaseModel):
     limitations: list[str] = Field(default_factory=list)
 
 
+class IntradayDeepLaneReason(BaseModel):
+    """两层模式下该候选进入深度层的原因：计划钉选或异动排名（v1 闸门）。
+
+    闸门不是信号：晋升只决定「谁被深度分析」，不代表方向或质量结论。
+    """
+
+    promoted_by: Literal["plan_always_include", "mover_rank"]
+    mover_rank: Optional[int] = Field(default=None, ge=1)
+    basis: Literal["abs_change_percent_then_turnover_v1"]
+
+
+class IntradaySnapshotOnlyRow(BaseModel):
+    """宽层（仅快照）单行：只有快照可得字段，绝不虚构深度层读数。
+
+    行内没有爆发/形态/速度/异动/财报字段——那些属于深度层；缺失即缺席。
+    """
+
+    ticker: str
+    state: Literal["ready", "partial", "unavailable"]
+    last_price: Optional[float] = Field(default=None, gt=0)
+    change_percent: Optional[float] = None
+    change_basis: Literal["moomoo_snapshot_prev_close"]
+    session_high: Optional[float] = Field(default=None, gt=0)
+    session_low: Optional[float] = Field(default=None, gt=0)
+    volume: Optional[float] = Field(default=None, ge=0)
+    turnover: Optional[float] = Field(default=None, ge=0)
+    quote_as_of: Optional[str] = None
+    unavailable_reason: Optional[str] = None
+
+
+class IntradayDeepLaneEntry(BaseModel):
+    """深度层名单单行：含未上榜候选，保证深度层名单本身无声不了之。"""
+
+    ticker: str
+    promoted_by: Literal["plan_always_include", "mover_rank"]
+    mover_rank: Optional[int] = Field(default=None, ge=1)
+
+
+class IntradayUniverseScan(BaseModel):
+    """watchlist 两层模式的诚实 universe 概览：谁被深扫、谁只有快照。
+
+    仅在 INTRADAY_WATCHLIST 已配置且客户端未显式传 symbols 时出现；
+    单层（现状）模式恒为 null。
+    """
+
+    mode: Literal["watchlist_two_tier"]
+    gate_basis: Literal["abs_change_percent_then_turnover_v1"]
+    watchlist_total: int = Field(ge=0)
+    watchlist_truncated: bool = False
+    scanned_total: int = Field(ge=0)
+    deep_lane_count: int = Field(ge=0)
+    deep_lane_max: int = Field(ge=1, le=20)
+    deep_lane: list[IntradayDeepLaneEntry] = Field(default_factory=list)
+    plan_always_include: list[str] = Field(default_factory=list)
+    gated_out_count: int = Field(ge=0)
+    snapshot_unresolved_symbols: list[str] = Field(default_factory=list)
+    day_promotion_cap: int = Field(ge=1)
+    day_promotion_cap_reached: bool = False
+    snapshot_only: list[IntradaySnapshotOnlyRow] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+
+
 class IntradayTopCandidate(BaseModel):
     """一行盘中滚动研究候选：每个指标要么有值+口径，要么显式标缺原因。"""
 
@@ -1216,6 +1278,9 @@ class IntradayTopCandidate(BaseModel):
     evidence: list[EvidenceItem] = Field(default_factory=list)
     message: str
     limitations: list[str] = Field(default_factory=list)
+    # watchlist 两层模式（additive）：单层模式恒为 null。
+    scan_tier: Optional[Literal["deep"]] = None
+    deep_lane_reason: Optional[IntradayDeepLaneReason] = None
 
 
 class IntradayTopRecentOptionEvent(BaseModel):
@@ -1262,6 +1327,8 @@ class IntradayTopResponse(BaseModel):
     statistics_track: Literal["none_intraday_v1_unscored"]
     moomoo_enabled: bool
     universe: list[str] = Field(default_factory=list)
+    # watchlist 两层模式（additive）：单层（现状）模式恒为 null。
+    universe_scan: Optional[IntradayUniverseScan] = None
     unsupported_symbols: list[str] = Field(default_factory=list)
     requested_limit: int = Field(ge=1, le=10)
     candidate_count: int = Field(ge=0)
