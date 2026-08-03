@@ -338,7 +338,7 @@ class TestRunAssembly:
         run = self._run()
         assert run["schema_version"] == "intraday-top/1.0"
         assert run["signal_version"] == INTRADAY_TOP_SIGNAL_VERSION
-        assert run["signal_version"] == "intraday_session_evidence_v4"
+        assert run["signal_version"] == "intraday_session_evidence_v5"
         # 盘中（current_session scope）＝爆发分优先；休市退回证据计数。
         assert run["ranking_method"] == RANKING_METHOD_BURST_FIRST
         assert self._run(session_state="closed")["ranking_method"] == (

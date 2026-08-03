@@ -242,7 +242,7 @@ def test_contract_regular_session_full_row(monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert body["schema_version"] == "intraday-top/1.0"
-    assert body["signal_version"] == "intraday_session_evidence_v4"
+    assert body["signal_version"] == "intraday_session_evidence_v5"
     # 盘中主排序 = 波段爆发分优先。
     assert body["ranking_method"] == "burst_score_first_then_evidence_count"
     # 不冻结、不入统计的显式标记。

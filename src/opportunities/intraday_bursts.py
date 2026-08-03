@@ -60,14 +60,20 @@ BURST_WINDOW_MINUTES = BURST_WINDOW_BARS * BURST_BAR_MINUTES
 # 当日 K 线不足 6 根时（开盘前 30 分钟内），中位数基准回退到上一交易时段，
 # 避免用 2-3 根开盘 K 线自证归一化分母。
 MEDIAN_FALLBACK_MIN_BARS = 6
-# 记为一个「波段」的最低 burst_score（校准依据见模块 docstring 表格）。
+# 记为「强波段」的最低 burst_score（校准依据见模块 docstring 表格：
+# 2026-07-31 用户标注的暴动波全部 ≥8.56）。
 LEG_MIN_SCORE = 8.0
+# 记为「中波段」的最低 burst_score。v2 分级校准：2026-08-03 上午 NVDA
+# 09:55→10:25 的真实可交易推升（用户实时指认「这一波应该有记录」）峰值
+# 5.03、持续段 2.5-3.1，而同日无波时段窗口 <1.1 —— 2.5 收录该波全程且
+# 不触及静默期。中波段只是记录与展示分级，不改变 supports 口径。
+LEG_MEDIUM_MIN_SCORE = 2.5
 # 当前窗口记为 supports 的最低 burst_score（比 LEG_MIN_SCORE 低一档，
 # 让正在发展中的爆发提前一根 K 线亮起）。
 BURST_SUPPORT_MIN = 6.0
 # 两个独立波段的窗口起点至少相隔 30 分钟，否则视为同一波并合并。
 LEG_MIN_GAP_MINUTES = 30
-# 单一交易时段最多报告 4 个波段。
+# 单一交易时段最多报告 4 个波段（强弱合计，强波段优先保留）。
 LEG_MAX_COUNT = 4
 
 BURST_BASIS = "rolling_15m_thrust_over_median_range_times_volume_ratio"
@@ -82,8 +88,9 @@ SPEED_BASIS = "consecutive_rolling_15m_window_burst_score_delta_5m_bars"
 
 BURST_LIMITATIONS = (
     "波段爆发＝15 分钟推力（|收−开| ÷ 当日 5 分钟 K 线波幅中位数）×量比"
-    "（窗口量 ÷ 3×5 分钟量中位数）；阈值按 2026-07-31 用户标注样本校准，"
-    "是确定性研究度量，不是买卖信号。",
+    "（窗口量 ÷ 3×5 分钟量中位数）；强波段阈值（≥8.0）按 2026-07-31 用户"
+    "标注暴动样本校准、中波段阈值（≥2.5）按 2026-08-03 NVDA 上午持续推升"
+    "校准，是确定性研究度量，不是买卖信号。",
     "仅统计正股 09:30–16:00 ET 常规时段 5 分钟 K 线；盘前盘后不参与。",
     "开盘前 30 分钟（当日不足 6 根 K 线）中位数基准回退上一交易时段并显式标注。",
     "速度分级＝相邻两个 15 分钟窗口爆发分之差（5m K 线近似，非 1m/2m 秒级速度）；"
@@ -341,11 +348,14 @@ def compute_burst_windows(
 
 
 def select_distinct_legs(windows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Top distinct windows: score ≥ LEG_MIN_SCORE, starts ≥30min apart, ≤4.
+    """Top distinct windows: score ≥ LEG_MEDIUM_MIN_SCORE, starts ≥30min apart, ≤4.
 
     Greedy by descending score so one violent move keeps its single best
     window instead of flooding the list with overlapping neighbours; the
-    result is re-sorted chronologically for display.
+    result is re-sorted chronologically for display.  v2 分级：每个波段带
+    ``grade``（strong ≥ LEG_MIN_SCORE / medium ≥ LEG_MEDIUM_MIN_SCORE）——
+    强波段是 2026-07-31 校准的暴动口径，中波段收录像 2026-08-03 NVDA
+    上午那样的持续推升；贪心按分数降序，强波段天然优先占据名额。
     """
 
     picked: list[Mapping[str, Any]] = []
@@ -354,7 +364,7 @@ def select_distinct_legs(windows: Sequence[Mapping[str, Any]]) -> list[dict[str,
         key=lambda row: (-row["score"], row["_start_minutes"]),
     )
     for row in ordered:
-        if row["score"] < LEG_MIN_SCORE:
+        if row["score"] < LEG_MEDIUM_MIN_SCORE:
             break
         if any(
             abs(row["_start_minutes"] - other["_start_minutes"]) < LEG_MIN_GAP_MINUTES
@@ -365,7 +375,12 @@ def select_distinct_legs(windows: Sequence[Mapping[str, Any]]) -> list[dict[str,
         if len(picked) >= LEG_MAX_COUNT:
             break
     picked.sort(key=lambda row: row["_start_minutes"])
-    return [_public_window(row) for row in picked]
+    legs = []
+    for row in picked:
+        leg = _public_window(row)
+        leg["grade"] = "strong" if row["score"] >= LEG_MIN_SCORE else "medium"
+        legs.append(leg)
+    return legs
 
 
 def _public_window(row: Mapping[str, Any]) -> dict[str, Any]:

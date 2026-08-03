@@ -52,7 +52,7 @@ from src.opportunities.intraday_setups import (
 # Playbook setup（S1 低点抬高突破 / S2 跳空托举 / S3 高开遇阻）做纯形状对比，
 # 输出 matched/partial/not_matched/unavailable 四态标注（src/opportunities/
 # intraday_setups.py）。同样只是标注：不参与排序、不隐藏行、不是信号。
-INTRADAY_TOP_SIGNAL_VERSION = "intraday_session_evidence_v4"
+INTRADAY_TOP_SIGNAL_VERSION = "intraday_session_evidence_v5"
 INTRADAY_TOP_SCHEMA_VERSION = "intraday-top/1.0"
 
 # ---------------------------------------------------------------------------

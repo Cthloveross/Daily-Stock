@@ -1056,6 +1056,10 @@ class IntradayBurstWindow(BaseModel):
     vol_norm: Optional[float] = Field(default=None, ge=0)
     score: Optional[float] = Field(default=None, ge=0)
     direction: Literal["up", "down", "flat"]
+    # v2 波段分级：strong=暴动口径（≥8.0，2026-07-31 校准）、medium=持续
+    # 推升口径（≥2.5，2026-08-03 NVDA 上午波校准）。仅波段列表携带；
+    # current 窗口不分级（其强弱由 supports 口径决定）。
+    grade: Optional[Literal["strong", "medium"]] = None
 
 
 class IntradayBurstSpeed(BaseModel):
@@ -1330,7 +1334,7 @@ class IntradayTopResponse(BaseModel):
     quote_session_scope: Literal["current_session", "latest_prior_session"]
     quote_session_label: str
     market_context: IntradayMarketContext
-    signal_version: Literal["intraday_session_evidence_v4"]
+    signal_version: Literal["intraday_session_evidence_v5"]
     ranking_method: Literal[
         "burst_score_first_then_evidence_count",
         "rule_based_evidence_count",

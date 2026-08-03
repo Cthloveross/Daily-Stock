@@ -22,6 +22,7 @@ import pytest
 from src.opportunities.intraday_bursts import (
     BURST_SUPPORT_MIN,
     LEG_MAX_COUNT,
+    LEG_MEDIUM_MIN_SCORE,
     LEG_MIN_GAP_MINUTES,
     LEG_MIN_SCORE,
     MEDIAN_BASIS_CURRENT,
@@ -115,11 +116,19 @@ class TestCalibrationRegression:
         assert googl_best < mu_best
 
     def test_all_labeled_legs_clear_support_threshold_too(self, labeled_bars):
-        # supports 阈值低于 leg 阈值：任何标注波段都必然点亮「波段爆发」。
+        # supports 阈值低于强波段阈值：任何强波段都必然点亮「波段爆发」；
+        # v2 分级后中波段（≥2.5）合法存在于 supports 阈值之下，但每个
+        # 波段都必须 ≥ 中波段下限并携带正确 grade。
         assert BURST_SUPPORT_MIN < LEG_MIN_SCORE
+        assert LEG_MEDIUM_MIN_SCORE < BURST_SUPPORT_MIN
         for symbol in ("MU", "AMZN", "NVDA"):
             for leg in _profile(labeled_bars, symbol)["legs"]:
-                assert leg["score"] >= BURST_SUPPORT_MIN
+                assert leg["score"] >= LEG_MEDIUM_MIN_SCORE
+                if leg["grade"] == "strong":
+                    assert leg["score"] >= LEG_MIN_SCORE
+                else:
+                    assert leg["grade"] == "medium"
+                    assert leg["score"] < LEG_MIN_SCORE
 
 
 def _bar(ts: str, *, open_, high, low, close, volume):
@@ -278,13 +287,21 @@ class TestDistinctLegMerging:
         assert [leg["direction"] for leg in legs] == ["down", "up"]
 
     def test_below_threshold_and_cap(self):
+        # v2 分级：强波段阈值之下、中波段阈值之上 → 记为 medium 波段；
+        # 中波段阈值之下 → 不记录。
         rows = [self._window(570, LEG_MIN_SCORE - 0.01)]
-        assert select_distinct_legs(rows) == []
+        legs = select_distinct_legs(rows)
+        assert [leg["grade"] for leg in legs] == ["medium"]
+        assert select_distinct_legs(
+            [self._window(570, LEG_MEDIUM_MIN_SCORE - 0.01)]
+        ) == []
         many = [
             self._window(570 + index * LEG_MIN_GAP_MINUTES, 10.0 + index)
             for index in range(LEG_MAX_COUNT + 3)
         ]
-        assert len(select_distinct_legs(many)) == LEG_MAX_COUNT
+        capped = select_distinct_legs(many)
+        assert len(capped) == LEG_MAX_COUNT
+        assert all(leg["grade"] == "strong" for leg in capped)
 
     def test_legs_are_chronological(self):
         rows = [self._window(930, 12.0), self._window(575, 20.0)]
