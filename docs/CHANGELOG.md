@@ -439,6 +439,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] 日内扫描「今日波段」列接入 signal v5 波段分级：burst leg 类型新增 additive `grade` 字段（strong＝爆发分 ≥8 暴动 / medium＝≥2.5 持续推升），前端以「09:45↓ 强」实底警示 chip 与「10:00↑ 中」描边 chip 呈现，每波分级并入 aria-label 波段明细；缺 grade 的旧载荷渲染无分级 chip，绝不发明分级。
 - [测试] IntradayScanTable 测试更新至两级布局（20 例全过）：新增 9 列默认网格与次要指标不入首屏、强/中/无分级波段 chip 与空态/标缺、仅快照列表前 5 檔折叠与展开切换、展开行研究读数网格、footer 短行 + 完整口径切换、按当前爆发排序标缺行恒最后且服务端排名不改写等回归。
 - [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` §2.8 扫描表列清单更新为 9 列默认网格并注明两级布局与 v5 波段分级 chips；根 README 不承载日内列级细节，故未改动。
+- [新功能] 日内波段记录分级（signal v5）：强波段 ≥8（2026-07-31 暴动样本校准，阈值不变）之外新增中波段 ≥2.5（2026-08-03 NVDA 上午 09:55→10:25 持续推升实时校准，峰值 5.03/持续段 2.5-3.1/无波时段 <1.1），持续推升型可交易波不再漏记；波段携带 grade（strong/medium）additive 字段，强波段贪心优先占据 ≤4 名额。
 
 ## [3.11.0] - 2026-03-27
 
