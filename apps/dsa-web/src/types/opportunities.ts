@@ -856,11 +856,16 @@ export interface IntradaySessionBursts {
   limitations: string[];
 }
 
+/** 闸门口径：常规＝|当日涨跌|→成交额；盘前＝|盘前涨跌|→盘前成交额。 */
+export type IntradayGateBasis =
+  | 'abs_change_percent_then_turnover_v1'
+  | 'premarket_pre_price_change_then_pre_turnover_v1';
+
 /** 两层模式下该候选进入深度层的原因：计划钉选或异动排名（v1 闸门，非信号）。 */
 export interface IntradayDeepLaneReason {
   promotedBy: 'plan_always_include' | 'mover_rank';
   moverRank: number | null;
-  basis: 'abs_change_percent_then_turnover_v1';
+  basis: IntradayGateBasis;
 }
 
 /** 宽层（仅快照）单行：只有快照可得字段，绝不虚构深度层读数。 */
@@ -876,6 +881,9 @@ export interface IntradaySnapshotOnlyRow {
   turnover: number | null;
   quoteAsOf: string | null;
   unavailableReason: string | null;
+  /** 盘前读数（additive）：盘前时段常规字段仍指向上一常规时段；缺列＝null，旧载荷可省略。 */
+  preChangePercent?: number | null;
+  preTurnover?: number | null;
 }
 
 /** 深度层名单单行（含未上榜候选，名单本身绝不无声截断）。 */
@@ -888,7 +896,9 @@ export interface IntradayDeepLaneEntry {
 /** watchlist 两层模式的诚实 universe 概览；单层（现状）模式恒为 null。 */
 export interface IntradayUniverseScan {
   mode: 'watchlist_two_tier';
-  gateBasis: 'abs_change_percent_then_turnover_v1';
+  gateBasis: IntradayGateBasis;
+  /** 闸门降级警示（如盘前字段不可用回退常规口径）；旧载荷可省略。 */
+  gateWarnings?: string[];
   watchlistTotal: number;
   watchlistTruncated: boolean;
   scannedTotal: number;

@@ -432,6 +432,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] 深度层 5m K 线额度按 Moomoo `request_history_kline` 真实配额语义设计（30 天滚动窗口去重标的数、账户档位 100 起、同标的重复请求不扣额）：晋升去重上界＝清单长度，另设每 ET 日新晋升去重标的数护栏 30 档（内部常量），触顶如实标注 `day_promotion_cap_reached`；前端页头/footer 改为「全清单 N 檔快照 · 深度分析前 K 檔 · 其余仅快照」，表下新增「仅快照 · 未做深度分析」紧凑列表（含快照未解析点名与截断警示），深度行附「计划钉选/异动 #n」徽标。
 - [测试] 新增 `api/v1/tests/test_intraday_top_two_tier.py`（8：未配置清单回归锁定、显式 symbols 绕过两层、单快照批次+闸门排序+宽层无深度字段、计划钉选去重不占 K、日晋升护栏、Moomoo 禁用诚实降级、清单显式截断、K 值钳制）；既有空 symbols 回归用例固定清单未配置；前端 IntradayScanTable +4（两层页头/footer/徽标、仅快照列表与未解析点名、无 universeScan 单层渲染回归、日护栏警示行）。
 - [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` 新增 §2.11 两层扫描（启用条件与回滚＝取消 `INTRADAY_WATCHLIST`、闸门口径、K 线配额语义、每周期请求预算、additive 响应合同）；`.env.example` 新增两键中文说明与用户实际 69 档清单示例值；根 README 不承载日内 universe 细节，故未改动。
+- [修复] 日内两层扫描盘前时段（ET 04:00–09:30）改按真实盘前口径晋升与排序（`gate_basis=premarket_pre_price_change_then_pre_turnover_v1`：|pre_change_rate|（盘前价 vs 上一常规收盘，可为负）→ pre_turnover）：Moomoo 常规快照字段在盘前仍指向上一常规时段，原口径会把昨天的异动复现成今晨深度榜；缺盘前字段的行不可晋升且宽层恒排最后，整批无盘前字段时显式回退常规口径并在 `universe_scan.gate_warnings` 携带 `premarket_fields_unavailable_ranking_reflects_prior_session`；宽层行 additive 携带 `pre_change_percent`/`pre_turnover`（缺列＝null 绝不 0 回填）；前端盘前口径下页头/footer 附「盘前异动排序（盘前价 vs 前收 · 盘前成交额次序）」、仅快照行展示「盘前 ±x%」与盘前成交额（缺盘前字段显式「盘前标缺」）、回退时显示「盘前字段不可用 · 当前排序反映上一常规时段」警示。
+- [测试] 盘前闸门契约测试 +3（盘前口径按 |盘前涨跌|→盘前成交额 晋升且上一时段最大异动因缺盘前字段绝不晋升、整批无盘前字段显式回退+警示、常规时段无视盘前字段且口径与警示逐字节回归）+ Moomoo 快照解析器盘前字段单测（负 pre_change_rate 合法、pre_price 零/负与非法值/缺列一律 None）；前端 IntradayScanTable +3（盘前口径页头/footer 标注、盘前读数 chip 与盘前标缺行诚实渲染、回退警示 chip、常规时段无盘前标注回归）。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` §2.11 新增盘前口径小节（常规快照字段盘前指向上一常规时段的语义、pre_change_rate 相对上一常规收盘口径、回退警示诚实边界与前端标注）；根 README 不承载日内闸门细节，故未改动。
 
 ## [3.11.0] - 2026-03-27
 

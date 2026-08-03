@@ -190,6 +190,105 @@ def test_option_underlying_overview_fails_closed_on_provider_error(monkeypatch):
     assert moomoo_options.fetch_option_underlying_overviews_moomoo(["AAPL"]) == {}
 
 
+class _SessionSnapshotContext:
+    def __init__(self, frame: pd.DataFrame):
+        self.frame = frame
+        self.calls: list[list[str]] = []
+
+    def get_market_snapshot(self, codes):
+        self.calls.append(list(codes))
+        return 0, self.frame
+
+
+def test_underlying_session_quote_parses_pre_fields_present_absent_invalid(
+    monkeypatch,
+):
+    """盘前字段解析：present 保留（负 pre_change_rate 合法）、缺列/非法一律 None。
+
+    Moomoo 盘前时段常规字段仍指向上一常规时段，真实盘前变动只在 pre_*：
+    pre_change_rate 为相对上一常规收盘的百分比、可为负；pre_price 零/负、
+    pre_volume/pre_turnover 负值、无法解析的值全部保持 None，绝不 0 回填。
+    """
+
+    _install_fake_moomoo(monkeypatch)
+    frame = pd.DataFrame(
+        [
+            {
+                # 盘前字段齐全：负 pre_change_rate 是合法读数。
+                "code": "US.NVDA",
+                "last_price": 130.5,
+                "prev_close_price": 124.0,
+                "pre_price": 128.7,
+                "pre_change_rate": -2.35,
+                "pre_volume": 12_000,
+                "pre_turnover": 1_218_000.0,
+            },
+            {
+                # 快照缺盘前列（pandas 混排下为 NaN）：全部 None。
+                "code": "US.MU",
+                "last_price": 100.5,
+                "prev_close_price": 99.0,
+            },
+            {
+                # 值非法：pre_price=0、pre_change_rate 不可解析、量额为负。
+                "code": "US.AMD",
+                "last_price": 150.0,
+                "prev_close_price": 149.0,
+                "pre_price": 0.0,
+                "pre_change_rate": "not_a_number",
+                "pre_volume": -5,
+                "pre_turnover": -1.0,
+            },
+            {
+                # pre_price 为负 → None；同行合法的 pre_change_rate 照常保留。
+                "code": "US.TSLA",
+                "last_price": 300.0,
+                "prev_close_price": 305.0,
+                "pre_price": -3.0,
+                "pre_change_rate": -1.2,
+                "pre_volume": 800,
+                "pre_turnover": 240_000.0,
+            },
+        ]
+    )
+    ctx = _SessionSnapshotContext(frame)
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+    monkeypatch.setattr(moomoo_options, "_get_ctx", lambda: ctx)
+
+    result = moomoo_options.fetch_underlying_session_quotes_moomoo(
+        ["NVDA", "MU", "AMD", "TSLA"]
+    )
+
+    assert ctx.calls == [["US.NVDA", "US.MU", "US.AMD", "US.TSLA"]]
+    assert set(result) == {"NVDA", "MU", "AMD", "TSLA"}
+
+    nvda = result["NVDA"]
+    # 常规字段照旧解析（additive：盘前字段不改变既有语义）。
+    assert nvda.last_price == pytest.approx(130.5)
+    assert nvda.pre_price == pytest.approx(128.7)
+    assert nvda.pre_change_rate == pytest.approx(-2.35)
+    assert nvda.pre_volume == 12_000
+    assert nvda.pre_turnover == pytest.approx(1_218_000.0)
+
+    mu = result["MU"]
+    assert mu.pre_price is None
+    assert mu.pre_change_rate is None
+    assert mu.pre_volume is None
+    assert mu.pre_turnover is None
+
+    amd = result["AMD"]
+    assert amd.pre_price is None  # 零价不是价格。
+    assert amd.pre_change_rate is None
+    assert amd.pre_volume is None
+    assert amd.pre_turnover is None
+
+    tsla = result["TSLA"]
+    assert tsla.pre_price is None  # 负价不是价格。
+    assert tsla.pre_change_rate == pytest.approx(-1.2)
+    assert tsla.pre_volume == 800
+    assert tsla.pre_turnover == pytest.approx(240_000.0)
+
+
 def test_chain_joins_static_contracts_with_dynamic_snapshots(monkeypatch):
     _install_fake_moomoo(monkeypatch)
     chain = pd.DataFrame([_chain_row()])

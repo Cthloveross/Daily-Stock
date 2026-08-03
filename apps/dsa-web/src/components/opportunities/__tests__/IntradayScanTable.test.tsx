@@ -612,6 +612,75 @@ describe('IntradayScanTable watchlist 两层模式（universeScan）', () => {
       screen.getByText(/今日新晋升深度位已达上限（30 檔 · K 线额度护栏）/),
     ).toBeInTheDocument();
   });
+
+  it('renders the premarket basis caption and pre-change chips during the premarket gate', () => {
+    const response = twoTierResponse();
+    response.universeScan = {
+      ...response.universeScan!,
+      gateBasis: 'premarket_pre_price_change_then_pre_turnover_v1',
+      gateWarnings: [],
+      snapshotOnly: response.universeScan!.snapshotOnly.map((row) => {
+        if (row.ticker === 'AAPL') {
+          return { ...row, preChangePercent: 1.85, preTurnover: 12_000_000 };
+        }
+        if (row.ticker === 'TSLA') {
+          return { ...row, preChangePercent: -0.42, preTurnover: 3_000_000 };
+        }
+        return { ...row, preChangePercent: null, preTurnover: null };
+      }),
+    };
+    render(<IntradayScanTable data={response} loading={false} error={null} />);
+
+    // 页头 + footer 均如实声明盘前口径（恰好两处）。
+    expect(
+      screen.getAllByText(/盘前异动排序（盘前价 vs 前收 · 盘前成交额次序）/).length,
+    ).toBe(2);
+    // 仅快照区改按盘前口径描述，行内展示真实盘前涨跌与盘前成交额。
+    const section = screen.getByLabelText('仅快照标的');
+    expect(within(section).getByText(/按 \|盘前涨跌幅\| 排序（盘前价 vs 前收）/)).toBeInTheDocument();
+    expect(within(section).getByText('盘前 +1.85%')).toBeInTheDocument();
+    expect(within(section).getByText('$12.0M')).toBeInTheDocument();
+    expect(within(section).getByText('盘前 −0.42%')).toBeInTheDocument();
+    // 缺盘前字段的行显式「盘前标缺」，绝不以上一常规时段涨跌冒充盘前变动。
+    expect(within(section).getByText('盘前标缺')).toBeInTheDocument();
+    expect(within(section).queryByText('+2.31%')).not.toBeInTheDocument();
+    // 盘前字段可得：无回退警示。
+    expect(
+      screen.queryByText(/盘前字段不可用 · 当前排序反映上一常规时段/),
+    ).not.toBeInTheDocument();
+  });
+
+  it('shows the explicit fallback warning chip when premarket fields are unavailable', () => {
+    const response = twoTierResponse();
+    response.universeScan = {
+      ...response.universeScan!,
+      gateWarnings: ['premarket_fields_unavailable_ranking_reflects_prior_session'],
+    };
+    render(<IntradayScanTable data={response} loading={false} error={null} />);
+
+    // 页头警示 chip + footer 各一处，明说当前排序反映上一常规时段。
+    expect(
+      screen.getAllByText(/盘前字段不可用 · 当前排序反映上一常规时段/).length,
+    ).toBe(2);
+    // 回退口径下仍按常规涨跌渲染，绝不伪装盘前读数。
+    expect(screen.queryByText(/盘前异动排序/)).not.toBeInTheDocument();
+    const section = screen.getByLabelText('仅快照标的');
+    expect(within(section).getByText('+2.31%')).toBeInTheDocument();
+  });
+
+  it('keeps the legacy caption without premarket markers during the regular session', () => {
+    render(<IntradayScanTable data={twoTierResponse()} loading={false} error={null} />);
+
+    expect(screen.queryByText(/盘前异动排序/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/盘前字段不可用/)).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/（\|涨跌\|→成交额）· 其余仅快照/),
+    ).toBeInTheDocument();
+    const section = screen.getByLabelText('仅快照标的');
+    expect(within(section).getByText('按 |涨跌幅| 排序 · 闸门之外无爆发/形态/速度读数——缺席即缺席，不以 0 冒充')).toBeInTheDocument();
+    expect(within(section).getByText('+2.31%')).toBeInTheDocument();
+    expect(within(section).queryByText(/盘前/)).not.toBeInTheDocument();
+  });
 });
 
 describe('IntradayScanTable 临期合约 row interaction', () => {

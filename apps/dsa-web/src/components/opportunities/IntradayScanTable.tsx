@@ -123,6 +123,13 @@ const DIRECTION_ARROWS: Record<'up' | 'down' | 'flat', string> = {
   flat: '·',
 };
 
+/** 盘前闸门口径标注：常规快照字段在盘前仍指向上一常规时段，须如实声明。 */
+const PREMARKET_GATE_BASIS = 'premarket_pre_price_change_then_pre_turnover_v1';
+const PREMARKET_GATE_CAPTION = '盘前异动排序（盘前价 vs 前收 · 盘前成交额次序）';
+const PREMARKET_FIELDS_UNAVAILABLE_WARNING =
+  'premarket_fields_unavailable_ranking_reflects_prior_session';
+const PREMARKET_FALLBACK_CHIP = '盘前字段不可用 · 当前排序反映上一常规时段';
+
 function formatBurstThrust(value: number | null): string {
   if (value === null) return '—';
   const sign = value > 0 ? '+' : value < 0 ? '−' : '';
@@ -319,6 +326,12 @@ export function IntradayScanTable({
   const [sort, setSort] = useState<SortState | null>(null);
   const [expandedTicker, setExpandedTicker] = useState<string | null>(null);
 
+  // 盘前口径：闸门/宽层排序按盘前字段；回退时携带显式警示，绝不静默。
+  const premarketBasis = data?.universeScan?.gateBasis === PREMARKET_GATE_BASIS;
+  const premarketFieldsUnavailable = (data?.universeScan?.gateWarnings ?? []).includes(
+    PREMARKET_FIELDS_UNAVAILABLE_WARNING,
+  );
+
   const rows = useMemo(() => {
     const candidates = data?.candidates ?? [];
     if (!sort) return candidates;
@@ -371,14 +384,22 @@ export function IntradayScanTable({
           </span>
         </div>
         {data && (
-          <span className="text-caption text-text-3">
-            {data.quoteSessionLabel}
-            {data.universeScan
-              ? ` · 全清单 ${data.universeScan.scannedTotal} 檔快照 · 深度分析 ${data.universeScan.deepLaneCount} 檔`
-              : ` · 扫描 ${data.universe.length} 个标的`}
-            {data.unsupportedSymbols.length > 0
-              ? ` · ${data.unsupportedSymbols.length} 个非美股期权标的未纳入`
-              : ''}
+          <span className="flex flex-wrap items-baseline gap-x-2 gap-y-1 text-caption text-text-3">
+            <span>
+              {data.quoteSessionLabel}
+              {data.universeScan
+                ? ` · 全清单 ${data.universeScan.scannedTotal} 檔快照 · 深度分析 ${data.universeScan.deepLaneCount} 檔`
+                : ` · 扫描 ${data.universe.length} 个标的`}
+              {premarketBasis ? ` · ${PREMARKET_GATE_CAPTION}` : ''}
+              {data.unsupportedSymbols.length > 0
+                ? ` · ${data.unsupportedSymbols.length} 个非美股期权标的未纳入`
+                : ''}
+            </span>
+            {premarketFieldsUnavailable && (
+              <span className="inline-block whitespace-nowrap rounded-ds-sm border border-[color:var(--warn-muted)] bg-bg-0 px-1.5 py-0.5 text-caption font-medium text-warning">
+                {PREMARKET_FALLBACK_CHIP}
+              </span>
+            )}
           </span>
         )}
       </header>
@@ -627,7 +648,8 @@ export function IntradayScanTable({
               仅快照 · 未做深度分析（{data.universeScan.snapshotOnly.length} 檔）
             </span>
             <span className="text-caption text-text-3">
-              按 |涨跌幅| 排序 · 闸门之外无爆发/形态/速度读数——缺席即缺席，不以 0 冒充
+              {premarketBasis ? '按 |盘前涨跌幅| 排序（盘前价 vs 前收）' : '按 |涨跌幅| 排序'}
+              {' '}· 闸门之外无爆发/形态/速度读数——缺席即缺席，不以 0 冒充
             </span>
           </div>
           {data.universeScan.snapshotOnly.length > 0 && (
@@ -638,22 +660,51 @@ export function IntradayScanTable({
                   className="inline-flex items-baseline gap-1.5 rounded-ds-sm border border-subtle bg-bg-1 px-2 py-1"
                 >
                   <span className="font-mono text-mono-xs font-medium text-text-1">{row.ticker}</span>
-                  <span
-                    className={`font-mono text-mono-xs ${
-                      row.changePercent === null
-                        ? 'text-text-3'
-                        : row.changePercent > 0
-                          ? 'text-up-strong'
-                          : row.changePercent < 0
-                            ? 'text-down-strong'
-                            : 'text-text-3'
-                    }`}
-                  >
-                    {formatSignedPercent(row.changePercent)}
-                  </span>
-                  <span className="font-mono text-mono-xs text-text-3">
-                    {row.turnover !== null ? formatCompactUsd(row.turnover) : '标缺'}
-                  </span>
+                  {premarketBasis ? (
+                    // 盘前口径：只展示真实盘前读数；缺盘前字段显式「盘前标缺」，
+                    // 绝不把上一常规时段涨跌冒充成盘前变动。
+                    row.preChangePercent !== null && row.preChangePercent !== undefined ? (
+                      <>
+                        <span
+                          className={`font-mono text-mono-xs ${
+                            row.preChangePercent > 0
+                              ? 'text-up-strong'
+                              : row.preChangePercent < 0
+                                ? 'text-down-strong'
+                                : 'text-text-3'
+                          }`}
+                        >
+                          盘前 {formatSignedPercent(row.preChangePercent)}
+                        </span>
+                        <span className="font-mono text-mono-xs text-text-3">
+                          {row.preTurnover !== null && row.preTurnover !== undefined
+                            ? formatCompactUsd(row.preTurnover)
+                            : '标缺'}
+                        </span>
+                      </>
+                    ) : (
+                      <span className="font-mono text-mono-xs text-text-3">盘前标缺</span>
+                    )
+                  ) : (
+                    <>
+                      <span
+                        className={`font-mono text-mono-xs ${
+                          row.changePercent === null
+                            ? 'text-text-3'
+                            : row.changePercent > 0
+                              ? 'text-up-strong'
+                              : row.changePercent < 0
+                                ? 'text-down-strong'
+                                : 'text-text-3'
+                        }`}
+                      >
+                        {formatSignedPercent(row.changePercent)}
+                      </span>
+                      <span className="font-mono text-mono-xs text-text-3">
+                        {row.turnover !== null ? formatCompactUsd(row.turnover) : '标缺'}
+                      </span>
+                    </>
+                  )}
                 </li>
               ))}
             </ul>
@@ -680,8 +731,12 @@ export function IntradayScanTable({
 
       {data?.universeScan && (
         <div className="border-t border-subtle bg-bg-0 px-4 py-2 text-caption text-text-3">
-          全清单 {data.universeScan.scannedTotal} 檔快照 · 深度分析前 {data.universeScan.deepLaneMax} 檔（|涨跌|→成交额）· 其余仅快照；
+          全清单 {data.universeScan.scannedTotal} 檔快照 · 深度分析前 {data.universeScan.deepLaneMax} 檔
+          {premarketBasis
+            ? ` · ${PREMARKET_GATE_CAPTION} · 其余仅快照；`
+            : '（|涨跌|→成交额）· 其余仅快照；'}
           计划钉选 {data.universeScan.planAlwaysInclude.length} 檔始终占深度位（不占 K 名额）。
+          {premarketFieldsUnavailable ? `${PREMARKET_FALLBACK_CHIP}。` : ''}
           闸门为 v1 启发式，晋升不代表方向或质量结论。
         </div>
       )}
