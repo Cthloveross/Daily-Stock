@@ -16,6 +16,8 @@ from src.opportunities.intraday_bursts import (
     DISPLACEMENT_ATR_BASIS_DAILY,
     DISPLACEMENT_ATR_BASIS_PROXY,
     DISPLACEMENT_SURVIVAL_LINE_ATR,
+    FIZZLE_BASIS,
+    FIZZLE_REFERENCE,
 )
 from src.opportunities.intraday_top import (
     ACTIVE_SUPPORT_MIN,
@@ -343,7 +345,7 @@ class TestRunAssembly:
         run = self._run()
         assert run["schema_version"] == "intraday-top/1.0"
         assert run["signal_version"] == INTRADAY_TOP_SIGNAL_VERSION
-        assert run["signal_version"] == "intraday_session_evidence_v6"
+        assert run["signal_version"] == "intraday_session_evidence_v7"
         # 盘中（current_session scope）＝爆发分优先；休市退回证据计数。
         assert run["ranking_method"] == RANKING_METHOD_BURST_FIRST
         assert self._run(session_state="closed")["ranking_method"] == (
@@ -479,6 +481,59 @@ class TestBurstEvidence:
         assert bursts["current"]["score"] == 12.0
         assert bursts["legs"][0]["direction"] == "up"
         assert bursts["basis"].startswith("rolling_15m")
+
+
+class TestFizzleFlagWiring:
+    """v7 哑火形态在候选行上的接线：additive、单一真源、缺输入即标缺。
+
+    研究结论是否定的（起速那一刻方向不可预测），因此这个标注**不参与**
+    supports 计数、不参与排序、不隐藏行——这里就是在断言这件事。
+    """
+
+    @staticmethod
+    def _profile_with_flag(state: str = "flagged"):
+        profile = _burst_profile(3.0)
+        profile["fizzle_flag"] = {
+            "state": state,
+            "efficiency": 0.94,
+            "vol_norm": 1.2,
+            "stratum": "intraday",
+            "reason": "intraday_clean_thrust_with_unremarkable_volume",
+            "basis": FIZZLE_BASIS,
+            "reference": dict(FIZZLE_REFERENCE),
+        }
+        return profile
+
+    def test_flag_is_copied_onto_the_candidate_verbatim(self):
+        profile = self._profile_with_flag()
+        candidate = _candidate(burst_profile=profile)
+        assert candidate["fizzle_flag"] == profile["fizzle_flag"]
+        assert candidate["fizzle_flag"]["reference"]["n_out"] == 177
+
+    def test_flag_never_changes_supports_count_or_state(self):
+        flagged = _candidate(burst_profile=self._profile_with_flag())
+        not_flagged = _candidate(burst_profile=self._profile_with_flag("not_flagged"))
+        assert (
+            flagged["supporting_evidence_count"]
+            == not_flagged["supporting_evidence_count"]
+        )
+        assert flagged["research_state"] == not_flagged["research_state"]
+        # 不作为一条证据出现——它不是「支持/反对」，只是形态描述。
+        assert all(
+            item["metric"] != "fizzle_flag" for item in flagged["evidence"]
+        )
+
+    def test_profile_without_the_field_is_explicitly_unavailable(self):
+        candidate = _candidate(burst_profile=_burst_profile(9.0))
+        assert candidate["fizzle_flag"]["state"] == "unavailable"
+        assert candidate["fizzle_flag"]["reason"] == (
+            "fizzle_flag_missing_from_burst_profile"
+        )
+
+    def test_missing_profile_is_unavailable_not_a_silent_pass(self):
+        candidate = _candidate(burst_profile=None)
+        assert candidate["fizzle_flag"]["state"] == "unavailable"
+        assert candidate["fizzle_flag"]["reason"] == "burst_profile_unavailable"
 
 
 class TestBurstRanking:

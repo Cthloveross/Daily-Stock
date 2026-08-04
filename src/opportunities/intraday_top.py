@@ -32,12 +32,18 @@ from src.opportunities.intraday import (
     session_phase_label,
 )
 from src.opportunities.intraday_bursts import (
+    ATR_SCALE_LIMITATION_LINE,
     BURST_BASIS,
     BURST_LIMITATIONS,
     BURST_SUPPORT_MIN,
     DISPLACEMENT_LIMITATION_LINE,
+    FIZZLE_CAVEAT,
+    FIZZLE_EFFICIENCY_MIN,
+    FIZZLE_REFERENCE,
+    FIZZLE_VOL_NORM_MAX,
     compute_recent_displacement,
     unavailable_burst_profile,
+    unavailable_fizzle_flag,
 )
 from src.opportunities.intraday_setups import (
     SETUP_GAP_ATR_MULTIPLE_MIN,
@@ -58,7 +64,18 @@ from src.opportunities.intraday_setups import (
 # 766 笔回合取证分析的同一把 ATR 标尺回答「它已经在不在动」，0.5 ATR 是他自己
 # 样本里的经验「活下来」线（描述统计，非预测、非信号）。additive 字段：
 # 不参与 supports 计数、不参与排序、不隐藏行。
-INTRADAY_TOP_SIGNAL_VERSION = "intraday_session_evidence_v6"
+# v7: 2026-08 起速回放研究（9,173 次爆发起点、21 标的 × 123 时段）的**否定性
+# 结论**先行——起速那一刻方向不可预测（P(方向)=50.6%，19 个候选因子方向 AUC
+# 0.48–0.52，MFE/|MAE| 中位 1.026），因此本版**不新增**任何延续概率或真假速度
+# 评分。只落两件经样本外验证活下来的事：
+#   1) 哑火形态 fizzle_flag（intraday stratum + 窗口效率 ≥0.9 + vol_norm <2.0，
+#      30 分钟内达到 ≥0.5 ATR 有利位移仅 26.8%/25.4% vs 基准 47.8%/50.5%）——
+#      additive 标注：不进 supports、不参与排序、不隐藏行、不是卖出信号；
+#   2) ATR 标尺可比性修正（recent_displacement.atr_scale_comparability +
+#      新的日线量级回退），日线 ATR14 主路径数值口径逐字未变。
+# 研究另建议过的「起速幅度分档列」被**明确不做**：表格已过密，且该列只描述
+# 波动幅度、无方向含义，容易被读成方向信号。
+INTRADAY_TOP_SIGNAL_VERSION = "intraday_session_evidence_v7"
 INTRADAY_TOP_SCHEMA_VERSION = "intraday-top/1.0"
 
 # ---------------------------------------------------------------------------
@@ -154,6 +171,23 @@ INTRADAY_TOP_LIMITATIONS = (
     "形态标签的 Playbook 对应关系（候选/已晋升）为只读展示；Playbook 规则不反哺"
     "任何评分、排序或提示词。",
     DISPLACEMENT_LIMITATION_LINE,
+    ATR_SCALE_LIMITATION_LINE,
+    # v7：把研究的否定性结论摆在前面，再说这个标注是什么。
+    "起速那一刻分不出方向（2026-08 回放研究：9,173 次爆发起点、21 标的 × 123 个交易时段、"
+    "2026-02-05→08-03，用户自己的 5m K 线逐根重放、无未来函数）：30 分钟后净位移仍在爆发"
+    "方向的概率 = 50.6%，19 个候选判别因子的方向 AUC 全在 0.48–0.52，MFE/|MAE| 中位 = 1.026"
+    "（有利与不利同幅放大）。因此本系统**不提供**延续概率、真假速度评分或方向判断。",
+    f"「哑火形态」＝当前 15 分钟窗口同时满足 intraday 分层（非开盘回退基准段）、窗口效率 ≥"
+    f"{FIZZLE_EFFICIENCY_MIN}（|收−开| ÷ 窗口高低差，几乎无回撤）、量比 <{FIZZLE_VOL_NORM_MAX}（量能平平）："
+    f"该形态 30 分钟内达到 ≥0.5 ATR 有利位移的比例仅 {FIZZLE_REFERENCE['in_sample_rate'] * 100:.1f}%"
+    f"（样本内 Feb–May，n={FIZZLE_REFERENCE['n_in']}）与 {FIZZLE_REFERENCE['out_of_sample_rate'] * 100:.1f}%"
+    f"（样本外 Jun–Aug，n={FIZZLE_REFERENCE['n_out']}），基准 "
+    f"{FIZZLE_REFERENCE['base_rate_in'] * 100:.1f}%/{FIZZLE_REFERENCE['base_rate_out'] * 100:.1f}%；"
+    f"方向一致性 20/20 标的、6/6 月、三把 ATR 标尺同号。{FIZZLE_CAVEAT}"
+    "约 200 次比较下 Bonferroni 无一存活，该规则按方向一致性与样本外稳定性保留，不是按 p 值；"
+    "它是 additive 标注：不参与 supports 计数、不参与排序、不隐藏行。",
+    "研究提出但**明确不做**的一项：「起速幅度分档」列。它只描述波动幅度、不含方向信息"
+    "（同一档内 P(方向) ≈ 53%），且表格已过密——不新增列，避免把波动读数读成方向信号。",
 )
 
 _RECENT_EVENT_FIELDS = (
@@ -1085,6 +1119,14 @@ def build_intraday_top_candidate(
         "atr_range_expansion": atr_range_expansion,
         "range_expansion_unavailable_reason": range_expansion_unavailable_reason,
         "session_bursts": bursts,
+        # v7 哑火形态：描述**当前这个 15 分钟窗口**的形态 + 历史频率（回避型
+        # 参考，不是卖出信号、不是方向判断）。additive：不进 supports 计数、
+        # 不参与排序、不隐藏行；burst profile 缺席时显式标缺，绝不冒充「没命中」。
+        "fizzle_flag": (
+            dict(bursts.get("fizzle_flag"))
+            if isinstance(bursts.get("fizzle_flag"), Mapping)
+            else unavailable_fizzle_flag("fizzle_flag_missing_from_burst_profile")
+        ),
         # v3 上下文信号：只是标注，不参与 supporting_evidence_count 或排序。
         "earnings_proximity": compute_earnings_proximity(
             ticker,

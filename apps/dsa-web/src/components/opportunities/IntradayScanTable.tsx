@@ -79,6 +79,60 @@ const GRADE_DETAIL_LABELS: Record<'strong' | 'medium', string> = {
 };
 
 /** 强波段＝实底警示底色 chip；中波段/未分级＝描边 chip。 */
+/**
+ * v7 哑火形态标记：只在命中时渲染一枚 warning-muted 小徽标（挂在既有
+ * 「当前爆发」单元格里，不新增列）。not_flagged / unavailable 一律**不渲染**——
+ * 缺席不是结论，而表格已经足够密。
+ */
+const FIZZLE_CHIP_CLASS =
+  'mt-0.5 inline-block whitespace-nowrap rounded-ds-sm border border-[color:var(--warn-muted)] bg-bg-0 px-1.5 py-0.5 text-caption font-medium text-warning';
+
+const FIZZLE_CAVEAT =
+  '这是形态描述与历史频率，不是卖出信号；方向本身在样本中约 53%，与掷硬币无实质差别。';
+
+function formatPercentRate(value: number | null | undefined): string {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? `${(value * 100).toFixed(1)}%`
+    : '标缺';
+}
+
+/** 哑火形态 tooltip：口径 + 样本外/样本内频率 + 基准 + 诚实边界。 */
+function fizzleTooltip(flag: NonNullable<IntradayTopCandidate['fizzleFlag']>): string {
+  const reference = flag.reference;
+  const efficiency =
+    typeof flag.efficiency === 'number' ? flag.efficiency.toFixed(2) : '标缺';
+  const volNorm = typeof flag.volNorm === 'number' ? flag.volNorm.toFixed(2) : '标缺';
+  return [
+    `哑火形态：当前 15 分钟窗口效率 ${efficiency}（≥0.9，|收−开| ÷ 窗口高低差，`
+    + `几乎没有回撤）+ 量比 ${volNorm}（<2.0，量能平平）+ 盘中段（非开盘回退基准段）。`,
+    `这类窗口在 30 分钟内达到 ≥0.5 ATR 有利位移的比例：样本内（2026-02→05）`
+    + `${formatPercentRate(reference.inSampleRate)}（n=${reference.nIn}）、`
+    + `样本外（2026-06→08）${formatPercentRate(reference.outOfSampleRate)}（n=${reference.nOut}），`
+    + `同期基准 ${formatPercentRate(reference.baseRateIn)} / ${formatPercentRate(reference.baseRateOut)}。`,
+    `样本：${reference.sample}（21 个标的 × 123 个交易时段，你自己的 5m K 线逐根重放、无未来函数）；`
+    + '方向一致性 20/20 个标的、6/6 个月、三把 ATR 标尺同号。',
+    '读法：一段几乎不回撤、量能却平平的干净推升——最像「真速度」的形态，恰恰是这份样本里最常哑火的。',
+    FIZZLE_CAVEAT,
+  ].join('\n');
+}
+
+/**
+ * 命中才渲染的哑火徽标；未命中 / 标缺一律返回 null（不占位、不解释）。
+ * 落在既有「当前爆发」单元格内——本版**不新增列**。
+ */
+function fizzleMarker(item: IntradayTopCandidate) {
+  const flag = item.fizzleFlag;
+  if (!flag || flag.state !== 'flagged') return null;
+  const tooltip = fizzleTooltip(flag);
+  return (
+    <Tooltip focusable content={<span className="whitespace-pre-line">{tooltip}</span>}>
+      <span aria-label={tooltip} className={FIZZLE_CHIP_CLASS}>
+        哑火形态
+      </span>
+    </Tooltip>
+  );
+}
+
 const LEG_CHIP_STRONG_CLASS =
   'inline-block whitespace-nowrap rounded-ds-sm border border-[color:var(--warn-muted)] bg-bg-0 px-1.5 py-0.5 text-caption font-medium text-warning';
 const LEG_CHIP_DEFAULT_CLASS =
@@ -283,7 +337,7 @@ const ALIGNMENT_HEADER_TOOLTIP =
  * 文本本身必须可一键展开查看。
  */
 const FULL_METHODOLOGY_TEXT =
-  '当前爆发＝最近 15 分钟（3 根 5m K 线）|收−开| ÷ 当日 5m 波幅中位 × 窗口量比（阈值按 2026-07-31 标注样本校准，盘中排序优先，不是信号）；速度＝相邻两个 15 分钟窗口爆发分之差（5m 近似，非 1m/2m 秒级；减速=你的离场信号，R1）；今日波段＝爆发分分级记录的独立窗口（强 ≥8 按 2026-07-31 暴动样本校准、中 ≥2.5 按 2026-08-03 NVDA 上午持续推升校准；起点相隔 ≥30 分钟，≤4 个，休市显示最近一个交易时段）；缺口＝开盘价对参考前收（休市时段改用快照前收并标注）；量能节奏＝当日累计 vs 20 日全日中位（未按时点折算）；大盘＝候选爆发方向 vs SPY 会话 VWAP 位置（累计额/量近似）；波幅扩张＝当日高低价差 ÷ ATR14；财报＝Finnhub 前向 5 天窗口，≤3 天标「期权贵」（你的回避规则）；期权异动＝最近一页 Moomoo 分类计数，不推断开平仓。你的战绩＝Journal 当前默认 build 已平仓回合按标的聚合（净盈亏/胜率/笔数，<5 笔样本不足，净亏损且 ≥20 笔警示；持仓时长与结果存在内生性，描述非因果、不构成建议）。时段/财报/大盘/速度/你的战绩均为上下文标注——系统标注，用户过滤：不隐藏行、不阻断操作、不参与排序。形态＝styleMatch v1（S1 低点抬高 / S2 跳空托举 / S3 高开遇阻，与你的 Playbook setup 的形状对比；「· 似」=部分相似，缺 K 线或快照输入时标缺）：形态相似度为 v1 几何检测（5m近似），不含你的进场确认帧（2m/1m 回踩8/13EMA），不是信号。近30分位移＝最近 30 分钟（6 根 5m K 线）相对「30 分钟前价格」（窗口首根开盘）的净位移 ÷ ATR 标尺，同时给出区间最高/最低偏移；ATR 标尺优先日线 ATR14（与取证分析同源），缺失时回退盘中代理（最近 20 根 5m 波幅均值 ×3）并逐行标注实际基准，两者都不可得时显式标缺。0.5 ATR 这条线来自你自己 766 笔期权回合（2026-06-08→07-31，Journal build #3）的取证分析：进场几何（追高 vs 回调）对结果没有预测力，而进场后 30 分钟的位移把结果分得很开——速死亏损单（持仓<30分钟）前向 MFE 中位 0.18 ATR / MAE −0.49 ATR，仅 18.3% 达到 ≥0.5 ATR；走出来的赢家（30分钟-3小时）MFE 0.69 / MAE −0.13，71.2% 达到 ≥0.5 ATR；该样本 84% 的合约 ≤1DTE，对「不动」零容忍。诚实边界：这是对已经发生的事的描述统计，不是预测、不是买卖信号；样本窗口恰是你最差的两个月，分组按持仓时长定义（与结果存在循环性），K 线为非官方 5m 聚合。缺失字段显式标缺，不以 0 冒充。';
+  '当前爆发＝最近 15 分钟（3 根 5m K 线）|收−开| ÷ 当日 5m 波幅中位 × 窗口量比（阈值按 2026-07-31 标注样本校准，盘中排序优先，不是信号）；速度＝相邻两个 15 分钟窗口爆发分之差（5m 近似，非 1m/2m 秒级；减速=你的离场信号，R1）；今日波段＝爆发分分级记录的独立窗口（强 ≥8 按 2026-07-31 暴动样本校准、中 ≥2.5 按 2026-08-03 NVDA 上午持续推升校准；起点相隔 ≥30 分钟，≤4 个，休市显示最近一个交易时段）；缺口＝开盘价对参考前收（休市时段改用快照前收并标注）；量能节奏＝当日累计 vs 20 日全日中位（未按时点折算）；大盘＝候选爆发方向 vs SPY 会话 VWAP 位置（累计额/量近似）；波幅扩张＝当日高低价差 ÷ ATR14；财报＝Finnhub 前向 5 天窗口，≤3 天标「期权贵」（你的回避规则）；期权异动＝最近一页 Moomoo 分类计数，不推断开平仓。你的战绩＝Journal 当前默认 build 已平仓回合按标的聚合（净盈亏/胜率/笔数，<5 笔样本不足，净亏损且 ≥20 笔警示；持仓时长与结果存在内生性，描述非因果、不构成建议）。时段/财报/大盘/速度/你的战绩均为上下文标注——系统标注，用户过滤：不隐藏行、不阻断操作、不参与排序。形态＝styleMatch v1（S1 低点抬高 / S2 跳空托举 / S3 高开遇阻，与你的 Playbook setup 的形状对比；「· 似」=部分相似，缺 K 线或快照输入时标缺）：形态相似度为 v1 几何检测（5m近似），不含你的进场确认帧（2m/1m 回踩8/13EMA），不是信号。近30分位移＝最近 30 分钟（6 根 5m K 线）相对「30 分钟前价格」（窗口首根开盘）的净位移 ÷ ATR 标尺，同时给出区间最高/最低偏移；ATR 标尺优先日线 ATR14（与取证分析同源），缺失时先回退「上一批交易时段真实波幅均值」（日线量级、当日内恒定），连一个上一时段都没有时才落回旧盘中代理（最近 20 根 5m 波幅均值 ×3）；每行标注实际基准与可比性——旧代理与真实日线 ATR14 之比在盘中 0.28→0.42→0.20 漂移，因此标了「不可比」的行不要与走 ATR14 的行横向比较，全都不可得时显式标缺。0.5 ATR 这条线来自你自己 766 笔期权回合（2026-06-08→07-31，Journal build #3）的取证分析：进场几何（追高 vs 回调）对结果没有预测力，而进场后 30 分钟的位移把结果分得很开——速死亏损单（持仓<30分钟）前向 MFE 中位 0.18 ATR / MAE −0.49 ATR，仅 18.3% 达到 ≥0.5 ATR；走出来的赢家（30分钟-3小时）MFE 0.69 / MAE −0.13，71.2% 达到 ≥0.5 ATR；该样本 84% 的合约 ≤1DTE，对「不动」零容忍。诚实边界：这是对已经发生的事的描述统计，不是预测、不是买卖信号；样本窗口恰是你最差的两个月，分组按持仓时长定义（与结果存在循环性），K 线为非官方 5m 聚合。缺失字段显式标缺，不以 0 冒充。「哑火形态」（当前爆发格内的小徽标，命中才出现）＝当前 15 分钟窗口效率 ≥0.9（几乎无回撤）+ 量比 <2.0（量能平平）+ 盘中段：2026-08 起速回放研究（9,173 次爆发起点、21 标的 × 123 个交易时段）里这类窗口 30 分钟内达到 ≥0.5 ATR 有利位移的比例只有 26.8%（样本内 n=291）/ 25.4%（样本外 n=177），基准 47.8%/50.5%。同一份研究的首要结论是否定的：起速那一刻**方向不可预测**（P(方向)=50.6%，19 个候选因子方向 AUC 0.48–0.52，MFE/|MAE| 中位 1.026），所以本表**没有**延续概率或真假速度评分；哑火形态是形态描述与历史频率，不是卖出信号。';
 
 function formatBurstThrust(value: number | null): string {
   if (value === null) return '—';
@@ -439,7 +493,17 @@ function speedCaption(item: IntradayTopCandidate): string {
  */
 const DISPLACEMENT_BASIS_LABELS: Record<string, string> = {
   atr14_daily: 'ATR14 日线',
+  prior_sessions_true_range_mean: '上一批交易时段真实波幅均值（日线量级，当日内恒定）',
   intraday_20bar_proxy_x3: '盘中代理（最近 20 根 5m 波幅均值 ×3）',
+};
+
+/** v7：这一行的 ATR 读数能不能和走 ATR14 的行放一起比——直说。 */
+const DISPLACEMENT_COMPARABILITY_LABELS: Record<string, string> = {
+  daily_atr14: '可与其它 ATR14 行横向比较',
+  daily_scale_prior_sessions_approximate:
+    '日线量级、可近似比较（仅 ≤3 个时段，比 ATR14 噪声大）',
+  intraday_scale_not_comparable:
+    '盘中量级，不可与 ATR14 行或跨时点比较（该代理与真实日线 ATR14 之比在盘中 0.28→0.42→0.20 漂移）',
 };
 
 /**
@@ -452,12 +516,22 @@ function displacementTooltip(item: IntradayTopCandidate): string {
   const line = displacement?.survivalLineAtr ?? 0.5;
   const basis = displacement?.atrBasis
     ? DISPLACEMENT_BASIS_LABELS[displacement.atrBasis] ?? displacement.atrBasis
-    : '标缺（ATR14 日线 / 盘中代理均不可得）';
+    : '标缺（ATR14 日线 / 上一时段波幅 / 盘中代理均不可得）';
   const parts = [
     `近 ${minutes} 分钟（6×5m）净位移 ÷ ATR。${line} ATR 是你自己 766 笔样本里「活下来」的`
     + '经验线（描述统计，非预测、非信号）；基准：'
     + basis,
   ];
+  // v7：不同标尺的读数不能混着比——把这行读数的可比性直接说出来。
+  if (displacement?.atrScaleComparability) {
+    const comparability =
+      DISPLACEMENT_COMPARABILITY_LABELS[displacement.atrScaleComparability]
+      ?? displacement.atrScaleComparability;
+    const sessions = displacement.atrPriorSessionCount
+      ? `（取 ${displacement.atrPriorSessionCount} 个已结束时段）`
+      : '';
+    parts.push(`标尺可比性：${comparability}${sessions}。`);
+  }
   if (displacement?.state === 'ready') {
     parts.push(
       `区间：最高 ${formatSignedAtr(displacement.highExcursionAtr)}`
@@ -820,7 +894,7 @@ export function IntradayScanTable({
             {data?.quoteSessionScope === 'latest_prior_session'
               ? '休市 · 按最近交易时段最强波段排序'
               : '波段爆发优先排名'}
-            （{data?.signalVersion ?? 'intraday_session_evidence_v6'}）· 不冻结 · 不入统计
+            （{data?.signalVersion ?? 'intraday_session_evidence_v7'}）· 不冻结 · 不入统计
           </span>
           {data?.universeScan && (
             <span className="text-caption text-text-3">
@@ -973,6 +1047,7 @@ export function IntradayScanTable({
                         <div className="mt-0.5 text-caption text-text-3">
                           15分 {formatBurstThrust(item.sessionBursts.current.thrustPercent)}
                         </div>
+                        {fizzleMarker(item)}
                       </>
                     ) : (
                       <>

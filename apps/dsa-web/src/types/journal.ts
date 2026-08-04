@@ -1033,6 +1033,52 @@ export interface PersonalEdgeMonthlyBucket {
 }
 
 /**
+ * 规模与频率纪律读数：每美元回报（真账）+ 仓位 + 频率 + 本体/尾部拆解 +
+ * 成交明细来源。任何比率分母不足即为 null 并附 `*Reason`，绝不以 0 冒充；
+ * `exactFillShare < 1` 表示该区间含重建成交明细（时点仅供参考）。
+ */
+export interface PersonalEdgeDisciplineStats {
+  n: number;
+  tradingDayCount: number;
+  tradesPerDay: number | null;
+  tradesPerDayReason: string | null;
+  premiumKnownCount: number;
+  premiumMissingCount: number;
+  medianPremiumAtRisk: number | null;
+  totalPremiumAtRisk: number | null;
+  premiumReason: string | null;
+  netPnl: number;
+  pnlPerDollarRisked: number | null;
+  pnlPerDollarRiskedReason: string | null;
+  medianEpisodePnl: number | null;
+  bodyPnl: number | null;
+  bodyEpisodeCount: number | null;
+  bodyPnlReason: string | null;
+  dteKnownCount: number;
+  zeroDteShare: number | null;
+  zeroDteReason: string | null;
+  exactFillShare: number | null;
+  hasReconstructedFills: boolean;
+}
+
+export interface PersonalEdgeDisciplineMonth extends PersonalEdgeDisciplineStats {
+  month: string;
+}
+
+export interface PersonalEdgeDisciplineWindow extends PersonalEdgeDisciplineStats {
+  requestedTradingDays: number;
+  startDate: string | null;
+  endDate: string | null;
+}
+
+export interface PersonalEdgeDiscipline {
+  monthly: PersonalEdgeDisciplineMonth[];
+  currentWindow: PersonalEdgeDisciplineWindow;
+  bodyTrimCount: number;
+  bodyMinEpisodeCount: number;
+}
+
+/**
  * 个人画像回灌：当前默认 build 已平仓回合的描述统计（build_id + 日期范围 +
  * computed_at 全程可见）。描述不是因果——内生性 caveat 在 limitations 原文携带。
  */
@@ -1057,6 +1103,8 @@ export interface PersonalEdgeResponse {
   dteBuckets: PersonalEdgeDteBucket[];
   dteUnknown: PersonalEdgeDteBucket | null;
   monthly: PersonalEdgeMonthlyBucket[];
+  /** additive（2026-08-04）：规模与频率纪律；not_built 或旧后端响应时缺席。 */
+  discipline?: PersonalEdgeDiscipline | null;
   monthBasis: string | null;
   limitations: string[];
 }

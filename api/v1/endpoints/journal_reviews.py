@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import time
+from dataclasses import asdict
 from threading import Lock
 
 from fastapi import APIRouter, HTTPException, Query
 
 from api.v1.schemas.journal_reviews import (
+    PersonalEdgeDisciplineModel,
+    PersonalEdgeDisciplineMonthModel,
+    PersonalEdgeDisciplineWindowModel,
     PersonalEdgeDteBucketModel,
     PersonalEdgeHoldBucketModel,
     PersonalEdgeMonthlyBucketModel,
@@ -276,6 +280,25 @@ def _personal_edge_response(
             )
             for item in result.monthly
         ],
+        discipline=PersonalEdgeDisciplineModel(
+            monthly=[
+                PersonalEdgeDisciplineMonthModel(
+                    month=item.month,
+                    **asdict(item.stats),
+                )
+                for item in result.discipline.monthly
+            ],
+            current_window=PersonalEdgeDisciplineWindowModel(
+                requested_trading_days=(
+                    result.discipline.current_window.requested_trading_days
+                ),
+                start_date=result.discipline.current_window.start_date,
+                end_date=result.discipline.current_window.end_date,
+                **asdict(result.discipline.current_window.stats),
+            ),
+            body_trim_count=result.discipline.body_trim_count,
+            body_min_episode_count=result.discipline.body_min_episode_count,
+        ),
         month_basis=result.month_basis,
         limitations=list(result.limitations),
     )
@@ -292,10 +315,13 @@ def get_personal_edge(
 ) -> PersonalEdgeResponse:
     """个人画像回灌：当前默认 build 已平仓回合的零写描述统计。
 
-    Per-underlying / hold-time / DTE / monthly buckets recomputed from the
-    same effective default build the other journal reads use, cached
-    in-process for ~10 minutes.  Descriptive only — never a signal, never a
-    filter; the endogeneity caveat ships verbatim in ``limitations``.
+    Per-underlying / hold-time / DTE / monthly buckets plus the additive
+    ``discipline`` block (规模与频率：每美元回报 + 仓位 + 频率 + 本体/尾部 +
+    成交明细来源，按月与近 20 个交易日窗口) recomputed from the same effective
+    default build the other journal reads use, cached in-process for ~10
+    minutes.  Descriptive only — never a signal, never a filter; the
+    endogeneity, reconstructed-fill and fail-closed caveats ship verbatim in
+    ``limitations``.
     """
     now = time.monotonic()
     with _personal_edge_cache_lock:

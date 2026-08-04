@@ -21,9 +21,15 @@ from src.journal.ledger.repository import (
 from src.journal.personal_edge import (
     MONTH_BASIS_UTC_MINUS_4,
     PERSONAL_EDGE_LIMITATIONS,
+    REASON_NO_DTE,
+    REASON_NO_PREMIUM,
+    REASON_ZERO_PREMIUM,
     get_personal_edge_stats,
 )
 from src.storage import get_db
+
+
+_BUILD_SEQUENCE = 0
 
 
 def _seed_build(
@@ -39,9 +45,12 @@ def _seed_build(
     """
     init_ledger_schema()
     db = get_db()
+    global _BUILD_SEQUENCE
+    _BUILD_SEQUENCE += 1
     with db.session_scope() as session:
         build = EpisodeBuild(
-            build_key=f"synthetic-personal-edge-{len(specs)}",
+            # build_key 全局唯一：同一测试内可为不同账户各播一个构建。
+            build_key=f"synthetic-personal-edge-{account_key}-{_BUILD_SEQUENCE}",
             broker="moomoo",
             account_key=account_key,
             builder_name="synthetic-personal-edge-test",
@@ -135,10 +144,11 @@ def _seed_build(
                     total_fee=spec.get("total_fee"),
                     realized_pnl_net=pnl,
                     dte_at_entry=spec.get("dte_at_entry"),
+                    opening_cash_flow=spec.get("opening_cash_flow"),
                     construction_basis="fills",
                     is_left_censored=False,
                     is_right_censored=False,
-                    has_exact_fill_times=True,
+                    has_exact_fill_times=spec.get("has_exact_fill_times", True),
                     has_exact_fill_prices=True,
                     has_complete_fees=True,
                     matching_evidence_json=json.dumps(
@@ -329,3 +339,174 @@ def test_min_underlying_episode_count_must_be_positive():
 
     with pytest.raises(EpisodeRepositoryError):
         get_personal_edge_stats(min_underlying_episode_count=0)
+
+
+# --- 规模与频率纪律（discipline）-------------------------------------------
+
+
+def _discipline_spec(
+    opened_at: datetime,
+    pnl: str,
+    *,
+    opening_cash_flow: Optional[str] = None,
+    dte: Optional[int] = 1,
+    exact: bool = True,
+) -> dict:
+    return {
+        "underlying": "AAA",
+        "opened_at": opened_at,
+        "hold_seconds": 1_200,
+        "realized_pnl_net": Decimal(pnl),
+        "total_fee": Decimal("1"),
+        "dte_at_entry": dte,
+        "opening_cash_flow": (
+            Decimal(opening_cash_flow) if opening_cash_flow is not None else None
+        ),
+        "has_exact_fill_times": exact,
+    }
+
+
+def test_discipline_monthly_ratios_and_et_day_counting():
+    """日均笔数按 ET≈UTC−4 自然日去重；每美元回报＝净盈亏 ÷ Σ|开仓现金流|。"""
+    specs = [
+        # 同一 ET 交易日（04-06）的两笔，只算一个交易日。
+        _discipline_spec(_april(6, 14), "300", opening_cash_flow="-1000", dte=0),
+        _discipline_spec(_april(6, 18), "-100", opening_cash_flow="-1000", dte=0),
+        # 贷方开仓（正现金流）按绝对值计风险金额；重建成交明细。
+        _discipline_spec(
+            _april(7, 14), "50", opening_cash_flow="2000", dte=5, exact=False
+        ),
+        # 04-08 03:00 UTC → ET 04-07 23:00：仍归入 04-07 这个交易日。
+        _discipline_spec(
+            datetime(2026, 4, 8, 3, 0, tzinfo=timezone.utc), "-50", dte=None
+        ),
+    ]
+    _seed_build(specs)
+    result = get_personal_edge_stats()
+    assert result is not None
+
+    assert [item.month for item in result.discipline.monthly] == ["2026-04"]
+    stats = result.discipline.monthly[0].stats
+    assert stats.n == 4
+    assert stats.trading_day_count == 2
+    assert stats.trades_per_day == pytest.approx(2.0)
+    assert stats.trades_per_day_reason is None
+    # 开仓现金流缺失只计缺席，绝不以 0 拉低中位仓位。
+    assert (stats.premium_known_count, stats.premium_missing_count) == (3, 1)
+    assert stats.median_premium_at_risk == pytest.approx(1000.0)
+    assert stats.total_premium_at_risk == pytest.approx(4000.0)
+    assert stats.net_pnl == pytest.approx(200.0)
+    assert stats.pnl_per_dollar_risked == pytest.approx(0.05)
+    assert stats.median_episode_pnl == pytest.approx(0.0)
+    # DTE 缺失不进 0DTE 分母。
+    assert stats.dte_known_count == 3
+    assert stats.zero_dte_share == pytest.approx(0.6667)
+    assert stats.exact_fill_share == pytest.approx(0.75)
+    assert stats.has_reconstructed_fills is True
+
+
+def test_discipline_body_pnl_gate_needs_fifteen_episodes():
+    """本体盈亏去掉最好/最差各 5 笔；<15 笔显式 null + 原因。"""
+    specs = [
+        _discipline_spec(
+            datetime(2026, 5, day, 14, 0, tzinfo=timezone.utc),
+            str(day),
+            opening_cash_flow="100",
+        )
+        for day in range(1, 16)  # 15 笔：P&L 1..15
+    ] + [
+        _discipline_spec(
+            datetime(2026, 6, day, 14, 0, tzinfo=timezone.utc),
+            "10",
+            opening_cash_flow="100",
+        )
+        for day in range(1, 15)  # 14 笔：不足门槛
+    ]
+    _seed_build(specs)
+    result = get_personal_edge_stats()
+    assert result is not None
+    by_month = {item.month: item.stats for item in result.discipline.monthly}
+
+    may = by_month["2026-05"]
+    assert may.n == 15
+    # 去掉 1..5 与 11..15 后剩 6..10 = 40。
+    assert may.body_pnl == pytest.approx(40.0)
+    assert may.body_episode_count == 5
+    assert may.body_pnl_reason is None
+
+    june = by_month["2026-06"]
+    assert june.n == 14
+    assert june.body_pnl is None
+    assert june.body_episode_count is None
+    assert june.body_pnl_reason is not None
+    assert "14" in june.body_pnl_reason and "15" in june.body_pnl_reason
+
+
+def test_discipline_current_window_takes_last_twenty_trading_days():
+    """当前窗口＝build 内实际存在的最后 20 个交易日，不足即取全部。"""
+    specs = [
+        _discipline_spec(
+            datetime(2026, 6, 1, 14, 0, tzinfo=timezone.utc) + timedelta(days=offset),
+            "10" if offset % 2 else "-4",
+            opening_cash_flow="100",
+        )
+        for offset in range(25)  # 25 个不同 ET 交易日，每日 1 笔
+    ]
+    _seed_build(specs)
+    result = get_personal_edge_stats()
+    assert result is not None
+    window = result.discipline.current_window
+
+    assert window.requested_trading_days == 20
+    assert window.start_date == "2026-06-06"
+    assert window.end_date == "2026-06-25"
+    assert window.stats.n == 20
+    assert window.stats.trading_day_count == 20
+    assert window.stats.trades_per_day == pytest.approx(1.0)
+    assert window.stats.total_premium_at_risk == pytest.approx(2000.0)
+    assert window.stats.exact_fill_share == pytest.approx(1.0)
+    assert window.stats.has_reconstructed_fills is False
+
+
+def test_discipline_fails_closed_on_zero_denominators():
+    """无开仓现金流 / 合计为 0 / 无已知 DTE：一律 null + 原因，绝不以 0 冒充。"""
+    specs = [
+        _discipline_spec(_april(6, 14), "10", dte=None),
+        _discipline_spec(_april(7, 14), "-10", dte=None),
+    ]
+    _seed_build(specs)
+    result = get_personal_edge_stats()
+    assert result is not None
+    stats = result.discipline.monthly[0].stats
+    assert stats.median_premium_at_risk is None
+    assert stats.total_premium_at_risk is None
+    assert stats.premium_reason == REASON_NO_PREMIUM
+    assert stats.pnl_per_dollar_risked is None
+    assert stats.pnl_per_dollar_risked_reason == REASON_NO_PREMIUM
+    assert stats.zero_dte_share is None
+    assert stats.zero_dte_reason == REASON_NO_DTE
+
+    # 现金流已知但合计为 0：与「没有现金流」是两回事，原因必须区分。
+    _seed_build(
+        [
+            _discipline_spec(_april(8, 14), "5", opening_cash_flow="0"),
+            _discipline_spec(_april(9, 14), "-5", opening_cash_flow="0"),
+        ],
+        account_key="zero_premium_account",
+    )
+    zero = get_personal_edge_stats("zero_premium_account")
+    assert zero is not None
+    zero_stats = zero.discipline.monthly[0].stats
+    assert zero_stats.premium_known_count == 2
+    assert zero_stats.total_premium_at_risk == pytest.approx(0.0)
+    assert zero_stats.pnl_per_dollar_risked is None
+    assert zero_stats.pnl_per_dollar_risked_reason == REASON_ZERO_PREMIUM
+
+
+def test_discipline_limitations_carry_reconstructed_fill_and_gate_notes():
+    _seed_build([_discipline_spec(_april(6, 14), "10", opening_cash_flow="100")])
+    result = get_personal_edge_stats()
+    assert result is not None
+    assert result.limitations == PERSONAL_EDGE_LIMITATIONS
+    assert any("重建" in line for line in result.limitations)
+    assert any("fail-closed" in line for line in result.limitations)

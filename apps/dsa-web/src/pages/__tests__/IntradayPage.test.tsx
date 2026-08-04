@@ -434,7 +434,7 @@ function topResponse(
       source: 'moomoo_openapi',
       unavailableReason: null,
     },
-    signalVersion: 'intraday_session_evidence_v6',
+    signalVersion: 'intraday_session_evidence_v7',
     rankingMethod:
       sessionState === 'closed'
         ? 'rule_based_evidence_count'
@@ -562,7 +562,7 @@ describe('IntradayPage', () => {
 
     // 页头副标题：爆发分优先排名 + 版本号。
     expect(screen.getByText(/波段爆发优先排名/)).toBeInTheDocument();
-    expect(screen.getByText(/intraday_session_evidence_v6/)).toBeInTheDocument();
+    expect(screen.getByText(/intraday_session_evidence_v7/)).toBeInTheDocument();
 
     // 主次顺序：实时扫描（主表）在前，今日计划跟踪其后，期权事件流最后。
     const scanSection = screen.getByLabelText('实时扫描');

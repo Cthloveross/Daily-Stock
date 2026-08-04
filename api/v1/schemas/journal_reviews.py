@@ -356,6 +356,57 @@ class PersonalEdgeMonthlyBucketModel(BaseModel):
     win_rate: Optional[float] = Field(default=None, ge=0, le=1)
 
 
+class PersonalEdgeDisciplineStatsModel(BaseModel):
+    """规模与频率纪律读数：每美元回报 + 仓位 + 频率 + 本体/尾部 + 成交明细来源.
+
+    比率一律 fail-closed：分母为 0、无可用开仓现金流或样本不足时为 null 并附
+    ``*_reason``；``exact_fill_share`` < 1 表示该区间含重建成交明细。
+    """
+
+    n: int = Field(ge=0)
+    trading_day_count: int = Field(ge=0)
+    trades_per_day: Optional[float] = Field(default=None, ge=0)
+    trades_per_day_reason: Optional[str] = None
+    premium_known_count: int = Field(default=0, ge=0)
+    premium_missing_count: int = Field(default=0, ge=0)
+    median_premium_at_risk: Optional[float] = None
+    total_premium_at_risk: Optional[float] = None
+    premium_reason: Optional[str] = None
+    net_pnl: float = 0.0
+    pnl_per_dollar_risked: Optional[float] = None
+    pnl_per_dollar_risked_reason: Optional[str] = None
+    median_episode_pnl: Optional[float] = None
+    body_pnl: Optional[float] = None
+    body_episode_count: Optional[int] = Field(default=None, ge=0)
+    body_pnl_reason: Optional[str] = None
+    dte_known_count: int = Field(default=0, ge=0)
+    zero_dte_share: Optional[float] = Field(default=None, ge=0, le=1)
+    zero_dte_reason: Optional[str] = None
+    exact_fill_share: Optional[float] = Field(default=None, ge=0, le=1)
+    has_reconstructed_fills: bool = False
+
+
+class PersonalEdgeDisciplineMonthModel(PersonalEdgeDisciplineStatsModel):
+    month: str = Field(pattern=r"^\d{4}-\d{2}$")
+
+
+class PersonalEdgeDisciplineWindowModel(PersonalEdgeDisciplineStatsModel):
+    """Trailing-N-trading-day window over the days present in the build."""
+
+    requested_trading_days: int = Field(ge=1)
+    start_date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    end_date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+
+
+class PersonalEdgeDisciplineModel(BaseModel):
+    """规模与频率监控：月度序列 + 当前窗口，同一 build 同一口径."""
+
+    monthly: list[PersonalEdgeDisciplineMonthModel] = Field(default_factory=list)
+    current_window: PersonalEdgeDisciplineWindowModel
+    body_trim_count: int = Field(ge=1)
+    body_min_episode_count: int = Field(ge=1)
+
+
 class PersonalEdgeResponse(BaseModel):
     """Descriptive personal stats over the current default episode build.
 
@@ -396,5 +447,7 @@ class PersonalEdgeResponse(BaseModel):
     monthly: list[PersonalEdgeMonthlyBucketModel] = Field(
         default_factory=list
     )
+    # additive（2026-08-04）：规模与频率纪律；not_built 时为 null。
+    discipline: Optional[PersonalEdgeDisciplineModel] = None
     month_basis: Optional[str] = None
     limitations: list[str] = Field(default_factory=list)

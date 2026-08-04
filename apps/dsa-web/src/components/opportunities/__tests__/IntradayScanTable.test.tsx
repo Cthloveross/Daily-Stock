@@ -301,7 +301,7 @@ function topResponse(): IntradayTopResponse {
       source: 'moomoo_openapi',
       unavailableReason: 'spy_quote_unavailable',
     },
-    signalVersion: 'intraday_session_evidence_v6',
+    signalVersion: 'intraday_session_evidence_v7',
     rankingMethod: 'burst_score_first_then_evidence_count',
     statisticsTrack: 'none_intraday_v1_unscored',
     moomooEnabled: true,
@@ -1281,6 +1281,7 @@ describe('IntradayScanTable 近30分位移列（v6 recent displacement）', () =
             lowExcursionAtr: -0.95,
             absRangeAtr: 1.0,
             atrBasis: 'intraday_20bar_proxy_x3',
+            atrScaleComparability: 'intraday_scale_not_comparable',
             barCount: 18,
             unavailableReason: null,
           }),
@@ -1293,11 +1294,44 @@ describe('IntradayScanTable 近30分位移列（v6 recent displacement）', () =
     const value = within(table).getByText('−0.83 ATR');
     expect(value).toHaveClass('text-down-strong');
     // 回退基准如实标注为盘中代理，不冒充 ATR14。
-    expect(
-      within(displacementCellOf(table))
-        .getByLabelText(/区间：最高/)
-        .getAttribute('aria-label'),
-    ).toContain('基准：盘中代理（最近 20 根 5m 波幅均值 ×3）');
+    const label = within(displacementCellOf(table))
+      .getByLabelText(/区间：最高/)
+      .getAttribute('aria-label') ?? '';
+    expect(label).toContain('基准：盘中代理（最近 20 根 5m 波幅均值 ×3）');
+    // v7：这把尺子随时点伸缩，tooltip 必须直说它不可与 ATR14 行横向比较。
+    expect(label).toContain('标尺可比性：');
+    expect(label).toContain('不可');
+    expect(label).toContain('0.28→0.42→0.20');
+  });
+
+  it('says the prior-session fallback is daily-scale and reports how many sessions it used', () => {
+    render(
+      <IntradayScanTable
+        data={displacementResponse(
+          displacementProfile({
+            state: 'ready',
+            netMoveAtr: 0.61,
+            highExcursionAtr: 0.7,
+            lowExcursionAtr: -0.05,
+            absRangeAtr: 0.75,
+            atrBasis: 'prior_sessions_true_range_mean',
+            atrScaleComparability: 'daily_scale_prior_sessions_approximate',
+            atrPriorSessionCount: 2,
+            barCount: 30,
+            unavailableReason: null,
+          }),
+        )}
+        loading={false}
+        error={null}
+      />,
+    );
+    const table = screen.getByRole('table', { name: '实时扫描表' });
+    const label = within(displacementCellOf(table))
+      .getByLabelText(/区间：最高/)
+      .getAttribute('aria-label') ?? '';
+    expect(label).toContain('上一批交易时段真实波幅均值（日线量级，当日内恒定）');
+    expect(label).toContain('日线量级、可近似比较');
+    expect(label).toContain('（取 2 个已结束时段）');
   });
 
   it('mutes a move inside ±0.5 ATR and says 未达 0.5 instead of pretending', () => {
@@ -1563,5 +1597,130 @@ describe('IntradayScanTable 「你的战绩」列（个人画像回灌）', () =
       within(section).getByLabelText('你的历史亏钱标的 · 92 笔 · 净 −$53K · 胜率 21.7%'),
     ).toBeInTheDocument();
     expect(within(section).getByText('已轮换出')).toBeInTheDocument();
+  });
+});
+
+describe('IntradayScanTable 哑火形态标记（v7，命中才渲染）', () => {
+  beforeEach(() => {
+    navigateMock.mockReset();
+    vi.mocked(fetchNearExpiryContracts).mockReset();
+    vi.mocked(fetchNearExpiryContracts).mockImplementation(
+      async (symbol: string) => nearExpiryEmpty(symbol),
+    );
+  });
+
+  function fizzleFlag(
+    overrides: Partial<NonNullable<IntradayTopCandidate['fizzleFlag']>> = {},
+  ): NonNullable<IntradayTopCandidate['fizzleFlag']> {
+    return {
+      state: 'flagged',
+      efficiency: 0.94,
+      volNorm: 1.2,
+      stratum: 'intraday',
+      reason: 'intraday_clean_thrust_with_unremarkable_volume',
+      basis:
+        'current_15m_window_intraday_stratum_and_efficiency_ge_0.9_and_vol_norm_lt_2.0',
+      reference: {
+        sample:
+          '9173_burst_onsets_21_underlyings_123_sessions_2026-02-05_to_2026-08-03_fresh_onsets_time_ordered_split',
+        inSampleRate: 0.268,
+        outOfSampleRate: 0.254,
+        baseRateIn: 0.478,
+        baseRateOut: 0.505,
+        nIn: 291,
+        nOut: 177,
+      },
+      ...overrides,
+    };
+  }
+
+  function burstReadyCandidate(
+    flag: IntradayTopCandidate['fizzleFlag'],
+  ): IntradayTopCandidate {
+    return candidate({
+      fizzleFlag: flag,
+      sessionBursts: {
+        ...candidate().sessionBursts,
+        state: 'ready',
+        sessionDateEt: '2026-08-04',
+        barCount: 12,
+        medianBasis: 'current_session_bars_so_far',
+        current: {
+          startEt: '10:15',
+          endEt: '10:30',
+          thrustPercent: 1.2,
+          thrustNorm: 3.0,
+          volNorm: 1.2,
+          score: 3.6,
+          direction: 'up',
+        },
+        legs: [],
+        unavailableReason: null,
+      },
+    });
+  }
+
+  function renderWith(flag: IntradayTopCandidate['fizzleFlag']) {
+    const response = {
+      ...topResponse(),
+      candidates: [burstReadyCandidate(flag)],
+      universe: ['NVDA'],
+    };
+    render(<IntradayScanTable data={response} loading={false} error={null} />);
+    return screen.getByRole('table', { name: '实时扫描表' });
+  }
+
+  it('renders a warning-muted chip inside the existing 当前爆发 cell, adding no column', () => {
+    const table = renderWith(fizzleFlag());
+    // 不新增列：默认网格仍是 10 列。
+    expect(within(table).getAllByRole('columnheader').length).toBe(10);
+    const chip = within(table).getByText('哑火形态');
+    expect(chip).toBeInTheDocument();
+    expect(chip.className).toContain('text-warning');
+    // 徽标落在「当前爆发」格里（与该窗口的分数同一单元格）。
+    const cell = chip.closest('td');
+    expect(cell).not.toBeNull();
+    expect(within(cell as HTMLElement).getByText('3.6')).toBeInTheDocument();
+  });
+
+  it('carries the study rates, the sample and the honest caveat in its tooltip', () => {
+    const table = renderWith(fizzleFlag());
+    const label = within(table).getByText('哑火形态').getAttribute('aria-label') ?? '';
+    expect(label).toContain('26.8%');
+    expect(label).toContain('n=291');
+    expect(label).toContain('25.4%');
+    expect(label).toContain('n=177');
+    expect(label).toContain('47.8%');
+    expect(label).toContain('50.5%');
+    expect(label).toContain('9173_burst_onsets_21_underlyings_123_sessions');
+    expect(label).toContain(
+      '这是形态描述与历史频率，不是卖出信号；方向本身在样本中约 53%，与掷硬币无实质差别。',
+    );
+    // 当前窗口的实际读数一并给出，便于本人复核。
+    expect(label).toContain('0.94');
+    expect(label).toContain('1.20');
+  });
+
+  it('renders nothing when the window is not flagged (no clutter)', () => {
+    const table = renderWith(
+      fizzleFlag({ state: 'not_flagged', reason: 'efficiency_below_0.9' }),
+    );
+    expect(within(table).queryByText('哑火形态')).not.toBeInTheDocument();
+  });
+
+  it('renders nothing when the flag is unavailable (absence is not a claim)', () => {
+    const table = renderWith(
+      fizzleFlag({
+        state: 'unavailable',
+        efficiency: null,
+        reason: 'window_high_equals_low_efficiency_undefined',
+      }),
+    );
+    expect(within(table).queryByText('哑火形态')).not.toBeInTheDocument();
+  });
+
+  it('renders nothing when the payload omits the field entirely (v6 载荷)', () => {
+    const table = renderWith(undefined);
+    expect(within(table).queryByText('哑火形态')).not.toBeInTheDocument();
   });
 });

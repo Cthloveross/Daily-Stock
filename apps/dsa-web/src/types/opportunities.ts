@@ -842,6 +842,37 @@ export interface IntradaySetupMatchProfile {
   limitations: string[];
 }
 
+/** 哑火形态的冻结研究参考数字（后端下发，前端不硬编码）。 */
+export interface IntradayFizzleReference {
+  sample: string;
+  inSampleRate: number;
+  outOfSampleRate: number;
+  baseRateIn: number;
+  baseRateOut: number;
+  nIn: number;
+  nOut: number;
+}
+
+/**
+ * v7 哑火形态：对**当前 15 分钟窗口**的形态描述 + 历史频率（additive 标注）。
+ *
+ * 命中＝intraday 分层 + 窗口效率 ≥0.9（几乎无回撤）+ 量比 <2.0（量能平平）。
+ * 2026-08 起速回放研究（9,173 次爆发起点）：该形态 30 分钟内达到 ≥0.5 ATR
+ * 有利位移仅 26.8%（样本内 n=291）/ 25.4%（样本外 n=177），基准 47.8%/50.5%。
+ *
+ * **不是卖出信号、不是方向判断**——同一份样本里起速那一刻的方向 AUC 全在
+ * 0.48–0.52。`not_flagged` 与 `unavailable` 一律**不渲染**：缺席不是结论。
+ */
+export interface IntradayFizzleFlag {
+  state: 'flagged' | 'not_flagged' | 'unavailable';
+  efficiency: number | null;
+  volNorm: number | null;
+  stratum: 'open' | 'intraday' | null;
+  reason: string;
+  basis: string;
+  reference: IntradayFizzleReference;
+}
+
 /** 波段爆发（v2 主信号）：当前窗口 + 当日（或最近一个交易时段）波段列表。 */
 export interface IntradaySessionBursts {
   state: 'ready' | 'insufficient_bars' | 'unavailable';
@@ -854,6 +885,8 @@ export interface IntradaySessionBursts {
   current: IntradayBurstWindow | null;
   legs: IntradayBurstWindow[];
   speed: IntradayBurstSpeed;
+  /** v7 哑火形态（additive）：描述 current 窗口；旧载荷可省略。 */
+  fizzleFlag?: IntradayFizzleFlag | null;
   unavailableReason: string | null;
   source: string | null;
   fetchedAt: string | null;
@@ -877,7 +910,22 @@ export interface IntradayRecentDisplacement {
   highExcursionAtr: number | null;
   lowExcursionAtr: number | null;
   absRangeAtr: number | null;
-  atrBasis: 'atr14_daily' | 'intraday_20bar_proxy_x3' | null;
+  atrBasis:
+    | 'atr14_daily'
+    | 'prior_sessions_true_range_mean'
+    | 'intraday_20bar_proxy_x3'
+    | null;
+  /**
+   * v7 ATR 标尺可比性（additive）：这一行的读数能不能与「日线 ATR14 口径」
+   * 横向比较。旧盘中代理与真实日线 ATR14 之比在盘中 0.28→0.42→0.20 漂移，
+   * 因此显式标 not_comparable。旧载荷可省略。
+   */
+  atrScaleComparability?:
+    | 'daily_atr14'
+    | 'daily_scale_prior_sessions_approximate'
+    | 'intraday_scale_not_comparable'
+    | null;
+  atrPriorSessionCount?: number | null;
   survivalLineAtr: number;
   barCount: number;
   unavailableReason: string | null;
@@ -997,6 +1045,8 @@ export interface IntradayTopCandidate {
   atrRangeExpansion: number | null;
   rangeExpansionUnavailableReason: string | null;
   sessionBursts: IntradaySessionBursts;
+  /** v7 哑火形态（additive）：当前窗口的形态描述 + 历史频率；旧载荷可省略。 */
+  fizzleFlag?: IntradayFizzleFlag | null;
   earningsProximity: IntradayEarningsProximity;
   marketAlignment: IntradayMarketAlignment;
   setupMatch: IntradaySetupMatchProfile;
@@ -1046,7 +1096,7 @@ export interface IntradayTopResponse {
   quoteSessionScope: 'current_session' | 'latest_prior_session';
   quoteSessionLabel: string;
   marketContext: IntradayMarketContext;
-  signalVersion: 'intraday_session_evidence_v6';
+  signalVersion: 'intraday_session_evidence_v7';
   rankingMethod: 'burst_score_first_then_evidence_count' | 'rule_based_evidence_count';
   statisticsTrack: 'none_intraday_v1_unscored';
   moomooEnabled: boolean;

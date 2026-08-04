@@ -14,6 +14,7 @@ import type {
 } from '../types/opportunities';
 import { useUserWatchlistStore } from '../stores/userWatchlistStore';
 import { IntradayPulseStrip } from '../components/opportunities/IntradayPulseStrip';
+import { IntradayDisciplineStrip } from '../components/opportunities/IntradayDisciplineStrip';
 import { IntradayScanTable } from '../components/opportunities/IntradayScanTable';
 import { IntradayOptionEventFeed } from '../components/opportunities/IntradayOptionEventFeed';
 import { IntradayTrackingPanel } from '../components/opportunities/IntradayTrackingPanel';
@@ -26,9 +27,10 @@ export const INTRADAY_PAGE_POLL_INTERVAL_MS = 60_000;
  * 日内工作台：交易时段的单屏主界面。
  *
  * 自上而下（2026-08-04 命名与主次整理）：市场脉搏（SPY/QQQ/VIX + 盘段 +
- * 刷新指示）→ 实时扫描（现在谁在动，主表；盘中滚动证据排名 + 今日曾深扫
- * 账本）→ 今日计划跟踪（盘前冻结计划走到哪了，冻结盘前 Top 5 对照）→
- * 期权事件流。全部内容是盘中滚动研究：不是信号、不冻结、不进入统计；
+ * 刷新指示）→ 规模与频率（近 20 个交易日的每美元回报/日均笔数/中位仓位/
+ * 本体盈亏，镜子读数）→ 实时扫描（现在谁在动，主表；盘中滚动证据排名 +
+ * 今日曾深扫账本）→ 今日计划跟踪（盘前冻结计划走到哪了，冻结盘前 Top 5
+ * 对照）→ 期权事件流。全部内容是盘中滚动研究：不是信号、不冻结、不进入统计；
  * 期权异动是 Moomoo 分类，不证明方向。周内（盘前冻结）研究仍在 /regime。
  */
 const IntradayPage: React.FC = () => {
@@ -188,6 +190,9 @@ const IntradayPage: React.FC = () => {
         error={pulseError}
         pollingActive={pollingActive}
       />
+
+      {/* 规模与频率：紧随脉搏的一行镜子读数（每美元回报才是真账），不是警报。 */}
+      <IntradayDisciplineStrip />
 
       {/* 主次顺序：实时扫描（现在谁在动）为主表，今日计划跟踪其后，期权事件流侧栏。 */}
       <div className="grid gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(340px,1fr)]">

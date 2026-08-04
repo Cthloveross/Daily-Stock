@@ -14,6 +14,7 @@ import FrameworkPanel from '../components/journal/FrameworkPanel';
 import AskJournalChat from '../components/journal/AskJournalChat';
 import PositionEpisodesPanel from '../components/journal/PositionEpisodesPanel';
 import ReviewInsightsPanel from '../components/journal/ReviewInsightsPanel';
+import DisciplineMonthlyPanel from '../components/journal/DisciplineMonthlyPanel';
 import PlaybookPanel from '../components/journal/PlaybookPanel';
 import CurrentPositionsSnapshotCard from '../components/journal/CurrentPositionsSnapshotCard';
 import { positionReviewPath } from '../components/journal/review/journalReviewRouting';
@@ -293,6 +294,8 @@ const JournalPage: React.FC = () => {
           <ReviewInsightsPanel
             onCandidateSaved={() => setPlaybookRefreshToken((token) => token + 1)}
           />
+          {/* 模式观察的同层兄弟：规模与频率（每美元回报才是真账）按月摊开。 */}
+          <DisciplineMonthlyPanel />
           <PlaybookPanel refreshToken={playbookRefreshToken} />
         </div>
       )}

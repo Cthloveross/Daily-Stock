@@ -1104,6 +1104,40 @@ class IntradayMarketContext(BaseModel):
     unavailable_reason: Optional[str] = None
 
 
+class IntradayFizzleReference(BaseModel):
+    """哑火形态的冻结研究参考数字（fresh onsets、时间有序切分）。"""
+
+    sample: str
+    in_sample_rate: float = Field(ge=0, le=1)
+    out_of_sample_rate: float = Field(ge=0, le=1)
+    base_rate_in: float = Field(ge=0, le=1)
+    base_rate_out: float = Field(ge=0, le=1)
+    n_in: int = Field(ge=0)
+    n_out: int = Field(ge=0)
+
+
+class IntradayFizzleFlag(BaseModel):
+    """v7 哑火形态：对**当前 15 分钟窗口**的形态描述 + 历史频率（additive 标注）。
+
+    命中＝intraday 分层（median_basis 非上一时段回退）且窗口效率 ≥0.9
+    （|收−开| ÷ 窗口高低差，几乎无回撤）且量比 <2.0（量能平平）。2026-08 起速
+    回放研究（9,173 次爆发起点、21 标的 × 123 个交易时段）实测：该形态 30 分钟
+    内达到 ≥0.5 ATR 有利位移仅 26.8%（样本内 n=291）/ 25.4%（样本外 n=177），
+    基准 47.8%/50.5%；方向一致性 20/20 标的、6/6 月、三把 ATR 标尺同号。
+
+    **不是卖出信号、不是方向判断**：同一份样本里起速那一刻的方向 AUC 全在
+    0.48–0.52、P(方向)=50.6%。unavailable＝缺输入，缺席不是「没命中」的结论。
+    """
+
+    state: Literal["flagged", "not_flagged", "unavailable"]
+    efficiency: Optional[float] = Field(default=None, ge=0)
+    vol_norm: Optional[float] = Field(default=None, ge=0)
+    stratum: Optional[Literal["open", "intraday"]] = None
+    reason: str
+    basis: str
+    reference: IntradayFizzleReference
+
+
 class IntradaySessionBursts(BaseModel):
     """波段爆发（v2 主信号）：当前窗口 + 当日（或最近一个交易时段）波段列表。
 
@@ -1122,6 +1156,8 @@ class IntradaySessionBursts(BaseModel):
     current: Optional[IntradayBurstWindow] = None
     legs: list[IntradayBurstWindow] = Field(default_factory=list)
     speed: IntradayBurstSpeed
+    # v7 哑火形态（additive）：描述 current 窗口；旧载荷可省略。
+    fizzle_flag: Optional[IntradayFizzleFlag] = None
     unavailable_reason: Optional[str] = None
     source: Optional[str] = None
     fetched_at: Optional[str] = None
@@ -1196,8 +1232,24 @@ class IntradayRecentDisplacement(BaseModel):
     low_excursion_atr: Optional[float] = None
     abs_range_atr: Optional[float] = Field(default=None, ge=0)
     atr_basis: Optional[
-        Literal["atr14_daily", "intraday_20bar_proxy_x3"]
+        Literal[
+            "atr14_daily",
+            # v7 新增回退层：上一批交易时段真实波幅均值（日线量级、当日内恒定）。
+            "prior_sessions_true_range_mean",
+            "intraday_20bar_proxy_x3",
+        ]
     ] = None
+    # v7 ATR 标尺可比性（additive）：这一行的读数能不能与「日线 ATR14 口径」
+    # 横向比较。旧盘中代理与真实日线 ATR14 之比在盘中 0.28→0.42→0.20 漂移，
+    # 因此显式标 not_comparable，绝不让它冒充同一把尺。旧载荷可省略。
+    atr_scale_comparability: Optional[
+        Literal[
+            "daily_atr14",
+            "daily_scale_prior_sessions_approximate",
+            "intraday_scale_not_comparable",
+        ]
+    ] = None
+    atr_prior_session_count: Optional[int] = Field(default=None, ge=1)
     survival_line_atr: float = Field(0.5, gt=0)
     bar_count: int = Field(0, ge=0)
     unavailable_reason: Optional[str] = None
@@ -1342,6 +1394,8 @@ class IntradayTopCandidate(BaseModel):
     atr_range_expansion: Optional[float] = Field(default=None, ge=0)
     range_expansion_unavailable_reason: Optional[str] = None
     session_bursts: IntradaySessionBursts
+    # v7 哑火形态（additive）：当前窗口的形态描述 + 历史频率；旧载荷可省略。
+    fizzle_flag: Optional[IntradayFizzleFlag] = None
     earnings_proximity: IntradayEarningsProximity
     market_alignment: IntradayMarketAlignment
     setup_match: IntradaySetupMatchProfile
@@ -1392,7 +1446,7 @@ class IntradayTopResponse(BaseModel):
     quote_session_scope: Literal["current_session", "latest_prior_session"]
     quote_session_label: str
     market_context: IntradayMarketContext
-    signal_version: Literal["intraday_session_evidence_v6"]
+    signal_version: Literal["intraday_session_evidence_v7"]
     ranking_method: Literal[
         "burst_score_first_then_evidence_count",
         "rule_based_evidence_count",

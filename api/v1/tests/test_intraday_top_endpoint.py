@@ -242,7 +242,7 @@ def test_contract_regular_session_full_row(monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert body["schema_version"] == "intraday-top/1.0"
-    assert body["signal_version"] == "intraday_session_evidence_v6"
+    assert body["signal_version"] == "intraday_session_evidence_v7"
     # 盘中主排序 = 波段爆发分优先。
     assert body["ranking_method"] == "burst_score_first_then_evidence_count"
     # 不冻结、不入统计的显式标记。
@@ -336,6 +336,46 @@ def test_contract_regular_session_full_row(monkeypatch):
     assert displacement["low_excursion_atr"] == pytest.approx(-0.5 / 1.5, abs=1e-4)
     assert displacement["abs_range_atr"] == pytest.approx(4.0 / 1.5, abs=1e-4)
     assert displacement["unavailable_reason"] is None
+    # v7 ATR 标尺可比性：走日线 ATR14 的行显式标「可比」，且回退计数缺席。
+    assert displacement["atr_scale_comparability"] == "daily_atr14"
+    assert displacement["atr_prior_session_count"] is None
+    # v7 哑火形态：末窗效率 |103 − 100| ÷ (103.5 − 99.5) = 0.75 < 0.9、
+    # 量比 3.0 ≥ 2.0 → 两个条件都不满足，如实给出**两个**未满足原因。
+    fizzle = item["fizzle_flag"]
+    assert fizzle["state"] == "not_flagged"
+    assert fizzle["stratum"] == "intraday"
+    assert fizzle["efficiency"] == pytest.approx(0.75, abs=1e-6)
+    assert fizzle["vol_norm"] == pytest.approx(3.0, abs=1e-6)
+    assert fizzle["reason"] == "efficiency_below_0.9+vol_norm_at_or_above_2.0"
+    # 冻结的研究参考数字随行下发（供 UI 原样展示，不在前端硬编码）。
+    assert fizzle["reference"]["n_in"] == 291
+    assert fizzle["reference"]["n_out"] == 177
+    assert fizzle["reference"]["in_sample_rate"] == pytest.approx(0.268)
+    assert fizzle["reference"]["out_of_sample_rate"] == pytest.approx(0.254)
+    assert fizzle["reference"]["base_rate_in"] == pytest.approx(0.478)
+    assert fizzle["reference"]["base_rate_out"] == pytest.approx(0.505)
+    # burst profile 内同一读数（单一真源），候选行只是把它提到顶层。
+    assert bursts["fizzle_flag"] == fizzle
+    # additive-only：v6 的既有字段一个不少、语义不变。
+    for legacy_key in (
+        "session_bursts",
+        "recent_displacement",
+        "setup_match",
+        "market_alignment",
+        "earnings_proximity",
+        "option_activity",
+        "evidence",
+    ):
+        assert legacy_key in item
+    # 哑火形态是标注：不进 supports 计数，也不出现在 evidence 列表里。
+    assert all(entry["metric"] != "fizzle_flag" for entry in item["evidence"])
+    # 否定性结论与「不做什么」写在 limitations 里，用户能直接读到。
+    assert any("起速那一刻分不出方向" in text for text in body["limitations"])
+    assert any("不是卖出信号" in text for text in body["limitations"])
+    assert any("起速幅度分档" in text for text in body["limitations"])
+    assert any(
+        "3.74 个窗口" in text for text in item["session_bursts"]["limitations"]
+    )
     # 位移是 additive 标注：不进 supports 计数，也不出现在 evidence 列表里。
     assert all(
         entry["metric"] != "recent_displacement" for entry in item["evidence"]
@@ -603,6 +643,9 @@ def test_burst_fetch_failure_is_isolated_and_never_blocks_aggregates(monkeypatch
     assert bursts["state"] == "unavailable"
     assert bursts["unavailable_reason"] == "history_5m_unavailable:RuntimeError"
     assert bursts["current"] is None and bursts["legs"] == []
+    # v7：没有窗口就没有形态可谈——显式标缺，绝不冒充「没命中」。
+    assert item["fizzle_flag"]["state"] == "unavailable"
+    assert item["fizzle_flag"]["reason"] == "burst_profile_unavailable"
     burst_evidence = next(
         entry
         for entry in item["evidence"]

@@ -122,6 +122,81 @@ def test_ready_contract_recomputes_from_default_build():
     assert any("UTC−4" in line for line in body["limitations"])
 
 
+def test_discipline_block_is_additive_and_fails_closed():
+    """规模与频率是追加字段：既有字段一字不改，缺分母的比率 null + 原因。"""
+    _seed()
+    client = _client()
+    body = client.get(URL).json()
+
+    # 既有合同原样保留（additive-only）。
+    assert body["schema_version"] == "journal-personal-edge/1.0"
+    assert body["closed_episode_count"] == 5
+    assert body["monthly"] == [
+        {"month": "2026-04", "n": 5, "net": 220.0, "fees": 5.0, "win_rate": 0.6}
+    ]
+    assert body["underlyings"][0]["underlying"] == "AAA"
+    assert body["month_basis"] == "opened_at_utc_minus_4_approximation"
+
+    discipline = body["discipline"]
+    assert discipline["body_trim_count"] == 5
+    assert discipline["body_min_episode_count"] == 15
+    row = discipline["monthly"][0]
+    assert row["month"] == "2026-04"
+    assert row["n"] == 5
+    assert row["trading_day_count"] == 5
+    assert row["trades_per_day"] == 1.0
+    # 该 fixture 不带 opening_cash_flow：仓位与每美元回报显式缺席，绝不以 0 冒充。
+    assert row["median_premium_at_risk"] is None
+    assert row["total_premium_at_risk"] is None
+    assert row["premium_reason"] is not None
+    assert row["pnl_per_dollar_risked"] is None
+    assert row["pnl_per_dollar_risked_reason"] is not None
+    assert row["body_pnl"] is None
+    assert "15" in row["body_pnl_reason"]
+    assert row["exact_fill_share"] == 1.0
+    assert row["has_reconstructed_fills"] is False
+
+
+def test_discipline_window_reports_size_and_frequency():
+    from src.journal.tests.test_personal_edge import _seed_build
+
+    _seed_build(
+        [
+            {
+                "underlying": "AAA",
+                "opened_at": datetime(2026, 7, day, 14, 0, tzinfo=timezone.utc),
+                "hold_seconds": 1_200,
+                "realized_pnl_net": Decimal("100") if day % 2 else Decimal("-60"),
+                "total_fee": Decimal("1"),
+                "dte_at_entry": 0 if day % 2 else 3,
+                "opening_cash_flow": Decimal("-2000"),
+                "has_exact_fill_times": day != 1,
+            }
+            for day in range(1, 5)
+        ]
+    )
+    client = _client()
+    body = client.get(URL).json()
+    window = body["discipline"]["current_window"]
+
+    assert window["requested_trading_days"] == 20
+    assert window["start_date"] == "2026-07-01"
+    assert window["end_date"] == "2026-07-04"
+    assert window["n"] == 4
+    assert window["trading_day_count"] == 4
+    assert window["trades_per_day"] == 1.0
+    assert window["median_premium_at_risk"] == 2000.0
+    assert window["total_premium_at_risk"] == 8000.0
+    # (100 - 60 + 100 - 60) / 8000 = 0.01
+    assert window["pnl_per_dollar_risked"] == 0.01
+    assert window["median_episode_pnl"] == 20.0
+    assert window["zero_dte_share"] == 0.5
+    # 4 笔里 1 笔为重建成交明细 → 0.75，并置位重建标志供 UI 标注。
+    assert window["exact_fill_share"] == 0.75
+    assert window["has_reconstructed_fills"] is True
+    assert any("重建" in line for line in body["limitations"])
+
+
 def test_ten_minute_cache_serves_and_reset_clears():
     _seed()
     client = _client()
