@@ -357,10 +357,16 @@ class PersonalEdgeMonthlyBucketModel(BaseModel):
 
 
 class PersonalEdgeDisciplineStatsModel(BaseModel):
-    """规模与频率纪律读数：每美元回报 + 仓位 + 频率 + 本体/尾部 + 成交明细来源.
+    """规模与频率纪律读数：每美元回报 + 仓位 + 频率 + 本体/尾部 + 口径来源.
 
-    比率一律 fail-closed：分母为 0、无可用开仓现金流或样本不足时为 null 并附
-    ``*_reason``；``exact_fill_share`` < 1 表示该区间含重建成交明细。
+    比率一律 fail-closed：分母为 0、无可用开仓现金流、缺 total_fee 或样本不足时
+    为 null 并附 ``*_reason``。
+
+    口径来源以 ``fill_detailed_share``（``evidence_summary_json.fill_allocations
+    > 0``）为准——它才是「是否由明细成交构建」这一因果判据；``exact_fill_share``
+    （``has_exact_fill_times`` 均值）仅作历史连续性保留，两者会不一致。
+    ``basis_break=true`` 的区间其风险金额分母被低估，**不可**与全明细区间连成一
+    条趋势线，消费端必须断开显示。
     """
 
     n: int = Field(ge=0)
@@ -384,6 +390,25 @@ class PersonalEdgeDisciplineStatsModel(BaseModel):
     zero_dte_reason: Optional[str] = None
     exact_fill_share: Optional[float] = Field(default=None, ge=0, le=1)
     has_reconstructed_fills: bool = False
+    # additive（2026-08-04）：口径来源判据 + 断裂标记。
+    fill_detailed_count: int = Field(default=0, ge=0)
+    aggregate_only_count: int = Field(default=0, ge=0)
+    fill_provenance_unknown_count: int = Field(default=0, ge=0)
+    fill_detailed_share: Optional[float] = Field(default=None, ge=0, le=1)
+    basis_break: bool = False
+    basis_break_reason: Optional[str] = None
+    # additive（2026-08-04）：恒定过路费与毛口径（gross = net + fee）。
+    fees_total: Optional[float] = None
+    fees_missing_count: int = Field(default=0, ge=0)
+    fee_pct_of_premium_at_risk: Optional[float] = None
+    fee_pct_of_premium_at_risk_reason: Optional[str] = None
+    gross_pct_of_premium_at_risk: Optional[float] = None
+    gross_pct_of_premium_at_risk_reason: Optional[str] = None
+    # additive（2026-08-04）：剔除最好 N 笔后的每美元回报（body_pnl 的每美元版本）。
+    pnl_per_dollar_excluding_top_n: Optional[float] = None
+    gross_pct_excluding_top_n: Optional[float] = None
+    excluding_top_n_count: Optional[int] = Field(default=None, ge=0)
+    excluding_top_n_reason: Optional[str] = None
 
 
 class PersonalEdgeDisciplineMonthModel(PersonalEdgeDisciplineStatsModel):
@@ -405,6 +430,9 @@ class PersonalEdgeDisciplineModel(BaseModel):
     current_window: PersonalEdgeDisciplineWindowModel
     body_trim_count: int = Field(ge=1)
     body_min_episode_count: int = Field(ge=1)
+    # additive（2026-08-04）：剔除最好 N 笔的 N，以及「哪个口径字段说了算」的原文。
+    exclude_top_n: int = Field(default=5, ge=1)
+    fill_detailed_governs: Optional[str] = None
 
 
 class PersonalEdgeResponse(BaseModel):

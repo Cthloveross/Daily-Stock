@@ -19,11 +19,13 @@ from src.journal.ledger.repository import (
     init_ledger_schema,
 )
 from src.journal.personal_edge import (
+    FILL_DETAILED_GOVERNS,
     MONTH_BASIS_UTC_MINUS_4,
     PERSONAL_EDGE_LIMITATIONS,
     REASON_NO_DTE,
     REASON_NO_PREMIUM,
     REASON_ZERO_PREMIUM,
+    fill_detailed_from_evidence_summary,
     get_personal_edge_stats,
 )
 from src.storage import get_db
@@ -160,7 +162,13 @@ def _seed_build(
                             ),
                         }
                     ),
-                    evidence_summary_json="{}",
+                    # 默认＝由明细成交构建（fill_allocations>0）；spec 可覆盖成
+                    # 汇总 ORDER 口径或任意畸形形状，用于口径来源判据的边界测试。
+                    evidence_summary_json=spec.get(
+                        "evidence_summary_json",
+                        '{"allocation_count":3,"fill_allocations":3,'
+                        '"order_allocations":0}',
+                    ),
                     completeness_score=Decimal("1"),
                     completeness_status="exact",
                     completeness_json="{}",
@@ -344,6 +352,16 @@ def test_min_underlying_episode_count_must_be_positive():
 # --- 规模与频率纪律（discipline）-------------------------------------------
 
 
+def _evidence_summary(fill_allocations: int, order_allocations: int = 0) -> str:
+    return json.dumps(
+        {
+            "allocation_count": fill_allocations + order_allocations,
+            "fill_allocations": fill_allocations,
+            "order_allocations": order_allocations,
+        }
+    )
+
+
 def _discipline_spec(
     opened_at: datetime,
     pnl: str,
@@ -351,19 +369,352 @@ def _discipline_spec(
     opening_cash_flow: Optional[str] = None,
     dte: Optional[int] = 1,
     exact: bool = True,
+    fee: Optional[str] = "1",
+    evidence_summary_json: Optional[str] = None,
 ) -> dict:
-    return {
+    spec = {
         "underlying": "AAA",
         "opened_at": opened_at,
         "hold_seconds": 1_200,
         "realized_pnl_net": Decimal(pnl),
-        "total_fee": Decimal("1"),
+        "total_fee": Decimal(fee) if fee is not None else None,
         "dte_at_entry": dte,
         "opening_cash_flow": (
             Decimal(opening_cash_flow) if opening_cash_flow is not None else None
         ),
         "has_exact_fill_times": exact,
     }
+    if evidence_summary_json is not None:
+        spec["evidence_summary_json"] = evidence_summary_json
+    return spec
+
+
+# --- 口径来源判据（fill_allocations）---------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        # 生产形状：明细成交 vs 纯汇总 ORDER 行。
+        ('{"allocation_count":6,"fill_allocations":6,"order_allocations":0}', True),
+        ('{"allocation_count":2,"fill_allocations":0,"order_allocations":2}', False),
+        # build #3 有 2 行带额外 key，必须照常解析，不能因为多字段判成未知。
+        (
+            '{"allocation_count":2,"fill_allocations":2,"group_fee_unallocated":true,'
+            '"order_allocations":0}',
+            True,
+        ),
+        # 以下一律 fail closed 到「未知」，绝不当作全明细。
+        (None, None),
+        ("", None),
+        ("   ", None),
+        ("not json", None),
+        ("[]", None),
+        ("null", None),
+        ('"fill_allocations"', None),
+        ("{}", None),  # 旧行与既有 fixture 写的就是空对象
+        ('{"allocation_count":2,"order_allocations":2}', None),
+        ('{"fill_allocations":null}', None),
+        ('{"fill_allocations":"3"}', None),
+        ('{"fill_allocations":1.5}', None),
+        ('{"fill_allocations":-1}', None),
+        # bool 是 int 的子类：True 绝不能被读成「1 笔明细成交」。
+        ('{"fill_allocations":true}', None),
+        ('{"fill_allocations":false}', None),
+    ],
+)
+def test_fill_detailed_discriminator_shape_edge_cases(raw, expected):
+    """`fill_allocations == 0` 才是「由汇总 ORDER 行构建」的判据，形状异常一律未知。"""
+    assert fill_detailed_from_evidence_summary(raw) is expected
+
+
+def test_fill_detailed_discriminator_accepts_dict_and_bytes():
+    assert fill_detailed_from_evidence_summary({"fill_allocations": 4}) is True
+    assert fill_detailed_from_evidence_summary({"fill_allocations": 0}) is False
+    assert fill_detailed_from_evidence_summary(b'{"fill_allocations":2}') is True
+    assert fill_detailed_from_evidence_summary(b"\xff\xfe") is None
+
+
+def test_fill_detailed_share_disagrees_with_exact_fill_share_and_is_surfaced():
+    """两个字段会不一致（build #3 有 3 笔 4 月回合如此）——差异必须暴露，不能藏。
+
+    构造：4 笔均由明细成交构建（fill_allocations>0），其中 1 笔
+    ``has_exact_fill_times=0``。口径可比性看 fill_detailed_share（=1.0，不断裂），
+    历史连续性看 exact_fill_share（=0.75）。断裂判定必须只听前者。
+    """
+    specs = [
+        _discipline_spec(
+            _april(day, 14),
+            "10",
+            opening_cash_flow="100",
+            exact=(day != 6),
+            evidence_summary_json=_evidence_summary(3),
+        )
+        for day in (6, 7, 8, 9)
+    ]
+    _seed_build(specs)
+    result = get_personal_edge_stats()
+    assert result is not None
+    stats = result.discipline.monthly[0].stats
+
+    assert stats.fill_detailed_share == pytest.approx(1.0)
+    assert stats.exact_fill_share == pytest.approx(0.75)
+    # 不一致时以 fill_detailed_share 为准：口径没断，只是时点有重建。
+    assert stats.basis_break is False
+    assert stats.basis_break_reason is None
+    assert stats.has_reconstructed_fills is True
+    assert stats.fill_detailed_count == 4
+    assert stats.aggregate_only_count == 0
+    assert stats.fill_provenance_unknown_count == 0
+
+
+def test_basis_break_flags_aggregate_only_and_unknown_provenance_months():
+    """任一非明细成交回合即置位 basis_break，并在原因里说清成因与笔数。"""
+    specs = [
+        # 4 月：2 笔汇总 ORDER 行（fill_allocations=0）+ 2 笔明细成交。
+        _discipline_spec(
+            _april(6, 14),
+            "10",
+            opening_cash_flow="100",
+            evidence_summary_json=_evidence_summary(0, 2),
+        ),
+        _discipline_spec(
+            _april(7, 14),
+            "10",
+            opening_cash_flow="100",
+            evidence_summary_json=_evidence_summary(0, 3),
+        ),
+        _discipline_spec(
+            _april(8, 14),
+            "10",
+            opening_cash_flow="100",
+            evidence_summary_json=_evidence_summary(3),
+        ),
+        _discipline_spec(
+            _april(9, 14),
+            "10",
+            opening_cash_flow="100",
+            evidence_summary_json=_evidence_summary(3),
+        ),
+        # 5 月：1 笔口径来源不可判定（空对象）+ 1 笔明细成交 → 同样不可认证为干净。
+        _discipline_spec(
+            datetime(2026, 5, 6, 14, 0, tzinfo=timezone.utc),
+            "10",
+            opening_cash_flow="100",
+            evidence_summary_json="{}",
+        ),
+        _discipline_spec(
+            datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+            "10",
+            opening_cash_flow="100",
+            evidence_summary_json=_evidence_summary(3),
+        ),
+        # 6 月：全部明细成交 → 唯一干净月份。
+        _discipline_spec(
+            datetime(2026, 6, 8, 14, 0, tzinfo=timezone.utc),
+            "10",
+            opening_cash_flow="100",
+            evidence_summary_json=_evidence_summary(2),
+        ),
+    ]
+    _seed_build(specs)
+    result = get_personal_edge_stats()
+    assert result is not None
+    by_month = {item.month: item.stats for item in result.discipline.monthly}
+
+    april = by_month["2026-04"]
+    assert april.basis_break is True
+    assert april.aggregate_only_count == 2
+    assert april.fill_detailed_count == 2
+    assert april.fill_detailed_share == pytest.approx(0.5)
+    assert "汇总 ORDER 行" in april.basis_break_reason
+    assert "fill_allocations=0" in april.basis_break_reason
+    assert "audit_only_not_execution_cash_flow" in april.basis_break_reason
+    assert "2/4" in april.basis_break_reason
+
+    # 来源不可判定同样 fail closed：不可认证为全明细，就必须断开。
+    may = by_month["2026-05"]
+    assert may.basis_break is True
+    assert may.fill_provenance_unknown_count == 1
+    assert may.aggregate_only_count == 0
+    assert may.fill_detailed_share == pytest.approx(0.5)
+    assert "不可判定" in may.basis_break_reason
+
+    june = by_month["2026-06"]
+    assert june.basis_break is False
+    assert june.basis_break_reason is None
+    assert june.fill_detailed_share == pytest.approx(1.0)
+
+
+# --- 费用门槛与毛口径 -------------------------------------------------------
+
+
+def test_fee_and_gross_pct_share_the_denominator_and_reconcile():
+    """毛 = 净 + 费用，三者同分母——恒等式必须在同一行上严格成立。"""
+    specs = [
+        _discipline_spec(_april(6, 14), "100", opening_cash_flow="1000", fee="20"),
+        _discipline_spec(_april(7, 14), "-40", opening_cash_flow="1000", fee="30"),
+    ]
+    _seed_build(specs)
+    result = get_personal_edge_stats()
+    assert result is not None
+    stats = result.discipline.monthly[0].stats
+
+    assert stats.fees_total == pytest.approx(50.0)
+    assert stats.fees_missing_count == 0
+    # 净 60/2000 = 3%；费用 50/2000 = 2.5%；毛 110/2000 = 5.5%。
+    assert stats.pnl_per_dollar_risked == pytest.approx(0.03)
+    assert stats.fee_pct_of_premium_at_risk == pytest.approx(0.025)
+    assert stats.gross_pct_of_premium_at_risk == pytest.approx(0.055)
+    assert stats.gross_pct_of_premium_at_risk == pytest.approx(
+        stats.pnl_per_dollar_risked + stats.fee_pct_of_premium_at_risk
+    )
+    assert stats.fee_pct_of_premium_at_risk_reason is None
+    assert stats.gross_pct_of_premium_at_risk_reason is None
+
+
+def test_fee_and_gross_pct_fail_closed_on_zero_and_missing_denominators():
+    """分母为 0 / 无现金流 / 缺 total_fee：一律 null + 可区分的原因。"""
+    # (a) 风险金额合计为 0。
+    _seed_build(
+        [
+            _discipline_spec(_april(6, 14), "5", opening_cash_flow="0"),
+            _discipline_spec(_april(7, 14), "-5", opening_cash_flow="0"),
+        ],
+        account_key="fee_zero_premium",
+    )
+    zero = get_personal_edge_stats("fee_zero_premium")
+    assert zero is not None
+    zero_stats = zero.discipline.monthly[0].stats
+    assert zero_stats.fee_pct_of_premium_at_risk is None
+    assert zero_stats.gross_pct_of_premium_at_risk is None
+    assert zero_stats.fee_pct_of_premium_at_risk_reason == REASON_ZERO_PREMIUM
+    assert zero_stats.gross_pct_of_premium_at_risk_reason == REASON_ZERO_PREMIUM
+
+    # (b) 完全没有开仓现金流。
+    _seed_build(
+        [_discipline_spec(_april(6, 14), "5")],
+        account_key="fee_no_premium",
+    )
+    none_premium = get_personal_edge_stats("fee_no_premium")
+    assert none_premium is not None
+    np_stats = none_premium.discipline.monthly[0].stats
+    assert np_stats.fee_pct_of_premium_at_risk is None
+    assert np_stats.fee_pct_of_premium_at_risk_reason == REASON_NO_PREMIUM
+
+    # (c) 缺 total_fee：过路费绝不能以 0 冒充，整体 fail-closed。
+    _seed_build(
+        [
+            _discipline_spec(_april(6, 14), "10", opening_cash_flow="100", fee="2"),
+            _discipline_spec(_april(7, 14), "10", opening_cash_flow="100", fee=None),
+        ],
+        account_key="fee_missing",
+    )
+    missing = get_personal_edge_stats("fee_missing")
+    assert missing is not None
+    m_stats = missing.discipline.monthly[0].stats
+    assert m_stats.fees_missing_count == 1
+    assert m_stats.fees_total is None
+    assert m_stats.fee_pct_of_premium_at_risk is None
+    assert m_stats.gross_pct_of_premium_at_risk is None
+    assert "total_fee" in m_stats.fee_pct_of_premium_at_risk_reason
+    assert "1/2" in m_stats.fee_pct_of_premium_at_risk_reason
+    # 净口径不依赖费用，仍然成立。
+    assert m_stats.pnl_per_dollar_risked == pytest.approx(0.1)
+
+
+# --- 剔除最好 N 笔后的每美元回报 --------------------------------------------
+
+
+def test_excluding_top_n_math_and_fifteen_episode_gate():
+    """剔除最好 5 笔＝同一子集上分子分母同时去尾；<15 笔显式 null + 原因。"""
+    specs = [
+        # 5 月 15 笔：14 笔 −10（各 100 风险），1 笔尾部赢家 +1000（100 风险）。
+        _discipline_spec(
+            datetime(2026, 5, day, 14, 0, tzinfo=timezone.utc),
+            "-10",
+            opening_cash_flow="100",
+            fee="1",
+        )
+        for day in range(1, 15)
+    ] + [
+        _discipline_spec(
+            datetime(2026, 5, 15, 14, 0, tzinfo=timezone.utc),
+            "1000",
+            opening_cash_flow="100",
+            fee="1",
+        ),
+    ] + [
+        # 6 月 14 笔：不足门槛。
+        _discipline_spec(
+            datetime(2026, 6, day, 14, 0, tzinfo=timezone.utc),
+            "10",
+            opening_cash_flow="100",
+            fee="1",
+        )
+        for day in range(1, 15)
+    ]
+    _seed_build(specs)
+    result = get_personal_edge_stats()
+    assert result is not None
+    by_month = {item.month: item.stats for item in result.discipline.monthly}
+
+    may = by_month["2026-05"]
+    assert may.n == 15
+    # 含尾部赢家：(1000 - 140) / 1500 = +5.733%。
+    assert may.pnl_per_dollar_risked == pytest.approx(0.573333, abs=1e-6)
+    # 去掉最好的 5 笔（+1000 与 4 笔 −10）后剩 10 笔 −10，分母同步降到 1000。
+    assert may.excluding_top_n_count == 10
+    assert may.pnl_per_dollar_excluding_top_n == pytest.approx(-0.1)
+    # 毛口径把 10 笔 × $1 费用加回：(−100 + 10) / 1000 = −9%。
+    assert may.gross_pct_excluding_top_n == pytest.approx(-0.09)
+    assert may.excluding_top_n_reason is None
+    # 一笔就把整月每美元回报从 −10% 翻成 +57%：尾部集中度必须能被看见。
+    assert may.pnl_per_dollar_risked > 0 > may.pnl_per_dollar_excluding_top_n
+
+    june = by_month["2026-06"]
+    assert june.n == 14
+    assert june.pnl_per_dollar_excluding_top_n is None
+    assert june.gross_pct_excluding_top_n is None
+    assert june.excluding_top_n_count is None
+    assert "14" in june.excluding_top_n_reason
+    assert "15" in june.excluding_top_n_reason
+
+
+def test_excluding_top_n_gate_counts_only_premium_known_episodes():
+    """门槛按「风险金额已知」的样本数判定：分子分母必须同一子集。"""
+    specs = [
+        _discipline_spec(
+            datetime(2026, 5, day, 14, 0, tzinfo=timezone.utc),
+            "10",
+            opening_cash_flow="100",
+        )
+        for day in range(1, 15)  # 14 笔有风险金额
+    ] + [
+        _discipline_spec(
+            datetime(2026, 5, 15, 14, 0, tzinfo=timezone.utc),
+            "10",
+            opening_cash_flow=None,  # 第 15 笔缺风险金额，不能凑数
+        ),
+    ]
+    _seed_build(specs)
+    result = get_personal_edge_stats()
+    assert result is not None
+    stats = result.discipline.monthly[0].stats
+    assert stats.n == 15
+    assert stats.premium_known_count == 14
+    assert stats.pnl_per_dollar_excluding_top_n is None
+    assert "14" in stats.excluding_top_n_reason
+
+
+def test_discipline_block_publishes_exclude_top_n_and_governing_field():
+    _seed_build([_discipline_spec(_april(6, 14), "10", opening_cash_flow="100")])
+    result = get_personal_edge_stats()
+    assert result is not None
+    assert result.discipline.exclude_top_n == result.discipline.body_trim_count
+    assert result.discipline.fill_detailed_governs == FILL_DETAILED_GOVERNS
+    assert "fill_detailed_share" in result.discipline.fill_detailed_governs
+    assert "has_exact_fill_times" in result.discipline.fill_detailed_governs
 
 
 def test_discipline_monthly_ratios_and_et_day_counting():
@@ -508,5 +859,13 @@ def test_discipline_limitations_carry_reconstructed_fill_and_gate_notes():
     result = get_personal_edge_stats()
     assert result is not None
     assert result.limitations == PERSONAL_EDGE_LIMITATIONS
-    assert any("重建" in line for line in result.limitations)
+    # 口径断裂的成因必须原文出现：汇总 ORDER 行 + 管线自身的 audit-only 标记。
+    assert any("fill_allocations" in line for line in result.limitations)
+    assert any(
+        "audit_only_not_execution_cash_flow" in line for line in result.limitations
+    )
+    # 「哪个字段说了算」必须随响应下发，避免消费端继续用 has_exact_fill_times 判可比性。
+    assert FILL_DETAILED_GOVERNS in result.limitations
     assert any("fail-closed" in line for line in result.limitations)
+    # 费用门槛的语义（毛低于门槛即净为负）也要原文携带。
+    assert any("门槛" in line for line in result.limitations)

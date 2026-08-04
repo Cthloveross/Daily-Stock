@@ -146,6 +146,103 @@ describe('IntradayDisciplineStrip', () => {
     expect(await screen.findByRole('tooltip')).toHaveTextContent(LIMITATION);
   });
 
+  it('refuses to baseline against a contaminated month and says which month it used', async () => {
+    // 4 月口径断裂（含汇总 ORDER 行构建的回合）→ 基线必须跳到最早的干净月份 7 月。
+    const response = ready();
+    response.discipline!.monthly = [
+      {
+        month: '2026-04',
+        ...stats({
+          tradesPerDay: 17.19,
+          medianPremiumAtRisk: 4209,
+          pnlPerDollarRisked: 0.048476,
+          bodyPnl: 48376.74,
+          exactFillShare: 0.4155,
+          hasReconstructedFills: true,
+          basisBreak: true,
+          aggregateOnlyCount: 208,
+          fillDetailedShare: 0.4238,
+        }),
+      },
+      {
+        month: '2026-07',
+        ...stats({
+          tradesPerDay: 24.68,
+          medianPremiumAtRisk: 9690,
+          pnlPerDollarRisked: 0.012,
+          basisBreak: false,
+          fillDetailedShare: 1,
+        }),
+      },
+    ];
+    vi.mocked(fetchPersonalEdge).mockResolvedValue(response);
+    render(<IntradayDisciplineStrip />);
+
+    const perDollar = await screen.findByLabelText('每美元回报');
+    // 绝不拿被污染的 4 月 +4.85% 当基线。
+    expect(perDollar).not.toHaveTextContent('4月 +4.85%');
+    expect(perDollar).toHaveTextContent('7月 +1.20%');
+    // 并且说明白基线取的是哪个月、为什么跳过更早的月份。
+    expect(
+      screen.getByText(/基线取最早的全明细成交月份（7月）/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/分母被低估，不可比/)).toBeInTheDocument();
+  });
+
+  it('drops the baseline entirely when every month is contaminated', async () => {
+    const response = ready();
+    response.discipline!.monthly = [
+      { month: '2026-03', ...stats({ pnlPerDollarRisked: 0.1076, basisBreak: true }) },
+      { month: '2026-04', ...stats({ pnlPerDollarRisked: 0.048476, basisBreak: true }) },
+    ];
+    vi.mocked(fetchPersonalEdge).mockResolvedValue(response);
+    render(<IntradayDisciplineStrip />);
+
+    const perDollar = await screen.findByLabelText('每美元回报');
+    expect(perDollar).toHaveTextContent('+3.24%');
+    // 宁可没有基线，也不与被污染的月份比较。
+    expect(perDollar).not.toHaveTextContent('3月');
+    expect(perDollar).not.toHaveTextContent('4月');
+    expect(screen.getByText(/基线不显示 · 早期月份均由汇总 ORDER 行构建/)).toBeInTheDocument();
+  });
+
+  it('shows the constant fee toll beside the gross per-dollar reading', async () => {
+    vi.mocked(fetchPersonalEdge).mockResolvedValue(
+      ready({
+        grossPctOfPremiumAtRisk: 0.046642,
+        feePctOfPremiumAtRisk: 0.014214,
+      }),
+    );
+    render(<IntradayDisciplineStrip />);
+
+    expect(await screen.findByLabelText('毛每美元')).toHaveTextContent('+4.66%');
+    expect(screen.getByLabelText('费用门槛')).toHaveTextContent('1.42%');
+  });
+
+  it('marks the window when gross does not clear the toll', async () => {
+    vi.mocked(fetchPersonalEdge).mockResolvedValue(
+      ready({
+        grossPctOfPremiumAtRisk: 0.012234,
+        feePctOfPremiumAtRisk: 0.012543,
+      }),
+    );
+    render(<IntradayDisciplineStrip />);
+
+    expect(await screen.findByLabelText('费用门槛')).toHaveTextContent(
+      '毛口径不及门槛 · 净口径为负',
+    );
+  });
+
+  it('flags a basis-broken current window instead of comparing it silently', async () => {
+    vi.mocked(fetchPersonalEdge).mockResolvedValue(
+      ready({ basisBreak: true, aggregateOnlyCount: 12, fillDetailedShare: 0.7 }),
+    );
+    render(<IntradayDisciplineStrip />);
+    expect(
+      await screen.findByText(/本窗口口径断裂 · 含汇总 ORDER 行构建的回合/),
+    ).toBeInTheDocument();
+  });
+
   it('flags reconstructed fills inside the current window', async () => {
     vi.mocked(fetchPersonalEdge).mockResolvedValue(
       ready({ exactFillShare: 0.42, hasReconstructedFills: true }),

@@ -298,6 +298,8 @@ def _personal_edge_response(
             ),
             body_trim_count=result.discipline.body_trim_count,
             body_min_episode_count=result.discipline.body_min_episode_count,
+            exclude_top_n=result.discipline.exclude_top_n,
+            fill_detailed_governs=result.discipline.fill_detailed_governs,
         ),
         month_basis=result.month_basis,
         limitations=list(result.limitations),

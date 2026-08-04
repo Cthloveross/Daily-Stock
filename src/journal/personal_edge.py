@@ -863,6 +863,7 @@ def get_personal_edge_stats(
                 PositionEpisode.dte_at_entry,
                 PositionEpisode.opening_cash_flow,
                 PositionEpisode.has_exact_fill_times,
+                PositionEpisode.evidence_summary_json,
             ).where(
                 PositionEpisode.episode_build_id == build_id,
                 PositionEpisode.account_key == resolved_account_key,
@@ -953,6 +954,13 @@ def get_personal_edge_stats(
                     else None
                 ),
                 has_exact_fill_times=bool(row.has_exact_fill_times),
+                # 费用缺失只计缺席：过路费不能以 0 冒充（费用桶另有 0 兜底口径）。
+                fee=(
+                    Decimal(row.total_fee) if row.total_fee is not None else None
+                ),
+                fill_detailed=fill_detailed_from_evidence_summary(
+                    row.evidence_summary_json
+                ),
             )
         )
 

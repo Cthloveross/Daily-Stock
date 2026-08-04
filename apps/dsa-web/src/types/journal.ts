@@ -1034,8 +1034,12 @@ export interface PersonalEdgeMonthlyBucket {
 
 /**
  * 规模与频率纪律读数：每美元回报（真账）+ 仓位 + 频率 + 本体/尾部拆解 +
- * 成交明细来源。任何比率分母不足即为 null 并附 `*Reason`，绝不以 0 冒充；
- * `exactFillShare < 1` 表示该区间含重建成交明细（时点仅供参考）。
+ * 口径来源。任何比率分母不足即为 null 并附 `*Reason`，绝不以 0 冒充。
+ *
+ * 口径可比性以 `fillDetailedShare` 为准（回合是否由明细成交构建），
+ * `exactFillShare`（`has_exact_fill_times` 均值）仅作历史连续性保留，两者会不
+ * 一致。`basisBreak === true` 的区间风险金额分母被低估，**不可**与全明细区间
+ * 连成一条趋势线——消费端必须断开显示并说明原因。
  */
 export interface PersonalEdgeDisciplineStats {
   n: number;
@@ -1059,6 +1063,25 @@ export interface PersonalEdgeDisciplineStats {
   zeroDteReason: string | null;
   exactFillShare: number | null;
   hasReconstructedFills: boolean;
+  /** additive（2026-08-04）：口径来源判据 —— 缺席时按「未知」处理，不得当作全明细。 */
+  fillDetailedCount?: number;
+  aggregateOnlyCount?: number;
+  fillProvenanceUnknownCount?: number;
+  fillDetailedShare?: number | null;
+  basisBreak?: boolean;
+  basisBreakReason?: string | null;
+  /** additive（2026-08-04）：恒定过路费与毛口径（毛 = 净 + 费用）。 */
+  feesTotal?: number | null;
+  feesMissingCount?: number;
+  feePctOfPremiumAtRisk?: number | null;
+  feePctOfPremiumAtRiskReason?: string | null;
+  grossPctOfPremiumAtRisk?: number | null;
+  grossPctOfPremiumAtRiskReason?: string | null;
+  /** additive（2026-08-04）：剔除最好 N 笔后的每美元回报（bodyPnl 的每美元版本）。 */
+  pnlPerDollarExcludingTopN?: number | null;
+  grossPctExcludingTopN?: number | null;
+  excludingTopNCount?: number | null;
+  excludingTopNReason?: string | null;
 }
 
 export interface PersonalEdgeDisciplineMonth extends PersonalEdgeDisciplineStats {
@@ -1076,6 +1099,9 @@ export interface PersonalEdgeDiscipline {
   currentWindow: PersonalEdgeDisciplineWindow;
   bodyTrimCount: number;
   bodyMinEpisodeCount: number;
+  /** additive（2026-08-04）：剔除最好 N 笔的 N，以及「哪个口径字段说了算」的原文。 */
+  excludeTopN?: number;
+  fillDetailedGoverns?: string | null;
 }
 
 /**

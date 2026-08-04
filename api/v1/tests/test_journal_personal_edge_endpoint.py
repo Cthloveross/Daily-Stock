@@ -191,10 +191,14 @@ def test_discipline_window_reports_size_and_frequency():
     assert window["pnl_per_dollar_risked"] == 0.01
     assert window["median_episode_pnl"] == 20.0
     assert window["zero_dte_share"] == 0.5
-    # 4 笔里 1 笔为重建成交明细 → 0.75，并置位重建标志供 UI 标注。
+    # 4 笔里 1 笔 has_exact_fill_times=0 → 0.75，重建标志保留供 UI 连续性使用。
     assert window["exact_fill_share"] == 0.75
     assert window["has_reconstructed_fills"] is True
-    assert any("重建" in line for line in body["limitations"])
+    # 口径可比性由 fill_detailed_share 判定，与 exact_fill_share 是两件事。
+    assert "fill_detailed_share" in window
+    assert "basis_break" in window
+    assert any("fill_allocations" in line for line in body["limitations"])
+    assert any("audit_only_not_execution_cash_flow" in line for line in body["limitations"])
 
 
 def test_ten_minute_cache_serves_and_reset_clears():

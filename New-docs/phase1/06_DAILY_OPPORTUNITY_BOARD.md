@@ -622,3 +622,62 @@ Qualification v2 进一步令方向性标的路径与实际回填合同一致：
 - 单票详情尚未提供完整合约级 bid/ask size、spread、期限结构、skew、可成交滑点和用户风险预算；这些缺口不会由聚合 Volume/OI、IV 或 Gross Gamma 补推。
 - 结果摘要是严格 cohort 内的小样本描述，不是策略胜率；达到人工调查门槛也不会自动修改排名。
 - FINRA 公共数据不具备当日时效；第三方 TRF 源尚未配置。
+
+## 8. 规模与频率口径订正：断开显示 + 费用门槛 + 剔尾读数（2026-08-04 晚）
+
+> 本节自足，可独立阅读；订正对象是 §2.12.1 的 `discipline` 区块。若与 §2.12.1 中「每美元回报塌了约 24 倍」的旧表述冲突，**以本节为准**——那条趋势线本身约 75% 是口径假象。
+
+### 8.1 为什么订正：被证伪的头条
+
+工作台此前把月度 `pnl_per_dollar_risked` 画成一条连续趋势线（默认 build #1：4 月 4.85% → 7 月 1.80%；build #3：4 月 4.85% → 7 月 −0.19%），读起来像「边际在衰减」。后续取证表明**这条曲线约 75% 是测量口径造成的，把它当趋势线发布是主动误导**：
+
+| 证据 | 数值 |
+| --- | --- |
+| build #3 中由**汇总 ORDER 行**构建的回合（`evidence_summary_json.fill_allocations == 0`，无明细成交） | 245 笔，恰好是 3 月 + 4/1–4/20 |
+| 断点位置 | 4/20–21 ≈ CSV 导出日（2026-07-21）前约 90 天＝券商明细成交保留窗口，**不是**行情或行为边界 |
+| 汇总口径 vs 明细口径毛每美元（全样本） | 9.64% vs 1.77%（5.4 倍） |
+| **同在 4 月内**的对照（同一人、同一月、同一行情） | **9.53%（汇总） vs 2.42%（明细）** |
+| 分母被低估的典型特征 | 汇总行 4.08% 的回报 >+200%（明细行 1.84%）；配平笔数中位 2 vs 3 |
+| 管线自身的标记 | canonical 投影已写明 `aggregate_order_amount_policy = "audit_only_not_execution_cash_flow"`（仅供审计，不是执行现金流） |
+
+在**可比窗口**（4/20–7/31，1,410 笔）上，毛每美元为 2.42 / 2.58 / 2.00 / 1.22%，两两置换检验**全部 p ≥ 0.756**，Kruskal p=0.887，日度边际对日历时间 rho=+0.126 p=0.295——**没有可检出的边际衰减**；按笔等权，7 月反而是第二好的月份。
+
+真正成立的两件事：**单笔风险 +68%**（$6,760 → $11,340）而单笔美元盈亏基本持平（$163 → $138）；**费用门槛恒定**在约 119–138 bp 权利金（每张合约往返 $3.29–3.31），在约 1.2% 毛边际下把 7 月**净**边际压成 −0.19%。以及尾部事实：可比窗口内最好的 **5 笔（共 1,410 笔）贡献了 80% 的毛盈亏**，剔除每月最好 5 笔后四个月每美元边际**全为负**（4 月 −3.53%、5 月 −0.91%、6 月 −0.86%、7 月 −1.77%）。
+
+### 8.2 口径来源判据订正（correctness）
+
+`personal_edge.py` 此前用 `has_exact_fill_times` 计算 `exact_fill_share`。**因果上正确的判据是「该回合是否由明细成交构建」**，即 `evidence_summary_json.fill_allocations > 0`——决定风险金额分母是否可信的是构建来源，不是时点是否精确。两者**会不一致**：build #3 有 **3 笔 4 月回合**由明细成交构建但 `has_exact_fill_times=0`（4 月 `fill_detailed_share` 0.4238 vs `exact_fill_share` 0.4155）。
+
+- 新增 `fill_detailed_share` —— **口径可比性以它为准**；`exact_fill_share` 保留供历史连续性，两者差异不隐藏（`discipline.fill_detailed_governs` 原文下发这条规则，`limitations` 亦携带）。
+- 判据解析 **fail closed**：`NULL` / 空串 / 非法 JSON / 非对象 / 缺 `fill_allocations` 键（旧行与既有 fixture 写的就是 `{}`）/ 布尔值（`True` 是 `int` 子类，绝不能读成「1 笔明细成交」）/ 非整数 / 负数 一律记为**来源不可判定**，计入 `fill_provenance_unknown_count`，**绝不当作全明细**。额外键（build #3 有 2 行带 `group_fee_unallocated`）照常解析。
+- 任一区间只要不是 100% 明细成交，即置位 `basis_break: true` + `basis_break_reason`（写明笔数、成因与 `audit_only_not_execution_cash_flow`）。
+
+### 8.3 端点合同（additive，既有字段一字不改）
+
+`discipline.monthly[]` 与 `discipline.current_window` 每行新增：
+
+| 字段 | 含义 |
+| --- | --- |
+| `fill_detailed_count` / `aggregate_only_count` / `fill_provenance_unknown_count` | 口径来源三分计数 |
+| `fill_detailed_share` | 由明细成交构建的占比（分母＝区间全部回合；不可判定会拉低它） |
+| `basis_break` / `basis_break_reason` | 机器可读的断裂标记与原因 |
+| `fees_total` / `fees_missing_count` | 费用合计与缺席计数 |
+| `fee_pct_of_premium_at_risk` (+`_reason`) | **恒定过路费**＝Σ`total_fee` ÷ Σ`\|opening_cash_flow\|` |
+| `gross_pct_of_premium_at_risk` (+`_reason`) | 毛口径＝(净盈亏＋费用) ÷ 同一分母；恒等式 **毛 = 净 + 费用** 在同一行严格成立 |
+| `pnl_per_dollar_excluding_top_n` / `gross_pct_excluding_top_n` | 剔除最好 N 笔后的每美元回报（净／毛），N＝`exclude_top_n`（＝`body_trim_count`＝5） |
+| `excluding_top_n_count` / `excluding_top_n_reason` | 剩余笔数与不成立原因 |
+
+区块级新增 `exclude_top_n` 与 `fill_detailed_governs`。**剔尾口径**：分子分母取同一子集（风险金额已知的回合），按净盈亏排序去掉最好的 N 笔，门槛与 `body_pnl` 同为 **n≥15**（按「风险金额已知」的样本数判定）。**fail-closed**：分母为 0、无可用 `opening_cash_flow`、**任一回合缺 `total_fee`**（过路费绝不以 0 冒充）或样本不足时返回 `null` + `*_reason`。
+
+### 8.4 消费面
+
+- **Journal「规模与频率」表**（`DisciplineMonthlyPanel`）：`basis_break` 月份单独成组、行内标注「口径断裂 · 不可与后续月份比较」（悬停给出笔数与成因），两组之间插入一条**显式断口行**，并在表上方给出说明段——写明分母来自管线自己标记 `audit_only_not_execution_cash_flow` 的汇总 ORDER 行，以及**同在 4 月内 9.53% vs 2.42%** 的对照。新增「毛每美元 / 费用门槛 / 剔除最好 5 笔 / 明细成交占比」四列；毛口径 ≤ 门槛的月份加「不及门槛」标记（净口径必为负）。
+- **`/intraday` 规模与频率条**（`IntradayDisciplineStrip`）：新增「毛每美元」「费用门槛」两个 chip；**基线选择拒绝被污染的月份**——`baseline()` 跳过所有 `basis_break` 月份，只取**最早一个全明细成交月份**并在脚注写明取的是哪个月（「基线取最早的全明细成交月份（N 月）」）；一个干净月份都没有时**宁可不显示基线**（「基线不显示 · 早期月份均由汇总 ORDER 行构建」）。当前窗口自身断裂时显式警示，不静默比较。
+
+### 8.5 Playbook 候选 R9
+
+经既有 `POST /api/v1/journal/v2/playbook/candidates` 路径显式创建（append-only、幂等、未晋升）：**「R9 · 没有「好做的行情」，也没有边际衰减（衰减 75% 是口径假象）」**（candidate id=12，接在 R8 id=11 之后）。`rule_text` 内嵌：regime 零结果（132 项检验仅 5 项名义显著 < 随机期望 6.6；BH q<0.20 无一存活；族向置换 p=0.12；样本外相关号一致率 45.3%；岭回归 R²_out=−3.85；日度边际 lag-1 自相关 −0.053、游程检验 p=0.94；并纠正「4 月是回调后磨」的叙事前提——4 月实为近乎不间断上涨 +9.68%、最大回撤 −0.85%）、75% 口径假象拆解与 4 月内 9.53% vs 2.42% 对照、可比窗口无衰减及其 p 值、真实变化（单笔风险 +68% 而美元盈亏持平、恒定约 125bp 门槛、7 月净 −0.19%）、尾部事实（top 5/1,410 ＝ 80% 毛盈亏；剔尾后四个月全负）。定位为**数据描述供本人复核，非建议**，并携带 n=92 交易日 / 单一 regime / 单一交易者的边界。
+
+### 8.6 诚实边界
+
+样本为单一交易者、单一 regime、92 个交易日的描述统计，**不是因果结论、不构成建议**。`basis_break` 区间的每美元读数**只能自比，不可跨组比较**，也不得进入任何排序、信号或过滤。月度口径仍为 ET≈UTC−4 近似（3 月初 EST 为 UTC−5，边界样本可能偏移 ±1 小时）。本区块的样本＝该 build 全部**已平仓且有净盈亏**的回合（含少量正股回合），与上述只取期权回合的研究样本不同，绝对值会有差异、方向一致。
