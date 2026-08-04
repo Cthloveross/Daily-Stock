@@ -555,8 +555,10 @@ describe('IntradayPage', () => {
     }
     expect(within(table).getAllByRole('columnheader').length).toBe(10);
     expect(within(table).queryByText('波段vs大盘')).not.toBeInTheDocument();
-    // v6 位移：NVDA 越过 0.5 ATR 经验线。
-    expect(within(table).getByText('+0.72 ATR')).toBeInTheDocument();
+    // v6 位移：NVDA 越过 0.5 ATR 经验线；主行为可对照盘面的美元
+    // （0.72 ATR × ATR14 1.5 = $1.08），ATR 刻度退到副行。
+    expect(within(table).getByText('+$1.08')).toBeInTheDocument();
+    expect(within(table).getByText(/\+0\.72 ATR/)).toBeInTheDocument();
     // v3 上下文（财报回避窗 badge；速度加速↑）。
     expect(within(table).getByText('财报 2 天内 · 期权贵')).toBeInTheDocument();
     expect(within(table).getByText('加速↑')).toBeInTheDocument();
@@ -564,7 +566,13 @@ describe('IntradayPage', () => {
 
     // 当前爆发：分数 + 15 分钟推力%；今日波段 chips；标缺行诚实。
     expect(within(table).getByText('8.6')).toBeInTheDocument();
-    expect(within(table).getByText('15分 +0.95%')).toBeInTheDocument();
+    // 副行同时给出量比（暴不暴量的直读），文本被拆成多节点故用匹配函数。
+    expect(
+      within(table).getByText(
+        (_t, node) => node?.textContent?.startsWith('15分 +0.95%') === true
+          && node.textContent.includes('量比'),
+      ),
+    ).toBeInTheDocument();
     expect(within(table).getByText('09:40↓')).toBeInTheDocument();
     expect(within(table).getByText('15:15↑')).toBeInTheDocument();
     const tslaRow = within(table).getByLabelText('打开 TSLA 即时扫描详情');
