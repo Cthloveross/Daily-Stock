@@ -13,6 +13,7 @@ import {
 import { stocksApi } from '../api/stocks';
 import { CandlestickChart, type Candle, type MAOverlay } from '../components/charts/CandlestickChart';
 import { NearExpiryContractPanel } from '../components/opportunities/NearExpiryContractPanel';
+import { OptionWallRatioPanel } from '../components/opportunities/OptionWallRatioPanel';
 import { WallLevelExpiryBreakdown } from '../components/opportunities/WallLevelExpiryBreakdown';
 import { Tabs } from '../components/ui';
 import type {
@@ -937,6 +938,9 @@ const OpportunityDetailPage: React.FC = () => {
                 {!wallLoading && !wallError && wall && (wall.state === 'ready' || wall.state === 'partial') && (
                   <>
                     {wall.state === 'partial' && <div className="mb-4 border-l-2 border-warn-strong pl-3 text-caption text-text-2">链覆盖不完整，请结合覆盖率和失败批次数解读。</div>}
+                    <div className="mb-5 max-w-xl">
+                      <OptionWallRatioPanel item={wall} />
+                    </div>
                     <div className="grid gap-x-10 gap-y-6 md:grid-cols-2 xl:grid-cols-3">
                       {PRIMARY_WALL_KEYS.map((key) => (
                         <WallTable key={key} title={WALL_TITLES[key]} levels={wall.walls[key]} />

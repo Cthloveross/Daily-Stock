@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from dataclasses import asdict
 from threading import Lock
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -45,6 +46,15 @@ from api.v1.schemas.journal_reviews import (
     RuleComplianceLaneStatModel,
     RuleComplianceSliceModel,
     RuleComplianceStatModel,
+    RulesEvidenceChosenParamsModel,
+    RulesEvidenceCorrelationModel,
+    RulesEvidenceDteHoldModel,
+    RulesEvidenceFeeThresholdModel,
+    RulesEvidenceHourModel,
+    RulesEvidencePositionModel,
+    RulesEvidencePriceBandModel,
+    RulesEvidenceResponse,
+    RulesEvidenceWeekdayModel,
 )
 from src.journal.ledger.episode_repository import EpisodeRepositoryError
 from src.journal.ledger.playbook_repository import (
@@ -67,6 +77,10 @@ from src.journal.personal_edge import (
     RULE_SET_V2_ADOPTED_AT,
     RuleComplianceSlice,
     get_personal_edge_stats,
+)
+from src.journal.rules_evidence import (
+    RulesEvidenceResult,
+    get_rules_evidence,
 )
 from src.journal.ledger.review_insights import (
     DEFAULT_MIN_DISTINCT_TRADING_DAY_COUNT,
@@ -222,6 +236,24 @@ def _reset_personal_edge_cache() -> None:
     """Test hook: drop every cached personal-edge response."""
     with _personal_edge_cache_lock:
         _personal_edge_cache.clear()
+
+
+# --- 交易纪律证据页（/rules）: same clean basis, same zero-write contract ----
+_RULES_EVIDENCE_CACHE_TTL_SECONDS = 600.0
+# Key is (account_key, build_id, ticket_usd, daily_breaker_usd, max_concurrent):
+# every request-controlled input changes the arithmetic, so none of them may
+# share a cache entry with another value.
+_rules_evidence_cache: dict[
+    tuple[str, Optional[int], int, int, int],
+    tuple[float, RulesEvidenceResponse],
+] = {}
+_rules_evidence_cache_lock = Lock()
+
+
+def _reset_rules_evidence_cache() -> None:
+    """Test hook: drop every cached rules-evidence response."""
+    with _rules_evidence_cache_lock:
+        _rules_evidence_cache.clear()
 
 
 def _compliance_slice(slice_: RuleComplianceSlice) -> RuleComplianceSliceModel:
@@ -415,6 +447,129 @@ def get_personal_edge(
     response = _personal_edge_response(account_key, result)
     with _personal_edge_cache_lock:
         _personal_edge_cache[cache_key] = (now, response)
+    return response
+
+
+def _rules_evidence_response(
+    account_key: str,
+    result: RulesEvidenceResult,
+) -> RulesEvidenceResponse:
+    """Transport shell only — every number is already computed in the reader."""
+
+    return RulesEvidenceResponse(
+        data_state="ready",
+        account_key=result.account_key or account_key,
+        build_id=result.build_id,
+        build_key=result.build_key,
+        source_kind=result.source_kind,
+        computed_at=result.computed_at,
+        clean_basis_start=result.clean_basis_start,
+        clean_basis_reason=result.clean_basis_reason,
+        rule_set_adopted_at=result.rule_set_adopted_at,
+        sample_episode_count=result.sample_episode_count,
+        excluded_before_clean_basis=result.excluded_before_clean_basis,
+        excluded_aggregate_or_unknown_basis=(
+            result.excluded_aggregate_or_unknown_basis
+        ),
+        excluded_missing_premium=result.excluded_missing_premium,
+        excluded_not_closed_or_missing_pnl=(
+            result.excluded_not_closed_or_missing_pnl
+        ),
+        first_trading_day=result.first_trading_day,
+        last_trading_day=result.last_trading_day,
+        banner=result.banner,
+        price_band_headline=result.price_band_headline,
+        price_band_boundary_policy=result.price_band_boundary_policy,
+        price_bands=[
+            RulesEvidencePriceBandModel(**asdict(row)) for row in result.price_bands
+        ],
+        hold_style_basis=result.hold_style_basis,
+        dte_hold_lanes=[
+            RulesEvidenceDteHoldModel(**asdict(row)) for row in result.dte_hold_lanes
+        ],
+        et_hours=[RulesEvidenceHourModel(**asdict(row)) for row in result.et_hours],
+        weekday_headline=result.weekday_headline,
+        weekdays=[
+            RulesEvidenceWeekdayModel(**asdict(row)) for row in result.weekdays
+        ],
+        fee_threshold=RulesEvidenceFeeThresholdModel(
+            **asdict(result.fee_threshold)
+        ),
+        position=RulesEvidencePositionModel(**asdict(result.position)),
+        correlation=RulesEvidenceCorrelationModel(**asdict(result.correlation)),
+        overnight_gap_note=result.overnight_gap_note,
+        limitations=list(result.limitations),
+    )
+
+
+@router.get("/v2/rules-evidence", response_model=RulesEvidenceResponse)
+def get_rules_evidence_endpoint(
+    account_key: str = Query(
+        DEFAULT_LEDGER_ACCOUNT_KEY,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    ),
+    build_id: Optional[int] = Query(
+        None,
+        ge=1,
+        description=(
+            "显式指定要读的 episode build；缺省走与其余 journal 读数相同的默认解析"
+            "（已激活 build，无激活记录时回落到最新 CSV build）。响应始终回显 "
+            "build_id/build_key，页面据此显示「这页在读哪个 build」。"
+        ),
+    ),
+    ticket_usd: int = Query(
+        3000,
+        ge=1,
+        le=1_000_000,
+        description="你选择的单笔金额（用于熔断触发算术）；不落库、不改变样本。",
+    ),
+    daily_breaker_usd: int = Query(
+        6000,
+        ge=1,
+        le=10_000_000,
+        description="你选择的每日熔断额度；不落库、不改变样本。",
+    ),
+    max_concurrent: int = Query(
+        2,
+        ge=1,
+        le=100,
+        description="你选择的最大并发持仓数；仅用于相关性提醒的文案。",
+    ),
+) -> RulesEvidenceResponse:
+    """「交易纪律」页的证据读数：与车道遵守度同一干净口径的零写聚合。
+
+    合约价格甜蜜区 / DTE × 持有方式 / 时段 / 星期 × 0DTE 可用性 / 手续费门槛 /
+    仓位与回撤算术 / 相关性簇，全部在后端算完并按 ``(account_key, build_id,
+    参数)`` 缓存 ~10 分钟。纯描述统计——不是建议、不是信号、不参与任何排序或
+    下单；单一 regime、样本内拟合与 fail-closed 的告警随 ``limitations`` 原样下发。
+    """
+    now = time.monotonic()
+    cache_key = (account_key, build_id, ticket_usd, daily_breaker_usd, max_concurrent)
+    with _rules_evidence_cache_lock:
+        cached = _rules_evidence_cache.get(cache_key)
+        if cached is not None and now - cached[0] < _RULES_EVIDENCE_CACHE_TTL_SECONDS:
+            return cached[1]
+    try:
+        result = get_rules_evidence(
+            account_key,
+            build_id=build_id,
+            ticket_usd=ticket_usd,
+            daily_breaker_usd=daily_breaker_usd,
+            max_concurrent=max_concurrent,
+        )
+    except EpisodeRepositoryError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if result is None:
+        # 未构建不进缓存：导入后第一次构建完成即可立刻看到数据。
+        return RulesEvidenceResponse(
+            data_state="not_built",
+            account_key=account_key,
+        )
+    response = _rules_evidence_response(account_key, result)
+    with _rules_evidence_cache_lock:
+        _rules_evidence_cache[cache_key] = (now, response)
     return response
 
 

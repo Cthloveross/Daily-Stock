@@ -672,6 +672,60 @@ class OptionWallAtmCallIv(BaseModel):
     ]
 
 
+class OptionWallTotals(BaseModel):
+    """Window totals behind the aggregate ratios (so a reader can check them)."""
+
+    call_oi: float = Field(ge=0)
+    put_oi: float = Field(ge=0)
+    call_volume: float = Field(ge=0)
+    put_volume: float = Field(ge=0)
+
+
+class OptionWallRatio(BaseModel):
+    """One aggregate call/put ratio — a fact, never a direction signal.
+
+    ``value`` is ``None`` with an explicit ``reason`` whenever the denominator
+    is zero or the window carries no valid contracts.  它绝不以 0、1 或无穷大
+    冒充一个「有定义」的比例。``metric_basis`` 说明这一侧读的是**上一交易日
+    结算后的 OI** 还是**当日累计成交量**——两者不是同一件事，不可混读。
+    """
+
+    value: Optional[float] = Field(default=None, ge=0)
+    numerator_total: float = Field(ge=0)
+    denominator_total: float = Field(ge=0)
+    numerator_side: Literal["call", "put"]
+    denominator_side: Literal["call", "put"]
+    metric_basis: Literal[
+        "settled_open_interest_prior_session",
+        "current_session_cumulative_volume",
+    ]
+    reason: Optional[str] = None
+
+
+class OptionWallRatios(BaseModel):
+    call_put_oi_ratio: OptionWallRatio
+    call_put_volume_ratio: OptionWallRatio
+    #: 逐字渲染：这两个比例在本账户数据上尚未被检验过。
+    caveat: str
+
+
+class OptionWallOiWeightedCenter(BaseModel):
+    """``Σ(strike × OI) / Σ(OI)`` —— 描述性重心，**不是** max pain 预测。
+
+    ``validated_as_price_magnet`` 恒为 ``False``：本仓库没有历史 OI 序列，
+    从未检验过价格是否会向这个位置靠拢，因此任何把它当目标位使用的读法都
+    是在用未经检验的假设下注。
+    """
+
+    strike: Optional[float] = Field(default=None, gt=0)
+    total_open_interest: float = Field(ge=0)
+    label: str
+    method: Literal["open_interest_weighted_mean_strike"]
+    metric_basis: Literal["settled_open_interest_prior_session"]
+    validated_as_price_magnet: Literal[False] = False
+    reason: Optional[str] = None
+
+
 class OptionWallItem(BaseModel):
     ticker: str
     state: Literal["ready", "partial", "not_configured", "unavailable"]
@@ -684,6 +738,11 @@ class OptionWallItem(BaseModel):
     scope: OptionWallScope
     coverage: OptionWallCoverage
     walls: OptionWallSet
+    # Additive (option-wall/1.3); optional with defaults so pre-1.3 payloads
+    # and older clients stay valid.
+    totals: Optional[OptionWallTotals] = None
+    ratios: Optional[OptionWallRatios] = None
+    oi_weighted_center: Optional[OptionWallOiWeightedCenter] = None
     message: str
     assumptions: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
@@ -694,6 +753,39 @@ class OptionWallResponse(BaseModel):
     generated_at: str
     market_date_et: str
     items: list[OptionWallItem] = Field(default_factory=list)
+
+
+class OptionWallSnapshotRequest(OptionWallRequest):
+    """Same bounded symbol contract as the wall read it reuses (≤5 symbols).
+
+    刻意继承 :class:`OptionWallRequest`：逐日快照记录器**复用同一条墙位车道
+    与它的缓存**，不新增取数路径，也不会扩大标的范围。
+    """
+
+
+class OptionWallSnapshotResultItem(BaseModel):
+    """One ticker's outcome: written, replayed, or explicitly skipped.
+
+    ``written=False`` 且 ``duplicate=False`` 表示 fail-closed 跳过——该标的
+    本次没有取得可用观测，于是**什么都没写**（不是写了一行 0）。
+    """
+
+    ticker: str
+    market_date_et: str
+    state: str
+    written: bool
+    duplicate: bool
+    reason: Optional[str] = None
+    coverage_percent: Optional[float] = Field(default=None, ge=0, le=100)
+
+
+class OptionWallSnapshotResponse(BaseModel):
+    schema_version: Literal["option-wall-daily-snapshot/1.0"] = (
+        "option-wall-daily-snapshot/1.0"
+    )
+    market_date_et: str
+    generated_at: str
+    results: list[OptionWallSnapshotResultItem] = Field(default_factory=list)
 
 
 class IntradayEarningsProximity(BaseModel):
@@ -1003,10 +1095,24 @@ class IntradayTopRequest(BaseModel):
         False,
         description="显式刷新时绕过服务端 60 秒 TTL；仍复用同 key 的在途请求。",
     )
+    # 用户在「盘中计划」里手动提升的标的（additive，≤8）：与既有 user_pinned
+    # 同语义并入深度层（不占异动额度、与计划/钉选去重、并入同一批快照，
+    # 不新增任何取数路径）。**不影响 universe 解析**：仍是空 symbols 才走两层
+    # 扫描，因此它不会像 symbols 那样把两层模式关掉。单层路径完全不受影响。
+    focus_symbols: list[str] = Field(
+        default_factory=list,
+        max_length=8,
+        description="盘中计划提升的标的（最多 8 个）；只在两层扫描模式下生效。",
+    )
 
     @field_validator("symbols")
     @classmethod
     def normalize_symbols(cls, value: list[str]) -> list[str]:
+        return _normalized_symbols(value)
+
+    @field_validator("focus_symbols")
+    @classmethod
+    def normalize_focus_symbols(cls, value: list[str]) -> list[str]:
         return _normalized_symbols(value)
 
 
@@ -1283,7 +1389,9 @@ class IntradayDeepLaneReason(BaseModel):
     普涨跳空日校准：|当日涨跌| 单口径会让隔夜跳空横盘标的挤掉正在动的标的）。
     """
 
-    promoted_by: Literal["plan_always_include", "user_pinned", "mover_rank"]
+    promoted_by: Literal[
+        "plan_always_include", "user_pinned", "user_focus", "mover_rank"
+    ]
     mover_rank: Optional[int] = Field(default=None, ge=1)
     basis: Literal[
         "abs_change_percent_then_turnover_v1",
@@ -1319,7 +1427,9 @@ class IntradayDeepLaneEntry(BaseModel):
     """深度层名单单行：含未上榜候选，保证深度层名单本身无声不了之。"""
 
     ticker: str
-    promoted_by: Literal["plan_always_include", "user_pinned", "mover_rank"]
+    promoted_by: Literal[
+        "plan_always_include", "user_pinned", "user_focus", "mover_rank"
+    ]
     mover_rank: Optional[int] = Field(default=None, ge=1)
 
 
@@ -1339,6 +1449,15 @@ class IntradayDayLedgerEntry(BaseModel):
     )
     last_change_percent: Optional[float] = None
     state: Literal["rotated_out"]
+
+
+class IntradayTrimmedLaneEntry(BaseModel):
+    """因总行数上限未进深度层的标的：显式披露，绝不静默丢弃。"""
+
+    ticker: str
+    would_be_promoted_by: Literal[
+        "plan_always_include", "user_pinned", "user_focus", "mover_rank"
+    ]
 
 
 class IntradayUniverseScan(BaseModel):
@@ -1364,6 +1483,8 @@ class IntradayUniverseScan(BaseModel):
     plan_always_include: list[str] = Field(default_factory=list)
     # 用户钉选（INTRADAY_PINNED_TICKERS，additive）：旧载荷可省略。
     user_pinned: list[str] = Field(default_factory=list)
+    # 盘中计划提升（请求内 focus_symbols，additive）：旧载荷可省略。
+    user_focus: list[str] = Field(default_factory=list)
     gated_out_count: int = Field(ge=0)
     snapshot_unresolved_symbols: list[str] = Field(default_factory=list)
     day_promotion_cap: int = Field(ge=1)
@@ -1373,6 +1494,12 @@ class IntradayUniverseScan(BaseModel):
     day_ledger_basis: Literal[
         "in_process_since_service_start_resets_on_restart"
     ] = "in_process_since_service_start_resets_on_restart"
+    # 深度层总行数硬顶（用户要求「留 8 个」）与被挤掉的标的：优先级
+    # 盘中计划 → 用户钉选 → 异动（保底名额）→ 盘前计划；披露而非静默丢弃。
+    deep_lane_total_max: int = Field(default=8, ge=1, le=40)
+    trimmed_by_total_cap: list[IntradayTrimmedLaneEntry] = Field(
+        default_factory=list
+    )
     snapshot_only: list[IntradaySnapshotOnlyRow] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
 

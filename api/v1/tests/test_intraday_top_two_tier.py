@@ -293,10 +293,11 @@ def test_two_tier_plan_tickers_always_included_and_deduped(monkeypatch):
     # 计划钉选并入同一批快照（仍是一次请求）。
     assert quote_batches == [("AAA", "BBB", "CCC", "PPP", "SPY")]
     # 深度层 = 计划（PPP、BBB）+ 异动 Top1（CCC，BBB 已被计划钉选去重）。
+    # 总行数硬顶下的优先级：盘中计划 → 用户钉选 → 异动（保底）→ 盘前计划。
     assert scan["deep_lane"] == [
+        {"ticker": "CCC", "promoted_by": "mover_rank", "mover_rank": 1},
         {"ticker": "PPP", "promoted_by": "plan_always_include", "mover_rank": None},
         {"ticker": "BBB", "promoted_by": "plan_always_include", "mover_rank": None},
-        {"ticker": "CCC", "promoted_by": "mover_rank", "mover_rank": 1},
     ]
     # K 只约束异动名额：deep_lane_count(3) > deep_lane_max(1) 是合同内行为。
     assert scan["deep_lane_count"] == 3
@@ -612,10 +613,10 @@ def test_two_tier_pinned_tickers_always_deep_deduped_and_off_quota(monkeypatch):
     assert quote_batches == [("AAA", "BBB", "PPP", "NVDA", "SPY")]
     # 深度层 = 计划（PPP、NVDA）+ 用户钉选（BBB，去重后）+ 异动 Top1（AAA）。
     assert scan["deep_lane"] == [
-        {"ticker": "PPP", "promoted_by": "plan_always_include", "mover_rank": None},
-        {"ticker": "NVDA", "promoted_by": "plan_always_include", "mover_rank": None},
         {"ticker": "BBB", "promoted_by": "user_pinned", "mover_rank": None},
         {"ticker": "AAA", "promoted_by": "mover_rank", "mover_rank": 1},
+        {"ticker": "PPP", "promoted_by": "plan_always_include", "mover_rank": None},
+        {"ticker": "NVDA", "promoted_by": "plan_always_include", "mover_rank": None},
     ]
     # 钉选不占 K 名额：K=1 全额留给异动晋升（deep_lane_count > K 合同内）。
     assert scan["deep_lane_count"] == 4
@@ -1075,3 +1076,205 @@ def test_single_tier_path_has_no_lane_availability_block(monkeypatch):
     )
     assert response.status_code == 200
     assert response.json()["lane_availability"] is None
+
+
+# --- 盘中计划提升（请求内 focus_symbols，additive）--------------------------
+
+
+def test_focus_symbols_join_the_deep_lane_off_quota_and_deduped(monkeypatch):
+    """focus_symbols：并入同一批快照、不占异动额度、与计划/钉选去重。"""
+
+    monkeypatch.setenv("MOOMOO_OPEND_ENABLED", "true")
+    _stub_daily_loader(monkeypatch)
+    _watchlist(monkeypatch, ["AAA", "BBB"], deep_lane_max=1)
+    monkeypatch.setattr(
+        opportunities, "_configured_intraday_pinned_tickers", lambda: ["BBB"]
+    )
+    monkeypatch.setattr(
+        opportunities, "_todays_plan_tickers", lambda market_date_et: ["PPP"]
+    )
+    quote_batches: list[tuple[str, ...]] = []
+
+    def quotes(symbols):
+        quote_batches.append(tuple(symbols))
+        return {
+            "AAA": _quote("AAA", last_price=101.0, prev_close_price=100.0, turnover=100.0),
+            "BBB": _quote("BBB", last_price=105.0, prev_close_price=100.0, turnover=200.0),
+            "PPP": _quote("PPP", last_price=50.0, prev_close_price=50.0, turnover=10.0),
+            "MU": _quote("MU", last_price=60.0, prev_close_price=60.0, turnover=5.0),
+        }
+
+    monkeypatch.setattr(opportunities, "_fetch_underlying_session_quotes", quotes)
+    _stub_events(monkeypatch, {})
+
+    response = _client().post(
+        "/api/v1/opportunities/intraday-top",
+        # MU 不在清单（须并入同一批快照）；BBB 已是配置钉选、PPP 已是计划标的
+        # （均须去重，只占一个深度位）；重复的 mu 由 schema 归一化去重。
+        json={"symbols": [], "focus_symbols": ["mu", "BBB", "PPP", "mu"]},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    scan = body["universe_scan"]
+    # 仍然只有一次批量快照请求（无新增取数路径）。
+    assert quote_batches == [("AAA", "BBB", "PPP", "MU", "SPY")]
+    assert scan["user_focus"] == ["MU"]
+    assert scan["user_pinned"] == ["BBB"]
+    assert scan["plan_always_include"] == ["PPP"]
+    assert scan["deep_lane"] == [
+        {"ticker": "MU", "promoted_by": "user_focus", "mover_rank": None},
+        {"ticker": "BBB", "promoted_by": "user_pinned", "mover_rank": None},
+        {"ticker": "AAA", "promoted_by": "mover_rank", "mover_rank": 1},
+        {"ticker": "PPP", "promoted_by": "plan_always_include", "mover_rank": None},
+    ]
+    # 不占异动额度：K=1 仍整额留给异动晋升。
+    assert scan["deep_lane_count"] == 4
+    assert scan["deep_lane_max"] == 1
+    by_ticker = {item["ticker"]: item for item in body["candidates"]}
+    assert by_ticker["MU"]["scan_tier"] == "deep"
+    assert by_ticker["MU"]["deep_lane_reason"]["promoted_by"] == "user_focus"
+    assert by_ticker["MU"]["deep_lane_reason"]["mover_rank"] is None
+
+
+def test_focus_symbols_are_bounded_at_eight(monkeypatch):
+    """focus_symbols 上界 8：超出显式 422，绝不静默截断。"""
+
+    monkeypatch.setenv("MOOMOO_OPEND_ENABLED", "true")
+    _watchlist(monkeypatch, ["AAA"])
+    response = _client().post(
+        "/api/v1/opportunities/intraday-top",
+        json={"symbols": [], "focus_symbols": [f"SYM{i}" for i in range(9)]},
+    )
+    assert response.status_code == 422
+
+
+def test_focus_symbols_are_part_of_the_scan_cache_key(monkeypatch):
+    """不同 focus 名单＝不同深度层名单：绝不共用同一份缓存结果。"""
+
+    monkeypatch.setenv("MOOMOO_OPEND_ENABLED", "true")
+    _stub_daily_loader(monkeypatch)
+    _watchlist(monkeypatch, ["AAA"])
+    quote_batches: list[tuple[str, ...]] = []
+
+    def quotes(symbols):
+        quote_batches.append(tuple(symbols))
+        return {
+            "AAA": _quote("AAA", last_price=101.0, prev_close_price=100.0, turnover=100.0),
+            "MU": _quote("MU", last_price=60.0, prev_close_price=60.0, turnover=5.0),
+        }
+
+    monkeypatch.setattr(opportunities, "_fetch_underlying_session_quotes", quotes)
+    _stub_events(monkeypatch, {})
+    client = _client()
+
+    first = client.post(
+        "/api/v1/opportunities/intraday-top", json={"symbols": []}
+    )
+    assert first.status_code == 200
+    assert first.json()["universe_scan"]["user_focus"] == []
+
+    # 同一 TTL 内换一个 focus 名单：必须重新计算（否则新提升的标的读不到）。
+    second = client.post(
+        "/api/v1/opportunities/intraday-top",
+        json={"symbols": [], "focus_symbols": ["MU"]},
+    )
+    assert second.status_code == 200
+    assert second.json()["universe_scan"]["user_focus"] == ["MU"]
+    assert len(quote_batches) == 2
+
+    # 同一 focus 名单在 TTL 内复用缓存（不额外发请求）。
+    third = client.post(
+        "/api/v1/opportunities/intraday-top",
+        json={"symbols": [], "focus_symbols": ["MU"]},
+    )
+    assert third.status_code == 200
+    assert len(quote_batches) == 2
+
+
+def test_focus_symbols_do_not_disable_two_tier_or_touch_single_tier(monkeypatch):
+    """focus_symbols 不参与 universe 解析：两层模式照旧；单层路径完全不受影响。"""
+
+    monkeypatch.setenv("MOOMOO_OPEND_ENABLED", "true")
+    _stub_daily_loader(monkeypatch)
+    _watchlist(monkeypatch, ["AAA"])
+
+    def quotes(symbols):
+        return {
+            "AAA": _quote("AAA", last_price=101.0, prev_close_price=100.0, turnover=100.0),
+            "MU": _quote("MU", last_price=60.0, prev_close_price=60.0, turnover=5.0),
+            "NVDA": _quote(),
+        }
+
+    monkeypatch.setattr(opportunities, "_fetch_underlying_session_quotes", quotes)
+    _stub_events(monkeypatch, {})
+
+    # 空 symbols + 已配置清单 + focus → 仍走两层扫描（universe_scan 非 null）。
+    two_tier = _client().post(
+        "/api/v1/opportunities/intraday-top",
+        json={"symbols": [], "focus_symbols": ["MU"]},
+    )
+    assert two_tier.status_code == 200
+    assert two_tier.json()["universe_scan"]["mode"] == "watchlist_two_tier"
+
+    # 显式 symbols（单层路径）：focus 一律不生效，响应与现状逐字节一致。
+    opportunities._reset_scan_cache_for_tests()
+    single = _client().post(
+        "/api/v1/opportunities/intraday-top",
+        json={"symbols": ["NVDA"], "focus_symbols": ["MU"]},
+    )
+    assert single.status_code == 200
+    body = single.json()
+    assert body["universe"] == ["NVDA"]
+    assert body["universe_scan"] is None
+    assert body["candidates"][0]["scan_tier"] is None
+    assert body["candidates"][0]["deep_lane_reason"] is None
+
+
+def test_deep_lane_total_cap_trims_lowest_priority_and_discloses(monkeypatch):
+    """总行数硬顶 8：优先级 盘中计划 → 钉选 → 异动（保底 4）→ 盘前计划；
+    被挤掉的标的必须出现在 trimmed_by_total_cap，绝不静默丢弃。"""
+
+    watch = [f"W{a}{b}" for a in "ABC" for b in "ABCD"]
+    plan = ["LAA", "LAB", "LAC", "LAD", "LAE"]
+    monkeypatch.setenv("MOOMOO_OPEND_ENABLED", "true")
+    _stub_daily_loader(monkeypatch)
+    _watchlist(monkeypatch, watch, deep_lane_max=12)
+    monkeypatch.setattr(
+        opportunities, "_configured_intraday_pinned_tickers", lambda: ["PAA", "PAB"]
+    )
+    monkeypatch.setattr(
+        opportunities, "_todays_plan_tickers", lambda _d: list(plan)
+    )
+    prices = {
+        sym: 100.0 + idx
+        for idx, sym in enumerate([*watch, *plan, "PAA", "PAB", "FAA"])
+    }
+    monkeypatch.setattr(
+        opportunities, "_fetch_underlying_session_quotes", _lane_quotes(prices)
+    )
+    _stub_events(monkeypatch, {})
+    _stub_earnings(monkeypatch, [])
+
+    response = _client().post(
+        "/api/v1/opportunities/intraday-top",
+        json={"symbols": [], "focus_symbols": ["FAA"]},
+    )
+    assert response.status_code == 200
+    scan = response.json()["universe_scan"]
+
+    assert scan["deep_lane_total_max"] == 8
+    assert scan["deep_lane_count"] == 8
+    kinds = [row["promoted_by"] for row in scan["deep_lane"]]
+    assert kinds[0] == "user_focus"
+    assert kinds[1:3] == ["user_pinned", "user_pinned"]
+    # 异动保底名额必须兑现，否则扫描表失去发现能力。
+    assert kinds.count("mover_rank") >= 4
+    # 盘前计划最低优先级：它们另有「今日计划跟踪」面板（独立接口）。
+    trimmed = scan["trimmed_by_total_cap"]
+    assert trimmed, "超出上限的标的必须被显式披露"
+    assert {row["ticker"] for row in trimmed} & set(plan)
+    assert all(
+        row["would_be_promoted_by"]
+        in {"plan_always_include", "mover_rank", "user_pinned", "user_focus"}
+        for row in trimmed
+    )

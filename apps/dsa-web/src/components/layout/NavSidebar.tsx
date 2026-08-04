@@ -6,6 +6,7 @@ import {
   Gauge,
   CandlestickChart,
   NotebookPen,
+  ScrollText,
   Rewind,
   Settings,
   LogOut,
@@ -27,6 +28,8 @@ const ITEMS: NavItem[] = [
   { to: '/regime', label: 'Regime', icon: Gauge },
   { to: '/watchlist', label: 'Watchlist', icon: CandlestickChart },
   { to: '/journal', label: 'Journal', icon: NotebookPen },
+  // 交易纪律：规则原文 + 支撑它的证据表，只读。
+  { to: '/rules', label: '纪律', icon: ScrollText },
   { to: '/backtest', label: 'Backtest', icon: Rewind },
   { to: '/settings', label: 'Settings', icon: Settings },
 ];

@@ -964,7 +964,89 @@ def test_option_walls_return_ranked_observable_and_gamma_levels(monkeypatch):
             "nearest_expiry_atm_call_from_same_wall_snapshot"
         ),
     }
-    assert response.json()["schema_version"] == "option-wall/1.2"
+    assert response.json()["schema_version"] == "option-wall/1.3"
+
+    # option-wall/1.3: aggregate call/put ratios travel as additive facts with
+    # their metric basis; the fixture holds 1_000 call OI vs 1_500 put OI and
+    # 250 call volume vs 300 put volume.
+    assert item["totals"] == {
+        "call_oi": 1_000.0,
+        "put_oi": 1_500.0,
+        "call_volume": 250.0,
+        "put_volume": 300.0,
+    }
+    oi_ratio = item["ratios"]["call_put_oi_ratio"]
+    assert oi_ratio["value"] == pytest.approx(1_000 / 1_500)
+    assert oi_ratio["metric_basis"] == "settled_open_interest_prior_session"
+    assert oi_ratio["reason"] is None
+    volume_ratio = item["ratios"]["call_put_volume_ratio"]
+    assert volume_ratio["value"] == pytest.approx(250 / 300)
+    assert volume_ratio["metric_basis"] == "current_session_cumulative_volume"
+    # The untested-hypothesis caveat must ship verbatim with the ratios.
+    assert "尚未被检验" in item["ratios"]["caveat"]
+    assert item["ratios"]["caveat"] in item["limitations"]
+
+    # Σ(strike × OI) / Σ(OI) = (105×1000 + 95×1500) / 2500 = 99.0 — described
+    # as a weighted centre, never asserted to attract price.
+    center = item["oi_weighted_center"]
+    assert center["strike"] == pytest.approx(99.0)
+    assert center["validated_as_price_magnet"] is False
+    assert center["label"] == "未平仓分布的加权中心（描述，未验证是否有引力）"
+
+
+def test_option_walls_report_zero_denominator_ratio_as_null_with_reason(monkeypatch):
+    """A put-free window makes the ratio undefined — never 0, 1, or infinity."""
+
+    snapshot = _wall_snapshot()
+    calls_only = SimpleNamespace(
+        **{
+            **snapshot.__dict__,
+            "contracts": tuple(
+                contract
+                for contract in snapshot.contracts
+                if contract.right == "C"
+            ),
+        }
+    )
+    monkeypatch.setattr(opportunities, "_moomoo_opend_enabled", lambda: True)
+    monkeypatch.setattr(
+        opportunities,
+        "_compute_option_wall_moomoo",
+        lambda symbol, *, dte_min, dte_max: calls_only,
+    )
+
+    response = _client().post(
+        "/api/v1/opportunities/option-walls",
+        json={"symbols": ["nvda"], "dte_min": 0, "dte_max": 45},
+    )
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    for key in ("call_put_oi_ratio", "call_put_volume_ratio"):
+        ratio = item["ratios"][key]
+        assert ratio["value"] is None
+        assert ratio["denominator_total"] == 0.0
+        assert ratio["numerator_total"] > 0
+        assert "分母为 0" in ratio["reason"]
+
+
+def test_option_walls_disabled_reports_ratios_as_undefined(monkeypatch):
+    """A disabled read records nothing rather than zeros or a fake 1.0."""
+
+    monkeypatch.setattr(opportunities, "_moomoo_opend_enabled", lambda: False)
+
+    response = _client().post(
+        "/api/v1/opportunities/option-walls",
+        json={"symbols": ["nvda"], "dte_min": 0, "dte_max": 45},
+    )
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["state"] == "not_configured"
+    assert item["ratios"]["call_put_oi_ratio"]["value"] is None
+    assert item["ratios"]["call_put_oi_ratio"]["reason"]
+    assert item["oi_weighted_center"]["strike"] is None
+    assert item["oi_weighted_center"]["validated_as_price_magnet"] is False
 
 
 def test_option_wall_level_schema_accepts_legacy_levels_without_breakdown():

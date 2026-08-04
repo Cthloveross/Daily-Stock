@@ -388,20 +388,33 @@ export async function fetchIntradayTracking(
  * 日内 Top 滚动扫描：盘中持续重排，不冻结、不入统计。
  * 服务端 60 秒 TTL + single-flight；本函数只做在途去重，不写 sessionCache，
  * 保证每次轮询拿到的都是服务端允许的最新时点。空 symbols 由服务端回退 STOCK_LIST。
+ *
+ * `focusSymbols`（盘中计划提升，≤8）是**加法字段**：它不进 `symbols`，因此
+ * 不会把服务端的两层扫描模式关掉；服务端只把它并入深度层（与用户钉选同
+ * 语义，不新增取数路径）。
  */
+export const INTRADAY_FOCUS_MAX_SYMBOLS = 8;
+
 export async function fetchIntradayTop(
   symbols: string[],
-  options: { limit?: number; refresh?: boolean } = {},
+  options: { limit?: number; refresh?: boolean; focusSymbols?: string[] } = {},
 ): Promise<IntradayTopResponse> {
   const requestedSymbols = normalizedSymbols(symbols).slice(0, 20);
+  const focusSymbols = normalizedSymbols(options.focusSymbols ?? [])
+    .slice(0, INTRADAY_FOCUS_MAX_SYMBOLS);
   const limit = options.limit ?? 5;
-  const key = `opportunities:intraday-top:${requestedSymbols.join(',')}:${limit}:${options.refresh ? 'refresh' : 'cached'}`;
+  const key = `opportunities:intraday-top:${requestedSymbols.join(',')}:${focusSymbols.join(',')}:${limit}:${options.refresh ? 'refresh' : 'cached'}`;
   const pending = intradayTopInFlight.get(key);
   if (pending) return pending;
 
   const request = apiClient.post<Record<string, unknown>>(
     '/api/v1/opportunities/intraday-top',
-    { symbols: requestedSymbols, limit, refresh: Boolean(options.refresh) },
+    {
+      symbols: requestedSymbols,
+      limit,
+      refresh: Boolean(options.refresh),
+      focus_symbols: focusSymbols,
+    },
     { timeout: INTRADAY_TOP_TIMEOUT_MS },
   ).then((response) => toCamelCase<IntradayTopResponse>(response.data))
     .finally(() => {

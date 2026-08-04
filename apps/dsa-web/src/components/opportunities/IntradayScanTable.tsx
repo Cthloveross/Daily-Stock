@@ -1,5 +1,6 @@
 import { Fragment, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { ArrowUp } from 'lucide-react';
 import type {
   IntradaySetupMatch,
   IntradayTopCandidate,
@@ -7,6 +8,11 @@ import type {
 } from '../../types/opportunities';
 import type { PersonalEdgeUnderlyingStat } from '../../types/journal';
 import { usePersonalEdge, type PersonalEdgeView } from '../../hooks/usePersonalEdge';
+import {
+  INTRADAY_PLAN_MAX_TICKERS,
+  selectPlanTickers,
+  useIntradayPlanStore,
+} from '../../stores/intradayPlanStore';
 import { parseApiTimestamp } from '../../utils/marketTime';
 import { Tooltip } from '../common/Tooltip';
 import {
@@ -367,12 +373,16 @@ function legsBasisCaption(item: IntradayTopCandidate): string {
     : '≥30 分钟独立波段';
 }
 
-/** 两层模式深度位徽标：计划钉选 / 用户钉选 / 异动排名（闸门标注，非信号）。 */
+/**
+ * 两层模式深度位徽标：计划钉选 / 用户钉选 / 盘中计划 / 异动排名
+ * （闸门标注，非信号）。
+ */
 function deepLaneBadge(item: IntradayTopCandidate): string | null {
   const reason = item.deepLaneReason;
   if (!reason) return null;
   if (reason.promotedBy === 'plan_always_include') return '计划钉选';
   if (reason.promotedBy === 'user_pinned') return '钉选';
+  if (reason.promotedBy === 'user_focus') return '盘中计划';
   return reason.moverRank !== null ? `异动 #${reason.moverRank}` : '异动晋升';
 }
 
@@ -829,6 +839,12 @@ export function IntradayScanTable({
   const navigate = useNavigate();
   // 个人画像回灌：每会话/10 分钟最多取一次；失败或未构建 → 显式标缺。
   const personalEdge = usePersonalEdge();
+  // 盘中计划（按 ET 交易日作用域的本地清单）：行内一键提升到页面顶部的
+  // 「盘中计划」区块。它走的是 additive 的 focus_symbols，**不进 symbols**，
+  // 因此不会关掉服务端两层扫描。
+  const planTickers = useIntradayPlanStore(selectPlanTickers);
+  const promote = useIntradayPlanStore((state) => state.promote);
+  const planFull = planTickers.length >= INTRADAY_PLAN_MAX_TICKERS;
   const [sort, setSort] = useState<SortState | null>(null);
   const [expandedTicker, setExpandedTicker] = useState<string | null>(null);
   const [snapshotListExpanded, setSnapshotListExpanded] = useState(false);
@@ -1120,22 +1136,50 @@ export function IntradayScanTable({
                   <td className="px-3 py-2.5">{setupMatchCell(item)}</td>
                   <td className="px-3 py-2.5">{personalStatCell(personalEdge, item.ticker)}</td>
                   <td className="px-3 py-2.5">
-                    <button
-                      type="button"
-                      onClick={(event) => {
-                        // 阻断整行导航：按钮只负责展开/收起研究读数 + 合约面板。
-                        event.stopPropagation();
-                        setExpandedTicker((current) => (
-                          current === item.ticker ? null : item.ticker
-                        ));
-                      }}
-                      className="whitespace-nowrap rounded-ds-sm border border-subtle px-2 py-1 text-caption text-text-2 hover:bg-bg-2 hover:text-text-1"
-                      aria-expanded={expandedTicker === item.ticker}
-                      aria-label={`展开 ${item.ticker} 研究读数与临期合约`}
-                    >
-                      详情
-                      {expandedTicker === item.ticker ? ' ▴' : ' ▾'}
-                    </button>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          // 阻断整行导航：按钮只负责展开/收起研究读数 + 合约面板。
+                          event.stopPropagation();
+                          setExpandedTicker((current) => (
+                            current === item.ticker ? null : item.ticker
+                          ));
+                        }}
+                        className="whitespace-nowrap rounded-ds-sm border border-subtle px-2 py-1 text-caption text-text-2 hover:bg-bg-2 hover:text-text-1"
+                        aria-expanded={expandedTicker === item.ticker}
+                        aria-label={`展开 ${item.ticker} 研究读数与临期合约`}
+                      >
+                        详情
+                        {expandedTicker === item.ticker ? ' ▴' : ' ▾'}
+                      </button>
+                      {planTickers.includes(item.ticker) ? (
+                        <span
+                          data-plan-state="promoted"
+                          className="whitespace-nowrap rounded-ds-sm border border-strong bg-bg-2 px-2 py-1 text-caption text-text-1"
+                          aria-label={`${item.ticker} 已在盘中计划`}
+                        >
+                          已在计划
+                        </span>
+                      ) : (
+                        <button
+                          type="button"
+                          disabled={planFull}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            promote(item.ticker);
+                          }}
+                          className="flex items-center gap-1 whitespace-nowrap rounded-ds-sm border border-subtle px-2 py-1 text-caption text-text-2 hover:bg-bg-2 hover:text-text-1 disabled:cursor-not-allowed disabled:opacity-50"
+                          // 满额原因走 aria-label（仓库禁用原生 title 属性）。
+                          aria-label={planFull
+                            ? `盘中计划已满（最多 ${INTRADAY_PLAN_MAX_TICKERS} 个标的）`
+                            : `把 ${item.ticker} 加入盘中计划`}
+                        >
+                          <ArrowUp size={11} />
+                          加入盘中计划
+                        </button>
+                      )}
+                    </div>
                   </td>
                 </tr>
                 {expandedTicker === item.ticker && (

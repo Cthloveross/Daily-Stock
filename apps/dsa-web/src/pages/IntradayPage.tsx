@@ -13,9 +13,11 @@ import type {
   OpportunityCandidate,
 } from '../types/opportunities';
 import { useUserWatchlistStore } from '../stores/userWatchlistStore';
+import { selectPlanTickers, useIntradayPlanStore } from '../stores/intradayPlanStore';
 import { IntradayPulseStrip } from '../components/opportunities/IntradayPulseStrip';
 import { IntradayDisciplineStrip } from '../components/opportunities/IntradayDisciplineStrip';
 import { LaneChecklistPanel } from '../components/opportunities/LaneChecklistPanel';
+import { IntradayPlanPanel } from '../components/opportunities/IntradayPlanPanel';
 import { IntradayScanTable } from '../components/opportunities/IntradayScanTable';
 import { IntradayOptionEventFeed } from '../components/opportunities/IntradayOptionEventFeed';
 import { IntradayTrackingPanel } from '../components/opportunities/IntradayTrackingPanel';
@@ -27,16 +29,25 @@ export const INTRADAY_PAGE_POLL_INTERVAL_MS = 60_000;
 /**
  * 日内工作台：交易时段的单屏主界面。
  *
- * 自上而下（2026-08-04 命名与主次整理）：市场脉搏（SPY/QQQ/VIX + 盘段 +
- * 刷新指示）→ 规模与频率（近 20 个交易日的每美元回报/日均笔数/中位仓位/
- * 本体盈亏，镜子读数）→ 实时扫描（现在谁在动，主表；盘中滚动证据排名 +
- * 今日曾深扫账本）→ 今日计划跟踪（盘前冻结计划走到哪了，冻结盘前 Top 5
- * 对照）→ 期权事件流。全部内容是盘中滚动研究：不是信号、不冻结、不进入统计；
- * 期权异动是 Moomoo 分类，不证明方向。周内（盘前冻结）研究仍在 /regime。
+ * 自上而下（2026-08-05 拆成「计划 / 扫描」两段）：市场脉搏（SPY/QQQ/VIX +
+ * 盘段 + 刷新指示）→ 规模与频率（近 20 个交易日的镜子读数）→ 车道清单
+ * （今日哪条车道成立）→ **盘中计划**（用户手动提升上来的标的，逐条机械核对
+ * + 合约候选 + 张数/手续费 + 失效位提示）→ **实时扫描（滚动）**（现在谁在动，
+ * 提升来源；盘中滚动证据排名 + 今日曾深扫账本）→ 今日计划跟踪（盘前冻结
+ * 计划走到哪了）→ 期权事件流。全部内容是盘中滚动研究：不是信号、不冻结、
+ * 不进入统计；期权异动是 Moomoo 分类，不证明方向。周内研究仍在 /regime。
+ *
+ * 盘中计划的标的以 additive 的 `focusSymbols` 传给服务端（**不进 `symbols`**）：
+ * 服务端只在「空 symbols + 已配置 INTRADAY_WATCHLIST」时走两层扫描，混进
+ * `symbols` 会像 `useUserWatchlistStore` 那样把两层模式整个关掉。
  */
 const IntradayPage: React.FC = () => {
   const userTickers = useUserWatchlistStore((state) => state.tickers);
   const symbols = useMemo(() => userTickers.slice(0, 20), [userTickers]);
+  // 盘中计划提升的标的走 additive 的 focusSymbols（**不进 symbols**）：
+  // 服务端只在「空 symbols + 已配置 INTRADAY_WATCHLIST」时走两层扫描，
+  // 混进 symbols 会像 userWatchlist 那样把两层模式整个关掉。
+  const planTickers = useIntradayPlanStore(selectPlanTickers);
 
   const [pulse, setPulse] = useState<IntradayPulseResponse | null>(null);
   const [pulseError, setPulseError] = useState<string | null>(null);
@@ -59,7 +70,7 @@ const IntradayPage: React.FC = () => {
     try {
       const [pulseResult, topResult] = await Promise.allSettled([
         fetchIntradayPulse(),
-        fetchIntradayTop(symbols, { limit: 5, refresh }),
+        fetchIntradayTop(symbols, { limit: 5, refresh, focusSymbols: planTickers }),
       ]);
       if (requestSequence.current !== requestId) return;
       if (pulseResult.status === 'fulfilled') {
@@ -81,7 +92,7 @@ const IntradayPage: React.FC = () => {
     } finally {
       if (requestSequence.current === requestId) setLoading(false);
     }
-  }, [symbols]);
+  }, [symbols, planTickers]);
 
   useEffect(() => {
     void load(false);
@@ -195,13 +206,15 @@ const IntradayPage: React.FC = () => {
       {/* 规模与频率：紧随脉搏的一行镜子读数（每美元回报才是真账），不是警报。 */}
       <IntradayDisciplineStrip />
 
-      {/* 开仓前车道检查：对照用户自己那套规则（V2-0…V2-D）的清单，不是推荐，
-          也不会下单——ET 时钟复用脉搏时点，财报读数复用深度层扫描候选。 */}
-      <LaneChecklistPanel pulse={pulse} top={top} />
+      {/* 开仓前车道检查：对照用户自己那套规则（V2-A…V2-E）的清单——今日无
+          0DTE 时整块警示并把日内车道置灰；ET 时钟复用脉搏时点。 */}
+      <LaneChecklistPanel pulse={pulse} top={top} loading={loading} />
 
-      {/* 主次顺序：实时扫描（现在谁在动）为主表，今日计划跟踪其后，期权事件流侧栏。 */}
+      {/* 主次顺序：盘中计划（真正干活的地方）在最上，实时扫描（滚动，谁现在
+          在动）在其下作为提升来源，今日计划跟踪其后，期权事件流侧栏。 */}
       <div className="grid gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(340px,1fr)]">
         <div className="min-w-0 space-y-4">
+          <IntradayPlanPanel pulse={pulse} top={top} loading={loading} />
           <IntradayScanTable data={top} loading={loading} error={topError} />
           <section aria-label="今日计划" className="overflow-hidden rounded-ds-md border border-subtle bg-bg-1">
             {planCandidates !== null && planCandidates.length > 0 ? (

@@ -14,6 +14,7 @@ import type {
   IntradayTopResponse,
   PremarketCycleResponse,
 } from '../../types/opportunities';
+import { useIntradayPlanStore } from '../../stores/intradayPlanStore';
 
 vi.mock('../../api/opportunities', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../api/opportunities')>();
@@ -23,6 +24,13 @@ vi.mock('../../api/opportunities', async (importOriginal) => {
     fetchIntradayTop: vi.fn(),
     fetchIntradayTracking: vi.fn().mockResolvedValue({ items: [], sessionState: 'closed', limitations: [] }),
     fetchPremarketCycleStatus: vi.fn(),
+    // 盘中计划卡片里的合约候选区：页面级测试固定成「未配置」，只验计划链路。
+    fetchNearExpiryContracts: vi.fn(async () => ({
+      schemaVersion: 'near-expiry-contracts/1.0',
+      generatedAt: '2026-07-28T14:30:05+00:00',
+      marketDateEt: '2026-07-28',
+      item: { ticker: 'NVDA', state: 'not_configured', message: 'Moomoo 未配置', expiries: [], limitations: [] },
+    })),
   };
 });
 
@@ -495,6 +503,8 @@ function renderPage() {
 
 describe('IntradayPage', () => {
   beforeEach(() => {
+    window.localStorage.clear();
+    useIntradayPlanStore.getState().clear();
     vi.mocked(fetchIntradayPulse).mockReset();
     vi.mocked(fetchIntradayTop).mockReset();
     vi.mocked(fetchPremarketCycleStatus).mockReset();
@@ -564,19 +574,26 @@ describe('IntradayPage', () => {
     expect(screen.getByText(/波段爆发优先排名/)).toBeInTheDocument();
     expect(screen.getByText(/intraday_session_evidence_v8/)).toBeInTheDocument();
 
-    // 主次顺序：实时扫描（主表）在前，今日计划跟踪其后，期权事件流最后。
-    const scanSection = screen.getByLabelText('实时扫描');
-    const planSection = screen.getByLabelText('今日计划');
-    const feed = screen.getByLabelText('期权异动');
-    expect(
-      scanSection.compareDocumentPosition(planSection)
-        & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
-    expect(
-      planSection.compareDocumentPosition(feed) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
+    // 主次顺序：脉搏 → 纪律条 → 车道清单 → 盘中计划 → 实时扫描（滚动）
+    // → 今日计划跟踪 → 期权事件流。
+    const order = [
+      '市场脉搏',
+      '规模与频率',
+      '开仓前车道检查',
+      '盘中计划',
+      '实时扫描',
+      '今日计划',
+      '期权异动',
+    ].map((label) => screen.getByLabelText(label));
+    for (let index = 0; index < order.length - 1; index += 1) {
+      expect(
+        order[index].compareDocumentPosition(order[index + 1])
+          & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    }
 
     // 期权异动 feed + 诚实边界文案。
+    const feed = screen.getByLabelText('期权异动');
     expect(within(feed).getByText('偏多（Moomoo 分类）')).toBeInTheDocument();
     expect(
       within(feed).getByText(/不推断开平仓，不证明真实主动买卖方向，不是信号/),
@@ -681,7 +698,7 @@ describe('IntradayPage', () => {
     await waitFor(() => {
       expect(fetchIntradayTop).toHaveBeenLastCalledWith(
         ['NVDA', 'TSLA'],
-        { limit: 5, refresh: true },
+        { limit: 5, refresh: true, focusSymbols: [] },
       );
     });
   });
@@ -690,5 +707,43 @@ describe('IntradayPage', () => {
     vi.mocked(fetchIntradayTop).mockRejectedValue(new Error('scan down'));
     renderPage();
     expect(await screen.findByText(/实时扫描暂不可用：scan down/)).toBeInTheDocument();
+  });
+
+  it('promotes a scan row into 盘中计划 via focusSymbols without touching symbols', async () => {
+    renderPage();
+    const table = await screen.findByRole('table', { name: '实时扫描表' });
+    // 起点：计划为空，请求里 focusSymbols 也是空数组。
+    expect(fetchIntradayTop).toHaveBeenLastCalledWith(
+      ['NVDA', 'TSLA'],
+      { limit: 5, refresh: false, focusSymbols: [] },
+    );
+    expect(screen.getByText(/还没有加入盘中计划的标的/)).toBeInTheDocument();
+
+    fireEvent.click(within(table).getByRole('button', { name: '把 NVDA 加入盘中计划' }));
+
+    // 卡片出现在页面顶部的盘中计划里。
+    expect(await screen.findByLabelText('NVDA 逐条核对')).toBeInTheDocument();
+    // 关键回归：提升只走 additive 的 focusSymbols，**绝不混进 symbols**——
+    // 混进去会像 userWatchlist 那样把服务端两层扫描整个关掉。
+    await waitFor(() => {
+      expect(fetchIntradayTop).toHaveBeenLastCalledWith(
+        ['NVDA', 'TSLA'],
+        { limit: 5, refresh: false, focusSymbols: ['NVDA'] },
+      );
+    });
+    // 已提升的行如实标注，不再提供重复的提升入口。
+    expect(within(table).getByLabelText('NVDA 已在盘中计划')).toBeInTheDocument();
+    expect(
+      within(table).queryByRole('button', { name: '把 NVDA 加入盘中计划' }),
+    ).toBeNull();
+
+    // 清空后回到空清单，请求里的 focusSymbols 也随之回到空。
+    fireEvent.click(screen.getByRole('button', { name: '清空盘中计划' }));
+    await waitFor(() => {
+      expect(fetchIntradayTop).toHaveBeenLastCalledWith(
+        ['NVDA', 'TSLA'],
+        { limit: 5, refresh: false, focusSymbols: [] },
+      );
+    });
   });
 });

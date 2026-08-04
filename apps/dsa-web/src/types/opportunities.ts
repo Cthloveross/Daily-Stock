@@ -312,6 +312,44 @@ export interface OpportunityOptionWallLevel {
   expiryBreakdown?: OpportunityOptionWallLevelExpiryBreakdown | null;
 }
 
+/**
+ * 一个聚合 call/put 比例——**事实描述，不是方向信号**。
+ *
+ * `value` 为 null 时必定带 `reason`（分母为 0 或该窗口无有效合约）：
+ * 比例无定义就是无定义，绝不以 0、1 或无穷大冒充。
+ */
+export interface OpportunityOptionWallRatio {
+  value: number | null;
+  numeratorTotal: number;
+  denominatorTotal: number;
+  numeratorSide: 'call' | 'put';
+  denominatorSide: 'call' | 'put';
+  metricBasis: 'settled_open_interest_prior_session' | 'current_session_cumulative_volume';
+  reason: string | null;
+}
+
+export interface OpportunityOptionWallRatios {
+  callPutOiRatio: OpportunityOptionWallRatio;
+  callPutVolumeRatio: OpportunityOptionWallRatio;
+  /** 逐字渲染：这两个比例在本账户数据上尚未被检验过。 */
+  caveat: string;
+}
+
+/**
+ * Σ(strike × OI) / Σ(OI) —— 描述性重心，**不是** max pain 预测。
+ * `validatedAsPriceMagnet` 恒为 false：本仓库没有历史 OI 序列，
+ * 从未检验过价格是否会向这个位置靠拢。
+ */
+export interface OpportunityOptionWallOiWeightedCenter {
+  strike: number | null;
+  totalOpenInterest: number;
+  label: string;
+  method: 'open_interest_weighted_mean_strike';
+  metricBasis: 'settled_open_interest_prior_session';
+  validatedAsPriceMagnet: false;
+  reason: string | null;
+}
+
 export interface OpportunityOptionWallItem {
   ticker: string;
   state: OpportunityOptionWallState;
@@ -352,6 +390,15 @@ export interface OpportunityOptionWallItem {
     putGammaConcentration: OpportunityOptionWallLevel[];
     grossGammaConcentration: OpportunityOptionWallLevel[];
   };
+  // Additive (option-wall/1.3); optional so pre-1.3 payloads remain valid.
+  totals?: {
+    callOi: number;
+    putOi: number;
+    callVolume: number;
+    putVolume: number;
+  } | null;
+  ratios?: OpportunityOptionWallRatios | null;
+  oiWeightedCenter?: OpportunityOptionWallOiWeightedCenter | null;
   message: string;
   assumptions: string[];
   limitations: string[];
@@ -948,9 +995,18 @@ export type IntradayGateBasis =
   | 'momentum15m_then_day_change_v2'
   | 'premarket_pre_price_change_then_pre_turnover_v1';
 
-/** 两层模式下该候选进入深度层的原因：计划钉选/用户钉选/异动排名（非信号）。 */
+/**
+ * 两层模式下该候选进入深度层的原因：计划钉选/用户钉选/盘中计划提升/
+ * 异动排名（非信号）。
+ */
+export type IntradayDeepLanePromotedBy =
+  | 'plan_always_include'
+  | 'user_pinned'
+  | 'user_focus'
+  | 'mover_rank';
+
 export interface IntradayDeepLaneReason {
-  promotedBy: 'plan_always_include' | 'user_pinned' | 'mover_rank';
+  promotedBy: IntradayDeepLanePromotedBy;
   moverRank: number | null;
   basis: IntradayGateBasis;
 }
@@ -976,7 +1032,7 @@ export interface IntradaySnapshotOnlyRow {
 /** 深度层名单单行（含未上榜候选，名单本身绝不无声截断）。 */
 export interface IntradayDeepLaneEntry {
   ticker: string;
-  promotedBy: 'plan_always_include' | 'user_pinned' | 'mover_rank';
+  promotedBy: IntradayDeepLanePromotedBy;
   moverRank: number | null;
 }
 
@@ -1008,6 +1064,8 @@ export interface IntradayUniverseScan {
   planAlwaysInclude: string[];
   /** 用户钉选（INTRADAY_PINNED_TICKERS，additive）；旧载荷可省略。 */
   userPinned?: string[];
+  /** 盘中计划提升（请求内 focusSymbols，additive）；旧载荷可省略。 */
+  userFocus?: string[];
   gatedOutCount: number;
   snapshotUnresolvedSymbols: string[];
   dayPromotionCap: number;

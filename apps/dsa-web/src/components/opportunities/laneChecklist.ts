@@ -4,7 +4,6 @@ import type {
   IntradayLaneDayType,
   IntradayTopCandidate,
 } from '../../types/opportunities';
-import type { RuleComplianceDailyBudget } from '../../types/journal';
 import { parseApiTimestamp } from '../../utils/marketTime';
 
 /**
@@ -13,8 +12,10 @@ import { parseApiTimestamp } from '../../utils/marketTime';
  * 这是**对用户自己那套规则**（Playbook 候选「V2-0」…「V2-D」）的对照检查，
  * 不是推荐、不是信号、不含概率，也永远不会下单——本系统只读。
  *
- * 每条检查只有三种结果：`pass` / `fail` / `missing`（标缺）。缺输入一律 `missing`
- * 并给出原因：**未知不等于安全**，绝不以「没查到」冒充「合规」。
+ * 每条检查有四种结果：`pass` / `fail` / `missing`（标缺）/ `requirement`（要求）。
+ * `missing` 只用于「查过了、拿不到」（**未知不等于安全**）；系统本来就知道的
+ * 硬性要求（今天只能 0DTE / 只能 4-7DTE、ET 12:00 截止线）一律用 `requirement`
+ * **直接写出要求本身**，绝不因为用户还没填输入就显示成「标缺」——要求不是缺失值。
  *
  * 规则出处（数字来自用户自身 build #3 干净口径样本 n=1,407，2026-04-21 起、仅明细
  * 成交构建；毛口径＝净＋费用，风险＝|开仓现金流|）：
@@ -51,7 +52,7 @@ import { parseApiTimestamp } from '../../utils/marketTime';
 
 export type LaneId = 'intraday' | 'overnight';
 
-export type CheckStatus = 'pass' | 'fail' | 'missing';
+export type CheckStatus = 'pass' | 'fail' | 'missing' | 'requirement';
 
 export interface LaneCheck {
   /** 稳定标识，供测试与 aria-label 使用。 */
@@ -68,36 +69,21 @@ export interface LaneHardBlock {
   reason: string;
 }
 
-export interface LaneBudgetReading {
-  id: string;
-  label: string;
-  /** 可算出来时是「x/6」这样的文本，算不出来时是 `null`（渲染成标缺）。 */
-  text: string | null;
-  limit: number;
-  reason: string | null;
-  /** 达到或超过额度：只是如实标注，不阻断任何操作。 */
-  atLimit: boolean;
-}
-
 export interface LaneChecklistInput {
   lane: LaneId;
-  /** 用户填写的进场 DTE；未填写＝标缺，不猜。 */
+  /** 用户填写的进场 DTE；未填写时显示「今天的要求」，不是标缺。 */
   dte: number | null;
-  /** 用户填写的标的；未填写＝标缺。 */
-  ticker: string | null;
   /** 用户自述「打算今天就平掉」——V2-C② 的唯一输入。 */
   intendsToCloseToday: boolean;
   /** 脉搏端点的 `generatedAt`（服务端时点）；缺席时 ET 时钟标缺。 */
   pulseGeneratedAt: string | null;
-  /** 日内扫描的深度层候选（财报邻近度的唯一来源）。 */
-  candidates: IntradayTopCandidate[];
-  /** 脉搏/扫描报告的 ET 市场日，用来判断额度读数是否已过期。 */
-  marketDateEt: string | null;
-  budget: RuleComplianceDailyBudget | null;
-  /** 额度读数不可得的原因（端点失败 / Journal 未构建）。 */
-  budgetUnavailableReason: string | null;
   /** 今日车道可用性（V2-E）；缺席＝标缺，不猜、不冒充「今天没有 0DTE」。 */
   laneAvailability: IntradayLaneAvailability | null;
+  /**
+   * 首轮请求仍在飞：此时的「读不到」是**还没读完**，不是「读过了拿不到」。
+   * 两者在 UI 上必须分开——冷启动显示「读取中…」，不是「标缺」。
+   */
+  loading?: boolean;
 }
 
 export interface LaneChecklistResult {
@@ -108,7 +94,6 @@ export interface LaneChecklistResult {
   checks: LaneCheck[];
   hardBlocks: LaneHardBlock[];
   reminders: string[];
-  budget: LaneBudgetReading[];
 }
 
 /** V2-A / V2-C③：ET 12:00 是 0DTE 的开仓截止线。 */
@@ -154,7 +139,8 @@ export const V2E_RULE_TITLE =
  */
 export type LaneDayTypeView =
   | IntradayLaneDayType
-  | 'blacklist_only';
+  | 'blacklist_only'
+  | 'loading';
 
 export interface LaneDayTypeReading {
   state: LaneDayTypeView;
@@ -168,6 +154,23 @@ export interface LaneDayTypeReading {
   blacklistedZeroDteTickers: string[];
 }
 
+/**
+ * 今日**唯一成立**的车道（V2-E）：有可交易 0DTE ⇒ 日内；确证今日无可用
+ * 0DTE ⇒ 只剩过夜；标缺/读取中 ⇒ `null`（不猜，也不默认放行日内）。
+ */
+export function laneForDayType(dayType: LaneDayTypeReading): LaneId | null {
+  if (dayType.state === 'intraday_available') return 'intraday';
+  if (dayType.state === 'overnight_only' || dayType.state === 'blacklist_only') {
+    return 'overnight';
+  }
+  return null;
+}
+
+/** 今日无可用 0DTE（过夜日或仅黑名单有 0DTE）：日内车道实际关闭。 */
+export function isIntradayLaneClosed(dayType: LaneDayTypeReading): boolean {
+  return dayType.state === 'overnight_only' || dayType.state === 'blacklist_only';
+}
+
 function laneAvailabilityTooltip(lines: string[]): string {
   return [`规则出处：${V2E_RULE_TITLE}`, ...lines].join('\n');
 }
@@ -175,15 +178,30 @@ function laneAvailabilityTooltip(lines: string[]): string {
 /**
  * 从服务端 `lane_availability` 区块推出面板顶部那一行。
  *
- * 四种状态（缺区块＝标缺，与「没有 0DTE」严格区分）：
+ * 五种状态（缺区块＝标缺，与「没有 0DTE」严格区分）：
  * 1. `intraday_available`：有非黑名单标的存在 0DTE → 日内车道可用；
  * 2. `blacklist_only`：确证有 0DTE，但**全部**落在黑名单上（V2-E 附带禁令）；
  * 3. `overnight_only`：全部标的都读到了链且都没有 0DTE → 日内车道关闭；
- * 4. `unknown`：区块缺席或链读不到 → 标缺 + 原因，**未知≠「今天没有 0DTE」**。
+ * 4. `unknown`：区块缺席或链读不到 → 标缺 + 原因，**未知≠「今天没有 0DTE」**；
+ * 5. `loading`：首轮扫描还在飞（冷启动/服务刚重启）→「读取中…」。
+ *    **标缺 ≠ 读取中**：前者是「查过了拿不到」，后者是「还没查完」。
  */
 export function evaluateLaneDayType(
   availability: IntradayLaneAvailability | null | undefined,
+  options: { loading?: boolean } = {},
 ): LaneDayTypeReading {
+  if (!availability && options.loading) {
+    return {
+      state: 'loading',
+      text: '今日车道可用性读取中…',
+      tooltip: laneAvailabilityTooltip([
+        '首轮盘中扫描仍在进行（服务刚启动时第一轮会更慢）。',
+        '读取中≠标缺：这里还没有结论，请等本轮扫描返回或手动刷新。',
+      ]),
+      zeroDteTickers: [],
+      blacklistedZeroDteTickers: [],
+    };
+  }
   if (!availability) {
     return {
       state: 'unknown',
@@ -310,13 +328,38 @@ function findEarnings(
   return hit ? hit.earningsProximity : null;
 }
 
-function dteCheckIntraday(dte: number | null): LaneCheck {
+/**
+ * 未填 DTE 时**直接写出今天的要求**（`requirement`），不是标缺：
+ * 系统已经知道今天哪条车道成立、该车道只能开什么期限。
+ */
+export function dteRequirementText(
+  lane: LaneId,
+  dayType: LaneDayTypeReading,
+): string {
+  if (isIntradayLaneClosed(dayType)) {
+    return `今日只能 ${OVERNIGHT_MIN_DTE}-${OVERNIGHT_MAX_DTE}DTE（今日无可用 0DTE）`
+      + ' · V2-E ⇒ V2-B，绝不退而买 1-3DTE';
+  }
+  if (dayType.state === 'intraday_available') {
+    return lane === 'intraday'
+      ? '今日只能 0DTE（V2-A：日内车道仅 0DTE，ET 12:00 前开、当日平）'
+      : `过夜车道只能 ${OVERNIGHT_MIN_DTE}-${OVERNIGHT_MAX_DTE}DTE（V2-B：至少持有到下一交易日）`;
+  }
+  const suffix = dayType.state === 'loading'
+    ? '今日车道可用性读取中'
+    : '今日车道可用性标缺——开仓前自行核对券商合约列表';
+  return lane === 'intraday'
+    ? `日内车道只能 0DTE（V2-A）· ${suffix}`
+    : `过夜车道只能 ${OVERNIGHT_MIN_DTE}-${OVERNIGHT_MAX_DTE}DTE（V2-B）· ${suffix}`;
+}
+
+function dteCheckIntraday(dte: number | null, dayType: LaneDayTypeReading): LaneCheck {
   if (dte === null) {
     return {
       id: 'dte',
       label: '合约期限',
-      status: 'missing',
-      reason: '未填写进场 DTE，无法对照 V2-A（日内车道仅 0DTE）',
+      status: 'requirement',
+      reason: dteRequirementText('intraday', dayType),
     };
   }
   if (dte === 0) {
@@ -335,13 +378,13 @@ function dteCheckIntraday(dte: number | null): LaneCheck {
   };
 }
 
-function dteCheckOvernight(dte: number | null): LaneCheck {
+function dteCheckOvernight(dte: number | null, dayType: LaneDayTypeReading): LaneCheck {
   if (dte === null) {
     return {
       id: 'dte',
       label: '合约期限',
-      status: 'missing',
-      reason: `未填写进场 DTE，无法对照 V2-B（过夜车道 ${OVERNIGHT_MIN_DTE}-${OVERNIGHT_MAX_DTE}DTE）`,
+      status: 'requirement',
+      reason: dteRequirementText('overnight', dayType),
     };
   }
   if (dte >= OVERNIGHT_MIN_DTE && dte <= OVERNIGHT_MAX_DTE) {
@@ -360,13 +403,19 @@ function dteCheckOvernight(dte: number | null): LaneCheck {
   };
 }
 
-function clockCheckIntraday(etHour: number | null, etClock: string | null): LaneCheck {
+function clockCheckIntraday(
+  etHour: number | null,
+  etClock: string | null,
+  loading: boolean,
+): LaneCheck {
   if (etHour === null) {
     return {
       id: 'clock',
       label: '开仓时点',
-      status: 'missing',
-      reason: '市场脉搏时点不可得，ET 时钟标缺——无法对照 V2-A / V2-C③ 的 12:00 截止线',
+      status: loading ? 'requirement' : 'missing',
+      reason: loading
+        ? `市场脉搏读取中…（约束：V2-A / V2-C③ ET ${INTRADAY_ET_CUTOFF_HOUR}:00 前开 0DTE）`
+        : '市场脉搏时点不可得，ET 时钟标缺——无法对照 V2-A / V2-C③ 的 12:00 截止线',
     };
   }
   if (etHour < INTRADAY_ET_CUTOFF_HOUR) {
@@ -374,24 +423,34 @@ function clockCheckIntraday(etHour: number | null, etClock: string | null): Lane
       id: 'clock',
       label: '开仓时点',
       status: 'pass',
-      reason: `V2-A：ET ${INTRADAY_ET_CUTOFF_HOUR}:00 前可开 0DTE，当前 ${etClock ?? '—'} ET`,
+      reason:
+        `当前 ${etClock ?? '—'} ET · 约束窗口 ET 09:30–${INTRADAY_ET_CUTOFF_HOUR}:00`
+        + `（V2-A：优先 09:30–11:00；${INTRADAY_ET_CUTOFF_HOUR}:00 后不开新的 0DTE）`,
     };
   }
   return {
     id: 'clock',
     label: '开仓时点',
     status: 'fail',
-    reason: `V2-C③：ET ${INTRADAY_ET_CUTOFF_HOUR}:00 后不开 0DTE，当前 ${etClock ?? '—'} ET`,
+    reason:
+      `当前 ${etClock ?? '—'} ET 已过 ET ${INTRADAY_ET_CUTOFF_HOUR}:00 截止线`
+      + '（V2-C③：12:00 后不开 0DTE，−8.19%，剔除最好 5 笔 −15.54%）',
   };
 }
 
-function clockCheckOvernight(etHour: number | null, etClock: string | null): LaneCheck {
+function clockCheckOvernight(
+  etHour: number | null,
+  etClock: string | null,
+  loading: boolean,
+): LaneCheck {
   if (etHour === null) {
     return {
       id: 'clock',
       label: '开仓时点',
-      status: 'missing',
-      reason: '市场脉搏时点不可得，ET 时钟标缺——无法对照 V2-B 的偏弱时段',
+      status: loading ? 'requirement' : 'missing',
+      reason: loading
+        ? '市场脉搏读取中…（约束：V2-B 避开 ET 11:00–12:00 与 13:00–14:00）'
+        : '市场脉搏时点不可得，ET 时钟标缺——无法对照 V2-B 的偏弱时段',
     };
   }
   if (OVERNIGHT_WEAK_ENTRY_ET_HOURS.includes(etHour)) {
@@ -410,8 +469,13 @@ function clockCheckOvernight(etHour: number | null, etClock: string | null): Lan
   };
 }
 
-/** 日内车道的财报回避检查：查不到就标缺，绝不以「无徽标」冒充安全。 */
-function earningsCheck(
+/**
+ * 财报回避检查：查不到就标缺，绝不以「无徽标」冒充安全。
+ *
+ * 它只在**有标的**的地方才有意义，因此不再出现在无标的的车道清单里，
+ * 而是在「盘中计划」的逐标的卡片上逐个渲染（见 `intradayPlanChecks.ts`）。
+ */
+export function earningsCheck(
   ticker: string | null,
   candidates: IntradayTopCandidate[],
 ): LaneCheck {
@@ -531,110 +595,34 @@ function hardBlocks(
 }
 
 /**
- * V2-D 的两个额度读数。
+ * V2-D 的两个额度上限（用户自己的规则）。
  *
- * 计数来自 `GET /journal/v2/personal-edge` 的 `rule_compliance.daily_budget`，
- * 它是**证据 build 的读数**，带自己的 `asOfTradingDay`。build 的最后一个交易日
- * 不是今天时，读数已过期——显式标缺并说明，**绝不显示 0**（0 会被读成「今天还没
- * 开过单」，而事实是「这个系统还不知道今天」）。
+ * 计数**不再**取 `journal/personal-edge` 的 `rule_compliance.daily_budget`：
+ * Journal 里只有导入的历史成交，它的 `asOfTradingDay` 永远落在过去，那两行
+ * 因此恒为「标缺」——一个永远标缺的读数等于没有。面板改为用户自己的当日
+ * 手动计数（`useIntradayManualBudgetStore`，按 ET 日作用域），如实标注
+ * 「手动维护」，不冒充系统读数。
  */
-function budgetReadings(input: LaneChecklistInput): LaneBudgetReading[] {
-  const { budget, marketDateEt, budgetUnavailableReason } = input;
-  const intradayLimit = budget?.intradayTicketLimit ?? 6;
-  const overnightLimit = budget?.overnightConcurrentLimit ?? 3;
+export const V2D_INTRADAY_TICKET_LIMIT = 6;
+export const V2D_OVERNIGHT_CONCURRENT_LIMIT = 3;
 
-  const unavailable = (reason: string): LaneBudgetReading[] => [
-    {
-      id: 'intraday_tickets',
-      label: '今日日内单',
-      text: null,
-      limit: intradayLimit,
-      reason,
-      atLimit: false,
-    },
-    {
-      id: 'overnight_positions',
-      label: '当前过夜持仓',
-      text: null,
-      limit: overnightLimit,
-      reason,
-      atLimit: false,
-    },
-  ];
-
-  if (!budget) {
-    return unavailable(
-      budgetUnavailableReason
-        ?? '车道遵守度读数不可得（Journal 未构建或端点不可得）——不以 0 冒充额度',
-    );
-  }
-  const asOf = budget.asOfTradingDay;
-  if (!asOf) {
-    return unavailable(
-      budget.intradayReason
-        ?? '证据 build 内没有可定位的最后一个交易日——不以 0 冒充额度',
-    );
-  }
-  if (marketDateEt && asOf !== marketDateEt) {
-    return unavailable(
-      `证据 build 截至 ${asOf}，不含今日（${marketDateEt} ET）的成交：`
-      + '额度读数已过期，显示 0 会被误读为「今天还没开过单」',
-    );
-  }
-  if (!marketDateEt) {
-    return unavailable(
-      `无法确定今日 ET 市场日，因此无法判断 build 的 ${asOf} 读数是否就是今天`,
-    );
-  }
-
-  const intradayCount = budget.intradayTicketCount;
-  const overnightCount = budget.overnightOpenCount;
-  const unknownOpen = budget.overnightUnknownDteOpenCount;
-  return [
-    {
-      id: 'intraday_tickets',
-      label: '今日日内单',
-      text: intradayCount === null ? null : `${intradayCount}/${intradayLimit}`,
-      limit: intradayLimit,
-      reason:
-        intradayCount === null
-          ? budget.intradayReason ?? '当日 0DTE 笔数不可得'
-          : `V2-D③：日内单每日最多 ${intradayLimit} 笔 · 证据 build 截至 ${asOf}`
-            + '（含 ET 12:00 后开的违规单，它们同样占用额度）',
-      atLimit: intradayCount !== null && intradayCount >= intradayLimit,
-    },
-    {
-      id: 'overnight_positions',
-      label: '当前过夜持仓',
-      text: overnightCount === null ? null : `${overnightCount}/${overnightLimit}`,
-      limit: overnightLimit,
-      reason:
-        overnightCount === null
-          ? budget.overnightReason ?? '当前未平仓的 4-7DTE 回合数不可得'
-          : `V2-D③：同时持有的过夜单不超过 ${overnightLimit} 个 · 证据 build 截至 ${asOf}`
-            + (unknownOpen > 0
-              ? ` · 另有 ${unknownOpen} 个未平仓回合缺 DTE，无法归入本计数`
-              : ''),
-      atLimit: overnightCount !== null && overnightCount >= overnightLimit,
-    },
-  ];
-}
-
-/** 按所选车道给出逐条检查、硬禁止、提醒与额度读数。判定不排序、不打分、不下单。 */
+/** 按所选车道给出逐条检查、硬禁止与提醒。判定不排序、不打分、不下单。 */
 export function evaluateLaneChecklist(input: LaneChecklistInput): LaneChecklistResult {
   const etHour = etHourFromPulse(input.pulseGeneratedAt);
   const etClock = etClockFromPulse(input.pulseGeneratedAt);
-  const dayType = evaluateLaneDayType(input.laneAvailability);
+  const loading = Boolean(input.loading);
+  const dayType = evaluateLaneDayType(input.laneAvailability, { loading });
 
+  // 财报回避不在这里：没有标的时它只能是「标缺」，等于噪音。它下沉到
+  // 「盘中计划」的逐标的卡片（那里一定有标的）。
   const checks: LaneCheck[] = input.lane === 'intraday'
     ? [
-      dteCheckIntraday(input.dte),
-      clockCheckIntraday(etHour, etClock),
-      earningsCheck(input.ticker, input.candidates),
+      dteCheckIntraday(input.dte, dayType),
+      clockCheckIntraday(etHour, etClock, loading),
     ]
     : [
-      dteCheckOvernight(input.dte),
-      clockCheckOvernight(etHour, etClock),
+      dteCheckOvernight(input.dte, dayType),
+      clockCheckOvernight(etHour, etClock, loading),
     ];
 
   const reminders = input.lane === 'overnight'
@@ -652,6 +640,5 @@ export function evaluateLaneChecklist(input: LaneChecklistInput): LaneChecklistR
     checks,
     hardBlocks: hardBlocks(input, etHour, dayType),
     reminders,
-    budget: budgetReadings(input),
   };
 }

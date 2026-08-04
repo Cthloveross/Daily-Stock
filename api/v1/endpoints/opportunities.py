@@ -16,7 +16,7 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
@@ -48,12 +48,19 @@ from api.v1.schemas.opportunities import (
     OptionEventResponse,
     OptionWallRequest,
     OptionWallResponse,
+    OptionWallSnapshotRequest,
+    OptionWallSnapshotResponse,
+    OptionWallSnapshotResultItem,
     PremarketCycleRequest,
     PremarketCycleResponse,
     PremarketUniversePutRequest,
     PremarketUniverseResponse,
 )
 from src.opportunities.repository import SnapshotConflictError
+from src.opportunities.wall_snapshot_repository import (
+    OptionWallSnapshotError,
+    record_wall_snapshots,
+)
 from src.opportunities.engine import (
     SIGNAL_VERSION,
     DailyHistoryInput,
@@ -105,7 +112,13 @@ from src.opportunities.near_expiry_contracts import (
 )
 from src.opportunities.option_walls import (
     ATM_CALL_IV_METHOD as OPTION_WALL_ATM_CALL_IV_METHOD,
+    CALL_PUT_RATIO_CAVEAT as OPTION_WALL_CALL_PUT_RATIO_CAVEAT,
     FORMULA_VERSION as OPTION_WALL_FORMULA_VERSION,
+    METRIC_BASIS_SESSION_VOLUME as OPTION_WALL_METRIC_BASIS_SESSION_VOLUME,
+    METRIC_BASIS_SETTLED_OI as OPTION_WALL_METRIC_BASIS_SETTLED_OI,
+    OI_WEIGHTED_CENTER_LABEL as OPTION_WALL_OI_WEIGHTED_CENTER_LABEL,
+    OI_WEIGHTED_CENTER_METHOD as OPTION_WALL_OI_WEIGHTED_CENTER_METHOD,
+    RATIO_REASON_NO_DATA as OPTION_WALL_RATIO_REASON_NO_DATA,
     build_option_wall_payload,
 )
 
@@ -122,7 +135,7 @@ _OPTION_CONTEXT_VERSION = "nearest_expiry_atm_call_iv_v1"
 _OPTION_CONTEXT_SOURCE = "moomoo_openapi"
 _OPTION_OVERVIEW_VERSION = "moomoo_option_underlying_overview_v1"
 _OPTION_OVERVIEW_SOURCE = "moomoo_openapi"
-_OPTION_WALL_VERSION = "observable_option_walls_v1_2"
+_OPTION_WALL_VERSION = "observable_option_walls_v1_3"
 _OPTION_WALL_SOURCE = "moomoo_openapi"
 _OPTION_EVENT_VERSION = "moomoo_unusual_option_events_v1"
 _OPTION_EVENT_SOURCE = "moomoo_openapi"
@@ -153,6 +166,7 @@ _OPTION_WALL_LIMITATIONS = (
     "Volume 是当日累计成交量，不代表新增仓位仍然存在。",
     "Gamma 集中墙使用绝对 Gamma，只表示风险集中度，不是真实 Dealer GEX。",
     "墙位不保证支撑、阻力、钉仓、突破或反转，仅作期权结构研究上下文。",
+    OPTION_WALL_CALL_PUT_RATIO_CAVEAT,
 )
 _OPTION_WALL_ASSUMPTIONS = (
     "Gamma concentration = abs(gamma) × OI × contract size × spot² × 1%。",
@@ -243,6 +257,14 @@ _LANE_AVAILABILITY_CHECKED_SCOPE = "intraday_deep_lane_tickers"
 _INTRADAY_WATCHLIST_MAX_SYMBOLS = 200
 _MOOMOO_SNAPSHOT_MAX_CODES_PER_REQUEST = 400  # 官方文档单次快照上限
 _INTRADAY_DEEP_DAILY_DISTINCT_CAP = 30
+# 盘中计划提升（请求内 focus_symbols）的服务端硬上界：与 schema 的 max_length
+# 一致（≤8），两处都设是为了「请求侧被绕过时服务端仍有界」。它与配置钉选
+# 同语义（不占异动额度、不受日上限约束），因此同样受 30 天去重配额约束。
+_INTRADAY_FOCUS_MAX_SYMBOLS = 8
+# 扫描表深度层总行数硬顶（用户明确要求「留 8 个」）。异动保底名额保证扫描表
+# 始终保留发现能力；被总数挤掉的标的进 universe_scan.trimmed_by_total_cap。
+_INTRADAY_DEEP_LANE_TOTAL_MAX = 8
+_INTRADAY_DEEP_MOVER_FLOOR = 4
 _INTRADAY_TWO_TIER_GATE_BASIS = "abs_change_percent_then_turnover_v1"
 # 盘前时段（ET 04:00–09:30）：Moomoo 常规快照字段仍指向上一常规时段，
 # 真实盘前变动只在 pre_* 字段。盘前闸门按 |pre_change_rate|→pre_turnover
@@ -1311,6 +1333,44 @@ def _empty_option_wall_payload(
             "put_gamma_concentration": [],
             "gross_gamma_concentration": [],
         },
+        # additive (option-wall/1.3): a failed or disabled read reports the
+        # ratios as explicitly undefined with the reason — never as 0 or 1.
+        "totals": {
+            "call_oi": 0.0,
+            "put_oi": 0.0,
+            "call_volume": 0.0,
+            "put_volume": 0.0,
+        },
+        "ratios": {
+            "call_put_oi_ratio": {
+                "value": None,
+                "numerator_total": 0.0,
+                "denominator_total": 0.0,
+                "numerator_side": "call",
+                "denominator_side": "put",
+                "metric_basis": OPTION_WALL_METRIC_BASIS_SETTLED_OI,
+                "reason": OPTION_WALL_RATIO_REASON_NO_DATA,
+            },
+            "call_put_volume_ratio": {
+                "value": None,
+                "numerator_total": 0.0,
+                "denominator_total": 0.0,
+                "numerator_side": "call",
+                "denominator_side": "put",
+                "metric_basis": OPTION_WALL_METRIC_BASIS_SESSION_VOLUME,
+                "reason": OPTION_WALL_RATIO_REASON_NO_DATA,
+            },
+            "caveat": OPTION_WALL_CALL_PUT_RATIO_CAVEAT,
+        },
+        "oi_weighted_center": {
+            "strike": None,
+            "total_open_interest": 0.0,
+            "label": OPTION_WALL_OI_WEIGHTED_CENTER_LABEL,
+            "method": OPTION_WALL_OI_WEIGHTED_CENTER_METHOD,
+            "metric_basis": OPTION_WALL_METRIC_BASIS_SETTLED_OI,
+            "validated_as_price_magnet": False,
+            "reason": OPTION_WALL_RATIO_REASON_NO_DATA,
+        },
         "message": message,
         "assumptions": list(_OPTION_WALL_ASSUMPTIONS),
         "limitations": list(_OPTION_WALL_LIMITATIONS),
@@ -1455,7 +1515,7 @@ def _execute_option_walls(
         default=requested_at.isoformat(),
     )
     return {
-        "schema_version": "option-wall/1.2",
+        "schema_version": "option-wall/1.3",
         "generated_at": generated_at,
         "market_date_et": market_date_et,
         "items": ordered_items,
@@ -2935,6 +2995,7 @@ def _execute_intraday_top_two_tier(
     deep_lane_max: int,
     watchlist_configured_total: int,
     pinned_tickers: Optional[list[str]] = None,
+    focus_tickers: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """watchlist 两层扫描：一次批量快照的宽层 + 异动闸门晋升的深度层。
 
@@ -2952,10 +3013,15 @@ def _execute_intraday_top_two_tier(
 
     plan_tickers_all = _todays_plan_tickers(market_date_et)
     pinned_tickers_all = normalize_symbols(list(pinned_tickers or []))
-    # 扫描 universe = 清单 ∪ 今日计划 ∪ 用户钉选：计划/钉选标的并入同一批
-    # 快照（仍 1 次请求），即使不在清单里也能拿到深度层所需的会话快照。
+    # 盘中计划提升（focus）：与配置钉选同一语义，只是来源是本次请求。
+    focus_tickers_all = normalize_symbols(list(focus_tickers or []))[
+        :_INTRADAY_FOCUS_MAX_SYMBOLS
+    ]
+    # 扫描 universe = 清单 ∪ 今日计划 ∪ 用户钉选 ∪ 盘中计划提升：计划/钉选/
+    # 提升标的并入同一批快照（仍 1 次请求），即使不在清单里也能拿到深度层
+    # 所需的会话快照——不新增任何取数路径。
     scan_symbols = normalize_symbols(
-        [*watchlist, *plan_tickers_all, *pinned_tickers_all]
+        [*watchlist, *plan_tickers_all, *pinned_tickers_all, *focus_tickers_all]
     )
     supported = [
         symbol for symbol in scan_symbols if is_supported_us_option_underlying(symbol)
@@ -2975,6 +3041,15 @@ def _execute_intraday_top_two_tier(
         symbol
         for symbol in pinned_tickers_all
         if symbol in supported_set and symbol not in plan_tickers
+    ]
+    # 盘中计划提升同样与计划/配置钉选去重：同一标的只占一个深度位，
+    # 标注取先出现的身份（计划 > 配置钉选 > 盘中计划提升）。
+    focus_effective = [
+        symbol
+        for symbol in focus_tickers_all
+        if symbol in supported_set
+        and symbol not in plan_tickers
+        and symbol not in pinned_effective
     ]
 
     # -- Tier 1：一次批量快照（SPY 并入，不新增请求次数）---------------------
@@ -3012,7 +3087,8 @@ def _execute_intraday_top_two_tier(
     # 回退 v1 当日涨跌口径并携带 warming-up 警示。
     plan_set = set(plan_tickers)
     pinned_set = set(pinned_effective)
-    always_deep_set = plan_set | pinned_set
+    focus_set = set(focus_effective)
+    always_deep_set = plan_set | pinned_set | focus_set
     session_phase_now = market_session_phase(requested_at)
     now_epoch = requested_at.timestamp()
     premarket_gate = session_phase_now == "premarket" and any(
@@ -3064,9 +3140,11 @@ def _execute_intraday_top_two_tier(
         )
         for key in [k for k in _intraday_deep_promotion_log if k != market_date_et]:
             _intraday_deep_promotion_log.pop(key, None)
-        # 计划/用户钉选不受日上限约束，但计入当日去重集合（额度语义一致）。
+        # 计划/用户钉选/盘中计划提升不受日上限约束，但计入当日去重集合
+        # （额度语义一致）。
         promoted_today.update(plan_tickers)
         promoted_today.update(pinned_effective)
+        promoted_today.update(focus_effective)
         for symbol in mover_order:
             if len(promoted_movers) >= deep_lane_max:
                 break
@@ -3080,11 +3158,42 @@ def _execute_intraday_top_two_tier(
             promoted_today.add(symbol)
             promoted_movers.append(symbol)
 
-    deep_symbols = [
-        *plan_tickers,
-        *pinned_effective,
-        *[symbol for symbol in promoted_movers if symbol not in always_deep_set],
+    # -- 深度层总行数硬顶 ----------------------------------------------------
+    # 用户要求扫描表「留 8 个，太多也看不过来」。优先级：盘中计划（用户当下
+    # 明确挑出来的）→ 用户钉选 → 异动（保底 _INTRADAY_DEEP_MOVER_FLOOR 个位置
+    # 给发现，否则扫描表失去意义）→ 盘前计划标的（它们另有「今日计划跟踪」
+    # 面板，走独立接口，不依赖本深度层）。被挤掉的一律显式披露，绝不静默丢弃。
+    mover_symbols = [
+        symbol for symbol in promoted_movers if symbol not in always_deep_set
     ]
+    ordered_groups = (
+        ("user_focus", list(focus_effective)),
+        ("user_pinned", list(pinned_effective)),
+        ("mover_rank", mover_symbols),
+        ("plan_always_include", list(plan_tickers)),
+    )
+    total_cap = _INTRADAY_DEEP_LANE_TOTAL_MAX
+    reserved_for_movers = min(_INTRADAY_DEEP_MOVER_FLOOR, len(mover_symbols))
+    deep_symbols = []
+    trimmed_by_total_cap: list[dict[str, Any]] = []
+    for group_key, members in ordered_groups:
+        for symbol in members:
+            if symbol in deep_symbols:
+                continue
+            remaining = total_cap - len(deep_symbols)
+            # 给异动留的保底名额不被前面的组占满之外的组吃掉。
+            if group_key != "mover_rank":
+                remaining -= max(
+                    0,
+                    reserved_for_movers
+                    - sum(1 for s in deep_symbols if s in set(mover_symbols)),
+                )
+            if remaining <= 0:
+                trimmed_by_total_cap.append(
+                    {"ticker": symbol, "would_be_promoted_by": group_key}
+                )
+                continue
+            deep_symbols.append(symbol)
     deep_set = set(deep_symbols)
 
     # -- Tier 2：既有 v4 管线，仅深度层标的 -----------------------------------
@@ -3165,6 +3274,12 @@ def _execute_intraday_top_two_tier(
         if symbol in pinned_set:
             return {
                 "promoted_by": "user_pinned",
+                "mover_rank": None,
+                "basis": gate_basis,
+            }
+        if symbol in focus_set:
+            return {
+                "promoted_by": "user_focus",
                 "mover_rank": None,
                 "basis": gate_basis,
             }
@@ -3257,12 +3372,15 @@ def _execute_intraday_top_two_tier(
         ],
         "plan_always_include": list(plan_tickers),
         "user_pinned": list(pinned_effective),
+        "user_focus": list(focus_effective),
         "gated_out_count": len(supported) - len(deep_symbols),
         "snapshot_unresolved_symbols": snapshot_unresolved,
         "day_promotion_cap": _INTRADAY_DEEP_DAILY_DISTINCT_CAP,
         "day_promotion_cap_reached": day_cap_reached,
         "day_ledger": day_ledger_rows,
         "day_ledger_basis": _INTRADAY_DAY_LEDGER_BASIS,
+        "deep_lane_total_max": _INTRADAY_DEEP_LANE_TOTAL_MAX,
+        "trimmed_by_total_cap": trimmed_by_total_cap,
         "snapshot_only": snapshot_only,
         "limitations": list(_INTRADAY_TWO_TIER_LIMITATIONS),
     }
@@ -3918,6 +4036,47 @@ def option_walls(payload: OptionWallRequest) -> OptionWallResponse:
     return OptionWallResponse.model_validate(result)
 
 
+@router.post(
+    "/option-walls/daily-snapshot",
+    response_model=OptionWallSnapshotResponse,
+)
+def option_walls_daily_snapshot(
+    payload: OptionWallSnapshotRequest,
+) -> OptionWallSnapshotResponse:
+    """Append today's wall aggregates for the given deep-lane tickers.
+
+    **显式触发，不是常驻守护进程。**本仓库目前没有一个「盘中每日跑一次」的
+    通用调度挂载点适合塞这件事（盘前 orchestration 只覆盖 premarket 周期），
+    因此这里按约定暴露为显式端点：由用户、cron 或外部调度每个 ET 交易日调用
+    一次即可，重复调用幂等。
+
+    它**复用既有的期权墙车道与其缓存**——同一 ``(symbol, date, dte)`` 键在
+    缓存 TTL 内不会产生新的 provider 请求；本端点自身**不新增任何取数路径**，
+    也不会扇出到全部 universe：symbols 上限与墙位端点一致（≤5），并由写入层
+    再钳一次。抓取失败的标的**不写任何行**（而不是写 0）。
+    """
+
+    result = _execute_option_walls(
+        payload.symbols,
+        enabled=_moomoo_opend_enabled(),
+        dte_min=payload.dte_min,
+        dte_max=payload.dte_max,
+    )
+    try:
+        written = record_wall_snapshots(result, tickers=payload.symbols)
+    except OptionWallSnapshotError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return OptionWallSnapshotResponse(
+        schema_version="option-wall-daily-snapshot/1.0",
+        market_date_et=str(result["market_date_et"]),
+        generated_at=str(result["generated_at"]),
+        results=[
+            OptionWallSnapshotResultItem(**asdict(item)) for item in written
+        ],
+    )
+
+
 @router.post("/option-events", response_model=OptionEventResponse)
 def option_events(payload: OptionEventRequest) -> OptionEventResponse:
     """Return recent Moomoo-classified unusual option transactions.
@@ -4018,6 +4177,10 @@ def intraday_top(payload: IntradayTopRequest) -> IntradayTopResponse:
     universe 解析：显式 ``symbols``（≤20）优先；空 symbols 时若配置了
     ``INTRADAY_WATCHLIST`` 走两层扫描（宽层批量快照 → 异动闸门 → 深度层，
     响应附 ``universe_scan``），否则回退 ``STOCK_LIST``（与既有行为一致）。
+    ``focus_symbols``（≤8，additive）是「盘中计划」手动提升的标的：**不参与
+    universe 解析**（因此不会关掉两层扫描），只在两层模式下并入深度层，
+    与既有用户钉选同语义（不占异动额度、与计划/钉选去重、并入同一批快照），
+    深度位标注 ``promoted_by="user_focus"``；单层路径完全不受影响。
     """
 
     enabled = _moomoo_opend_enabled()
@@ -4033,6 +4196,9 @@ def intraday_top(payload: IntradayTopRequest) -> IntradayTopResponse:
         watchlist = watchlist_configured[:_INTRADAY_WATCHLIST_MAX_SYMBOLS]
         deep_lane_max = _configured_deep_lane_max()
         pinned_configured = _configured_intraday_pinned_tickers()
+        # 盘中计划提升进入缓存 key：不同 focus 名单是不同的深度层名单，
+        # 共用一个 key 会让后提升的标的读到不含它的旧结果。
+        focus_requested = list(payload.focus_symbols)[:_INTRADAY_FOCUS_MAX_SYMBOLS]
         key = (
             "intraday_top",
             INTRADAY_TOP_SIGNAL_VERSION,
@@ -4041,6 +4207,7 @@ def intraday_top(payload: IntradayTopRequest) -> IntradayTopResponse:
                 "watchlist_two_tier",
                 tuple(watchlist),
                 tuple(pinned_configured),
+                tuple(focus_requested),
                 deep_lane_max,
             ),
             int(payload.limit),
@@ -4054,6 +4221,7 @@ def intraday_top(payload: IntradayTopRequest) -> IntradayTopResponse:
                 deep_lane_max=deep_lane_max,
                 watchlist_configured_total=len(watchlist_configured),
                 pinned_tickers=pinned_configured,
+                focus_tickers=focus_requested,
             )
         )
     else:

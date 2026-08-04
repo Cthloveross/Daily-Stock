@@ -1222,3 +1222,126 @@ export interface PersonalEdgeResponse {
   monthBasis: string | null;
   limitations: string[];
 }
+
+/* ------------------------------------------------------------------ */
+/* 交易纪律证据页（/rules）                                            */
+/*                                                                     */
+/* 所有数字都由后端算完下发：分档边界、剔尾 N、严重度分位数定义、费用   */
+/* 计算器的默认锚点全部来自响应。**前端不得硬编码任何一个统计量**。     */
+/* ------------------------------------------------------------------ */
+
+/** 一行读数：样本量 + 三个口径 + 显式缺席原因（缺席绝不以 0 冒充）。 */
+export interface RulesEvidenceCell {
+  label: string;
+  n: number;
+  grossPct: number | null;
+  netPct: number | null;
+  feePct: number | null;
+  winRatePct: number | null;
+  reason: string | null;
+}
+
+export interface RulesEvidencePriceBand extends RulesEvidenceCell {
+  lower: number | null;
+  upper: number | null;
+}
+
+export interface RulesEvidenceDteHold extends RulesEvidenceCell {
+  dteMin: number;
+  dteMax: number;
+  holdStyle: 'intraday' | 'overnight';
+  excludedTopN: number;
+  exTopNGrossPct: number | null;
+  exTopNN: number;
+  exTopNReason: string | null;
+}
+
+export interface RulesEvidenceHour extends RulesEvidenceCell {
+  etHour: number;
+}
+
+export interface RulesEvidenceWeekday extends RulesEvidenceCell {
+  weekday: number;
+  zeroDteN: number;
+  dte13N: number;
+}
+
+export interface RulesEvidenceFeeThreshold {
+  feePctOfPremium: number | null;
+  n: number;
+  reason: string | null;
+  defaultTicketUsd: number;
+  defaultTicketsPerDay: number;
+  tradingDaysPerMonth: number;
+  note: string;
+}
+
+export interface RulesEvidenceSeverityTier {
+  label: string;
+  definition: string;
+  lossPct: number | null;
+  ticketsToBreaker: number | null;
+  reason: string | null;
+}
+
+export interface RulesEvidenceChosenParams {
+  ticketUsd: number;
+  dailyBreakerUsd: number;
+  maxConcurrent: number;
+}
+
+export interface RulesEvidencePosition {
+  framing: string;
+  params: RulesEvidenceChosenParams;
+  severityTiers: RulesEvidenceSeverityTier[];
+  observedBreachDayCount: number;
+  observedTradingDayCount: number;
+  observedBreachOnePerDays: number | null;
+  observedMedianTicketsPerDay: number | null;
+  observedCadenceCaveat: string;
+  historicalMaxDrawdownPct: number | null;
+  historicalDrawdownSizingPct: number;
+  drawdownCaveat: string;
+  reason: string | null;
+}
+
+export interface RulesEvidenceCorrelation {
+  tickers: { ticker: string; n: number }[];
+  compliantEpisodeCount: number;
+  maxConcurrent: number;
+  note: string;
+}
+
+export interface RulesEvidenceResponse {
+  schemaVersion: string;
+  dataState: 'ready' | 'not_built';
+  accountKey: string;
+  buildId: number | null;
+  buildKey: string | null;
+  sourceKind: string | null;
+  computedAt: string | null;
+  cleanBasisStart: string | null;
+  cleanBasisReason: string | null;
+  ruleSetAdoptedAt: string | null;
+  sampleEpisodeCount: number;
+  excludedBeforeCleanBasis: number;
+  excludedAggregateOrUnknownBasis: number;
+  excludedMissingPremium: number;
+  excludedNotClosedOrMissingPnl: number;
+  firstTradingDay: string | null;
+  lastTradingDay: string | null;
+  banner: string | null;
+  priceBandHeadline: string | null;
+  priceBandBoundaryPolicy: string | null;
+  priceBands: RulesEvidencePriceBand[];
+  holdStyleBasis: string | null;
+  dteHoldLanes: RulesEvidenceDteHold[];
+  etHours: RulesEvidenceHour[];
+  weekdayHeadline: string | null;
+  weekdays: RulesEvidenceWeekday[];
+  feeThreshold: RulesEvidenceFeeThreshold | null;
+  position: RulesEvidencePosition | null;
+  correlation: RulesEvidenceCorrelation | null;
+  overnightGapNote: string | null;
+  limitations: string[];
+}

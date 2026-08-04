@@ -40,6 +40,7 @@ import type {
   RetirePlaybookRuleResponse,
   RealityTestResponse,
   ReviewInsightsResponse,
+  RulesEvidenceResponse,
   SavePositionEpisodeReviewAnnotationRequest,
   SavePositionEpisodeReviewAnnotationResponse,
   TradeItem,
@@ -304,6 +305,29 @@ export async function fetchPersonalEdge(refresh = false): Promise<PersonalEdgeRe
     sessionCache.set(key, camel);
   }
   return camel;
+}
+
+/**
+ * 交易纪律证据表（/rules 页）：与车道遵守度同一干净口径的后端读数。
+ *
+ * 所有统计量都在后端算完，前端只渲染。可选参数只改变「熔断触发算术」，
+ * 不改变样本；它们不落库，也不代表系统知道你的账户规模。
+ */
+export async function fetchRulesEvidence(
+  params: {
+    buildId?: number;
+    ticketUsd?: number;
+    dailyBreakerUsd?: number;
+    maxConcurrent?: number;
+  } = {},
+): Promise<RulesEvidenceResponse> {
+  const query: Record<string, number> = {};
+  if (params.buildId !== undefined) query.build_id = params.buildId;
+  if (params.ticketUsd !== undefined) query.ticket_usd = params.ticketUsd;
+  if (params.dailyBreakerUsd !== undefined) query.daily_breaker_usd = params.dailyBreakerUsd;
+  if (params.maxConcurrent !== undefined) query.max_concurrent = params.maxConcurrent;
+  const { data } = await apiClient.get(`${BASE}/v2/rules-evidence`, { params: query });
+  return toCamelCase<RulesEvidenceResponse>(data);
 }
 
 export async function fetchPlaybook(): Promise<PlaybookListResponse> {

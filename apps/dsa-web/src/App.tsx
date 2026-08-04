@@ -6,6 +6,7 @@ import LoginPage from './pages/LoginPage';
 import NotFoundPage from './pages/NotFoundPage';
 import JournalPage from './pages/JournalPage';
 import JournalEpisodeReviewPage from './pages/JournalEpisodeReviewPage';
+import RulesPage from './pages/RulesPage';
 import IntradayPage from './pages/IntradayPage';
 import RegimePage from './pages/RegimePage';
 import OpportunityDetailPage from './pages/OpportunityDetailPage';
@@ -69,6 +70,7 @@ const AppContent: React.FC = () => {
         <Route path="/stocks/:ticker" element={<StockDetailPage />} />
         <Route path="/journal" element={<JournalPage />} />
         <Route path="/journal/review/:episodeId" element={<JournalEpisodeReviewPage />} />
+        <Route path="/rules" element={<RulesPage />} />
         <Route path="/backtest" element={<BacktestPage />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="/design-lab" element={<DesignLabPage />} />

@@ -34,6 +34,7 @@ import type {
 } from '../../types/opportunities';
 import { Button, EmptyState } from '../ui';
 import { IntradayTrackingPanel } from './IntradayTrackingPanel';
+import { OptionWallRatioPanel } from './OptionWallRatioPanel';
 import { WallLevelExpiryBreakdown } from './WallLevelExpiryBreakdown';
 import { parseApiTimestamp } from '../../utils/marketTime';
 
@@ -887,6 +888,8 @@ function OptionWallSnapshot({ context }: { context: CandidateOptionWallContext }
           {item.coverage.validContracts}/{item.coverage.requestedContracts} · {item.coverage.coveragePercent.toFixed(1)}%
         </div>
       </div>
+
+      <OptionWallRatioPanel item={item} />
 
       <WallLevelList
         title="Call OI 墙（集中位）"

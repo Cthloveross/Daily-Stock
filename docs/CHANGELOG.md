@@ -504,6 +504,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] 车道可用性额度护栏：逐标的按 ET 交易日缓存 1 小时（失败仅短缓存 5 分钟）、单轮新增读取上限 8、单轮参与判定标的上限 12；超限标的显式列入 `deferred_tickers` 并在下一轮补齐，绝不把「没查」说成「没有 0DTE」。
 - [测试] 新增车道可用性纯判定层用例（有/无 0DTE/链读不到三态、越界与畸形到期日行、day_type 三态优先级含「正向证据不因部分读不到而作废」与「一个读不到就不敢说过夜日」、星期无关性）、适配器用例（只查到期日元数据、链窗口/快照/现价一旦被调用即失败、诚实空态、元数据失败 fail closed、参数边界）、端点 additive 合同用例（两层模式三态、Moomoo 未启用零供应商读取、逐标的缓存跨轮询、额度预算推迟、单层模式恒为 null）与临期合约面板可用性字段用例；前端补车道日类型四态渲染、V2-E 硬阻断证据文案、黑名单专属与混合场景。
 - [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` 新增 §10，记录星期效应实为合约可用性的取证依据（周一/三/五全部盈利 vs 周二 −2.61%、周四 −3.74%；1DTE 当日 −4.97% 是全样本最差桶）、判定规则与 fail-closed 语义、零新增抓取路径与额度护栏、端点 additive 合同、面板四态与黑名单叠加，以及 2026-08-04 周二的真实读数（12 个深度层标的均无 0DTE → 过夜日）。
+- [新功能] 新增 `/rules`「交易纪律」页与 `GET /api/v1/journal/v2/rules-evidence`：把合约价格甜蜜区、DTE × 持有方式、时段、星期 × 0DTE 可用性、手续费门槛、仓位与回撤算术、相关性簇集中为后端可复算读数，与车道遵守度共用同一干净口径（`fill_allocations>0` 且 ET 入场日 ≥ 2026-04-21，毛口径＝净＋费用，风险＝`ABS(opening_cash_flow)`），前端只渲染不硬编码任何统计量。
+- [新功能] 交易纪律页新增手续费门槛计算器（单笔金额 × 每天笔数）：费率与默认锚点由后端下发，输入仅存在于组件 state，不落库、不上报，系统不猜账户规模。
+- [新功能] `POST /opportunities/option-walls` 升到 option-wall/1.3，additive 新增 `totals`、`ratios.call_put_oi_ratio`、`ratios.call_put_volume_ratio`（各带 metric basis，分母为 0 时显式 null + 原因）与 `oi_weighted_center`，并在既有期权墙 UI 呈现。
+- [新功能] 新增 append-only `option_wall_daily_snapshots`（键 `(market_date_et, ticker)`）与 `POST /opportunities/option-walls/daily-snapshot` 显式写入端点：复用既有墙位车道与缓存、零新增取数路径、逐 `(日期, 标的)` 幂等、有界不扇出，抓取失败不写入任何行，部分覆盖如实记录 `coverage_percent`。
+- [改进] call/put 比例与墙位一律作为事实描述呈现，随响应下发标准告警并逐字渲染：本仓库尚无历史 OI 序列，「高 call 比例＝会涨」与「价格会向最大痛点靠拢」两个说法均**尚未被检验**；不计算也不展示 max pain 预测，唯一相关读数严格标注为「未平仓分布的加权中心（描述，未验证是否有引力）」并带 `validated_as_price_magnet: false`。
+- [改进] `rules-evidence` 端点始终回显 `build_id`/`build_key` 并接受显式 `build_id`：本仓库当前无 activation 记录，默认解析会落在 CSV build #1（n=1,191）而非 canonical build #3（n=1,407），页面据此显示「这页在读哪个 build」，绝不静默替换。
+- [测试] 新增证据表聚合算术用例（金额加权 vs 逐笔平均、毛＝净＋费用、分档边界 `[lower, upper)`、当日平/过夜按 ET 交易日切分、剔尾门槛 fail closed、星期表排除缺 DTE、分位数线性插值、熔断触发笔数与回撤单路径）、端点合同用例（未构建态、各表齐备、横幅与 limitations 逐字、参数改变算术不改变样本、未知 build_id 422）、期权墙比例用例（零分母 null+原因、未配置态、告警进入 limitations）与快照写入器用例（幂等、append-only deny trigger、部分覆盖、失败不写、有界不扇出）。
+- [测试] 前端新增 `/rules` 页用例（各表渲染、计算器算术与不持久化、横幅与合规面板链接、Playbook 读取失败降级）与期权墙比例面板用例（双口径标注、告警逐字、加权中心不得被称作 max pain、零分母显示）。
+- [文档] 新增 `New-docs/phase1/15_TRADING_DISCIPLINE_EVIDENCE.md`，记录干净口径定义、build 解析现实与两个 build 的真实读数、七张证据表的实测数字、call/put 比例的诚实边界、逐日快照表 DDL 与写入器约束、显式触发方式及 2026-08-04 首条 NVDA 真实记录。
+- [新功能] `/intraday` 拆成「盘中计划（上）+ 实时扫描（下）」：扫描表逐行可「加入盘中计划」，计划按 ET 交易日作用域存本机（换日自动为空、可清空），逐标的给车道/规则四态核对、按今日车道的合约候选（$2-8 甜蜜区高亮、<$1 灰显警示）、张数与手续费换算及中性失效位提示。
+- [新功能] `POST /opportunities/intraday-top` additive 新增 `focus_symbols`（≤8）：与既有用户钉选同语义并入深度层（不占异动额度、与计划/钉选去重、并入同一批快照、进缓存 key），标注 `deep_lane_reason.promoted_by="user_focus"`；不参与 universe 解析，单层路径不受影响。
+- [改进] 开仓前车道检查改为零输入可用：新增「要求」态直接写出今天只能开的期限与 ET 约束窗口（不再显示标缺），今日无 0DTE 时整块大字警示并禁用日内车道，冷启动显示「读取中」而非标缺，删除无标的的财报行，额度改为按 ET 日归零的手动计数，正文样板话收敛为一行、长口径 caveat 移入 tooltip。
+- [测试] 新增计划清单/手动计数按 ET 日作用域与不劫持两层扫描、`focus_symbols` 并入去重/上界/off-quota/缓存 key/单层不变、逐标的规则四态、合约分档与张数手续费算术、页面区块顺序等用例。
 
 ## [3.11.0] - 2026-03-27
 

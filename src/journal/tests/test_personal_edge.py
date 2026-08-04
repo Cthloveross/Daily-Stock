@@ -165,6 +165,9 @@ def _seed_build(
                     realized_pnl_net=pnl,
                     dte_at_entry=spec.get("dte_at_entry"),
                     opening_cash_flow=spec.get("opening_cash_flow"),
+                    # additive：合约价格分档（交易纪律证据页）需要它；
+                    # 未指定时保持 None，与既有用例行为完全一致。
+                    average_entry_price=spec.get("average_entry_price"),
                     construction_basis="fills",
                     is_left_censored=False,
                     is_right_censored=False,

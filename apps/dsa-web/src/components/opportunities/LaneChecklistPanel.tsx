@@ -1,13 +1,22 @@
 import { useMemo, useState } from 'react';
-import { usePersonalEdge } from '../../hooks/usePersonalEdge';
 import type {
   IntradayPulseResponse,
   IntradayTopResponse,
 } from '../../types/opportunities';
+import {
+  selectManualIntradayTickets,
+  selectManualOvernightPositions,
+  useIntradayManualBudgetStore,
+} from '../../stores/intradayPlanStore';
 import { Tooltip } from '../common/Tooltip';
 import {
+  DAY_TYPE_EVIDENCE_LINE,
   LANE_LABELS,
+  V2D_INTRADAY_TICKET_LIMIT,
+  V2D_OVERNIGHT_CONCURRENT_LIMIT,
   evaluateLaneChecklist,
+  isIntradayLaneClosed,
+  laneForDayType,
   type CheckStatus,
   type LaneDayTypeView,
   type LaneId,
@@ -21,6 +30,7 @@ const DAY_TYPE_MARK: Record<LaneDayTypeView, string> = {
   overnight_only: '✕',
   blacklist_only: '✕',
   unknown: '—',
+  loading: '…',
 };
 
 const DAY_TYPE_CLASS: Record<LaneDayTypeView, string> = {
@@ -28,65 +38,88 @@ const DAY_TYPE_CLASS: Record<LaneDayTypeView, string> = {
   overnight_only: 'text-warn-strong',
   blacklist_only: 'text-warn-strong',
   unknown: 'text-text-3',
+  loading: 'text-text-3',
 };
 
 const STATUS_TEXT: Record<CheckStatus, string> = {
   pass: '符合',
   fail: '不符合',
   missing: MISSING,
+  requirement: '要求',
 };
 
 const STATUS_CLASS: Record<CheckStatus, string> = {
   pass: 'text-text-1',
   fail: 'text-warn-strong',
   missing: 'text-text-3',
+  requirement: 'text-text-2',
 };
 
-/** 三态标记用文字而非颜色承载语义（无障碍 + 无涨跌色）。 */
+/** 四态标记用文字而非颜色承载语义（无障碍 + 无涨跌色）。 */
 const STATUS_MARK: Record<CheckStatus, string> = {
   pass: '✓',
   fail: '✕',
   missing: '—',
+  requirement: '▸',
 };
 
+/** 长口径 caveat：不再占正文，改挂 tooltip（内容一字不删）。 */
+export const LANE_SAMPLE_CAVEAT = [
+  '样本窗口仅 2026-04→07 一个市场状态（SPY 上行，隔夜多头天然占优）。',
+  '过夜车道 n=65 偏小，隔夜跳空风险在该窗口内未被充分体现。',
+  '规则由同一份样本内推出（in-sample）；前向验证见 /journal 的规则遵守度。',
+  '数字口径：build #3 干净口径，n=1,407，2026-04-21→07-31。',
+].join('\n');
+
 /**
- * 开仓前车道检查清单：把「这一单属于哪条车道、当下是否符合你自己那套规则」
- * 摊在盘面上的一小块面板。
+ * 开仓前车道检查清单：把「今天这条车道到底开不开、当下是否符合你自己那套
+ * 规则」摊在盘面上的一小块面板。
  *
- * 它检查的是**用户自己的规则**（Playbook 候选「V2-0」…「V2-D」，由用户本人的
- * 干净口径历史推出并采纳），不是推荐、不是信号、不含概率；本系统只读，
- * **永远不会下单**。
+ * 三条设计约束（2026-08-05 依用户反馈重排）：
+ * 1. **系统已经知道的事，绝不显示成「标缺」**。今天只能 0DTE / 只能 4-7DTE、
+ *    ET 12:00 截止线，都是**要求**（`requirement`）——直接写出要求本身；只有
+ *    「查过了拿不到」才是标缺。
+ * 2. **今日无 0DTE 是全屏最重要的一件事**：整块警示、大字、一行证据，并把
+ *    日内车道按钮置为「不可选 + 原因」，而不是让用户点进一堵失败墙。
+ * 3. **额度是用户自己数的**。Journal 只有导入的历史成交，永远不含今天，那两个
+ *    计数恒为标缺——改成按 ET 日作用域的手动 +1/−1，如实标注「手动维护」。
  *
- * 数据来源全部复用盘面已有的读数，不新起任何时钟或数据源：
- * - ET 时钟取市场脉搏端点的 `generatedAt`（与脉搏条「数据时点」同一口径）；
- * - 财报回避窗取日内扫描深度层候选上已有的 `earningsProximity`——标的不在深度层
- *   或日历不可得时显式标缺，**未知≠安全**；
- * - 额度读数取 `GET /journal/v2/personal-edge` 的 `rule_compliance.daily_budget`，
- *   它带自己的 `asOfTradingDay`：build 不含今日时显式标缺并说明，绝不显示 0。
- *
- * 面板第一行是**今日车道可用性**（V2-E）：取日内扫描响应的 `laneAvailability`
- * 区块（服务端按今日真实期权到期日元数据判定，**不含星期规则**）。今日无 0DTE 时
- * 选中日内车道会得到一条引用 V2-E 的硬阻断；若确证有 0DTE 但全部落在用户自己的
- * 黑名单上，则如实标注「今日仅黑名单标的有 0DTE」并同样阻断。区块缺席或链读不到
- * 一律显式标缺——**未知≠「今天没有 0DTE」**。
- *
- * V2-C 的三条硬禁止与所选车道无关：命中即列出，不会因为「选了另一条车道」而消失。
+ * ET 时钟取市场脉搏端点的 `generatedAt`（与脉搏条「数据时点」同一口径）；
+ * 车道可用性取日内扫描的 `laneAvailability`（服务端按当日真实期权到期日元
+ * 数据判定，不含星期规则）。首轮请求仍在飞时显示「读取中…」——**读取中 ≠
+ * 标缺**。财报回避需要标的才有意义，已下沉到「盘中计划」的逐标的卡片。
  */
 export function LaneChecklistPanel({
   pulse,
   top,
+  loading = false,
 }: {
   pulse: IntradayPulseResponse | null;
   top: IntradayTopResponse | null;
+  loading?: boolean;
 }) {
-  const [lane, setLane] = useState<LaneId>('intraday');
+  const [laneOverride, setLaneOverride] = useState<LaneId | null>(null);
   const [dteText, setDteText] = useState('');
-  const [ticker, setTicker] = useState('');
   const [intendsToCloseToday, setIntendsToCloseToday] = useState(false);
 
-  const view = usePersonalEdge();
-  const edge = view.state === 'ready' ? view.data : null;
-  const compliance = edge?.ruleCompliance ?? null;
+  const intradayTickets = useIntradayManualBudgetStore(selectManualIntradayTickets);
+  const overnightPositions = useIntradayManualBudgetStore(selectManualOvernightPositions);
+  const bump = useIntradayManualBudgetStore((state) => state.bump);
+
+  // 先按「今天成立的车道」预判一次日型，用来决定默认选中的车道与禁用状态。
+  const preview = useMemo(() => evaluateLaneChecklist({
+    lane: 'intraday',
+    dte: null,
+    intendsToCloseToday: false,
+    pulseGeneratedAt: pulse?.generatedAt ?? null,
+    laneAvailability: top?.laneAvailability ?? null,
+    loading: loading && !top,
+  }), [pulse, top, loading]);
+
+  const intradayClosed = isIntradayLaneClosed(preview.dayType);
+  // 今日只剩过夜车道时默认就落在过夜（不让用户先撞一堵失败墙）；用户仍可
+  // 在日型标缺/可用时自由切换。
+  const lane: LaneId = laneOverride ?? laneForDayType(preview.dayType) ?? 'intraday';
 
   const result = useMemo(() => {
     const trimmed = dteText.trim();
@@ -97,29 +130,32 @@ export function LaneChecklistPanel({
     return evaluateLaneChecklist({
       lane,
       dte,
-      ticker: ticker.trim() || null,
       intendsToCloseToday,
       pulseGeneratedAt: pulse?.generatedAt ?? null,
-      candidates: top?.candidates ?? [],
-      marketDateEt: top?.marketDateEt ?? pulse?.marketDateEt ?? null,
       laneAvailability: top?.laneAvailability ?? null,
-      budget: compliance?.dailyBudget ?? null,
-      budgetUnavailableReason:
-        view.state === 'unavailable'
-          ? '车道遵守度读数不可得（Journal 未构建或端点不可得）——不以 0 冒充额度'
-          : view.state === 'loading'
-            ? '车道遵守度读数读取中'
-            : compliance
-              ? null
-              : '端点未返回车道遵守度区块——不以 0 冒充额度',
+      loading: loading && !top,
     });
-  }, [lane, dteText, ticker, intendsToCloseToday, pulse, top, compliance, view.state]);
+  }, [lane, dteText, intendsToCloseToday, pulse, top, loading]);
 
-  const limitations = compliance?.limitations ?? [];
-  const limitationTooltip = [
-    '对照的是你自己那套规则（V2-0…V2-D），不是推荐；本系统只读，不会下单。',
-    ...limitations.map((line) => `· ${line}`),
-  ].join('\n');
+  const budgetRows = [
+    {
+      id: 'intraday_tickets' as const,
+      label: '今日日内单',
+      count: intradayTickets,
+      limit: V2D_INTRADAY_TICKET_LIMIT,
+      reason: `V2-D③：日内单每日最多 ${V2D_INTRADAY_TICKET_LIMIT} 笔。`
+        + '本计数由你自己维护（按 ET 交易日自动归零）——Journal 只有导入的历史成交，'
+        + '永远不含今天，因此不用它冒充今日读数。',
+    },
+    {
+      id: 'overnight_positions' as const,
+      label: '当前过夜持仓',
+      count: overnightPositions,
+      limit: V2D_OVERNIGHT_CONCURRENT_LIMIT,
+      reason: `V2-D③：同时持有的过夜单不超过 ${V2D_OVERNIGHT_CONCURRENT_LIMIT} 个。`
+        + '本计数由你自己维护（按 ET 交易日自动归零）。',
+    },
+  ];
 
   return (
     <section
@@ -127,45 +163,86 @@ export function LaneChecklistPanel({
       className="rounded-ds-sm border border-subtle bg-bg-1 px-4 py-2.5"
     >
       {/*
-        今日车道可用性（V2-E）：面板第一行。它决定「今天这条车道到底开不开」，
-        必须在用户选车道之前就看到；来源是当日真实期权到期日，不是星期规则。
+        今日无可用 0DTE 是这块面板上最重要的一件事：整块警示 + 大字 + 一行证据。
+        它决定「今天这条车道到底开不开」，必须在用户做任何选择之前先看到。
       */}
-      <Tooltip content={result.dayType.tooltip} focusable contentClassName="whitespace-pre-line">
-        <p
-          data-day-type={result.dayType.state}
-          aria-label={`今日车道可用性：${result.dayType.text} · ${result.dayType.tooltip}`}
-          className={`mb-2 border-b border-subtle pb-2 text-body font-medium ${
-            DAY_TYPE_CLASS[result.dayType.state]
-          }`}
+      {intradayClosed ? (
+        <div
+          data-day-type={preview.dayType.state}
+          role="status"
+          aria-label={`今日车道可用性：${preview.dayType.text} · ${preview.dayType.tooltip}`}
+          className="mb-3 rounded-ds-sm border border-[color:var(--warn-muted)] bg-bg-0 px-3 py-2.5"
         >
-          <span aria-hidden="true">{DAY_TYPE_MARK[result.dayType.state]} </span>
-          {result.dayType.text}
-        </p>
-      </Tooltip>
+          <p className="text-h3 font-semibold text-warn-strong">
+            <span aria-hidden="true">{DAY_TYPE_MARK[preview.dayType.state]} </span>
+            {preview.dayType.state === 'blacklist_only'
+              ? `今日仅黑名单标的有 0DTE（${preview.dayType.blacklistedZeroDteTickers.join('/')}）· 日内车道关闭`
+              : '今日无 0DTE · 日内车道关闭'}
+          </p>
+          <p className="mt-1 text-body-sm text-text-2">
+            只剩过夜车道（V2-B，4-7DTE）或不做；绝不退而买 1-3DTE。
+            {' '}
+            <span className="text-text-3">{DAY_TYPE_EVIDENCE_LINE}</span>
+          </p>
+          <Tooltip content={preview.dayType.tooltip} focusable contentClassName="whitespace-pre-line">
+            <span className="mt-1 inline-block text-caption text-text-3 underline decoration-dotted underline-offset-2">
+              判定依据（V2-E）
+            </span>
+          </Tooltip>
+        </div>
+      ) : (
+        <Tooltip content={preview.dayType.tooltip} focusable contentClassName="whitespace-pre-line">
+          <p
+            data-day-type={preview.dayType.state}
+            aria-label={`今日车道可用性：${preview.dayType.text} · ${preview.dayType.tooltip}`}
+            className={`mb-2 border-b border-subtle pb-2 text-body font-medium ${
+              DAY_TYPE_CLASS[preview.dayType.state]
+            }`}
+          >
+            <span aria-hidden="true">{DAY_TYPE_MARK[preview.dayType.state]} </span>
+            {preview.dayType.text}
+          </p>
+        </Tooltip>
+      )}
 
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-        <Tooltip content={limitationTooltip} focusable contentClassName="whitespace-pre-line">
-          <span className="text-caption font-medium text-text-2" aria-label={limitationTooltip}>
-            开仓前车道检查 · 对照你自己的规则
-          </span>
-        </Tooltip>
+        <span className="text-caption font-medium text-text-2">
+          开仓前车道检查 · 对照你自己的规则
+        </span>
 
         <div className="flex items-center gap-1" role="group" aria-label="车道">
-          {(['intraday', 'overnight'] as LaneId[]).map((option) => (
-            <button
-              key={option}
-              type="button"
-              aria-pressed={lane === option}
-              onClick={() => setLane(option)}
-              className={`rounded-ds-sm border px-2 py-0.5 text-caption ${
-                lane === option
-                  ? 'border-strong bg-bg-2 text-text-1'
-                  : 'border-subtle text-text-3'
-              }`}
-            >
-              {LANE_LABELS[option]}
-            </button>
-          ))}
+          {(['intraday', 'overnight'] as LaneId[]).map((option) => {
+            const disabled = option === 'intraday' && intradayClosed;
+            const disabledReason = '今日无可用 0DTE，日内车道关闭（V2-E）';
+            const button = (
+              <button
+                key={option}
+                type="button"
+                aria-pressed={lane === option}
+                disabled={disabled}
+                // 禁用原因走 aria-label + Tooltip（仓库禁用原生 title 属性）。
+                aria-label={disabled
+                  ? `${LANE_LABELS[option]} · 今日关闭 · ${disabledReason}`
+                  : undefined}
+                onClick={() => setLaneOverride(option)}
+                className={`rounded-ds-sm border px-2 py-0.5 text-caption ${
+                  disabled
+                    ? 'cursor-not-allowed border-dashed border-subtle text-text-3 opacity-60'
+                    : lane === option
+                      ? 'border-strong bg-bg-2 text-text-1'
+                      : 'border-subtle text-text-3'
+                }`}
+              >
+                {LANE_LABELS[option]}
+                {disabled ? ' · 今日关闭' : ''}
+              </button>
+            );
+            return disabled ? (
+              <Tooltip key={option} content={disabledReason} focusable>
+                {button}
+              </Tooltip>
+            ) : button;
+          })}
         </div>
 
         <label className="flex items-center gap-1.5 text-caption text-text-3">
@@ -182,18 +259,6 @@ export function LaneChecklistPanel({
           />
         </label>
 
-        <label className="flex items-center gap-1.5 text-caption text-text-3">
-          标的
-          <input
-            type="text"
-            value={ticker}
-            onChange={(event) => setTicker(event.target.value)}
-            aria-label="标的"
-            placeholder="选填"
-            className="w-20 rounded-ds-sm border border-subtle bg-bg-0 px-1.5 py-0.5 font-mono text-mono-xs uppercase text-text-1"
-          />
-        </label>
-
         <label className="flex cursor-pointer items-center gap-1.5 text-caption text-text-3">
           <input
             type="checkbox"
@@ -205,7 +270,11 @@ export function LaneChecklistPanel({
         </label>
 
         <span className="ml-auto text-caption text-text-3">
-          {result.etClock ? `${result.etClock} ET` : `ET 时钟 ${MISSING}`}
+          {result.etClock
+            ? `${result.etClock} ET`
+            : loading && !pulse
+              ? 'ET 时钟读取中…'
+              : `ET 时钟 ${MISSING}`}
         </span>
       </div>
 
@@ -223,6 +292,10 @@ export function LaneChecklistPanel({
                 <span className={`text-caption font-medium ${STATUS_CLASS[check.status]}`}>
                   {STATUS_MARK[check.status]} {STATUS_TEXT[check.status]}
                 </span>
+                {/* 要求态直接把要求写在盘面上：不用悬停才知道今天能开什么。 */}
+                {check.status === 'requirement' && (
+                  <span className="text-caption text-text-2">{check.reason}</span>
+                )}
               </span>
             </Tooltip>
           </li>
@@ -243,47 +316,58 @@ export function LaneChecklistPanel({
         </ul>
       )}
 
-      <ul className="mt-2 flex flex-wrap gap-x-5 gap-y-1">
-        {result.budget.map((reading) => (
-          <li key={reading.id}>
-            <Tooltip content={reading.reason ?? ''} focusable>
-              <span
-                className="flex items-baseline gap-1.5"
-                data-budget-id={reading.id}
-                aria-label={`${reading.label}：${reading.text ?? MISSING}${
-                  reading.reason ? ` · ${reading.reason}` : ''
-                }`}
-              >
-                <span className="text-caption text-text-3">{reading.label}</span>
+      <ul className="mt-2 flex flex-wrap items-center gap-x-5 gap-y-1" aria-label="今日额度（手动计数）">
+        {budgetRows.map((row) => {
+          const atLimit = row.count >= row.limit;
+          return (
+            <li key={row.id}>
+              <Tooltip content={row.reason} focusable contentClassName="whitespace-pre-line">
                 <span
-                  className={`font-mono text-mono-xs tabular-nums ${
-                    reading.text === null
-                      ? 'text-text-3'
-                      : reading.atLimit
-                        ? 'text-warn-strong'
-                        : 'text-text-1'
-                  }`}
+                  className="flex items-baseline gap-1.5"
+                  data-budget-id={row.id}
+                  aria-label={`${row.label}：${row.count}/${row.limit} · ${row.reason}`}
                 >
-                  {reading.text ?? MISSING}
+                  <span className="text-caption text-text-3">{row.label}</span>
+                  <span
+                    className={`font-mono text-mono-xs tabular-nums ${
+                      atLimit ? 'text-warn-strong' : 'text-text-1'
+                    }`}
+                  >
+                    {row.count}/{row.limit}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => bump(row.id, 1)}
+                    aria-label={`${row.label} 加 1`}
+                    className="rounded-ds-sm border border-subtle px-1 text-caption text-text-2 hover:bg-bg-2 hover:text-text-1"
+                  >
+                    +1
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => bump(row.id, -1)}
+                    aria-label={`${row.label} 减 1`}
+                    className="rounded-ds-sm border border-subtle px-1 text-caption text-text-2 hover:bg-bg-2 hover:text-text-1"
+                  >
+                    −1
+                  </button>
                 </span>
-                {reading.text === null && (
-                  <span className="text-caption text-text-3">（{reading.limit} 上限）</span>
-                )}
-              </span>
-            </Tooltip>
-          </li>
-        ))}
+              </Tooltip>
+            </li>
+          );
+        })}
+        <li className="text-caption text-text-3">手动维护 · 按 ET 交易日自动归零</li>
       </ul>
 
       <div className="mt-2 border-t border-subtle pt-1.5 text-caption text-text-3">
         {result.reminders.map((line) => (
           <p key={line}>· {line}</p>
         ))}
-        <p className="mt-1">
-          这是对照<strong className="text-text-2">你自己那套规则</strong>的检查清单，不是推荐、不含概率；
-          本系统只读，<strong className="text-text-2">不会下单</strong>。
-          样本仅 2026-04→07 一个市场状态，过夜车道 n=65 偏小、跳空风险未充分体现。
-        </p>
+        <Tooltip content={LANE_SAMPLE_CAVEAT} focusable contentClassName="whitespace-pre-line">
+          <p className="mt-1 underline decoration-dotted underline-offset-2" aria-label={LANE_SAMPLE_CAVEAT}>
+            按你自己的规则机械核对，不是买卖建议（样本与口径边界 ⓘ）
+          </p>
+        </Tooltip>
       </div>
     </section>
   );
