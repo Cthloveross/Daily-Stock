@@ -84,10 +84,70 @@ This block recomputes everything from the same default build, monthly and over
 the trailing ``DISCIPLINE_WINDOW_TRADING_DAYS`` trading days.  It stays
 descriptive: it is a mirror, not advice, and every ratio fails closed (null +
 reason) rather than showing a number its denominator cannot support.
+
+车道遵守度（``rule_compliance`` block, 2026-08-04）
+--------------------------------------------------
+
+Why this block exists — the user derived a two-lane rule set ("规则 v2",
+Playbook candidates 「V2-0」…「V2-D」) from their own clean-basis history and
+adopted it.  This block is the **forward falsification instrument**: it
+classifies every closed episode into a lane purely mechanically and reports
+合规单 vs 违规单 per-dollar edge, so the rule set can be confirmed or refuted
+by the user's own subsequent trades rather than by argument.
+
+Clean basis (``RULE_COMPLIANCE_CLEAN_BASIS_START``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The population is the same clean basis the rules were derived on: closed
+episodes with a known ``realized_pnl_net`` **and** a known
+``opening_cash_flow``, built from detailed fills
+(``evidence_summary_json.fill_allocations > 0``) and opened on/after
+2026-04-21 ET.  Everything before that boundary came from aggregate ORDER rows
+whose risk denominator the pipeline itself marks
+``audit_only_not_execution_cash_flow`` — mixing it in would silently inflate
+every per-dollar reading (see 口径订正 above).  ``risk`` is
+``ABS(opening_cash_flow)`` and ``gross`` is ``realized_pnl_net + total_fee``,
+the exact definitions the rule set quotes.
+
+The evidence the lanes encode (build #3, n=1,407)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+* **同一 4-7DTE 合约**：隔夜持有 gross **+34.13%** (n=65, win 61.5%, toll
+  1.55%, 剔除最好 3 笔仍 +22.27%、最好 5 笔仍 +19.13% — the **only**
+  tail-robust bucket in the whole sample); 当日平掉 **−4.04%** (n=57, win
+  22.8%, 剔除最好 5 笔 −10.28%);
+* **0DTE 日内** +3.44% (n=556, toll 1.76%, 剔除最好 5 笔 +0.41% → 尾部驱动);
+  按 ET 小时 9 点 +10.6% (n=160)、10 点 +2.7%、11 点 +4.9%，而 **12:00 之后
+  −8.19%** (剔除最好 5 笔 −15.54%);
+* **1-3DTE**：当日平 −2.94% (n=469, 剔除最好 5 笔 −6.45%)，隔夜 +6.98% 但剔除
+  最好 5 笔 −4.03%（纯尾部驱动）——两头都不占，整段排除;
+* **隔夜进场时段**：ET 11:00–12:00 (−1.76%) 与 13:00–14:00 (−2.99%) 明显偏弱，
+  其余时段 +21%…+36%;
+* **仓位纪律**：单笔风险 p25–p90 为 5,180–15,750（最大 70,375）；70 个交易日中
+  51% 为亏损日；最差单日 −82,130 恰好发生在投入最大的一天（498,743）；峰值累计
+  +205,619 之后最大回撤 −163,621。
+
+Hard boundaries of this block
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+* classification is **purely mechanical** — only ``dte_at_entry``, the ET hour
+  of ``opened_at``, the ET dates of ``opened_at``/``closed_at`` and
+  ``ABS(opening_cash_flow)`` are read.  It cannot know what the user *intended*
+  at entry, so it never claims to;
+* the exclude-top-N readings reuse the discipline block's machinery
+  (:func:`_exclude_top_n_readings`) and its ``n >= 15`` gate verbatim — a bucket
+  below the gate returns null + reason, never a truncated number;
+* two slices ship side by side: ``all_history`` (the whole clean basis, i.e.
+  how the rules were derived) and ``since_adoption`` (from
+  ``RULE_SET_V2_ADOPTED_AT``, the forward test).  The forward slice is
+  legitimately empty at first and says so explicitly
+  (``no_episodes_since_adoption``) instead of rendering zeros;
+* everything is descriptive: a single trader, a single market regime
+  (2026-04→07, SPY rising — overnight longs were structurally favoured), n=65
+  for the star bucket, and overnight gap risk is under-represented in that
+  window.  **Not advice, not a signal, and no order is ever placed.**
 """
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_EVEN
@@ -114,9 +174,30 @@ __all__ = [
     "DISCIPLINE_WINDOW_TRADING_DAYS",
     "DTE_BUCKETS",
     "FILL_DETAILED_GOVERNS",
+    "INTRADAY_LANE_DAILY_TICKET_LIMIT",
+    "INTRADAY_LANE_DTE",
+    "INTRADAY_LANE_ET_CUTOFF_HOUR",
+    "OVERNIGHT_LANE_CONCURRENT_LIMIT",
+    "OVERNIGHT_LANE_MAX_DTE",
+    "OVERNIGHT_LANE_MIN_DTE",
+    "OVERNIGHT_LANE_WEAK_ENTRY_ET_HOURS",
     "REASON_FEE_MISSING",
     "REASON_NO_PREMIUM",
     "REASON_ZERO_PREMIUM",
+    "RULE_COMPLIANCE_CLEAN_BASIS_REASON",
+    "RULE_COMPLIANCE_CLEAN_BASIS_START",
+    "RULE_COMPLIANCE_LANE_RULE_IDS",
+    "RULE_COMPLIANCE_LANE_VERDICTS",
+    "RULE_COMPLIANCE_LIMITATIONS",
+    "RULE_LANES",
+    "RULE_SET_V2_ADOPTED_AT",
+    "RULE_SET_V2_ID",
+    "RULE_VERDICTS",
+    "RuleComplianceDailyBudget",
+    "RuleComplianceLaneStat",
+    "RuleComplianceSlice",
+    "RuleComplianceStat",
+    "classify_rule_lane",
     "fill_detailed_from_evidence_summary",
     "HOLD_TIME_BUCKETS",
     "MONTH_BASIS_UTC_MINUS_4",
@@ -130,6 +211,7 @@ __all__ = [
     "PersonalEdgeHoldBucket",
     "PersonalEdgeMonthlyBucket",
     "PersonalEdgeResult",
+    "PersonalEdgeRuleCompliance",
     "PersonalEdgeUnderlyingStat",
     "get_personal_edge_stats",
 ]
@@ -185,6 +267,99 @@ PERSONAL_EDGE_LIMITATIONS = (
     "是恒定过路费——毛口径低于门槛即净口径为负",
 )
 
+# ---------------------------------------------------------------------------
+# 车道遵守度（rule_compliance）常量：本人规则 v2 的机器可判定部分
+#
+# 这些常量是 Playbook 候选「V2-0」…「V2-D」里数字的唯一代码真源；UI 文案引用
+# 规则编号，数值一律从这里（经端点）读出来，前端不硬编码。
+# ---------------------------------------------------------------------------
+RULE_SET_V2_ID = "v2"
+
+# 规则采纳日（ET 自然日，用户的下一个交易日）。它是「前向验证」的起点：
+# 在这一天之前的回合只说明规则从哪里推出来，之后的回合才能证伪或确认它。
+RULE_SET_V2_ADOPTED_AT = "2026-08-05"
+
+# 干净口径起点：4/20–21 是券商明细成交保留窗口的边界（CSV 导出日前约 90 天），
+# 不是行情或行为边界；更早的回合由汇总 ORDER 行构建，风险金额分母被低估。
+RULE_COMPLIANCE_CLEAN_BASIS_START = "2026-04-21"
+RULE_COMPLIANCE_CLEAN_BASIS_REASON = (
+    "样本＝已平仓、净盈亏与开仓现金流均已知、且由明细成交构建"
+    "（evidence_summary_json.fill_allocations>0）、ET 入场日 ≥ "
+    f"{RULE_COMPLIANCE_CLEAN_BASIS_START} 的回合；更早的回合由汇总 ORDER 行构建，"
+    "风险金额分母被管线自身标记 audit_only_not_execution_cash_flow（仅供审计，"
+    "不是执行现金流），混入会系统性抬高每美元读数，故整段排除"
+)
+
+# V2-A：日内车道＝仅 0DTE，ET 12:00 之后不开新的 0DTE。
+INTRADAY_LANE_DTE = 0
+INTRADAY_LANE_ET_CUTOFF_HOUR = 12
+# V2-B：过夜车道＝4-7DTE，至少持有到下一交易日。
+OVERNIGHT_LANE_MIN_DTE = 4
+OVERNIGHT_LANE_MAX_DTE = 7
+# V2-B：隔夜单在这两个 ET 小时明显偏弱（−1.76% / −2.99%），其余时段 +21%…+36%。
+OVERNIGHT_LANE_WEAK_ENTRY_ET_HOURS: tuple[int, ...] = (11, 13)
+# V2-D③：日内单每日最多 6 笔；同时持有的过夜单不超过 3 个。
+INTRADAY_LANE_DAILY_TICKET_LIMIT = 6
+OVERNIGHT_LANE_CONCURRENT_LIMIT = 3
+
+# 车道标识（合规两条 + 违规三条 + 规则未覆盖 + 不可判定）。
+RULE_LANES: tuple[str, ...] = (
+    "intraday_0dte",
+    "overnight_4_7",
+    "dte_1_3",
+    "bought_time_unused",
+    "late_0dte",
+    "other",
+    "unknown",
+)
+
+# 判定：合规 / 违规 / 规则未覆盖 / 不可判定。
+# `other`＝ ≥8DTE 隔夜——两条车道规则都没有覆盖它，既不算合规也不算违规。
+# `unknown`＝缺 DTE 或缺日期，无法机械判定：缺席即缺席，绝不并入 `other`。
+RULE_COMPLIANCE_LANE_VERDICTS: dict[str, str] = {
+    "intraday_0dte": "compliant",
+    "overnight_4_7": "compliant",
+    "dte_1_3": "violation",
+    "bought_time_unused": "violation",
+    "late_0dte": "violation",
+    "other": "uncovered",
+    "unknown": "unknown",
+}
+RULE_VERDICTS: tuple[str, ...] = (
+    "compliant",
+    "violation",
+    "uncovered",
+    "unknown",
+)
+
+# 每条车道对应的规则编号（UI 文案必须引用它，不得自行改写规则内容）。
+RULE_COMPLIANCE_LANE_RULE_IDS: dict[str, str] = {
+    "intraday_0dte": "V2-A",
+    "overnight_4_7": "V2-B",
+    "dte_1_3": "V2-C①",
+    "bought_time_unused": "V2-C②",
+    "late_0dte": "V2-C③",
+    "other": "V2-0",
+    "unknown": "V2-0",
+}
+
+# 每一个消费面都必须原文携带的边界（与 PERSONAL_EDGE_LIMITATIONS 同一约定）。
+RULE_COMPLIANCE_LIMITATIONS: tuple[str, ...] = (
+    "样本窗口仅 2026-04→07 一个市场状态（SPY 上行），隔夜多头在该状态下天然占优，"
+    "下跌市可能完全不同",
+    "唯一尾部稳健的组合（4-7DTE 隔夜）n=65 偏小，隔夜跳空风险在该窗口内未被充分体现",
+    "车道判定纯机械：只读 dte_at_entry、opened_at 的 ET 小时、opened_at/closed_at 的"
+    "ET 自然日与 ABS(opening_cash_flow)——它无从知道进场当时的意图，因此也不声称知道",
+    "这是对本人自身历史的描述统计与规则遵守度记账，不是因果结论、不是信号、不构成建议；"
+    "本系统只读，不下单",
+    RULE_COMPLIANCE_CLEAN_BASIS_REASON,
+)
+
+# Fail-closed reasons for the compliance block.
+REASON_COMPLIANCE_NO_SAMPLE = "该车道在本区间无样本"
+REASON_COMPLIANCE_ZERO_RISK = "该车道风险金额合计为 0"
+
+
 # (label, min_seconds inclusive, max_seconds exclusive; None = unbounded)
 HOLD_TIME_BUCKETS: tuple[tuple[str, int, Optional[int]], ...] = (
     ("<10m", 0, 600),
@@ -204,6 +379,7 @@ DTE_BUCKETS: tuple[tuple[str, int, Optional[int]], ...] = (
     ("8-30", 8, 30),
     (">30", 31, None),
 )
+
 
 def fill_detailed_from_evidence_summary(raw: object) -> Optional[bool]:
     """回合是否**由明细成交构建**——口径可比性的因果判据。
@@ -250,6 +426,8 @@ def fill_detailed_from_evidence_summary(raw: object) -> Optional[bool]:
         return None
     return value > 0
 
+
+_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 _RATE_QUANTUM = Decimal("0.0001")
 _AMOUNT_QUANTUM = Decimal("0.01")
@@ -382,6 +560,103 @@ class PersonalEdgeDiscipline:
 
 
 @dataclass(frozen=True)
+class RuleComplianceStat:
+    """One compliance bucket (a lane, or a verdict rollup over lanes).
+
+    ``key`` is the lane id (``RULE_LANES``) or the verdict id
+    (``RULE_VERDICTS``); both use the identical math so 合规单 vs 违规单 is
+    directly comparable with the per-lane rows above it.
+
+    ``gross`` = Σ(``realized_pnl_net`` + ``total_fee``), ``risk`` =
+    Σ``ABS(opening_cash_flow)`` — the exact definitions the rule set quotes.
+    Every ratio is null-with-reason rather than 0 when its denominator cannot
+    support it.
+    """
+
+    key: str
+    n: int
+    risk: Optional[float]
+    net: Optional[float]
+    gross: Optional[float]
+    gross_pct: Optional[float]
+    toll_pct: Optional[float]
+    win_rate: Optional[float]
+    gross_pct_excluding_top_n: Optional[float]
+    excluding_top_n_count: Optional[int]
+    excluding_top_n_reason: Optional[str]
+    ratio_reason: Optional[str]
+
+
+@dataclass(frozen=True)
+class RuleComplianceLaneStat(RuleComplianceStat):
+    """A lane bucket, tagged with its verdict and the rule id it comes from."""
+
+    verdict: str
+    rule_id: str
+
+
+@dataclass(frozen=True)
+class RuleComplianceSlice:
+    """One time slice of the clean basis (all-history or since-adoption).
+
+    ``state`` is ``ready`` when the slice has members, ``no_episodes`` for an
+    empty all-history slice and ``no_episodes_since_adoption`` for an empty
+    forward slice — the forward slice is legitimately empty right after
+    adoption, and it says so instead of rendering a zeroed table.
+    """
+
+    state: str
+    state_reason: Optional[str]
+    start_date: Optional[str]
+    n: int
+    lanes: tuple[RuleComplianceLaneStat, ...]
+    verdicts: tuple[RuleComplianceStat, ...]
+
+
+@dataclass(frozen=True)
+class RuleComplianceDailyBudget:
+    """V2-D 的两个额度读数，取自同一 build（因此带明确的 as-of 日）。
+
+    ``as_of_trading_day`` 是 build 内最后一个有入场的 ET 自然日。消费端必须把它
+    和「今天」对照：build 不含今日时读数是**过期**的，应显式标缺而不是显示 0。
+    """
+
+    as_of_trading_day: Optional[str]
+    intraday_ticket_count: Optional[int]
+    intraday_ticket_limit: int
+    intraday_reason: Optional[str]
+    overnight_open_count: Optional[int]
+    overnight_concurrent_limit: int
+    overnight_reason: Optional[str]
+    overnight_unknown_dte_open_count: int
+
+
+@dataclass(frozen=True)
+class PersonalEdgeRuleCompliance:
+    """车道遵守度：把本人规则 v2 变成可前向证伪的记账。"""
+
+    rule_set_id: str
+    adopted_at: str
+    clean_basis_start: str
+    clean_basis_reason: str
+    population_n: int
+    excluded_before_clean_basis_count: int
+    excluded_aggregate_or_unknown_basis_count: int
+    excluded_missing_premium_count: int
+    exclude_top_n: int
+    exclude_top_n_min_episode_count: int
+    intraday_lane_dte: int
+    intraday_lane_et_cutoff_hour: int
+    overnight_lane_min_dte: int
+    overnight_lane_max_dte: int
+    overnight_lane_weak_entry_et_hours: tuple[int, ...]
+    all_history: RuleComplianceSlice
+    since_adoption: RuleComplianceSlice
+    daily_budget: RuleComplianceDailyBudget
+    limitations: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class PersonalEdgeResult:
     """Derived read over one immutable default build; nothing persisted."""
 
@@ -404,6 +679,8 @@ class PersonalEdgeResult:
     dte_unknown: PersonalEdgeDteBucket
     monthly: tuple[PersonalEdgeMonthlyBucket, ...]
     discipline: PersonalEdgeDiscipline
+    # additive（2026-08-04）：车道遵守度前向统计。
+    rule_compliance: PersonalEdgeRuleCompliance
     month_basis: str
     limitations: tuple[str, ...]
 
@@ -540,6 +817,83 @@ def _median(values: list[Decimal]) -> Optional[Decimal]:
     if len(ordered) % 2 == 1:
         return ordered[middle]
     return (ordered[middle - 1] + ordered[middle]) / Decimal(2)
+
+
+@dataclass(frozen=True)
+class _ExcludeTopNReadings:
+    """剔除最好 N 笔后的每美元回报（净/毛）+ 剩余笔数 + 不成立原因。"""
+
+    net_pct: Optional[float]
+    gross_pct: Optional[float]
+    count: Optional[int]
+    reason: Optional[str]
+
+
+def _exclude_top_n_readings(
+    priced: list[tuple[Decimal, Optional[Decimal], Decimal]],
+) -> _ExcludeTopNReadings:
+    """剔除最好 N 笔后的每美元回报——``body_pnl`` 的每美元版本。
+
+    ``priced`` 是逐笔配对的 ``(净盈亏, 费用或 None, 风险金额)``，只收风险金额
+    已知的回合，因此分子分母天然取同一子集。按净盈亏排序去掉最好的
+    ``DISCIPLINE_EXCLUDE_TOP_N`` 笔后重算。
+
+    Fail-closed 三处：样本（按「风险金额已知」计）低于
+    ``DISCIPLINE_BODY_MIN_EPISODE_COUNT`` 时整体不成立；剩余风险金额为 0 时不成立；
+    剩余回合里只要有一笔缺 ``total_fee``，净口径仍成立而毛口径缺席——过路费绝不
+    以 0 冒充。
+
+    规模与频率（``_discipline_stats``）与车道遵守度（``_compliance_stat``）共用这
+    一份实现与同一个 n≥15 门槛，两处读数因此严格同口径。
+    """
+    priced_n = len(priced)
+    if priced_n < DISCIPLINE_BODY_MIN_EPISODE_COUNT:
+        return _ExcludeTopNReadings(
+            net_pct=None,
+            gross_pct=None,
+            count=None,
+            reason=(
+                f"风险金额已知样本 {priced_n} 笔 < "
+                f"{DISCIPLINE_BODY_MIN_EPISODE_COUNT} 笔，"
+                f"剔除最好 {DISCIPLINE_EXCLUDE_TOP_N} 笔后不成立"
+            ),
+        )
+    remaining = sorted(priced, key=lambda item: item[0])[
+        : priced_n - DISCIPLINE_EXCLUDE_TOP_N
+    ]
+    remaining_premium = sum((item[2] for item in remaining), Decimal("0"))
+    if remaining_premium == 0:
+        return _ExcludeTopNReadings(
+            net_pct=None, gross_pct=None, count=None, reason=REASON_ZERO_PREMIUM
+        )
+    remaining_pnl = sum((item[0] for item in remaining), Decimal("0"))
+    net_pct = float(
+        (remaining_pnl / remaining_premium).quantize(
+            _RATIO_QUANTUM, rounding=ROUND_HALF_EVEN
+        )
+    )
+    if any(item[1] is None for item in remaining):
+        # 净口径仍成立，毛口径缺费用即缺席。
+        return _ExcludeTopNReadings(
+            net_pct=net_pct,
+            gross_pct=None,
+            count=len(remaining),
+            reason=REASON_FEE_MISSING,
+        )
+    remaining_fee = sum(
+        (item[1] for item in remaining if item[1] is not None), Decimal("0")
+    )
+    gross_pct = float(
+        ((remaining_pnl + remaining_fee) / remaining_premium).quantize(
+            _RATIO_QUANTUM, rounding=ROUND_HALF_EVEN
+        )
+    )
+    return _ExcludeTopNReadings(
+        net_pct=net_pct,
+        gross_pct=gross_pct,
+        count=len(remaining),
+        reason=None,
+    )
 
 
 def _discipline_stats(state: _DisciplineMembers) -> PersonalEdgeDisciplineStats:
@@ -683,45 +1037,12 @@ def _discipline_stats(state: _DisciplineMembers) -> PersonalEdgeDisciplineStats:
         )
 
     # --- 剔除最好 N 笔后的每美元回报（body_pnl 的每美元版本）------------------
-    excl_net: Optional[float] = None
-    excl_gross: Optional[float] = None
-    excl_count: Optional[int] = None
-    excl_reason: Optional[str] = None
-    priced_n = len(state.priced)
-    if priced_n < DISCIPLINE_BODY_MIN_EPISODE_COUNT:
-        excl_reason = (
-            f"风险金额已知样本 {priced_n} 笔 < {DISCIPLINE_BODY_MIN_EPISODE_COUNT} 笔，"
-            f"剔除最好 {DISCIPLINE_EXCLUDE_TOP_N} 笔后不成立"
-        )
-    else:
-        # 分子分母取同一子集（风险金额已知的回合），按净盈亏排序去掉最好的 N 笔。
-        remaining = sorted(state.priced, key=lambda item: item[0])[
-            : priced_n - DISCIPLINE_EXCLUDE_TOP_N
-        ]
-        remaining_premium = sum((item[2] for item in remaining), Decimal("0"))
-        if remaining_premium == 0:
-            excl_reason = REASON_ZERO_PREMIUM
-        else:
-            excl_count = len(remaining)
-            remaining_pnl = sum((item[0] for item in remaining), Decimal("0"))
-            excl_net = float(
-                (remaining_pnl / remaining_premium).quantize(
-                    _RATIO_QUANTUM, rounding=ROUND_HALF_EVEN
-                )
-            )
-            if any(item[1] is None for item in remaining):
-                # 净口径仍成立，毛口径缺费用即缺席。
-                excl_reason = REASON_FEE_MISSING
-            else:
-                remaining_fee = sum(
-                    (item[1] for item in remaining if item[1] is not None),
-                    Decimal("0"),
-                )
-                excl_gross = float(
-                    ((remaining_pnl + remaining_fee) / remaining_premium).quantize(
-                        _RATIO_QUANTUM, rounding=ROUND_HALF_EVEN
-                    )
-                )
+    # 与车道遵守度共用同一份实现与同一个 n≥15 门槛（_exclude_top_n_readings）。
+    excluded = _exclude_top_n_readings(state.priced)
+    excl_net = excluded.net_pct
+    excl_gross = excluded.gross_pct
+    excl_count = excluded.count
+    excl_reason = excluded.reason
 
     return PersonalEdgeDisciplineStats(
         n=n,
@@ -805,6 +1126,260 @@ def _build_discipline(
     )
 
 
+# ---------------------------------------------------------------------------
+# 车道遵守度（rule_compliance）
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _ComplianceEpisode:
+    """One clean-basis closed episode reduced to its lane-classification inputs."""
+
+    lane: str
+    opened_trading_day: str
+    pnl: Decimal
+    fee: Optional[Decimal]
+    premium: Decimal
+
+
+def classify_rule_lane(
+    *,
+    dte: Optional[int],
+    opened_et_hour: Optional[int],
+    opened_trading_day: Optional[str],
+    closed_trading_day: Optional[str],
+) -> str:
+    """Classify one episode into a 规则 v2 车道, purely mechanically.
+
+    The decision order is fixed and total (every input maps to exactly one of
+    ``RULE_LANES``):
+
+    1. ``dte`` unknown or negative → ``unknown`` （负 DTE 是坏数据，不当作 0）;
+    2. ``dte == 0`` → needs the ET entry hour: unknown → ``unknown``;
+       hour ``>= INTRADAY_LANE_ET_CUTOFF_HOUR`` (12) → ``late_0dte`` (V2-C③);
+       otherwise → ``intraday_0dte`` (V2-A);
+    3. ``1 <= dte <= 3`` → ``dte_1_3`` (V2-C①) — excluded at any hour, held any
+       length of time: 当日平 −2.94%，隔夜 +6.98% 但剔除最好 5 笔 −4.03%;
+    4. ``dte >= 4`` → needs both ET dates: either unknown → ``unknown``;
+       closed on the same (or an earlier) date → ``bought_time_unused``
+       (V2-C②, 买了时间却不用); closed on a later date → ``overnight_4_7``
+       (V2-B) when ``4 <= dte <= 7``, else ``other`` (≥8DTE 隔夜，两条车道都没有
+       覆盖它).
+
+    Boundaries this pins down: DTE 0 → 日内, 1 and 3 → 违规, 4 and 7 → 过夜,
+    8 → 未覆盖; ET hour 11 → 日内合规 / 12 → 违规; same-date close vs later-date
+    close is by **ET calendar date**, not by hold duration — a 20-hour hold that
+    opens and closes on the same ET date is still a same-day close.
+
+    Note it reads only stored facts.  It cannot know the user's intent at
+    entry, so ``bought_time_unused`` is an outcome label, not a mind-read.
+    """
+    if dte is None or dte < 0:
+        return "unknown"
+    if dte == INTRADAY_LANE_DTE:
+        if opened_et_hour is None:
+            return "unknown"
+        if opened_et_hour >= INTRADAY_LANE_ET_CUTOFF_HOUR:
+            return "late_0dte"
+        return "intraday_0dte"
+    if 1 <= dte <= 3:
+        return "dte_1_3"
+    if opened_trading_day is None or closed_trading_day is None:
+        return "unknown"
+    if closed_trading_day <= opened_trading_day:
+        return "bought_time_unused"
+    if OVERNIGHT_LANE_MIN_DTE <= dte <= OVERNIGHT_LANE_MAX_DTE:
+        return "overnight_4_7"
+    return "other"
+
+
+def _compliance_stat(key: str, members: list[_ComplianceEpisode]) -> RuleComplianceStat:
+    """Reduce one bucket to its per-dollar readings, failing closed everywhere."""
+    n = len(members)
+    if n == 0:
+        return RuleComplianceStat(
+            key=key,
+            n=0,
+            risk=None,
+            net=None,
+            gross=None,
+            gross_pct=None,
+            toll_pct=None,
+            win_rate=None,
+            gross_pct_excluding_top_n=None,
+            excluding_top_n_count=None,
+            excluding_top_n_reason=REASON_COMPLIANCE_NO_SAMPLE,
+            ratio_reason=REASON_COMPLIANCE_NO_SAMPLE,
+        )
+
+    pnl_total = sum((item.pnl for item in members), Decimal("0"))
+    risk_total = sum((item.premium for item in members), Decimal("0"))
+    fees_missing = sum(1 for item in members if item.fee is None)
+    fee_total = sum(
+        (item.fee for item in members if item.fee is not None), Decimal("0")
+    )
+
+    gross_pct: Optional[float] = None
+    toll_pct: Optional[float] = None
+    gross_amount: Optional[float] = None
+    ratio_reason: Optional[str] = None
+    if fees_missing > 0:
+        # 毛口径 = 净 + 费用：缺一笔费用整条读数即缺席，绝不以 0 冒充过路费。
+        ratio_reason = f"{fees_missing}/{n} 笔缺 total_fee：{REASON_FEE_MISSING}"
+    elif risk_total == 0:
+        ratio_reason = REASON_COMPLIANCE_ZERO_RISK
+    else:
+        gross_amount = _amount(pnl_total + fee_total)
+        gross_pct = float(
+            ((pnl_total + fee_total) / risk_total).quantize(
+                _RATIO_QUANTUM, rounding=ROUND_HALF_EVEN
+            )
+        )
+        toll_pct = float(
+            (fee_total / risk_total).quantize(
+                _RATIO_QUANTUM, rounding=ROUND_HALF_EVEN
+            )
+        )
+
+    # 剔除最好 N 笔：复用规模与频率同一份实现与同一个 n≥15 门槛。
+    excluded = _exclude_top_n_readings(
+        [(item.pnl, item.fee, item.premium) for item in members]
+    )
+    return RuleComplianceStat(
+        key=key,
+        n=n,
+        risk=_amount(risk_total),
+        net=_amount(pnl_total),
+        gross=gross_amount,
+        gross_pct=gross_pct,
+        toll_pct=toll_pct,
+        win_rate=_win_rate([item.pnl for item in members]),
+        gross_pct_excluding_top_n=excluded.gross_pct,
+        excluding_top_n_count=excluded.count,
+        excluding_top_n_reason=excluded.reason,
+        ratio_reason=ratio_reason,
+    )
+
+
+def _compliance_lane_stat(
+    lane: str, members: list[_ComplianceEpisode]
+) -> RuleComplianceLaneStat:
+    """Same math as :func:`_compliance_stat`, tagged with verdict + rule id."""
+    base = _compliance_stat(lane, members)
+    return RuleComplianceLaneStat(
+        key=base.key,
+        n=base.n,
+        risk=base.risk,
+        net=base.net,
+        gross=base.gross,
+        gross_pct=base.gross_pct,
+        toll_pct=base.toll_pct,
+        win_rate=base.win_rate,
+        gross_pct_excluding_top_n=base.gross_pct_excluding_top_n,
+        excluding_top_n_count=base.excluding_top_n_count,
+        excluding_top_n_reason=base.excluding_top_n_reason,
+        ratio_reason=base.ratio_reason,
+        verdict=RULE_COMPLIANCE_LANE_VERDICTS[lane],
+        rule_id=RULE_COMPLIANCE_LANE_RULE_IDS[lane],
+    )
+
+
+def _compliance_slice(
+    members: list[_ComplianceEpisode],
+    *,
+    start_date: Optional[str],
+    empty_state: str,
+    empty_reason: str,
+) -> RuleComplianceSlice:
+    """Build one slice: per-lane buckets plus verdict rollups over the same rows."""
+    by_lane: dict[str, list[_ComplianceEpisode]] = {lane: [] for lane in RULE_LANES}
+    by_verdict: dict[str, list[_ComplianceEpisode]] = {
+        verdict: [] for verdict in RULE_VERDICTS
+    }
+    for episode in members:
+        by_lane[episode.lane].append(episode)
+        by_verdict[RULE_COMPLIANCE_LANE_VERDICTS[episode.lane]].append(episode)
+
+    return RuleComplianceSlice(
+        state="ready" if members else empty_state,
+        state_reason=None if members else empty_reason,
+        start_date=start_date,
+        n=len(members),
+        lanes=tuple(
+            _compliance_lane_stat(lane, by_lane[lane]) for lane in RULE_LANES
+        ),
+        verdicts=tuple(
+            _compliance_stat(verdict, by_verdict[verdict])
+            for verdict in RULE_VERDICTS
+        ),
+    )
+
+
+def _build_rule_compliance(
+    members: list[_ComplianceEpisode],
+    *,
+    adopted_at: str,
+    excluded_before_clean_basis_count: int,
+    excluded_aggregate_or_unknown_basis_count: int,
+    excluded_missing_premium_count: int,
+    daily_budget: RuleComplianceDailyBudget,
+) -> PersonalEdgeRuleCompliance:
+    """All-history + since-adoption slices over the same clean-basis rows."""
+    forward = [
+        episode for episode in members if episode.opened_trading_day >= adopted_at
+    ]
+    return PersonalEdgeRuleCompliance(
+        rule_set_id=RULE_SET_V2_ID,
+        adopted_at=adopted_at,
+        clean_basis_start=RULE_COMPLIANCE_CLEAN_BASIS_START,
+        clean_basis_reason=RULE_COMPLIANCE_CLEAN_BASIS_REASON,
+        population_n=len(members),
+        excluded_before_clean_basis_count=excluded_before_clean_basis_count,
+        excluded_aggregate_or_unknown_basis_count=(
+            excluded_aggregate_or_unknown_basis_count
+        ),
+        excluded_missing_premium_count=excluded_missing_premium_count,
+        exclude_top_n=DISCIPLINE_EXCLUDE_TOP_N,
+        exclude_top_n_min_episode_count=DISCIPLINE_BODY_MIN_EPISODE_COUNT,
+        # 判定与规则编号随每一条车道行下发（见 RuleComplianceLaneStat）——不另发
+        # 以车道 id 为键的字典：Web 层的深层 camelCase 会改写字典键，规则 id 必须
+        # 只以「值」的形式过网。
+        intraday_lane_dte=INTRADAY_LANE_DTE,
+        intraday_lane_et_cutoff_hour=INTRADAY_LANE_ET_CUTOFF_HOUR,
+        overnight_lane_min_dte=OVERNIGHT_LANE_MIN_DTE,
+        overnight_lane_max_dte=OVERNIGHT_LANE_MAX_DTE,
+        overnight_lane_weak_entry_et_hours=OVERNIGHT_LANE_WEAK_ENTRY_ET_HOURS,
+        all_history=_compliance_slice(
+            members,
+            start_date=RULE_COMPLIANCE_CLEAN_BASIS_START,
+            empty_state="no_episodes",
+            empty_reason=(
+                "干净口径样本为空："
+                f"该 build 内没有 ET 入场日 ≥ {RULE_COMPLIANCE_CLEAN_BASIS_START} "
+                "且由明细成交构建、风险金额已知的已平仓回合"
+            ),
+        ),
+        since_adoption=_compliance_slice(
+            forward,
+            start_date=adopted_at,
+            empty_state="no_episodes_since_adoption",
+            empty_reason=(
+                f"规则采纳日（{adopted_at}，ET）之后尚无已平仓回合进入该 build："
+                "前向样本为空是事实，不以 0 冒充读数"
+            ),
+        ),
+        daily_budget=daily_budget,
+        limitations=RULE_COMPLIANCE_LIMITATIONS,
+    )
+
+
+def _et_hour_utc_minus_4(moment: datetime) -> int:
+    """ET≈UTC−4 近似的入场小时（与月度/交易日口径同一换算）."""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return (moment.astimezone(timezone.utc) - timedelta(hours=4)).hour
+
+
 def _trading_day_utc_minus_4(opened_at: datetime) -> str:
     """ET≈UTC−4 近似的入场自然日（与月度口径同一换算，边界注记见 limitations）."""
     if opened_at.tzinfo is None:
@@ -830,15 +1405,24 @@ def get_personal_edge_stats(
     account_key: str = DEFAULT_LEDGER_ACCOUNT_KEY,
     *,
     min_underlying_episode_count: int = DEFAULT_MIN_UNDERLYING_EPISODE_COUNT,
+    rule_compliance_since: str = RULE_SET_V2_ADOPTED_AT,
 ) -> Optional[PersonalEdgeResult]:
     """Aggregate the default build's closed episodes into personal stats.
 
     Returns ``None`` when the account has no episode build.  The whole read
     happens in one session and issues only SELECT statements.
+
+    ``rule_compliance_since`` (ET ``YYYY-MM-DD``) moves the forward slice of the
+    车道遵守度 block; it defaults to ``RULE_SET_V2_ADOPTED_AT`` and never affects
+    the all-history slice or any pre-existing field.
     """
     if min_underlying_episode_count < 1:
         raise EpisodeRepositoryError(
             "min_underlying_episode_count must be positive"
+        )
+    if not _ISO_DATE.fullmatch(rule_compliance_since):
+        raise EpisodeRepositoryError(
+            "rule_compliance_since must be an ET calendar date (YYYY-MM-DD)"
         )
     init_ledger_schema()
     db = get_db()
@@ -888,9 +1472,43 @@ def get_personal_edge_stats(
     discipline_episodes: list[_DisciplineEpisode] = []
     closed_episode_count = 0
 
+    # --- 车道遵守度累加器（干净口径子集 + V2-D 额度读数）--------------------
+    compliance_episodes: list[_ComplianceEpisode] = []
+    compliance_excluded_before_clean_basis = 0
+    compliance_excluded_basis = 0
+    compliance_excluded_missing_premium = 0
+    budget_last_trading_day: Optional[str] = None
+    # 逐日 0DTE 开仓笔数（含 ET 12:00 后开的违规单——它们同样占用当日额度）。
+    budget_intraday_by_day: dict[str, int] = {}
+    budget_overnight_open = 0
+    budget_overnight_unknown_dte_open = 0
+
     for row in rows:
         if str(row.lifecycle_status) != "closed":
             excluded_open_count += 1
+            # V2-D③ 的「当前过夜持仓」＝该 build 内仍未平仓的 4-7DTE 回合。
+            if row.dte_at_entry is None:
+                budget_overnight_unknown_dte_open += 1
+            elif (
+                OVERNIGHT_LANE_MIN_DTE
+                <= int(row.dte_at_entry)
+                <= OVERNIGHT_LANE_MAX_DTE
+            ):
+                budget_overnight_open += 1
+            if row.opened_at is not None:
+                open_day = _trading_day_utc_minus_4(_utc(row.opened_at))
+                if (
+                    budget_last_trading_day is None
+                    or open_day > budget_last_trading_day
+                ):
+                    budget_last_trading_day = open_day
+                if (
+                    row.dte_at_entry is not None
+                    and int(row.dte_at_entry) == INTRADAY_LANE_DTE
+                ):
+                    budget_intraday_by_day[open_day] = (
+                        budget_intraday_by_day.get(open_day, 0) + 1
+                    )
             continue
         if row.realized_pnl_net is None:
             excluded_missing_pnl_count += 1
@@ -963,6 +1581,52 @@ def get_personal_edge_stats(
                 ),
             )
         )
+
+        # --- 车道遵守度：只收「干净口径」子集，其余逐类计缺席 ----------------
+        opened_trading_day = _trading_day_utc_minus_4(opened_at)
+        dte_value = (
+            int(row.dte_at_entry) if row.dte_at_entry is not None else None
+        )
+        if dte_value == INTRADAY_LANE_DTE:
+            budget_intraday_by_day[opened_trading_day] = (
+                budget_intraday_by_day.get(opened_trading_day, 0) + 1
+            )
+        if (
+            budget_last_trading_day is None
+            or opened_trading_day > budget_last_trading_day
+        ):
+            budget_last_trading_day = opened_trading_day
+
+        if opened_trading_day < RULE_COMPLIANCE_CLEAN_BASIS_START:
+            compliance_excluded_before_clean_basis += 1
+        elif fill_detailed_from_evidence_summary(row.evidence_summary_json) is not True:
+            # 汇总 ORDER 口径与「不可判定」同样出局：分母不可比即不进车道统计。
+            compliance_excluded_basis += 1
+        elif premium is None:
+            compliance_excluded_missing_premium += 1
+        else:
+            compliance_episodes.append(
+                _ComplianceEpisode(
+                    lane=classify_rule_lane(
+                        dte=dte_value,
+                        opened_et_hour=_et_hour_utc_minus_4(opened_at),
+                        opened_trading_day=opened_trading_day,
+                        closed_trading_day=(
+                            _trading_day_utc_minus_4(_utc(row.closed_at))
+                            if row.closed_at is not None
+                            else None
+                        ),
+                    ),
+                    opened_trading_day=opened_trading_day,
+                    pnl=pnl,
+                    fee=(
+                        Decimal(row.total_fee)
+                        if row.total_fee is not None
+                        else None
+                    ),
+                    premium=premium,
+                )
+            )
 
     qualifying = {
         underlying: state
@@ -1042,6 +1706,43 @@ def get_personal_edge_stats(
         dte_unknown=_dte_bucket("unknown", dte_unknown),
         monthly=monthly,
         discipline=_build_discipline(discipline_episodes),
+        rule_compliance=_build_rule_compliance(
+            compliance_episodes,
+            adopted_at=rule_compliance_since,
+            excluded_before_clean_basis_count=(
+                compliance_excluded_before_clean_basis
+            ),
+            excluded_aggregate_or_unknown_basis_count=compliance_excluded_basis,
+            excluded_missing_premium_count=compliance_excluded_missing_premium,
+            daily_budget=RuleComplianceDailyBudget(
+                as_of_trading_day=budget_last_trading_day,
+                intraday_ticket_count=(
+                    budget_intraday_by_day.get(budget_last_trading_day, 0)
+                    if budget_last_trading_day is not None
+                    else None
+                ),
+                intraday_ticket_limit=INTRADAY_LANE_DAILY_TICKET_LIMIT,
+                intraday_reason=(
+                    None
+                    if budget_last_trading_day is not None
+                    else "该 build 内没有任何带入场时间的回合，无法定位最后一个交易日"
+                ),
+                overnight_open_count=(
+                    budget_overnight_open
+                    if budget_last_trading_day is not None
+                    else None
+                ),
+                overnight_concurrent_limit=OVERNIGHT_LANE_CONCURRENT_LIMIT,
+                overnight_reason=(
+                    None
+                    if budget_last_trading_day is not None
+                    else "该 build 内没有任何带入场时间的回合，无法定位最后一个交易日"
+                ),
+                overnight_unknown_dte_open_count=(
+                    budget_overnight_unknown_dte_open
+                ),
+            ),
+        ),
         month_basis=MONTH_BASIS_UTC_MINUS_4,
         limitations=PERSONAL_EDGE_LIMITATIONS,
     )

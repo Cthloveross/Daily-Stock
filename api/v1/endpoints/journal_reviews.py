@@ -16,6 +16,7 @@ from api.v1.schemas.journal_reviews import (
     PersonalEdgeHoldBucketModel,
     PersonalEdgeMonthlyBucketModel,
     PersonalEdgeResponse,
+    PersonalEdgeRuleComplianceModel,
     PersonalEdgeUnderlyingModel,
     PlaybookCandidateCreateRequest,
     PlaybookCandidateCreateResponse,
@@ -40,6 +41,10 @@ from api.v1.schemas.journal_reviews import (
     ReviewInsightThresholds,
     ReviewInsightUnreviewed,
     ReviewInsightsResponse,
+    RuleComplianceDailyBudgetModel,
+    RuleComplianceLaneStatModel,
+    RuleComplianceSliceModel,
+    RuleComplianceStatModel,
 )
 from src.journal.ledger.episode_repository import EpisodeRepositoryError
 from src.journal.ledger.playbook_repository import (
@@ -59,6 +64,8 @@ from src.journal.ledger.playbook_repository import (
 from src.journal.ledger.repository import DEFAULT_LEDGER_ACCOUNT_KEY
 from src.journal.personal_edge import (
     PersonalEdgeResult,
+    RULE_SET_V2_ADOPTED_AT,
+    RuleComplianceSlice,
     get_personal_edge_stats,
 )
 from src.journal.ledger.review_insights import (
@@ -205,7 +212,9 @@ def get_review_insights(
 # In-process TTL cache: episodes are append-only per build, so a short cache
 # is safe; the response keeps computed_at so the as-of moment stays honest.
 _PERSONAL_EDGE_CACHE_TTL_SECONDS = 600.0
-_personal_edge_cache: dict[str, tuple[float, PersonalEdgeResponse]] = {}
+# Key is (account_key, rule-compliance `since`): the forward slice is the only
+# request-controlled input, so it must not share a cache entry with another one.
+_personal_edge_cache: dict[tuple[str, str], tuple[float, PersonalEdgeResponse]] = {}
 _personal_edge_cache_lock = Lock()
 
 
@@ -213,6 +222,21 @@ def _reset_personal_edge_cache() -> None:
     """Test hook: drop every cached personal-edge response."""
     with _personal_edge_cache_lock:
         _personal_edge_cache.clear()
+
+
+def _compliance_slice(slice_: RuleComplianceSlice) -> RuleComplianceSliceModel:
+    """Project one compliance slice; ``asdict`` keeps the dataclass the truth."""
+    return RuleComplianceSliceModel(
+        state=slice_.state,
+        state_reason=slice_.state_reason,
+        start_date=slice_.start_date,
+        n=slice_.n,
+        lanes=[RuleComplianceLaneStatModel(**asdict(lane)) for lane in slice_.lanes],
+        verdicts=[
+            RuleComplianceStatModel(**asdict(verdict))
+            for verdict in slice_.verdicts
+        ],
+    )
 
 
 def _personal_edge_response(
@@ -301,6 +325,43 @@ def _personal_edge_response(
             exclude_top_n=result.discipline.exclude_top_n,
             fill_detailed_governs=result.discipline.fill_detailed_governs,
         ),
+        rule_compliance=PersonalEdgeRuleComplianceModel(
+            rule_set_id=result.rule_compliance.rule_set_id,
+            adopted_at=result.rule_compliance.adopted_at,
+            clean_basis_start=result.rule_compliance.clean_basis_start,
+            clean_basis_reason=result.rule_compliance.clean_basis_reason,
+            population_n=result.rule_compliance.population_n,
+            excluded_before_clean_basis_count=(
+                result.rule_compliance.excluded_before_clean_basis_count
+            ),
+            excluded_aggregate_or_unknown_basis_count=(
+                result.rule_compliance.excluded_aggregate_or_unknown_basis_count
+            ),
+            excluded_missing_premium_count=(
+                result.rule_compliance.excluded_missing_premium_count
+            ),
+            exclude_top_n=result.rule_compliance.exclude_top_n,
+            exclude_top_n_min_episode_count=(
+                result.rule_compliance.exclude_top_n_min_episode_count
+            ),
+            intraday_lane_dte=result.rule_compliance.intraday_lane_dte,
+            intraday_lane_et_cutoff_hour=(
+                result.rule_compliance.intraday_lane_et_cutoff_hour
+            ),
+            overnight_lane_min_dte=result.rule_compliance.overnight_lane_min_dte,
+            overnight_lane_max_dte=result.rule_compliance.overnight_lane_max_dte,
+            overnight_lane_weak_entry_et_hours=list(
+                result.rule_compliance.overnight_lane_weak_entry_et_hours
+            ),
+            all_history=_compliance_slice(result.rule_compliance.all_history),
+            since_adoption=_compliance_slice(
+                result.rule_compliance.since_adoption
+            ),
+            daily_budget=RuleComplianceDailyBudgetModel(
+                **asdict(result.rule_compliance.daily_budget)
+            ),
+            limitations=list(result.rule_compliance.limitations),
+        ),
         month_basis=result.month_basis,
         limitations=list(result.limitations),
     )
@@ -314,24 +375,35 @@ def get_personal_edge(
         max_length=64,
         pattern=r"^[A-Za-z0-9_.:-]+$",
     ),
+    since: str = Query(
+        RULE_SET_V2_ADOPTED_AT,
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+        description=(
+            "车道遵守度前向切片的起点（ET 自然日）；默认＝规则 v2 采纳日。"
+            "只影响 rule_compliance.since_adoption，不影响任何既有字段。"
+        ),
+    ),
 ) -> PersonalEdgeResponse:
     """个人画像回灌：当前默认 build 已平仓回合的零写描述统计。
 
     Per-underlying / hold-time / DTE / monthly buckets plus the additive
     ``discipline`` block (规模与频率：每美元回报 + 仓位 + 频率 + 本体/尾部 +
-    成交明细来源，按月与近 20 个交易日窗口) recomputed from the same effective
-    default build the other journal reads use, cached in-process for ~10
-    minutes.  Descriptive only — never a signal, never a filter; the
-    endogeneity, reconstructed-fill and fail-closed caveats ship verbatim in
-    ``limitations``.
+    成交明细来源，按月与近 20 个交易日窗口) and the additive ``rule_compliance``
+    block (车道遵守度：把本人规则 v2 的车道判定与合规/违规每美元读数按干净口径
+    摊开，全历史 + 采纳后两个切片) recomputed from the same effective default
+    build the other journal reads use, cached in-process for ~10 minutes per
+    ``(account_key, since)``.  Descriptive only — never a signal, never a
+    filter, and no order is ever placed; the endogeneity, reconstructed-fill,
+    single-regime and fail-closed caveats ship verbatim in ``limitations``.
     """
     now = time.monotonic()
+    cache_key = (account_key, since)
     with _personal_edge_cache_lock:
-        cached = _personal_edge_cache.get(account_key)
+        cached = _personal_edge_cache.get(cache_key)
         if cached is not None and now - cached[0] < _PERSONAL_EDGE_CACHE_TTL_SECONDS:
             return cached[1]
     try:
-        result = get_personal_edge_stats(account_key)
+        result = get_personal_edge_stats(account_key, rule_compliance_since=since)
     except EpisodeRepositoryError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if result is None:
@@ -342,7 +414,7 @@ def get_personal_edge(
         )
     response = _personal_edge_response(account_key, result)
     with _personal_edge_cache_lock:
-        _personal_edge_cache[account_key] = (now, response)
+        _personal_edge_cache[cache_key] = (now, response)
     return response
 
 

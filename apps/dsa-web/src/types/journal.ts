@@ -1104,6 +1104,92 @@ export interface PersonalEdgeDiscipline {
   fillDetailedGoverns?: string | null;
 }
 
+// --- rule compliance (车道遵守度): 规则 v2 的前向证伪记账 ---------------------
+
+export type RuleComplianceVerdict = 'compliant' | 'violation' | 'uncovered' | 'unknown';
+
+export type RuleComplianceLane =
+  | 'intraday_0dte'
+  | 'overnight_4_7'
+  | 'dte_1_3'
+  | 'bought_time_unused'
+  | 'late_0dte'
+  | 'other'
+  | 'unknown';
+
+/**
+ * 一个车道桶（或合规/违规汇总）的口径读数。
+ * `gross` = Σ(净盈亏 + 费用)，`risk` = Σ|开仓现金流|——与规则文本引用的定义一致。
+ * 任何分母不足的比率为 `null` 并附原因，绝不以 0 冒充。
+ */
+export interface RuleComplianceStat {
+  key: string;
+  n: number;
+  risk: number | null;
+  net: number | null;
+  gross: number | null;
+  grossPct: number | null;
+  tollPct: number | null;
+  winRate: number | null;
+  grossPctExcludingTopN: number | null;
+  excludingTopNCount: number | null;
+  excludingTopNReason: string | null;
+  ratioReason: string | null;
+}
+
+/**
+ * 判定与规则编号随每一条车道行下发（后端不发以车道 id 为键的字典：本层的深层
+ * camelCase 会改写字典键，规则 id 必须只以「值」的形式过网）。
+ */
+export interface RuleComplianceLaneStat extends RuleComplianceStat {
+  verdict: RuleComplianceVerdict;
+  ruleId: string;
+}
+
+/** `no_episodes_since_adoption` ＝采纳后尚无样本：必须显式说明，不得渲染成全 0 的表。 */
+export interface RuleComplianceSlice {
+  state: 'ready' | 'no_episodes' | 'no_episodes_since_adoption';
+  stateReason: string | null;
+  startDate: string | null;
+  n: number;
+  lanes: RuleComplianceLaneStat[];
+  verdicts: RuleComplianceStat[];
+}
+
+/** V2-D 的两个额度读数；`asOfTradingDay` 不是今天时读数已过期，消费端须显式标缺。 */
+export interface RuleComplianceDailyBudget {
+  asOfTradingDay: string | null;
+  intradayTicketCount: number | null;
+  intradayTicketLimit: number;
+  intradayReason: string | null;
+  overnightOpenCount: number | null;
+  overnightConcurrentLimit: number;
+  overnightReason: string | null;
+  overnightUnknownDteOpenCount: number;
+}
+
+export interface PersonalEdgeRuleCompliance {
+  ruleSetId: string;
+  adoptedAt: string;
+  cleanBasisStart: string;
+  cleanBasisReason: string;
+  populationN: number;
+  excludedBeforeCleanBasisCount: number;
+  excludedAggregateOrUnknownBasisCount: number;
+  excludedMissingPremiumCount: number;
+  excludeTopN: number;
+  excludeTopNMinEpisodeCount: number;
+  intradayLaneDte: number;
+  intradayLaneEtCutoffHour: number;
+  overnightLaneMinDte: number;
+  overnightLaneMaxDte: number;
+  overnightLaneWeakEntryEtHours: number[];
+  allHistory: RuleComplianceSlice;
+  sinceAdoption: RuleComplianceSlice;
+  dailyBudget: RuleComplianceDailyBudget;
+  limitations: string[];
+}
+
 /**
  * 个人画像回灌：当前默认 build 已平仓回合的描述统计（build_id + 日期范围 +
  * computed_at 全程可见）。描述不是因果——内生性 caveat 在 limitations 原文携带。
@@ -1131,6 +1217,8 @@ export interface PersonalEdgeResponse {
   monthly: PersonalEdgeMonthlyBucket[];
   /** additive（2026-08-04）：规模与频率纪律；not_built 或旧后端响应时缺席。 */
   discipline?: PersonalEdgeDiscipline | null;
+  /** additive（2026-08-04）：车道遵守度；not_built 或旧后端响应时缺席。 */
+  ruleCompliance?: PersonalEdgeRuleCompliance | null;
   monthBasis: string | null;
   limitations: string[];
 }

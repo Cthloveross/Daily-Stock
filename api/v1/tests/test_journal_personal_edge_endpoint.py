@@ -209,7 +209,7 @@ def test_ten_minute_cache_serves_and_reset_clears():
 
     from api.v1.endpoints import journal_reviews
 
-    def _boom(_account_key):
+    def _boom(_account_key, **_kwargs):
         raise EpisodeRepositoryError("must not recompute inside the TTL")
 
     original = journal_reviews.get_personal_edge_stats
@@ -229,3 +229,176 @@ def test_ten_minute_cache_serves_and_reset_clears():
 def test_invalid_account_key_is_rejected():
     client = _client()
     assert client.get(URL, params={"account_key": "bad key"}).status_code == 422
+
+
+def _compliance_seed():
+    """Clean-basis rows covering每一条车道 + 一笔仍未平仓的过夜持仓。"""
+    from src.journal.tests.test_personal_edge import _seed_build
+
+    def spec(day, hour, pnl, dte, hold=1_200, **extra):
+        base = {
+            "underlying": "AAA",
+            "opened_at": datetime(2026, 5, day, hour, 0, tzinfo=timezone.utc),
+            "hold_seconds": hold,
+            "realized_pnl_net": Decimal(pnl),
+            "total_fee": Decimal("1"),
+            "dte_at_entry": dte,
+            "opening_cash_flow": Decimal("1000"),
+            "evidence_summary_json": (
+                '{"allocation_count":3,"fill_allocations":3,"order_allocations":0}'
+            ),
+        }
+        base.update(extra)
+        return base
+
+    return _seed_build(
+        [
+            spec(4, 14, "100", 0),          # ET 10:00 → 日内合规
+            spec(5, 17, "-30", 0),          # ET 13:00 → 午后 0DTE 违规
+            spec(6, 14, "300", 4, 90_000),  # 4DTE 跨日 → 过夜合规
+            spec(7, 14, "-20", 2),          # 1-3DTE → 违规
+            spec(8, 14, "-50", 5),          # 4-7DTE 当日平 → 违规
+            spec(11, 14, "10", 30, 90_000),  # ≥8DTE 隔夜 → 规则未覆盖
+            {
+                "underlying": "AAA",
+                "opened_at": datetime(2026, 5, 11, 14, 0, tzinfo=timezone.utc),
+                "lifecycle_status": "open",
+                "realized_pnl_net": None,
+                "dte_at_entry": 5,
+            },
+        ]
+    )
+
+
+def test_rule_compliance_block_is_additive_and_keeps_existing_fields():
+    """车道遵守度是追加字段：既有合同一字不改。"""
+    _seed()
+    client = _client()
+    body = client.get(URL).json()
+
+    # 既有合同原样保留（additive-only）。
+    assert body["schema_version"] == "journal-personal-edge/1.0"
+    assert body["data_state"] == "ready"
+    assert body["closed_episode_count"] == 5
+    assert body["monthly"] == [
+        {"month": "2026-04", "n": 5, "net": 220.0, "fees": 5.0, "win_rate": 0.6}
+    ]
+    assert body["underlyings"][0]["underlying"] == "AAA"
+    assert body["month_basis"] == "opened_at_utc_minus_4_approximation"
+    assert body["discipline"]["body_trim_count"] == 5
+    assert body["discipline"]["body_min_episode_count"] == 15
+
+    compliance = body["rule_compliance"]
+    assert compliance["rule_set_id"] == "v2"
+    assert compliance["adopted_at"] == "2026-08-05"
+    assert compliance["clean_basis_start"] == "2026-04-21"
+    assert compliance["exclude_top_n"] == 5
+    assert compliance["exclude_top_n_min_episode_count"] == 15
+    assert compliance["intraday_lane_dte"] == 0
+    assert compliance["intraday_lane_et_cutoff_hour"] == 12
+    assert compliance["overnight_lane_min_dte"] == 4
+    assert compliance["overnight_lane_max_dte"] == 7
+    assert compliance["overnight_lane_weak_entry_et_hours"] == [11, 13]
+    assert compliance["daily_budget"]["intraday_ticket_limit"] == 6
+    assert compliance["daily_budget"]["overnight_concurrent_limit"] == 3
+    # 判定与规则编号随每一条车道行下发（不发以车道 id 为键的字典：Web 层的深层
+    # camelCase 会改写字典键，规则 id 必须只以「值」的形式过网）。
+    lanes = {lane["key"]: lane for lane in compliance["all_history"]["lanes"]}
+    assert lanes["overnight_4_7"]["verdict"] == "compliant"
+    assert lanes["late_0dte"]["verdict"] == "violation"
+    assert lanes["late_0dte"]["rule_id"] == "V2-C③"
+    assert "lane_verdicts" not in compliance
+    assert "lane_rule_ids" not in compliance
+    assert any("不构成建议" in line for line in compliance["limitations"])
+    assert any("只读，不下单" in line for line in compliance["limitations"])
+
+
+def test_rule_compliance_lane_and_verdict_payload():
+    _compliance_seed()
+    client = _client()
+    compliance = client.get(URL).json()["rule_compliance"]
+
+    assert compliance["population_n"] == 6
+    history = compliance["all_history"]
+    assert history["state"] == "ready"
+    assert history["start_date"] == "2026-04-21"
+    lanes = {lane["key"]: lane for lane in history["lanes"]}
+    assert lanes["intraday_0dte"]["n"] == 1
+    assert lanes["intraday_0dte"]["verdict"] == "compliant"
+    assert lanes["intraday_0dte"]["rule_id"] == "V2-A"
+    assert lanes["late_0dte"]["n"] == 1
+    assert lanes["overnight_4_7"]["n"] == 1
+    assert lanes["dte_1_3"]["n"] == 1
+    assert lanes["bought_time_unused"]["n"] == 1
+    assert lanes["other"]["n"] == 1
+    assert lanes["unknown"]["n"] == 0
+    # 空桶不是 0%：比率缺席 + 原因。
+    assert lanes["unknown"]["gross_pct"] is None
+    assert lanes["unknown"]["ratio_reason"] is not None
+
+    verdicts = {item["key"]: item for item in history["verdicts"]}
+    assert verdicts["compliant"]["n"] == 2
+    # (100 + 300) + 2 费用 = 402，除以 2000。
+    assert verdicts["compliant"]["gross_pct"] == pytest.approx(0.201)
+    assert verdicts["violation"]["n"] == 3
+    # (−30 − 20 − 50) + 3 = −97，除以 3000。
+    assert verdicts["violation"]["gross_pct"] == pytest.approx(-0.032333)
+    # 样本不足时剔尾读数缺席，绝不给截断样本的数字。
+    assert verdicts["violation"]["gross_pct_excluding_top_n"] is None
+    assert "15" in verdicts["violation"]["excluding_top_n_reason"]
+
+    budget = compliance["daily_budget"]
+    assert budget["as_of_trading_day"] == "2026-05-11"
+    assert budget["overnight_open_count"] == 1
+
+
+def test_rule_compliance_since_adoption_is_empty_and_says_so():
+    _compliance_seed()
+    client = _client()
+    forward = client.get(URL).json()["rule_compliance"]["since_adoption"]
+    assert forward["state"] == "no_episodes_since_adoption"
+    assert forward["n"] == 0
+    assert "2026-08-05" in forward["state_reason"]
+    assert all(lane["n"] == 0 for lane in forward["lanes"])
+    assert all(lane["gross_pct"] is None for lane in forward["lanes"])
+
+
+def test_rule_compliance_since_query_moves_only_the_forward_slice():
+    _compliance_seed()
+    client = _client()
+    body = client.get(URL, params={"since": "2026-05-07"}).json()
+    compliance = body["rule_compliance"]
+    assert compliance["adopted_at"] == "2026-05-07"
+    # 全历史切片不受影响。
+    assert compliance["all_history"]["n"] == 6
+    forward = compliance["since_adoption"]
+    assert forward["state"] == "ready"
+    assert forward["start_date"] == "2026-05-07"
+    # 5/7、5/8、5/11 三笔（ET 口径同日）。
+    assert forward["n"] == 3
+
+
+def test_rule_compliance_since_query_is_cached_per_cutoff():
+    """不同 since 不得共用缓存条目（否则前向切片会串味）。"""
+    _compliance_seed()
+    client = _client()
+    default_body = client.get(URL).json()
+    moved_body = client.get(URL, params={"since": "2026-05-07"}).json()
+    assert default_body["rule_compliance"]["since_adoption"]["n"] == 0
+    assert moved_body["rule_compliance"]["since_adoption"]["n"] == 3
+    # 再取一次默认值：仍是空前向切片，没有被上一次请求污染。
+    assert client.get(URL).json()["rule_compliance"]["since_adoption"]["n"] == 0
+
+
+def test_rule_compliance_rejects_a_malformed_since():
+    _compliance_seed()
+    client = _client()
+    assert client.get(URL, params={"since": "20260805"}).status_code == 422
+    assert client.get(URL, params={"since": "not-a-date"}).status_code == 422
+
+
+def test_not_built_leaves_rule_compliance_absent_rather_than_zeroed():
+    client = _client()
+    body = client.get(URL).json()
+    assert body["data_state"] == "not_built"
+    assert body["rule_compliance"] is None

@@ -435,6 +435,89 @@ class PersonalEdgeDisciplineModel(BaseModel):
     fill_detailed_governs: Optional[str] = None
 
 
+class RuleComplianceStatModel(BaseModel):
+    """一个车道桶（或合规/违规汇总）的口径读数。
+
+    ``gross`` = Σ(``realized_pnl_net`` + ``total_fee``)，``risk`` =
+    Σ``ABS(opening_cash_flow)``——与规则文本引用的定义逐字一致。任何分母不足的
+    比率为 ``null`` 并附 ``ratio_reason`` / ``excluding_top_n_reason``。
+    """
+
+    key: str
+    n: int = Field(ge=0)
+    risk: Optional[float] = None
+    net: Optional[float] = None
+    gross: Optional[float] = None
+    gross_pct: Optional[float] = None
+    toll_pct: Optional[float] = None
+    win_rate: Optional[float] = Field(default=None, ge=0, le=1)
+    gross_pct_excluding_top_n: Optional[float] = None
+    excluding_top_n_count: Optional[int] = Field(default=None, ge=0)
+    excluding_top_n_reason: Optional[str] = None
+    ratio_reason: Optional[str] = None
+
+
+class RuleComplianceLaneStatModel(RuleComplianceStatModel):
+    """车道桶：额外携带判定与规则编号（UI 引用编号，不改写规则内容）。"""
+
+    verdict: Literal["compliant", "violation", "uncovered", "unknown"]
+    rule_id: str
+
+
+class RuleComplianceSliceModel(BaseModel):
+    """一个时间切片：全历史（规则怎么推出来的）或采纳后（前向验证）。
+
+    ``state`` 为 ``no_episodes_since_adoption`` 时前向样本为空——这是事实，
+    消费端必须显式说明，不得渲染成一张全 0 的表。
+    """
+
+    state: Literal["ready", "no_episodes", "no_episodes_since_adoption"]
+    state_reason: Optional[str] = None
+    start_date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    n: int = Field(ge=0)
+    lanes: list[RuleComplianceLaneStatModel] = Field(default_factory=list)
+    verdicts: list[RuleComplianceStatModel] = Field(default_factory=list)
+
+
+class RuleComplianceDailyBudgetModel(BaseModel):
+    """V2-D 的两个额度读数，带明确 as-of 交易日（消费端须自行判定是否过期）。"""
+
+    as_of_trading_day: Optional[str] = Field(
+        default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"
+    )
+    intraday_ticket_count: Optional[int] = Field(default=None, ge=0)
+    intraday_ticket_limit: int = Field(ge=1)
+    intraday_reason: Optional[str] = None
+    overnight_open_count: Optional[int] = Field(default=None, ge=0)
+    overnight_concurrent_limit: int = Field(ge=1)
+    overnight_reason: Optional[str] = None
+    overnight_unknown_dte_open_count: int = Field(default=0, ge=0)
+
+
+class PersonalEdgeRuleComplianceModel(BaseModel):
+    """车道遵守度：把本人规则 v2 变成可前向证伪的记账（描述统计，非建议）。"""
+
+    rule_set_id: str
+    adopted_at: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    clean_basis_start: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    clean_basis_reason: str
+    population_n: int = Field(ge=0)
+    excluded_before_clean_basis_count: int = Field(ge=0)
+    excluded_aggregate_or_unknown_basis_count: int = Field(ge=0)
+    excluded_missing_premium_count: int = Field(ge=0)
+    exclude_top_n: int = Field(ge=1)
+    exclude_top_n_min_episode_count: int = Field(ge=1)
+    intraday_lane_dte: int = Field(ge=0)
+    intraday_lane_et_cutoff_hour: int = Field(ge=0, le=23)
+    overnight_lane_min_dte: int = Field(ge=0)
+    overnight_lane_max_dte: int = Field(ge=0)
+    overnight_lane_weak_entry_et_hours: list[int] = Field(default_factory=list)
+    all_history: RuleComplianceSliceModel
+    since_adoption: RuleComplianceSliceModel
+    daily_budget: RuleComplianceDailyBudgetModel
+    limitations: list[str] = Field(default_factory=list)
+
+
 class PersonalEdgeResponse(BaseModel):
     """Descriptive personal stats over the current default episode build.
 
@@ -477,5 +560,7 @@ class PersonalEdgeResponse(BaseModel):
     )
     # additive（2026-08-04）：规模与频率纪律；not_built 时为 null。
     discipline: Optional[PersonalEdgeDisciplineModel] = None
+    # additive（2026-08-04）：车道遵守度前向统计；not_built 时为 null。
+    rule_compliance: Optional[PersonalEdgeRuleComplianceModel] = None
     month_basis: Optional[str] = None
     limitations: list[str] = Field(default_factory=list)

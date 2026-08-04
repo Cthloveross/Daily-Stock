@@ -15,6 +15,7 @@ import type {
 import { useUserWatchlistStore } from '../stores/userWatchlistStore';
 import { IntradayPulseStrip } from '../components/opportunities/IntradayPulseStrip';
 import { IntradayDisciplineStrip } from '../components/opportunities/IntradayDisciplineStrip';
+import { LaneChecklistPanel } from '../components/opportunities/LaneChecklistPanel';
 import { IntradayScanTable } from '../components/opportunities/IntradayScanTable';
 import { IntradayOptionEventFeed } from '../components/opportunities/IntradayOptionEventFeed';
 import { IntradayTrackingPanel } from '../components/opportunities/IntradayTrackingPanel';
@@ -193,6 +194,10 @@ const IntradayPage: React.FC = () => {
 
       {/* 规模与频率：紧随脉搏的一行镜子读数（每美元回报才是真账），不是警报。 */}
       <IntradayDisciplineStrip />
+
+      {/* 开仓前车道检查：对照用户自己那套规则（V2-0…V2-D）的清单，不是推荐，
+          也不会下单——ET 时钟复用脉搏时点，财报读数复用深度层扫描候选。 */}
+      <LaneChecklistPanel pulse={pulse} top={top} />
 
       {/* 主次顺序：实时扫描（现在谁在动）为主表，今日计划跟踪其后，期权事件流侧栏。 */}
       <div className="grid gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(340px,1fr)]">

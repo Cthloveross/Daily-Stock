@@ -18,13 +18,31 @@ from src.journal.ledger.repository import (
     DEFAULT_LEDGER_ACCOUNT_KEY,
     init_ledger_schema,
 )
+from src.journal.ledger.episode_repository import EpisodeRepositoryError
 from src.journal.personal_edge import (
+    DISCIPLINE_BODY_MIN_EPISODE_COUNT,
+    DISCIPLINE_EXCLUDE_TOP_N,
     FILL_DETAILED_GOVERNS,
+    INTRADAY_LANE_DAILY_TICKET_LIMIT,
+    INTRADAY_LANE_DTE,
+    INTRADAY_LANE_ET_CUTOFF_HOUR,
     MONTH_BASIS_UTC_MINUS_4,
+    OVERNIGHT_LANE_CONCURRENT_LIMIT,
+    OVERNIGHT_LANE_MAX_DTE,
+    OVERNIGHT_LANE_MIN_DTE,
+    OVERNIGHT_LANE_WEAK_ENTRY_ET_HOURS,
     PERSONAL_EDGE_LIMITATIONS,
     REASON_NO_DTE,
     REASON_NO_PREMIUM,
     REASON_ZERO_PREMIUM,
+    RULE_COMPLIANCE_CLEAN_BASIS_START,
+    RULE_COMPLIANCE_LANE_RULE_IDS,
+    RULE_COMPLIANCE_LANE_VERDICTS,
+    RULE_COMPLIANCE_LIMITATIONS,
+    RULE_LANES,
+    RULE_SET_V2_ADOPTED_AT,
+    RULE_VERDICTS,
+    classify_rule_lane,
     fill_detailed_from_evidence_summary,
     get_personal_edge_stats,
 )
@@ -869,3 +887,400 @@ def test_discipline_limitations_carry_reconstructed_fill_and_gate_notes():
     assert any("fail-closed" in line for line in result.limitations)
     # 费用门槛的语义（毛低于门槛即净为负）也要原文携带。
     assert any("门槛" in line for line in result.limitations)
+
+
+# ---------------------------------------------------------------------------
+# 车道遵守度（rule_compliance）：规则 v2 的机械判定 + 前向切片
+# ---------------------------------------------------------------------------
+
+
+def _lane(
+    dte: Optional[int],
+    hour: Optional[int],
+    opened: Optional[str],
+    closed: Optional[str],
+) -> str:
+    return classify_rule_lane(
+        dte=dte,
+        opened_et_hour=hour,
+        opened_trading_day=opened,
+        closed_trading_day=closed,
+    )
+
+
+def test_classify_rule_lane_truth_table_covers_every_boundary():
+    """车道判定真值表：DTE 0/1/3/4/7/8 + 当日/隔夜边界 + ET 12:00 边界。"""
+    same, later = "2026-05-04", "2026-05-05"
+
+    # DTE 0：ET 12:00 是硬边界（11 点仍是日内合规，12 点整即违规 V2-C③）。
+    assert _lane(0, 0, same, same) == "intraday_0dte"
+    assert _lane(0, 9, same, same) == "intraday_0dte"
+    assert _lane(0, 11, same, same) == "intraday_0dte"
+    assert _lane(0, 12, same, same) == "late_0dte"
+    assert _lane(0, 15, same, same) == "late_0dte"
+    # 0DTE 的判定与是否跨日无关：合约当天到期，午前开仓仍算日内车道。
+    assert _lane(0, 10, same, later) == "intraday_0dte"
+
+    # DTE 1-3：任何时段、任何持有时长一律违规（V2-C①），两头都不占。
+    for dte in (1, 2, 3):
+        assert _lane(dte, 9, same, same) == "dte_1_3"
+        assert _lane(dte, 9, same, later) == "dte_1_3"
+        assert _lane(dte, 13, same, later) == "dte_1_3"
+
+    # DTE 4 与 7 是过夜车道的两个端点（V2-B），跨自然日才成立。
+    assert _lane(4, 9, same, later) == "overnight_4_7"
+    assert _lane(7, 9, same, later) == "overnight_4_7"
+    # 同一批合约当日平掉＝买了时间却不用（V2-C②）。
+    assert _lane(4, 9, same, same) == "bought_time_unused"
+    assert _lane(7, 9, same, same) == "bought_time_unused"
+
+    # DTE 8 越过过夜车道上界：隔夜＝规则未覆盖，当日平仍是「买了时间却不用」。
+    assert _lane(8, 9, same, later) == "other"
+    assert _lane(8, 9, same, same) == "bought_time_unused"
+    assert _lane(400, 9, same, later) == "other"
+
+    # 缺席即缺席：缺 DTE、缺日期、缺 ET 小时、负 DTE 一律 unknown，绝不并入 other。
+    assert _lane(None, 9, same, same) == "unknown"
+    assert _lane(-1, 9, same, same) == "unknown"
+    assert _lane(0, None, same, same) == "unknown"
+    assert _lane(5, 9, same, None) == "unknown"
+    assert _lane(5, 9, None, later) == "unknown"
+
+
+def test_classify_rule_lane_same_day_boundary_is_calendar_not_duration():
+    """当日/隔夜按 ET 自然日判定，不按持仓时长——20 小时同日仍是当日平。"""
+    assert _lane(5, 4, "2026-05-04", "2026-05-04") == "bought_time_unused"
+    # 只跨过一个自然日边界（哪怕只有几分钟）就是过夜。
+    assert _lane(5, 23, "2026-05-04", "2026-05-05") == "overnight_4_7"
+
+
+def test_classify_rule_lane_is_total_over_the_declared_lanes():
+    """判定是全函数：任何输入都落在 RULE_LANES 内，且每条车道都有判定与规则号。"""
+    for dte in (None, -3, 0, 1, 2, 3, 4, 5, 6, 7, 8, 45, 400):
+        for hour in (None, 0, 9, 11, 12, 23):
+            for closed in (None, "2026-05-04", "2026-05-05"):
+                lane = _lane(dte, hour, "2026-05-04", closed)
+                assert lane in RULE_LANES
+    assert set(RULE_COMPLIANCE_LANE_VERDICTS) == set(RULE_LANES)
+    assert set(RULE_COMPLIANCE_LANE_RULE_IDS) == set(RULE_LANES)
+    assert set(RULE_COMPLIANCE_LANE_VERDICTS.values()) <= set(RULE_VERDICTS)
+
+
+def _compliance_spec(
+    opened_at: datetime,
+    pnl: str,
+    *,
+    dte: int,
+    hold_seconds: int = 1_200,
+    opening_cash_flow: str = "1000",
+    fee: Optional[str] = "1",
+    evidence_summary_json: Optional[str] = None,
+) -> dict:
+    return {
+        "underlying": "AAA",
+        "opened_at": opened_at,
+        "hold_seconds": hold_seconds,
+        "realized_pnl_net": Decimal(pnl),
+        "total_fee": Decimal(fee) if fee is not None else None,
+        "dte_at_entry": dte,
+        "opening_cash_flow": Decimal(opening_cash_flow),
+        "evidence_summary_json": (
+            evidence_summary_json
+            if evidence_summary_json is not None
+            else _evidence_summary(3)
+        ),
+    }
+
+
+def _may(day: int, hour: int = 14) -> datetime:
+    """UTC moment whose ET≈UTC−4 hour is ``hour - 4`` (14 UTC = 10:00 ET)."""
+    return datetime(2026, 5, day, hour, 0, tzinfo=timezone.utc)
+
+
+def test_rule_compliance_buckets_and_verdict_rollups():
+    """车道桶与合规/违规汇总同口径：gross=净+费用，risk=|开仓现金流|。"""
+    _seed_build(
+        [
+            # 日内合规（ET 10:00 开、0DTE）。
+            _compliance_spec(_may(4), "100", dte=0),
+            _compliance_spec(_may(5), "-40", dte=0),
+            # 午后 0DTE（ET 13:00）＝违规 V2-C③。
+            _compliance_spec(_may(6, 17), "-30", dte=0),
+            # 过夜合规（4DTE，跨自然日）。
+            _compliance_spec(_may(7), "300", dte=4, hold_seconds=90_000),
+            # 1-3DTE＝违规 V2-C①。
+            _compliance_spec(_may(8), "-20", dte=2),
+            # 买了时间却不用＝违规 V2-C②。
+            _compliance_spec(_may(11), "-50", dte=5),
+            # ≥8DTE 隔夜＝规则未覆盖。
+            _compliance_spec(_may(12), "10", dte=30, hold_seconds=90_000),
+            # 缺 DTE＝不可判定，绝不并入 other。
+            {
+                "underlying": "AAA",
+                "opened_at": _may(13),
+                "hold_seconds": 1_200,
+                "realized_pnl_net": Decimal("5"),
+                "total_fee": Decimal("1"),
+                "dte_at_entry": None,
+                "opening_cash_flow": Decimal("1000"),
+                "evidence_summary_json": _evidence_summary(3),
+            },
+        ]
+    )
+    result = get_personal_edge_stats()
+    assert result is not None
+    compliance = result.rule_compliance
+    assert compliance.rule_set_id == "v2"
+    assert compliance.adopted_at == RULE_SET_V2_ADOPTED_AT
+    assert compliance.clean_basis_start == RULE_COMPLIANCE_CLEAN_BASIS_START
+    assert compliance.population_n == 8
+
+    lanes = {lane.key: lane for lane in compliance.all_history.lanes}
+    assert set(lanes) == set(RULE_LANES)
+    assert lanes["intraday_0dte"].n == 2
+    assert lanes["intraday_0dte"].verdict == "compliant"
+    assert lanes["intraday_0dte"].rule_id == "V2-A"
+    # gross = 净 + 费用 = (100 - 40) + 2 = 62；risk = 2 × 1000。
+    assert lanes["intraday_0dte"].gross == pytest.approx(62.0)
+    assert lanes["intraday_0dte"].gross_pct == pytest.approx(0.031)
+    assert lanes["intraday_0dte"].toll_pct == pytest.approx(0.001)
+    assert lanes["intraday_0dte"].win_rate == pytest.approx(0.5)
+    assert lanes["intraday_0dte"].risk == pytest.approx(2000.0)
+    assert lanes["late_0dte"].n == 1
+    assert lanes["late_0dte"].verdict == "violation"
+    assert lanes["late_0dte"].rule_id == "V2-C③"
+    assert lanes["overnight_4_7"].n == 1
+    assert lanes["overnight_4_7"].rule_id == "V2-B"
+    assert lanes["dte_1_3"].n == 1
+    assert lanes["bought_time_unused"].n == 1
+    assert lanes["other"].n == 1
+    assert lanes["other"].verdict == "uncovered"
+    assert lanes["unknown"].n == 1
+    assert lanes["unknown"].verdict == "unknown"
+
+    verdicts = {item.key: item for item in compliance.all_history.verdicts}
+    assert verdicts["compliant"].n == 3
+    # (100 - 40 + 300) + 3 费用 = 363，除以 3000。
+    assert verdicts["compliant"].gross_pct == pytest.approx(0.121)
+    assert verdicts["violation"].n == 3
+    # (-30 - 20 - 50) + 3 = −97，除以 3000。
+    assert verdicts["violation"].gross_pct == pytest.approx(-0.032333)
+    assert verdicts["uncovered"].n == 1
+    assert verdicts["unknown"].n == 1
+    # 每一条边界原文下发，消费端不得自行改写。
+    assert compliance.limitations == RULE_COMPLIANCE_LIMITATIONS
+
+
+def test_rule_compliance_empty_bucket_says_no_sample_not_zero():
+    _seed_build([_compliance_spec(_may(4), "100", dte=0)])
+    result = get_personal_edge_stats()
+    assert result is not None
+    lanes = {lane.key: lane for lane in result.rule_compliance.all_history.lanes}
+    empty = lanes["overnight_4_7"]
+    assert empty.n == 0
+    # 空桶不是 0%：比率全部缺席并带原因。
+    assert empty.gross_pct is None
+    assert empty.toll_pct is None
+    assert empty.win_rate is None
+    assert empty.risk is None
+    assert empty.ratio_reason is not None
+    assert empty.gross_pct_excluding_top_n is None
+    assert empty.excluding_top_n_reason is not None
+
+
+def test_rule_compliance_reuses_exclude_top_n_gate():
+    """剔除最好 N 笔复用规模与频率同一实现与 n≥15 门槛。"""
+    # 14 笔 → 未达门槛：null + 原因（绝不给截断样本的数字）。
+    _seed_build(
+        [
+            _compliance_spec(_may(4), str(index), dte=0)
+            for index in range(1, 15)
+        ]
+    )
+    small = get_personal_edge_stats()
+    assert small is not None
+    lanes = {lane.key: lane for lane in small.rule_compliance.all_history.lanes}
+    assert lanes["intraday_0dte"].n == 14
+    assert lanes["intraday_0dte"].gross_pct_excluding_top_n is None
+    assert str(DISCIPLINE_BODY_MIN_EPISODE_COUNT) in (
+        lanes["intraday_0dte"].excluding_top_n_reason or ""
+    )
+
+    # 15 笔 → 恰好达标：去掉最好的 5 笔后剩 10 笔。
+    _seed_build(
+        [
+            _compliance_spec(_may(4), str(index), dte=0)
+            for index in range(1, 16)
+        ],
+        account_key="exclude_top_n_account",
+    )
+    big = get_personal_edge_stats("exclude_top_n_account")
+    assert big is not None
+    lane = {
+        item.key: item for item in big.rule_compliance.all_history.lanes
+    }["intraday_0dte"]
+    assert lane.n == 15
+    assert lane.excluding_top_n_count == 15 - DISCIPLINE_EXCLUDE_TOP_N
+    # 剩余 1..10 的净盈亏 55 + 10 费用 = 65，除以 10 × 1000。
+    assert lane.gross_pct_excluding_top_n == pytest.approx(0.0065)
+    assert lane.excluding_top_n_reason is None
+    assert big.rule_compliance.exclude_top_n == DISCIPLINE_EXCLUDE_TOP_N
+    assert (
+        big.rule_compliance.exclude_top_n_min_episode_count
+        == DISCIPLINE_BODY_MIN_EPISODE_COUNT
+    )
+
+
+def test_rule_compliance_clean_basis_excludes_aggregate_and_early_rows():
+    """干净口径：早于 2026-04-21、汇总 ORDER 口径、缺风险金额三类各自计缺席。"""
+    _seed_build(
+        [
+            # 早于干净口径起点。
+            _compliance_spec(_april(20, 14), "100", dte=0),
+            # 汇总 ORDER 口径（fill_allocations=0）。
+            _compliance_spec(
+                _may(4), "100", dte=0, evidence_summary_json=_evidence_summary(0)
+            ),
+            # 口径来源不可判定。
+            _compliance_spec(_may(5), "100", dte=0, evidence_summary_json="{}"),
+            # 缺开仓现金流。
+            {
+                "underlying": "AAA",
+                "opened_at": _may(6),
+                "hold_seconds": 1_200,
+                "realized_pnl_net": Decimal("100"),
+                "total_fee": Decimal("1"),
+                "dte_at_entry": 0,
+                "opening_cash_flow": None,
+                "evidence_summary_json": _evidence_summary(3),
+            },
+            # 唯一进入统计的回合。
+            _compliance_spec(_may(7), "100", dte=0),
+        ]
+    )
+    result = get_personal_edge_stats()
+    assert result is not None
+    compliance = result.rule_compliance
+    assert compliance.population_n == 1
+    assert compliance.excluded_before_clean_basis_count == 1
+    assert compliance.excluded_aggregate_or_unknown_basis_count == 2
+    assert compliance.excluded_missing_premium_count == 1
+    # 排除的理由原文可读，不是一个沉默的过滤器。
+    assert "fill_allocations" in compliance.clean_basis_reason
+    assert RULE_COMPLIANCE_CLEAN_BASIS_START in compliance.clean_basis_reason
+
+
+def test_rule_compliance_since_cutoff_slices_forward_only():
+    _seed_build(
+        [
+            _compliance_spec(_may(4), "100", dte=0),
+            _compliance_spec(_may(20), "-60", dte=0),
+            _compliance_spec(_may(21), "40", dte=0),
+        ]
+    )
+    result = get_personal_edge_stats(rule_compliance_since="2026-05-20")
+    assert result is not None
+    compliance = result.rule_compliance
+    assert compliance.adopted_at == "2026-05-20"
+    assert compliance.all_history.n == 3
+    assert compliance.all_history.state == "ready"
+    assert compliance.all_history.start_date == RULE_COMPLIANCE_CLEAN_BASIS_START
+    # 切点当天算「采纳后」（>=），5/4 的回合不进入前向切片。
+    assert compliance.since_adoption.n == 2
+    assert compliance.since_adoption.state == "ready"
+    assert compliance.since_adoption.start_date == "2026-05-20"
+    forward = {
+        item.key: item for item in compliance.since_adoption.lanes
+    }["intraday_0dte"]
+    assert forward.n == 2
+    # (−60 + 40) + 2 费用 = −18，除以 2000。
+    assert forward.gross_pct == pytest.approx(-0.009)
+
+
+def test_rule_compliance_since_adoption_empty_is_explicit_not_zeroed():
+    """采纳后尚无样本是事实：显式状态 + 原因，绝不渲染成一张全 0 的表。"""
+    _seed_build([_compliance_spec(_may(4), "100", dte=0)])
+    result = get_personal_edge_stats()
+    assert result is not None
+    forward = result.rule_compliance.since_adoption
+    assert forward.state == "no_episodes_since_adoption"
+    assert forward.n == 0
+    assert forward.state_reason is not None
+    assert RULE_SET_V2_ADOPTED_AT in forward.state_reason
+    # 每条车道都在，但都是「无样本」而不是 0%。
+    for lane in forward.lanes:
+        assert lane.n == 0
+        assert lane.gross_pct is None
+        assert lane.ratio_reason is not None
+
+
+def test_rule_compliance_since_rejects_a_non_date_cutoff():
+    _seed_build([_compliance_spec(_may(4), "100", dte=0)])
+    with pytest.raises(EpisodeRepositoryError):
+        get_personal_edge_stats(rule_compliance_since="not-a-date")
+
+
+def test_rule_compliance_daily_budget_counts_from_the_build_last_day():
+    """V2-D 额度读数带明确 as-of 交易日；午后 0DTE 同样占用当日额度。"""
+    _seed_build(
+        [
+            # 最后一个交易日（ET 2026-05-11）：3 笔 0DTE，其中 1 笔为午后违规单。
+            _compliance_spec(_may(11), "10", dte=0),
+            _compliance_spec(_may(11), "10", dte=0),
+            _compliance_spec(_may(11, 17), "10", dte=0),
+            # 更早的一天不进入当日额度。
+            _compliance_spec(_may(8), "10", dte=0),
+            # 仍未平仓的 4-7DTE＝当前过夜持仓。
+            {
+                "underlying": "AAA",
+                "opened_at": _may(11),
+                "lifecycle_status": "open",
+                "realized_pnl_net": None,
+                "dte_at_entry": 5,
+            },
+            # 未平仓但 DTE 不在 4-7：不计入过夜持仓。
+            {
+                "underlying": "AAA",
+                "opened_at": _may(11),
+                "lifecycle_status": "open",
+                "realized_pnl_net": None,
+                "dte_at_entry": 30,
+            },
+            # 未平仓且缺 DTE：单独计缺席，绝不悄悄算作 0。
+            {
+                "underlying": "AAA",
+                "opened_at": _may(11),
+                "lifecycle_status": "open",
+                "realized_pnl_net": None,
+                "dte_at_entry": None,
+            },
+        ]
+    )
+    result = get_personal_edge_stats()
+    assert result is not None
+    budget = result.rule_compliance.daily_budget
+    assert budget.as_of_trading_day == "2026-05-11"
+    assert budget.intraday_ticket_count == 3
+    assert budget.intraday_ticket_limit == INTRADAY_LANE_DAILY_TICKET_LIMIT == 6
+    assert budget.intraday_reason is None
+    assert budget.overnight_open_count == 1
+    assert budget.overnight_concurrent_limit == OVERNIGHT_LANE_CONCURRENT_LIMIT == 3
+    assert budget.overnight_unknown_dte_open_count == 1
+
+
+def test_rule_compliance_constants_match_the_adopted_rule_set():
+    """UI 引用规则编号，数值只此一处真源——常量漂移会立刻被这条测试抓到。"""
+    assert RULE_SET_V2_ADOPTED_AT == "2026-08-05"
+    assert RULE_COMPLIANCE_CLEAN_BASIS_START == "2026-04-21"
+    assert INTRADAY_LANE_DTE == 0
+    assert INTRADAY_LANE_ET_CUTOFF_HOUR == 12
+    assert (OVERNIGHT_LANE_MIN_DTE, OVERNIGHT_LANE_MAX_DTE) == (4, 7)
+    assert OVERNIGHT_LANE_WEAK_ENTRY_ET_HOURS == (11, 13)
+    assert INTRADAY_LANE_DAILY_TICKET_LIMIT == 6
+    assert OVERNIGHT_LANE_CONCURRENT_LIMIT == 3
+    # 单一 regime / n=65 / 跳空风险 / 非建议：四条边界必须原文在场。
+    joined = "".join(RULE_COMPLIANCE_LIMITATIONS)
+    assert "n=65" in joined
+    assert "跳空" in joined
+    assert "不构成建议" in joined
+    assert "只读，不下单" in joined

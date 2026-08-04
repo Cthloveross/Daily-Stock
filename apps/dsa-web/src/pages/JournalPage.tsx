@@ -15,6 +15,7 @@ import AskJournalChat from '../components/journal/AskJournalChat';
 import PositionEpisodesPanel from '../components/journal/PositionEpisodesPanel';
 import ReviewInsightsPanel from '../components/journal/ReviewInsightsPanel';
 import DisciplineMonthlyPanel from '../components/journal/DisciplineMonthlyPanel';
+import RuleCompliancePanel from '../components/journal/RuleCompliancePanel';
 import PlaybookPanel from '../components/journal/PlaybookPanel';
 import CurrentPositionsSnapshotCard from '../components/journal/CurrentPositionsSnapshotCard';
 import { positionReviewPath } from '../components/journal/review/journalReviewRouting';
@@ -296,6 +297,8 @@ const JournalPage: React.FC = () => {
           />
           {/* 模式观察的同层兄弟：规模与频率（每美元回报才是真账）按月摊开。 */}
           <DisciplineMonthlyPanel />
+          {/* 规模与频率的同层兄弟：两车道规则的遵守度记账（合规单 vs 违规单）。 */}
+          <RuleCompliancePanel />
           <PlaybookPanel refreshToken={playbookRefreshToken} />
         </div>
       )}
