@@ -169,9 +169,12 @@ describe('DisciplineMonthlyPanel', () => {
     const missing = within(august).getAllByText('标缺');
     // 中位仓位 / 风险金额合计 / 每美元回报 / 本体盈亏 四个读数全部显式缺席。
     expect(missing).toHaveLength(4);
-    expect(missing.some((node) => node.getAttribute('title')?.includes('15 笔'))).toBe(true);
+    // 原因走共享 Tooltip + aria-label（仓库 UI 治理禁用原生 title）。
     expect(
-      missing.some((node) => node.getAttribute('title')?.includes('opening_cash_flow')),
+      missing.some((node) => node.getAttribute('aria-label')?.includes('15 笔')),
+    ).toBe(true);
+    expect(
+      missing.some((node) => node.getAttribute('aria-label')?.includes('opening_cash_flow')),
     ).toBe(true);
   });
 

@@ -3,14 +3,21 @@
 
 包含两类：
 
-1. **校准回归**（永久 fixture）：2026-07-31（周五）常规时段真实 5m K 线
+1. **校准回归**（永久 fixture）：2026-07-31（周五）真实 5m K 线
    （MU/AMZN/NVDA/GOOGL，来自与 /stocks/{code}/history?period=5m 相同的
    服务端加载器），当日可交易机会由用户标注：MU ~09:45 跳水、AMZN 09:30
    开盘波、NVDA 09:40 与 15:15 两波；GOOGL 是 v1 失败样本（全时段聚合把它
    排第一，但它没有可比的 15 分钟爆发）。阈值改动若打破这些断言，必须先
    重新校准并升 signal_version。
+
+   **v8 口径修正**：fixture 现在保存**供应商原始时间戳**（Moomoo ``time_key``
+   按 K 线结束时间打标）且窗口放宽到 09:00–16:30，因此这批断言同时也在验证
+   「先归一到开始时间、再按 09:30 ≤ start < 16:00 取常规时段」这条链路。
+   用户标注的时刻是**人读盘面的开始时间**口径（「09:30 开盘波」＝开盘那一刻），
+   与归一后的标签一致；归一前它们整体晚 5 分钟。
 2. **单元**：归一化数学手工核对、开盘初段中位数回退、独立波段合并、
-   休市时段归属、无 K 线 fail-closed。
+   休市时段归属、无 K 线 fail-closed、时段边界（收盘集合竞价必须保留、
+   盘前 K 线必须排除）。
 """
 from __future__ import annotations
 
@@ -42,6 +49,7 @@ from src.opportunities.intraday_bursts import (
     MEDIAN_BASIS_CURRENT,
     MEDIAN_BASIS_PRIOR,
     SPEED_BASIS,
+    compute_burst_windows,
     compute_fizzle_flag,
     compute_recent_displacement,
     compute_session_burst_profile,
@@ -49,6 +57,7 @@ from src.opportunities.intraday_bursts import (
     compute_window_efficiency,
     filter_regular_session_bars,
     select_distinct_legs,
+    normalize_bar_label_convention,
     split_burst_session_bars,
     unavailable_burst_profile,
 )
@@ -64,9 +73,18 @@ def labeled_bars() -> dict:
         return json.load(fh)
 
 
+def _normalized(labeled_bars: dict, symbol: str) -> list[dict]:
+    """Fixture 存的是供应商原始（结束时间）标签，先按生产链路归一。"""
+
+    entry = labeled_bars["symbols"][symbol]
+    return normalize_bar_label_convention(
+        entry["bars"], source=entry["source"]
+    )
+
+
 def _profile(labeled_bars: dict, symbol: str) -> dict:
     return compute_session_burst_profile(
-        labeled_bars["symbols"][symbol]["bars"],
+        _normalized(labeled_bars, symbol),
         market_date_et="2026-07-31",
         quote_session_scope="current_session",
         source=labeled_bars["symbols"][symbol]["source"],
@@ -99,14 +117,52 @@ class TestCalibrationRegression:
         assert leg["vol_norm"] >= 4.0
 
     def test_amzn_opening_wave_detected(self, labeled_bars):
+        """AMZN 09:30 开盘波：v8 归一后仍是「强」窗口，但不再进 legs。
+
+        这是本次口径修正里**唯一**发生变化的校准断言，前后对照：
+
+        - 修正前：窗口标签 09:30 实际覆盖 09:25–09:40（含一根盘前 K 线，
+          且恰好收在 09:40 的日内尖顶 268.28），thrust +1.05% × volN 5.62
+          ⇒ score 18.72，稳居 legs 第一。
+        - 修正后：同一标签真正覆盖 09:30–09:45（官方开盘价 265.00 → 09:45
+          收 266.08，中间已回落），thrust +0.408% × volN 6.61 ⇒ score 8.56。
+
+        8.56 **仍然 ≥ LEG_MIN_SCORE（8.0）**——阈值不需要重新校准，开盘波
+        照样被识别为强窗口。它退出 legs 的原因是 LEG_MIN_GAP_MINUTES=30 的
+        去重：09:45 那个窗口（11.05）分更高且只隔 15 分钟，贪心先占位。
+        因此这里断言「开盘窗口仍是强 up 窗口」，而不是「它必须出现在 legs」，
+        以免把一个**选择规则**的结果误记成**检测能力**的丧失。
+        """
+
         profile = _profile(labeled_bars, "AMZN")
-        legs = profile["legs"]
+        _target, session_bars, _prior = split_burst_session_bars(
+            _normalized(labeled_bars, "AMZN"),
+            market_date_et="2026-07-31",
+            quote_session_scope="current_session",
+        )
+        windows = compute_burst_windows(
+            session_bars,
+            profile["median_bar_range"],
+            profile["median_bar_volume"],
+        )
         opening = [
-            leg for leg in legs if _minutes(leg["start_et"]) <= _minutes("09:35")
+            window
+            for window in windows
+            if _minutes(window["start_et"]) <= _minutes("09:35")
         ]
-        assert opening, f"AMZN 09:30 opening wave missing from legs: {legs}"
-        assert opening[0]["direction"] == "up"
-        assert opening[0]["score"] >= LEG_MIN_SCORE
+        assert opening, f"AMZN opening windows missing: {windows[:3]}"
+        first = opening[0]
+        assert first["start_et"] == "09:30"
+        assert first["direction"] == "up"
+        assert first["score"] >= LEG_MIN_SCORE
+        # 窗口首根开盘价必须是**官方开盘价**，不是盘前那根的开盘价：
+        # 这正是修正前被污染的量（265.50 盘前 → 265.00 官方开盘）。
+        assert session_bars[0]["open"] == pytest.approx(265.00, abs=0.01)
+        # 被 30 分钟去重挤掉它的那个窗口确实分更高、且在 30 分钟内。
+        winner = max(profile["legs"], key=lambda leg: leg["score"])
+        assert profile["legs"][0]["start_et"] == "09:45"
+        assert profile["legs"][0]["score"] > first["score"]
+        assert winner["score"] >= LEG_MIN_SCORE
 
     def test_nvda_two_waves_including_late_day(self, labeled_bars):
         profile = _profile(labeled_bars, "NVDA")
@@ -121,6 +177,81 @@ class TestCalibrationRegression:
         assert morning and morning[0]["direction"] == "down"
         assert late, f"NVDA post-15:00 wave missing: {legs}"
         assert late[0]["direction"] == "up"
+
+    def test_session_edges_keep_closing_auction_and_drop_premarket(
+        self, labeled_bars
+    ):
+        """时段边界（v8 回归）：收盘集合竞价必须在，盘前那根必须不在。
+
+        Moomoo 的 ``time_key`` 按 K 线**结束**时间打标，所以供应商标签 16:00
+        才是收盘集合竞价（15:55–16:00），而供应商标签 09:30 是盘前
+        （09:25–09:30）。归一前按 09:30 ≤ 标签 < 16:00 取，实际取到的是
+        09:25–15:55：多一根盘前、少一根收盘竞价。
+        """
+
+        for symbol in ("MU", "AMZN", "NVDA", "GOOGL"):
+            raw = labeled_bars["symbols"][symbol]["bars"]
+            by_vendor_label = {
+                bar["date"][11:16]: bar
+                for bar in raw
+                if bar["date"][:10] == "2026-07-31"
+            }
+            # fixture 必须真的含有两侧边界，否则这条断言是空转。
+            assert "09:30" in by_vendor_label and "16:00" in by_vendor_label
+
+            rows = [
+                row
+                for row in filter_regular_session_bars(
+                    _normalized(labeled_bars, symbol)
+                )
+                if row["session_date_et"] == "2026-07-31"
+            ]
+            labels = [row["start_et"].strftime("%H:%M") for row in rows]
+
+            # 常规时段恰好 78 根 5m K 线：09:30 … 15:55（含收盘竞价那根）。
+            assert len(rows) == 78, f"{symbol}: {len(rows)} bars"
+            assert labels[0] == "09:30" and labels[-1] == "15:55"
+            assert "16:00" not in labels  # 归一后不该再出现越界标签
+
+            # 收盘集合竞价（供应商标签 16:00）被保留，且落在 15:55 这根上。
+            closing = rows[-1]
+            assert closing["close"] == pytest.approx(
+                float(by_vendor_label["16:00"]["close"]), abs=1e-6
+            )
+            assert closing["volume"] == pytest.approx(
+                float(by_vendor_label["16:00"]["volume"]), abs=1e-6
+            )
+            # 盘前那根（供应商标签 09:30）被排除：它的成交量绝不出现在时段内。
+            premarket_volume = float(by_vendor_label["09:30"]["volume"])
+            assert all(
+                row["volume"] != pytest.approx(premarket_volume, abs=1e-6)
+                for row in rows
+            )
+            # 开盘那根＝供应商标签 09:35（开盘集合竞价），量能远大于盘前。
+            assert rows[0]["open"] == pytest.approx(
+                float(by_vendor_label["09:35"]["open"]), abs=1e-6
+            )
+            assert rows[0]["volume"] > premarket_volume * 3
+
+    def test_normalize_bar_label_convention_only_shifts_known_end_sources(self):
+        """归一只对已知「按结束时间打标」的源生效，其余逐字不动。"""
+
+        bars = [
+            {"date": "2026-07-31T09:35:00-04:00", "open": 1.0, "high": 1.0,
+             "low": 1.0, "close": 1.0, "volume": 1.0}
+        ]
+        shifted = normalize_bar_label_convention(bars, source="MoomooFetcher")
+        assert shifted[0]["date"].startswith("2026-07-31T09:30:00")
+        # 原始入参不被就地改写。
+        assert bars[0]["date"] == "2026-07-31T09:35:00-04:00"
+        for source in ("YfinanceFetcher", None, "", "unknown"):
+            same = normalize_bar_label_convention(bars, source=source)
+            assert same[0]["date"] == "2026-07-31T09:35:00-04:00"
+        # 解析不出时间戳的行原样保留，交给 filter 统一丢弃。
+        junk = [{"date": "not-a-time", "open": 1.0}]
+        assert normalize_bar_label_convention(
+            junk, source="MoomooFetcher"
+        )[0]["date"] == "not-a-time"
 
     def test_googl_best_leg_stays_below_mu_plunge(self, labeled_bars):
         """v1 失败样本保持修复：GOOGL 的最佳波段必须弱于 MU 的跳水。"""

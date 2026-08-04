@@ -1220,9 +1220,16 @@ class IntradayRecentDisplacement(BaseModel):
     MAE −0.49 ATR，仅 18.3% 达到 ≥0.5 ATR；走出来的赢家（30 分钟–3 小时）
     MFE 0.69 / MAE −0.13，71.2% 达到 ≥0.5 ATR；样本 84% 的合约 ≤1DTE。
 
-    因此 ``survival_line_atr = 0.5`` 是**用户自己样本里的经验线**——描述统计，
-    不是预测、不是买卖信号，样本窗口恰是他最差的两个月且分组按持仓时长定义
-    （与结果存在循环性）。K 线不足或 ATR 标尺不可得时显式标缺，绝不 0 回填。
+    【v8 更正】上面这张表按**持仓时长**分组，而持仓时长本身由结果决定——该分层
+    按构造就是循环的。2026-08 的 2m 回放研究（3,492 次回踩持稳进场）量化了它：
+    循环记分下「速度未死 vs 已死」的 P(>0) 差 37.6 个百分点（54.4% vs 16.8%），
+    改成只从第 15 分钟检查点**向前**计分后只剩 **0.1 个百分点**（49.9% vs
+    49.8%），且样本内那点微弱效应样本外反号（+0.122 → −0.128）。结论：肉眼可见
+    的鸿沟几乎全部是循环性，**本字段只描述已经发生的事，不含任何前向信息**。
+
+    因此 ``survival_line_atr = 0.5`` 只是**用户自己样本里的经验参考刻度**——
+    描述统计，不是预测、不是买卖信号，更不是「越过就能活下来」的门槛；样本窗口
+    恰是他最差的两个月。K 线不足或 ATR 标尺不可得时显式标缺，绝不 0 回填。
     """
 
     state: Literal["ready", "insufficient_bars", "unavailable"]
@@ -1446,7 +1453,7 @@ class IntradayTopResponse(BaseModel):
     quote_session_scope: Literal["current_session", "latest_prior_session"]
     quote_session_label: str
     market_context: IntradayMarketContext
-    signal_version: Literal["intraday_session_evidence_v7"]
+    signal_version: Literal["intraday_session_evidence_v8"]
     ranking_method: Literal[
         "burst_score_first_then_evidence_count",
         "rule_based_evidence_count",

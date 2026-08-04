@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { fetchPersonalEdge } from '../../api/journal';
 import { parseApiError, type ParsedApiError } from '../../api/error';
 import type { PersonalEdgeResponse } from '../../types/journal';
+import { Tooltip } from '../common/Tooltip';
 
 /**
  * 「规模与频率」：模式观察的同层兄弟区块，把每美元回报（真账）与仓位、频率、
@@ -45,10 +46,17 @@ const fmtShare = (value: number | null): string =>
 const fmtTrades = (value: number | null): string =>
   value === null ? MISSING : value.toLocaleString('en-US', { maximumFractionDigits: 1 });
 
-/** 分母不足的读数把原因挂到 title 上：屏幕上是「标缺」，悬停能读到为什么。 */
+/** 分母不足的读数用共享 Tooltip 挂原因：屏幕上是「标缺」，悬停能读到为什么。
+ * （原生 title 被仓库 UI 治理测试禁用，必须走 Tooltip 组件。） */
 const Cell: React.FC<{ text: string; reason?: string | null }> = ({ text, reason }) => (
   <td className="px-3 py-1.5 text-right font-mono text-mono-xs tabular-nums text-text-1">
-    <span title={text === MISSING && reason ? reason : undefined}>{text}</span>
+    {text === MISSING && reason ? (
+      <Tooltip content={reason}>
+        <span aria-label={reason}>{text}</span>
+      </Tooltip>
+    ) : (
+      <span>{text}</span>
+    )}
   </td>
 );
 

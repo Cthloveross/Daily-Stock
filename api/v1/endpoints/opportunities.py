@@ -2058,9 +2058,16 @@ def _fetch_intraday_5m_bars(symbol: str) -> tuple[list[dict[str, Any]], Optional
     """Server-side 5m bars via the same loader as /stocks/{code}/history.
 
     Isolated so tests can stub it; never called when the symbol is cached.
+
+    v8：这里是盘中 5m K 线进入研究管线（波段爆发 / 近 30 分钟位移 / v4 形态
+    对比）的**唯一入口**，因此也是把不同数据源的 K 线时间戳口径统一到「开始
+    时间」的唯一位置。Moomoo ``time_key`` 按 K 线**结束**时间打标（2026-08-04
+    实测确认，见 intraday_bursts 的口径说明），不归一就会漏掉收盘集合竞价那根、
+    反而混进一根盘前 K 线；yfinance 等本来就按开始时间打标的源逐字不动。
     """
 
     from src.services.stock_service import StockService
+    from src.opportunities.intraday_bursts import normalize_bar_label_convention
 
     result = StockService().get_history_data(
         symbol,
@@ -2068,7 +2075,11 @@ def _fetch_intraday_5m_bars(symbol: str) -> tuple[list[dict[str, Any]], Optional
         days=_INTRADAY_BURST_FETCH_DAYS,
         include_stock_name=False,
     )
-    return list(result.get("data") or []), result.get("source")
+    source = result.get("source")
+    bars = normalize_bar_label_convention(
+        list(result.get("data") or []), source=source
+    )
+    return bars, source
 
 
 def _prune_intraday_burst_cache(now: float) -> None:

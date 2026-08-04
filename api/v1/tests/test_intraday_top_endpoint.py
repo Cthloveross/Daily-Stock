@@ -242,7 +242,7 @@ def test_contract_regular_session_full_row(monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert body["schema_version"] == "intraday-top/1.0"
-    assert body["signal_version"] == "intraday_session_evidence_v7"
+    assert body["signal_version"] == "intraday_session_evidence_v8"
     # 盘中主排序 = 波段爆发分优先。
     assert body["ranking_method"] == "burst_score_first_then_evidence_count"
     # 不冻结、不入统计的显式标记。
@@ -380,7 +380,26 @@ def test_contract_regular_session_full_row(monkeypatch):
     assert all(
         entry["metric"] != "recent_displacement" for entry in item["evidence"]
     )
-    assert any("0.5 ATR 是你自己 766 笔回合" in text for text in body["limitations"])
+    assert any("0.5 ATR 仍按你自己 766 笔回合" in text for text in body["limitations"])
+    # v8：位移 limitation 必须携带循环性更正，且不得再有存活框架的读法。
+    displacement_line = next(
+        text for text in body["limitations"] if "近 30 分钟位移" in text
+    )
+    assert "【v8 更正】" in displacement_line
+    assert "按构造就是循环的" in displacement_line
+    assert "37.6 个百分点" in displacement_line and "0.1 个百分点" in displacement_line
+    assert "不含任何前向信息" in displacement_line
+    assert "不要把 0.5 读成「越过就能活下来」" in displacement_line
+    assert "经验「活下来」线" not in displacement_line
+    # v8：K 线时间戳口径修正与收盘竞价口径性质如实声明在波段证据的 limitations 里。
+    burst_limitations = next(
+        entry["limitations"]
+        for entry in item["evidence"]
+        if entry["metric"] == "session_momentum_burst"
+    )
+    assert any("K 线时间戳口径修正（v8）" in text for text in burst_limitations)
+    assert any("25/25 个标的-交易日逐分钱吻合" in text for text in burst_limitations)
+    assert any("收盘集合竞价的口径性质（v8）" in text for text in burst_limitations)
     assert any(
         "不是预测、不是买卖信号" in text for text in item["limitations"]
     )

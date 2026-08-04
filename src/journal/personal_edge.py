@@ -20,48 +20,74 @@ Hard boundaries (same family as ``review_insights``):
 * everything is descriptive, not causal — the mandatory limitation strings
   ship inside the result so every consumer renders the caveat verbatim.
 
-规模与频率纪律（``discipline`` block, 2026-08-04）
-------------------------------------------------
+规模与频率纪律（``discipline`` block, 2026-08-04；口径订正 2026-08-04 晚）
+--------------------------------------------------------------------
 
-Why this block exists — a full-sample forensic study of the user's own 1,554
-option episodes (2026-03-04→07-31, episode build #3, 5m bars from their own
-Moomoo feed) asked why April→July P&L decayed, and found the three usual
-suspects are statistically flat:
+Why this block exists — a full-sample forensic study of the user's own option
+episodes (2026-03-04→07-31, episode build #3) asked why April→July P&L
+"decayed", and found the three usual suspects statistically flat:
 
-* entry geometry — chase share 52.0% → 56.6%, χ² month × class p=0.105
-  (no detectable decay);
+* entry geometry — chase share 52.0% → 56.6%, χ² month × class p=0.105;
 * market follow-through — median forward-30m MFE 0.370 → 0.341, Kruskal
   p=0.337 across all five months (the months are indistinguishable);
 * stop discipline — median loss −22.6% → −24.4% of premium (stable).
 
-What did change is size, frequency and per-dollar edge:
+口径订正（本次改动的理由）
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+A follow-up study invalidated the headline this block used to imply.  The
+monthly ``pnl_per_dollar_risked`` fall (4.85% Apr → −0.19% Jul) is **75%
+measurement artifact**, and shipping it as one continuous trend line is
+actively misleading:
 
-* return per dollar risked collapsed ~24x (5.83% → 0.24%), a step down right
-  after April;
-* median premium at risk per trade 2.4x ($4,097 → $9,695); total premium
-  cycled $1.81M → $5.89M;
-* trades/day +44% (16.5 → 23.7); 0DTE share 26.7% → 46.7%; median contracts
-  per trade 15 → 32;
-* P&L concentrated into tail winners — stripping each month's 5 best and 5
-  worst trades leaves Apr +$51,709 / May −$23,918 / Jun −$49,517 /
-  Jul −$99,456, and median episode P&L fell −$385 → −$1,297.
+* 245 of build #3's episodes carry ``evidence_summary_json.fill_allocations
+  == 0`` — built from aggregate ORDER rows with no detailed fills.  They are
+  exactly March + Apr 1–20.  The Apr 20/21 boundary is ~90 days before the
+  2026-07-21 CSV export, i.e. the broker's detailed-fill retention window —
+  not a market or behaviour boundary;
+* aggregate-only episodes show gross edge 9.64% vs 1.77% for fill-detailed
+  ones (5.4x).  **Within April alone: 9.53% vs 2.42%** — same trader, same
+  month, same market.  That is the signature of an understated denominator
+  (4.08% of aggregate rows return >+200% vs 1.84% of fill rows; median
+  allocation count 2 vs 3).  The canonical projection already flags the cause:
+  ``aggregate_order_amount_policy = "audit_only_not_execution_cash_flow"``;
+* on the apples-to-apples window (Apr 20 – Jul 31) the gross per-dollar edge
+  is 2.42 / 2.58 / 2.00 / 1.22%, ALL pairwise permutation tests p ≥ 0.756,
+  Kruskal p=0.887, daily edge vs calendar time rho=+0.126 p=0.295.  **There is
+  no measurable erosion.**  Equal-weighted per trade, July is second-best.
 
-Provenance honesty: April's headline rests largely on Apr 1–24, where fills
-are RECONSTRUCTED (``has_exact_fill_times=0``); restricted to exact-fill
-episodes the per-dollar figures are Apr 0.72% / May 0.95% / Jun 0.16% /
-Jul 0.24%.  So ``exact_fill_share`` ships per row and every month below 1.0
-must be labelled by consumers.
+What IS real: risk per trade +68% ($6,760 → $11,340) while dollar P&L per
+trade stayed flat ($163 → $138); and the fee toll is constant at ~119–138 bp
+of premium ($3.29–3.31 round-turn per contract every month), which at ~1.2%
+gross edge makes July's NET edge −0.19%.  And the single most honest number:
+over the clean window the top 5 of 1,410 trades produced 80% of gross P&L —
+excluding each month's top 5 the per-dollar edge is NEGATIVE in all four
+months (Apr −3.53% / May −0.91% / Jun −0.86% / Jul −1.77%).
 
-The metric that would have caught this in May — and that the workstation did
-not show anywhere — is per-dollar edge next to size and frequency.  This block
-recomputes it from the same default build, monthly and over the trailing
-``DISCIPLINE_WINDOW_TRADING_DAYS`` trading days, so the user can see where
-they are now against their own history.  It stays descriptive: it is a mirror,
-not advice, and every ratio fails closed (null + reason) rather than showing a
-number its denominator cannot support.
+Consequences encoded here
+~~~~~~~~~~~~~~~~~~~~~~~~~
+* the provenance discriminator is ``evidence_summary_json.fill_allocations``,
+  NOT ``has_exact_fill_times``.  The causal question is "was this episode built
+  from detailed fills?", and the two fields disagree (3 April rows in build #3
+  are fill-detailed yet flagged ``has_exact_fill_times=0``).  Both ship:
+  ``fill_detailed_share`` governs comparability, ``exact_fill_share`` stays for
+  continuity — see ``FILL_DETAILED_GOVERNS`` for the rule consumers apply;
+* every month that is not 100% fill-detailed carries ``basis_break=True`` +
+  ``basis_break_reason``, so consumers render a BROKEN series instead of
+  blending incomparable denominators into one trend line;
+* the two decision-relevant readings ship additively:
+  ``fee_pct_of_premium_at_risk`` (the constant toll) next to
+  ``gross_pct_of_premium_at_risk`` (net + fees) so "above/below the toll" is
+  visible at a glance, and ``pnl_per_dollar_excluding_top_n`` /
+  ``gross_pct_excluding_top_n`` — the per-dollar analogue of ``body_pnl``.
+
+This block recomputes everything from the same default build, monthly and over
+the trailing ``DISCIPLINE_WINDOW_TRADING_DAYS`` trading days.  It stays
+descriptive: it is a mirror, not advice, and every ratio fails closed (null +
+reason) rather than showing a number its denominator cannot support.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_EVEN
@@ -87,6 +113,11 @@ __all__ = [
     "DISCIPLINE_BODY_TRIM_COUNT",
     "DISCIPLINE_WINDOW_TRADING_DAYS",
     "DTE_BUCKETS",
+    "FILL_DETAILED_GOVERNS",
+    "REASON_FEE_MISSING",
+    "REASON_NO_PREMIUM",
+    "REASON_ZERO_PREMIUM",
+    "fill_detailed_from_evidence_summary",
     "HOLD_TIME_BUCKETS",
     "MONTH_BASIS_UTC_MINUS_4",
     "PERSONAL_EDGE_LIMITATIONS",
@@ -114,24 +145,44 @@ DISCIPLINE_WINDOW_TRADING_DAYS = 20
 DISCIPLINE_BODY_TRIM_COUNT = 5
 DISCIPLINE_BODY_MIN_EPISODE_COUNT = 15
 
+# 剔除最好 N 笔＝与 body_pnl 同一个 N（去掉尾部赢家后的每美元回报）。
+DISCIPLINE_EXCLUDE_TOP_N = DISCIPLINE_BODY_TRIM_COUNT
+
 # Fail-closed reasons for every derived discipline ratio (surfaced verbatim).
 REASON_NO_TRADING_DAY = "窗口内无入场交易日"
 REASON_NO_PREMIUM = "无可用开仓现金流（opening_cash_flow 缺失）"
 REASON_ZERO_PREMIUM = "开仓风险金额合计为 0"
 REASON_NO_DTE = "无已知进场 DTE"
 REASON_NO_SAMPLE = "无样本"
+REASON_FEE_MISSING = "部分回合缺 total_fee，费用门槛与毛口径无法如实计算"
+
+# 哪一个字段说了算：口径可比性由「是否由明细成交构建」决定，不是 has_exact_fill_times。
+FILL_DETAILED_GOVERNS = (
+    "口径可比性由 fill_detailed_share 判定（evidence_summary_json.fill_allocations>0，"
+    "即该回合确由明细成交构建）；exact_fill_share 为 has_exact_fill_times 均值、"
+    "仅作历史连续性保留。两者会不一致——build #3 有 3 笔 4 月回合由明细成交构建但"
+    "has_exact_fill_times=0——不一致时以 fill_detailed_share 为准"
+)
 
 # Mandatory honesty strings — consumers surface these verbatim.
 PERSONAL_EDGE_LIMITATIONS = (
     "持仓时长与结果存在内生性（止损单天然短），描述统计不是因果结论，不构成建议",
     "月度口径按 ET≈UTC−4 近似换算 opened_at（UTC）；2026-03 月初为 EST（UTC−5），"
     "近午夜边界样本可能偏移 ±1 小时",
-    "部分回合的成交明细为重建（has_exact_fill_times=0，集中在 2026-04 前半段）："
-    "这些月份的时点、持仓时长与每美元回报只能作参考，不能与全精确成交的月份等量齐观；"
-    "各行以 exact_fill_share 如实标注",
-    "规模与频率的派生比率一律 fail-closed：分母为 0、无可用开仓现金流或样本不足"
-    f"（本体盈亏需 ≥{DISCIPLINE_BODY_MIN_EPISODE_COUNT} 笔）时返回 null 并给出原因，"
-    "绝不以 0 或截断样本冒充",
+    "部分回合由汇总 ORDER 行构建（evidence_summary_json.fill_allocations=0，无明细成交，"
+    "集中在 2026-03 与 2026-04-20 之前）：其风险金额分母被低估，管线自身把该金额标记为"
+    "aggregate_order_amount_policy=audit_only_not_execution_cash_flow，"
+    "因此这些月份的每美元口径与后续全明细月份**不可比**——basis_break=true 的月份"
+    "必须断开显示，不得与后续月份连成一条趋势线",
+    "汇总口径与明细口径的差异是分母假象而非边际衰减：同在 2026-04 内，汇总口径毛每美元 "
+    "9.53%、明细口径 2.42%（同一人、同一月、同一行情）；两个 20/21 日边界≈券商明细成交"
+    "保留窗口（导出日前约 90 天），不是行情或行为边界",
+    FILL_DETAILED_GOVERNS,
+    "规模与频率的派生比率一律 fail-closed：分母为 0、无可用开仓现金流、缺 total_fee 或"
+    f"样本不足（本体盈亏与剔除最好 {DISCIPLINE_EXCLUDE_TOP_N} 笔均需 ≥"
+    f"{DISCIPLINE_BODY_MIN_EPISODE_COUNT} 笔）时返回 null 并给出原因，绝不以 0 或截断样本冒充",
+    "每美元回报为净口径（已扣费）；毛口径 = 净 + 费用，费用门槛 fee_pct_of_premium_at_risk "
+    "是恒定过路费——毛口径低于门槛即净口径为负",
 )
 
 # (label, min_seconds inclusive, max_seconds exclusive; None = unbounded)
@@ -153,6 +204,52 @@ DTE_BUCKETS: tuple[tuple[str, int, Optional[int]], ...] = (
     ("8-30", 8, 30),
     (">30", 31, None),
 )
+
+def fill_detailed_from_evidence_summary(raw: object) -> Optional[bool]:
+    """回合是否**由明细成交构建**——口径可比性的因果判据。
+
+    Reads ``evidence_summary_json.fill_allocations``: ``>0`` means the episode
+    was built from detailed FILL rows; ``0`` means it came from aggregate ORDER
+    rows only, whose amount the canonical projection itself marks
+    ``audit_only_not_execution_cash_flow`` (an understated risk denominator).
+
+    Fails closed to ``None`` (= provenance unknown, never assumed clean) for
+    every shape that cannot answer the question: NULL, empty/blank text,
+    invalid JSON, a non-object payload, a missing ``fill_allocations`` key
+    (older rows and test fixtures write ``{}``), a bool (``True``/``False`` are
+    ``int`` subclasses in Python and must not read as 1/0 allocations), a
+    non-integer number, or a negative count.  Extra keys are ignored — build #3
+    carries ``group_fee_unallocated`` on 2 rows and must still parse.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        try:
+            payload = json.loads(text)
+        except (ValueError, TypeError):
+            return None
+    else:
+        payload = raw
+    if not isinstance(payload, dict):
+        return None
+    if "fill_allocations" not in payload:
+        return None
+    value = payload["fill_allocations"]
+    # bool 是 int 的子类：True 绝不能被读成「1 笔明细成交」。
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 0:
+        return None
+    return value > 0
+
 
 _RATE_QUANTUM = Decimal("0.0001")
 _AMOUNT_QUANTUM = Decimal("0.01")
@@ -233,6 +330,25 @@ class PersonalEdgeDisciplineStats:
     zero_dte_reason: Optional[str]
     exact_fill_share: Optional[float]
     has_reconstructed_fills: bool
+    # --- 口径来源（additive 2026-08-04）：fill_detailed_share 说了算 ---------
+    fill_detailed_count: int
+    aggregate_only_count: int
+    fill_provenance_unknown_count: int
+    fill_detailed_share: Optional[float]
+    basis_break: bool
+    basis_break_reason: Optional[str]
+    # --- 费用门槛与毛口径（additive 2026-08-04）-----------------------------
+    fees_total: Optional[float]
+    fees_missing_count: int
+    fee_pct_of_premium_at_risk: Optional[float]
+    fee_pct_of_premium_at_risk_reason: Optional[str]
+    gross_pct_of_premium_at_risk: Optional[float]
+    gross_pct_of_premium_at_risk_reason: Optional[str]
+    # --- 剔除最好 N 笔后的每美元回报（additive 2026-08-04）------------------
+    pnl_per_dollar_excluding_top_n: Optional[float]
+    gross_pct_excluding_top_n: Optional[float]
+    excluding_top_n_count: Optional[int]
+    excluding_top_n_reason: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -261,6 +377,8 @@ class PersonalEdgeDiscipline:
     current_window: PersonalEdgeDisciplineWindow
     body_trim_count: int
     body_min_episode_count: int
+    exclude_top_n: int
+    fill_detailed_governs: str
 
 
 @dataclass(frozen=True)
@@ -313,6 +431,13 @@ class _DisciplineMembers:
     zero_dte_count: int
     dte_known_count: int
     exact_fill_count: int
+    fees: list[Decimal]
+    fees_missing: int
+    fill_detailed_count: int
+    aggregate_only_count: int
+    fill_unknown_count: int
+    # 剔除最好 N 笔需要逐笔配对的（净盈亏, 费用, 风险金额），只收风险金额已知的回合。
+    priced: list[tuple[Decimal, Optional[Decimal], Decimal]]
 
     def __init__(self) -> None:
         self.pnl = []
@@ -322,6 +447,12 @@ class _DisciplineMembers:
         self.zero_dte_count = 0
         self.dte_known_count = 0
         self.exact_fill_count = 0
+        self.fees = []
+        self.fees_missing = 0
+        self.fill_detailed_count = 0
+        self.aggregate_only_count = 0
+        self.fill_unknown_count = 0
+        self.priced = []
 
     def add(self, episode: "_DisciplineEpisode") -> None:
         self.pnl.append(episode.pnl)
@@ -329,6 +460,11 @@ class _DisciplineMembers:
             self.premium_missing += 1
         else:
             self.premium.append(episode.premium)
+            self.priced.append((episode.pnl, episode.fee, episode.premium))
+        if episode.fee is None:
+            self.fees_missing += 1
+        else:
+            self.fees.append(episode.fee)
         self.trading_days.add(episode.trading_day)
         if episode.dte is not None:
             self.dte_known_count += 1
@@ -336,6 +472,12 @@ class _DisciplineMembers:
                 self.zero_dte_count += 1
         if episode.has_exact_fill_times:
             self.exact_fill_count += 1
+        if episode.fill_detailed is None:
+            self.fill_unknown_count += 1
+        elif episode.fill_detailed:
+            self.fill_detailed_count += 1
+        else:
+            self.aggregate_only_count += 1
 
 
 @dataclass(frozen=True)
@@ -348,6 +490,9 @@ class _DisciplineEpisode:
     premium: Optional[Decimal]
     dte: Optional[int]
     has_exact_fill_times: bool
+    fee: Optional[Decimal]
+    # None＝口径来源不可判定（fail closed，绝不当作明细成交）。
+    fill_detailed: Optional[bool]
 
 
 def _amount(value: Decimal) -> float:
@@ -476,6 +621,108 @@ def _discipline_stats(state: _DisciplineMembers) -> PersonalEdgeDisciplineStats:
             )
         )
 
+    # --- 口径来源：分母取桶内**全部**回合，不可判定的回合拉低 share（fail closed）---
+    fill_detailed_share: Optional[float] = None
+    if n > 0:
+        fill_detailed_share = float(
+            (Decimal(state.fill_detailed_count) / Decimal(n)).quantize(
+                _RATE_QUANTUM, rounding=ROUND_HALF_EVEN
+            )
+        )
+    basis_break = n > 0 and state.fill_detailed_count < n
+    basis_break_reason: Optional[str] = None
+    if basis_break:
+        parts: list[str] = []
+        if state.aggregate_only_count:
+            parts.append(
+                f"{state.aggregate_only_count}/{n} 笔由汇总 ORDER 行构建"
+                "（fill_allocations=0，无明细成交）"
+            )
+        if state.fill_unknown_count:
+            parts.append(
+                f"{state.fill_unknown_count}/{n} 笔口径来源不可判定"
+                "（evidence_summary_json 缺 fill_allocations 或无法解析）"
+            )
+        basis_break_reason = (
+            "；".join(parts)
+            + "：风险金额分母被低估（管线自身标记 audit_only_not_execution_cash_flow），"
+            "本区间每美元口径不可与全明细区间比较，须断开显示"
+        )
+
+    # --- 费用门槛与毛口径：缺任一 total_fee 即整体 fail-closed，不以 0 冒充过路费 ---
+    fees_total: Optional[float] = None
+    fee_pct: Optional[float] = None
+    fee_pct_reason: Optional[str] = None
+    gross_pct: Optional[float] = None
+    gross_pct_reason: Optional[str] = None
+    fee_sum = sum(state.fees, Decimal("0"))
+    if state.fees_missing == 0 and state.fees:
+        fees_total = _amount(fee_sum)
+    if n == 0:
+        fee_pct_reason = gross_pct_reason = REASON_NO_SAMPLE
+    elif state.fees_missing > 0:
+        fee_pct_reason = gross_pct_reason = (
+            f"{state.fees_missing}/{n} 笔缺 total_fee：{REASON_FEE_MISSING}"
+        )
+    elif not state.premium:
+        fee_pct_reason = gross_pct_reason = REASON_NO_PREMIUM
+    elif premium_total == 0:
+        fee_pct_reason = gross_pct_reason = REASON_ZERO_PREMIUM
+    else:
+        # 与 pnl_per_dollar_risked 同一约定（分子取桶内全部回合，分母取已知风险金额
+        # 合计），因此恒等式 gross = net + fee 在同一行上严格成立。
+        fee_pct = float(
+            (fee_sum / premium_total).quantize(
+                _RATIO_QUANTUM, rounding=ROUND_HALF_EVEN
+            )
+        )
+        gross_pct = float(
+            ((net_pnl + fee_sum) / premium_total).quantize(
+                _RATIO_QUANTUM, rounding=ROUND_HALF_EVEN
+            )
+        )
+
+    # --- 剔除最好 N 笔后的每美元回报（body_pnl 的每美元版本）------------------
+    excl_net: Optional[float] = None
+    excl_gross: Optional[float] = None
+    excl_count: Optional[int] = None
+    excl_reason: Optional[str] = None
+    priced_n = len(state.priced)
+    if priced_n < DISCIPLINE_BODY_MIN_EPISODE_COUNT:
+        excl_reason = (
+            f"风险金额已知样本 {priced_n} 笔 < {DISCIPLINE_BODY_MIN_EPISODE_COUNT} 笔，"
+            f"剔除最好 {DISCIPLINE_EXCLUDE_TOP_N} 笔后不成立"
+        )
+    else:
+        # 分子分母取同一子集（风险金额已知的回合），按净盈亏排序去掉最好的 N 笔。
+        remaining = sorted(state.priced, key=lambda item: item[0])[
+            : priced_n - DISCIPLINE_EXCLUDE_TOP_N
+        ]
+        remaining_premium = sum((item[2] for item in remaining), Decimal("0"))
+        if remaining_premium == 0:
+            excl_reason = REASON_ZERO_PREMIUM
+        else:
+            excl_count = len(remaining)
+            remaining_pnl = sum((item[0] for item in remaining), Decimal("0"))
+            excl_net = float(
+                (remaining_pnl / remaining_premium).quantize(
+                    _RATIO_QUANTUM, rounding=ROUND_HALF_EVEN
+                )
+            )
+            if any(item[1] is None for item in remaining):
+                # 净口径仍成立，毛口径缺费用即缺席。
+                excl_reason = REASON_FEE_MISSING
+            else:
+                remaining_fee = sum(
+                    (item[1] for item in remaining if item[1] is not None),
+                    Decimal("0"),
+                )
+                excl_gross = float(
+                    ((remaining_pnl + remaining_fee) / remaining_premium).quantize(
+                        _RATIO_QUANTUM, rounding=ROUND_HALF_EVEN
+                    )
+                )
+
     return PersonalEdgeDisciplineStats(
         n=n,
         trading_day_count=trading_day_count,
@@ -500,6 +747,22 @@ def _discipline_stats(state: _DisciplineMembers) -> PersonalEdgeDisciplineStats:
         has_reconstructed_fills=(
             exact_fill_share is not None and exact_fill_share < 1.0
         ),
+        fill_detailed_count=state.fill_detailed_count,
+        aggregate_only_count=state.aggregate_only_count,
+        fill_provenance_unknown_count=state.fill_unknown_count,
+        fill_detailed_share=fill_detailed_share,
+        basis_break=basis_break,
+        basis_break_reason=basis_break_reason,
+        fees_total=fees_total,
+        fees_missing_count=state.fees_missing,
+        fee_pct_of_premium_at_risk=fee_pct,
+        fee_pct_of_premium_at_risk_reason=fee_pct_reason,
+        gross_pct_of_premium_at_risk=gross_pct,
+        gross_pct_of_premium_at_risk_reason=gross_pct_reason,
+        pnl_per_dollar_excluding_top_n=excl_net,
+        gross_pct_excluding_top_n=excl_gross,
+        excluding_top_n_count=excl_count,
+        excluding_top_n_reason=excl_reason,
     )
 
 
@@ -537,6 +800,8 @@ def _build_discipline(
         ),
         body_trim_count=DISCIPLINE_BODY_TRIM_COUNT,
         body_min_episode_count=DISCIPLINE_BODY_MIN_EPISODE_COUNT,
+        exclude_top_n=DISCIPLINE_EXCLUDE_TOP_N,
+        fill_detailed_governs=FILL_DETAILED_GOVERNS,
     )
 
 

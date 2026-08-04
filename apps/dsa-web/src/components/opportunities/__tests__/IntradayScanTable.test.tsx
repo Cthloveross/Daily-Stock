@@ -301,7 +301,7 @@ function topResponse(): IntradayTopResponse {
       source: 'moomoo_openapi',
       unavailableReason: 'spy_quote_unavailable',
     },
-    signalVersion: 'intraday_session_evidence_v7',
+    signalVersion: 'intraday_session_evidence_v8',
     rankingMethod: 'burst_score_first_then_evidence_count',
     statisticsTrack: 'none_intraday_v1_unscored',
     moomooEnabled: true,
@@ -1259,14 +1259,21 @@ describe('IntradayScanTable 近30分位移列（v6 recent displacement）', () =
     expect(value).toHaveClass('font-medium');
     // 越线时副标题给出区间（本次 MFE/MAE 类比），不显示「未达」。
     expect(within(table).getByText('高 +0.91 ATR · 低 −0.14 ATR')).toBeInTheDocument();
-    expect(within(table).queryByText('未达 0.5')).not.toBeInTheDocument();
-    // tooltip 原文：口径 + 用户自己的经验线来源 + 实际 ATR 基准。
+    expect(within(table).queryByText('不足 0.5 ATR')).not.toBeInTheDocument();
+    // tooltip 原文：v8 循环性更正打头 + 口径 + 实际 ATR 基准。
     const tooltip = within(displacementCellOf(table))
       .getByLabelText(/区间：最高/)
       .getAttribute('aria-label') ?? '';
     expect(tooltip).toContain('近 30 分钟（6×5m）净位移 ÷ ATR');
-    expect(tooltip).toContain('0.5 ATR 是你自己 766 笔样本里「活下来」的经验线');
-    expect(tooltip).toContain('描述统计，非预测、非信号');
+    // v8：更正必须**打头**，且不得再出现存活框架。
+    expect(tooltip).toContain('【更正】');
+    expect(tooltip.indexOf('【更正】')).toBeLessThan(tooltip.indexOf('基准：'));
+    expect(tooltip).toContain('那个分层按构造就是循环的');
+    expect(tooltip).toContain('37.6 个百分点塌到 0.1 个百分点');
+    expect(tooltip).toContain('49.9% vs 49.8%，n=3,492');
+    expect(tooltip).toContain('不含任何前向信息');
+    expect(tooltip).toContain('不是「越过就能活下来」');
+    expect(tooltip).not.toContain('「活下来」的经验线');
     expect(tooltip).toContain('基准：ATR14 日线');
   });
 
@@ -1334,7 +1341,7 @@ describe('IntradayScanTable 近30分位移列（v6 recent displacement）', () =
     expect(label).toContain('（取 2 个已结束时段）');
   });
 
-  it('mutes a move inside ±0.5 ATR and says 未达 0.5 instead of pretending', () => {
+  it('mutes a move inside ±0.5 ATR and says 不足 0.5 ATR without survival framing', () => {
     render(
       <IntradayScanTable
         data={displacementResponse(
@@ -1357,7 +1364,9 @@ describe('IntradayScanTable 近30分位移列（v6 recent displacement）', () =
     const value = within(table).getByText('+0.18 ATR');
     expect(value).toHaveClass('text-text-3');
     expect(value).not.toHaveClass('text-up-strong');
-    expect(within(table).getByText('未达 0.5')).toBeInTheDocument();
+    expect(within(table).getByText('不足 0.5 ATR')).toBeInTheDocument();
+    // v8：「未达」隐含「本该达到」的存活框架，必须已经消失。
+    expect(within(table).queryByText('未达 0.5')).not.toBeInTheDocument();
   });
 
   it('marks 标缺 for insufficient bars, unavailable ATR unit and missing payload', () => {
@@ -1426,10 +1435,13 @@ describe('IntradayScanTable footer 口径两级展示', () => {
     // 默认只有一行简短口径说明（含 v5 波段分级图例），公式墙收起。
     expect(screen.getByText(/排序与口径说明：盘中排序＝爆发分优先/)).toBeInTheDocument();
     expect(screen.getByText(/强＝爆发分 ≥8 暴动 \/ 中＝≥2.5 持续推升/)).toBeInTheDocument();
-    // v6：位移一行也在默认简短口径里（含 0.5 ATR 经验线与「非预测」声明）。
+    // v8：位移一行仍在默认简短口径里，但存活框架已换成循环性更正。
     expect(
-      screen.getByText(/0.5 ATR 是你自己 766 笔样本的经验「活下来」线/),
+      screen.getByText(/0.5 ATR 只是参考刻度（原分层按持仓时长定义、循环性已被量化推翻/),
     ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/0.5 ATR 是你自己 766 笔样本的经验「活下来」线/),
+    ).not.toBeInTheDocument();
     expect(screen.queryByText(/当前爆发＝最近 15 分钟（3 根 5m K 线）/)).not.toBeInTheDocument();
 
     // 一键展开完整口径：原文逐字可见（隐藏 ≠ 删除）。
@@ -1446,6 +1458,15 @@ describe('IntradayScanTable footer 口径两级展示', () => {
     expect(screen.getByText(/71.2% 达到 ≥0.5 ATR/)).toBeInTheDocument();
     expect(screen.getByText(/84% 的合约 ≤1DTE/)).toBeInTheDocument();
     expect(screen.getByText(/样本窗口恰是你最差的两个月/)).toBeInTheDocument();
+    // v8：完整口径必须**紧接着**把那个分层的循环性讲透，并给出向前计分的数字。
+    expect(screen.getByText(/按构造就是循环的/)).toBeInTheDocument();
+    expect(screen.getByText(/等于拿结果去解释结果/)).toBeInTheDocument();
+    expect(screen.getByText(/速度未死均值 \+0.071 \/ P\(>0\) 54.4%/)).toBeInTheDocument();
+    expect(screen.getByText(/只剩 \+0.005 \/ 49.9% vs −0.013 \/ 49.8%/)).toBeInTheDocument();
+    expect(screen.getByText(/0.1 个百分点/)).toBeInTheDocument();
+    expect(screen.getByText(/样本外直接反号/)).toBeInTheDocument();
+    expect(screen.getByText(/\+0.122；样本外同一条件 → −0.128/)).toBeInTheDocument();
+    expect(screen.getByText(/这一列不含任何前向信息/)).toBeInTheDocument();
 
     // 再次点击收起。
     fireEvent.click(toggle);

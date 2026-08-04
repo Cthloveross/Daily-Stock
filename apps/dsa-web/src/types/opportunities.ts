@@ -1096,7 +1096,7 @@ export interface IntradayTopResponse {
   quoteSessionScope: 'current_session' | 'latest_prior_session';
   quoteSessionLabel: string;
   marketContext: IntradayMarketContext;
-  signalVersion: 'intraday_session_evidence_v7';
+  signalVersion: 'intraday_session_evidence_v8';
   rankingMethod: 'burst_score_first_then_evidence_count' | 'rule_based_evidence_count';
   statisticsTrack: 'none_intraday_v1_unscored';
   moomooEnabled: boolean;
