@@ -127,6 +127,18 @@ const PREMARKET_FIELDS_UNAVAILABLE_WARNING =
   'premarket_fields_unavailable_ranking_reflects_prior_session';
 const PREMARKET_FALLBACK_CHIP = '盘前字段不可用 · 当前排序反映上一常规时段';
 
+/**
+ * 闸门 v2（2026-08-03 普涨跳空日校准）：常规时段深度名额拆两档——约 2/3 按
+ * 最近 15 分钟动量（谁现在在动）、其余按当日涨跌兜底（谁今天最大）。动量
+ * 历史冷启动（服务重启/开盘）时服务端显式回退当日涨跌口径并携带警示——
+ * 前端必须原样透出，绝不静默假装在按动量排序。
+ */
+const MOMENTUM_GATE_BASIS = 'momentum15m_then_day_change_v2';
+const MOMENTUM_GATE_CAPTION = '15分动量优先（谁现在在动）· 当日涨跌兜底';
+const MOMENTUM_WARMING_UP_WARNING =
+  'momentum_history_warming_up_ranking_by_day_change';
+const MOMENTUM_WARMING_UP_CHIP = '动量样本预热中 · 暂按当日涨跌排序';
+
 /** 仅快照次级列表默认只展示前 N 檔，其余一键展开（重排可见性，不删除数据）。 */
 const SNAPSHOT_ONLY_COLLAPSED_COUNT = 5;
 
@@ -169,12 +181,25 @@ function legsBasisCaption(item: IntradayTopCandidate): string {
     : '≥30 分钟独立波段';
 }
 
-/** 两层模式深度位徽标：计划钉选 or 异动排名（闸门标注，非信号）。 */
+/** 两层模式深度位徽标：计划钉选 / 用户钉选 / 异动排名（闸门标注，非信号）。 */
 function deepLaneBadge(item: IntradayTopCandidate): string | null {
   const reason = item.deepLaneReason;
   if (!reason) return null;
   if (reason.promotedBy === 'plan_always_include') return '计划钉选';
+  if (reason.promotedBy === 'user_pinned') return '钉选';
   return reason.moverRank !== null ? `异动 #${reason.moverRank}` : '异动晋升';
+}
+
+/** 账本 as-of 时点：ISO → ET HH:MM（与主表 quote as-of 同一时区口径）。 */
+function ledgerAsOfLabel(iso: string): string {
+  const parsed = parseApiTimestamp(iso);
+  if (!parsed) return '时点未报告';
+  return `${new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'America/New_York',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).format(parsed)} ET`;
 }
 
 function optionActivityLabel(item: IntradayTopCandidate): string {
@@ -447,7 +472,9 @@ function ResearchReadoutsGrid({ item }: { item: IntradayTopCandidate }) {
 }
 
 /**
- * 日内扫描表：确定性证据计数排名的盘中滚动 Top N。
+ * 实时扫描表（现在谁在动）：确定性证据计数排名的盘中滚动 Top N。
+ * 两层模式下深度层为实时排名主表，表下依次为「今日曾深扫 · 波段保留」账本
+ * （轮换出深度层的标的以最后一次深扫摘要 as-of 保留）与「仅快照」次级列表。
  *
  * 两级布局（2026-08-03 声效整理）：默认网格只保留 9 列交易关键读数
  * （排名/标的/涨跌%/当前爆发/今日波段/速度/形态/波段vs大盘/详情），
@@ -477,6 +504,13 @@ export function IntradayScanTable({
   const premarketFieldsUnavailable = (data?.universeScan?.gateWarnings ?? []).includes(
     PREMARKET_FIELDS_UNAVAILABLE_WARNING,
   );
+  // v2 动量口径与冷启动预热警示：服务端如实声明，前端原样透出。
+  const momentumBasis = data?.universeScan?.gateBasis === MOMENTUM_GATE_BASIS;
+  const momentumWarmingUp = (data?.universeScan?.gateWarnings ?? []).includes(
+    MOMENTUM_WARMING_UP_WARNING,
+  );
+  // 今日曾深扫账本：轮换出深度层的标的以最后一次深扫摘要保留（as-of）。
+  const dayLedgerRows = data?.universeScan?.dayLedger ?? [];
 
   // 排名列＝服务端排名（响应内顺序）；客户端排序只重排行，不改写此排名。
   const serverRankByTicker = useMemo(() => {
@@ -532,16 +566,21 @@ export function IntradayScanTable({
     : snapshotRows.slice(0, SNAPSHOT_ONLY_COLLAPSED_COUNT);
 
   return (
-    <section aria-label="日内扫描" className="overflow-hidden rounded-ds-md border border-subtle bg-bg-1">
+    <section aria-label="实时扫描" className="overflow-hidden rounded-ds-md border border-subtle bg-bg-1">
       <header className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 border-b border-subtle px-4 py-3">
         <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-          <h2 className="text-h3 font-semibold text-text-1">日内扫描 · 盘中滚动</h2>
+          <h2 className="text-h3 font-semibold text-text-1">实时扫描 · 现在谁在动</h2>
           <span className="text-caption text-text-3">
             {data?.quoteSessionScope === 'latest_prior_session'
               ? '休市 · 按最近交易时段最强波段排序'
               : '波段爆发优先排名'}
             （{data?.signalVersion ?? 'intraday_session_evidence_v4'}）· 不冻结 · 不入统计
           </span>
+          {data?.universeScan && (
+            <span className="text-caption text-text-3">
+              深度层实时排名，下方为今日曾深扫账本
+            </span>
+          )}
         </div>
         {data && (
           <span className="flex flex-wrap items-baseline gap-x-2 gap-y-1 text-caption text-text-3">
@@ -551,6 +590,7 @@ export function IntradayScanTable({
                 ? ` · 全清单 ${data.universeScan.scannedTotal} 檔快照 · 深度分析 ${data.universeScan.deepLaneCount} 檔`
                 : ` · 扫描 ${data.universe.length} 个标的`}
               {premarketBasis ? ` · ${PREMARKET_GATE_CAPTION}` : ''}
+              {momentumBasis ? ` · ${MOMENTUM_GATE_CAPTION}` : ''}
               {data.unsupportedSymbols.length > 0
                 ? ` · ${data.unsupportedSymbols.length} 个非美股期权标的未纳入`
                 : ''}
@@ -560,13 +600,18 @@ export function IntradayScanTable({
                 {PREMARKET_FALLBACK_CHIP}
               </span>
             )}
+            {momentumWarmingUp && (
+              <span className="inline-block whitespace-nowrap rounded-ds-sm border border-[color:var(--warn-muted)] bg-bg-0 px-1.5 py-0.5 text-caption font-medium text-warning">
+                {MOMENTUM_WARMING_UP_CHIP}
+              </span>
+            )}
           </span>
         )}
       </header>
 
       {error && (
         <div className="border-b border-[color:var(--warn-muted)] bg-bg-0 px-4 py-2 text-caption text-warning" role="status">
-          日内扫描暂不可用：{error}
+          实时扫描暂不可用：{error}
           {data ? '。仍显示上一次成功结果。' : ''}
         </div>
       )}
@@ -583,7 +628,7 @@ export function IntradayScanTable({
         </div>
       ) : (
         <div className="overflow-auto">
-          <table className="w-full min-w-[1080px] border-collapse" aria-label="日内扫描表">
+          <table className="w-full min-w-[1080px] border-collapse" aria-label="实时扫描表">
             <thead>
               <tr className="border-b border-subtle text-left text-caption text-text-3">
                 <th className="px-3 py-2 text-right font-medium">
@@ -771,6 +816,76 @@ export function IntradayScanTable({
         </div>
       )}
 
+      {data?.universeScan && dayLedgerRows.length > 0 && (
+        <div
+          aria-label="今日曾深扫账本"
+          className="border-t border-subtle bg-bg-0 px-4 py-3"
+        >
+          <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+            <span className="text-body-sm font-medium text-text-2">
+              今日曾深扫 · 波段保留（{dayLedgerRows.length} 檔）
+            </span>
+            <span className="text-caption text-text-3">
+              已被轮换出深度层 · 显示最后一次深扫读数（as-of，不实时刷新）· 重启后从当前时刻累计
+            </span>
+          </div>
+          <ul className="mt-2 space-y-1.5">
+            {dayLedgerRows.map((row) => (
+              <li
+                key={row.ticker}
+                className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-ds-sm border border-subtle bg-bg-1 px-2 py-1.5"
+              >
+                <span className="font-mono text-mono-sm font-semibold text-text-1">
+                  {row.ticker}
+                </span>
+                <span className="font-mono text-mono-xs text-text-3">
+                  {ledgerAsOfLabel(row.lastSeenAt)} 深扫
+                </span>
+                <span
+                  className={`font-mono text-mono-xs ${
+                    row.lastChangePercent === null
+                      ? 'text-text-3'
+                      : row.lastChangePercent > 0
+                        ? 'text-up-strong'
+                        : row.lastChangePercent < 0
+                          ? 'text-down-strong'
+                          : 'text-text-3'
+                  }`}
+                >
+                  {formatSignedPercent(row.lastChangePercent)}
+                </span>
+                {row.sessionBurstsLegs.length > 0 ? (
+                  <span className="flex flex-wrap gap-1">
+                    {row.sessionBurstsLegs.map((leg) => (
+                      <span
+                        key={`${leg.startEt}-${leg.endEt}`}
+                        className={
+                          leg.grade === 'strong'
+                            ? LEG_CHIP_STRONG_CLASS
+                            : LEG_CHIP_DEFAULT_CLASS
+                        }
+                      >
+                        {leg.startEt}
+                        {DIRECTION_ARROWS[leg.direction]}
+                        {leg.grade ? ` ${GRADE_LABELS[leg.grade]}` : ''}
+                      </span>
+                    ))}
+                  </span>
+                ) : (
+                  <span className="text-caption text-text-3">无记录波段</span>
+                )}
+                <span className="text-caption text-text-3">
+                  形态 {row.setupMatchedSetups.length > 0 ? row.setupMatchedSetups.join('/') : '—'}
+                </span>
+                <span className="inline-block whitespace-nowrap rounded-ds-sm border border-dashed border-subtle px-1.5 py-0.5 text-caption text-text-3">
+                  已轮换出
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       {data?.universeScan && (
         <div
           aria-label="仅快照标的"
@@ -879,10 +994,17 @@ export function IntradayScanTable({
           全清单 {data.universeScan.scannedTotal} 檔快照 · 深度分析前 {data.universeScan.deepLaneMax} 檔
           {premarketBasis
             ? ` · ${PREMARKET_GATE_CAPTION} · 其余仅快照；`
-            : '（|涨跌|→成交额）· 其余仅快照；'}
-          计划钉选 {data.universeScan.planAlwaysInclude.length} 檔始终占深度位（不占 K 名额）。
+            : momentumBasis
+              ? `（${MOMENTUM_GATE_CAPTION}）· 其余仅快照；`
+              : '（|涨跌|→成交额）· 其余仅快照；'}
+          {`计划钉选 ${data.universeScan.planAlwaysInclude.length} 檔${
+            (data.universeScan.userPinned?.length ?? 0) > 0
+              ? ` + 用户钉选 ${data.universeScan.userPinned?.length} 檔`
+              : ''
+          }始终占深度位（不占 K 名额）。`}
           {premarketFieldsUnavailable ? `${PREMARKET_FALLBACK_CHIP}。` : ''}
-          闸门为 v1 启发式，晋升不代表方向或质量结论。
+          {momentumWarmingUp ? `${MOMENTUM_WARMING_UP_CHIP}。` : ''}
+          闸门为启发式，晋升不代表方向或质量结论。
         </div>
       )}
 

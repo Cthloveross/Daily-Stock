@@ -14,6 +14,7 @@ import os
 import re
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -228,15 +229,47 @@ _INTRADAY_TWO_TIER_PREMARKET_GATE_BASIS = (
 _INTRADAY_PREMARKET_FIELDS_UNAVAILABLE_WARNING = (
     "premarket_fields_unavailable_ranking_reflects_prior_session"
 )
+# --- 异动闸门 v2：15 分钟动量主导（2026-08-03 首个实盘日校准）----------------
+# 校准背景：2026-08-03 为普涨跳空日，v1 闸门按 |当日涨跌幅| 排序，深度层被
+# +5%~+11% 的隔夜跳空标的（RBLX/CRWV/TEAM…）长期占满；用户当日唯一认定
+# 「真正能交易」的 NVDA（+2.5% 稳步爬升，10:00–10:15 中波段爆发分 5.06）整日
+# 没能晋升深度层。结论：「谁今天涨得多」≠「谁现在在动」——隔夜跳空后横盘的
+# 标的当日涨跌幅恒定居高，却没有任何盘中动量。v2 在非盘前时段把 K 个异动
+# 名额拆成两个子额度：
+#   ceil(2K/3) 档按 |mom15|（最近 15 分钟动量，「谁现在在动」）降序；
+#   其余名额按 |当日涨跌幅|（「谁今天最大」）降序兜底；
+# 动量侧先占位、再去重，两侧各以成交额次序、代码字典序兜底（确定性）。
+# mom15 由宽层每轮批量快照喂养的进程内价格滚动历史推导（零新增请求）：取
+# 12–18 分钟回看窗内「最老」样本计算 (last/price_15m_ago − 1)×100；窗内无
+# 足龄样本（服务重启 / 开盘冷启动 / 样本已过期）时 mom15=None，该标的只能
+# 走当日涨跌子额度。整批皆无 mom15 时显式回退 v1 口径并携带 gate_warnings
+# 警示，绝不静默。盘前口径（pre_* 字段，G-12）完全不变。
+_INTRADAY_TWO_TIER_GATE_BASIS_V2 = "momentum15m_then_day_change_v2"
+_INTRADAY_MOMENTUM_WARMING_UP_WARNING = (
+    "momentum_history_warming_up_ranking_by_day_change"
+)
+_INTRADAY_MOMENTUM_LOOKBACK_MIN_SECONDS = 12 * 60
+_INTRADAY_MOMENTUM_LOOKBACK_MAX_SECONDS = 18 * 60
+# 60 秒轮询下 40 个样本 ≈ 40 分钟覆盖，远超 18 分钟回看上限（有界防涨）。
+_INTRADAY_MOMENTUM_HISTORY_MAXLEN = 40
+# 今日深扫账本（display truth）：进程内 per-ET-day 保留每个曾晋升深度层标的
+# 最后一次深扫的候选摘要（含分级波段），轮换出深度层后仍以「今日曾深扫」
+# as-of 行呈现——2026-08-03 实盘：ORCL 09:40 记录强波段后被后续 movers 挤出
+# 可见深度层，用户回看时波段整段消失。账本重启即清空（无 DB 写入），
+# basis 字段如实声明只从服务启动后累计。
+_INTRADAY_DAY_LEDGER_BASIS = "in_process_since_service_start_resets_on_restart"
 # 今日冻结盘前计划标的（深度层钉选）只读缓存：计划盘前冻结后当日不变。
 _INTRADAY_PLAN_CACHE_TTL_SECONDS = 300.0
 _INTRADAY_TWO_TIER_LIMITATIONS = (
     "两层扫描：全清单每轮仅一次批量快照；只有异动闸门晋升的标的做深度分析"
     "（波段爆发/形态/速度/异动/财报），其余标的仅快照、对应字段一律缺席，"
     "绝不虚构。",
-    "异动闸门为 v1 启发式：按 |当日涨跌幅| 主序、成交额次序晋升前 K 档；"
-    "当日冻结盘前计划标的始终占深度位，不占 K 名额。闸门不是信号，"
-    "晋升不代表方向或质量结论。",
+    "异动闸门为启发式（v2）：非盘前时段 K 名额拆两档——约 2/3 按最近 15 分钟"
+    "动量 |mom15|、其余按 |当日涨跌幅| 兜底（动量历史不足时显式回退当日涨跌"
+    "并警示）；当日冻结盘前计划与用户钉选标的始终占深度位，不占 K 名额。"
+    "闸门不是信号，晋升不代表方向或质量结论。",
+    "「今日曾深扫」账本为进程内展示缓存：只保留各标的最后一次深扫的 as-of"
+    " 摘要，不实时刷新、重启即清空、不写数据库。",
     "深度层 5m K 线走 Moomoo request_history_kline（30 天滚动去重标的数配额，"
     "账户档位 100 起）；每 ET 日新晋升去重标的数另设内部上限，触顶后新标的"
     "当日仅保留快照行并显式标注。",
@@ -313,6 +346,13 @@ _intraday_playbook_cache: dict[str, _ScanCacheEntry] = {}
 _intraday_plan_cache: dict[str, _ScanCacheEntry] = {}
 # 每 ET 日已进入深度层的去重标的集合（额度护栏，语义见上方常量注释）。
 _intraday_deep_promotion_log: dict[str, set[str]] = {}
+# 宽层滚动价格历史（mom15 输入）：symbol → deque[(epoch_seconds, last_price)]。
+# 仅常规时段喂养——盘前/盘后常规快照字段仍指向上一常规时段，喂入只会污染
+# 动量口径。ET 日期切换即整体清空；重启即冷启动（闸门显式回退并警示）。
+_intraday_momentum_history: dict[str, deque[tuple[float, float]]] = {}
+_intraday_momentum_history_date: Optional[str] = None
+# 今日深扫账本：ET 日期 → symbol → 最后一次深扫候选摘要（as-of，不刷新）。
+_intraday_day_ledger: dict[str, dict[str, dict[str, Any]]] = {}
 
 
 def _cache_now() -> float:
@@ -423,6 +463,7 @@ def _reset_scan_cache_for_tests() -> None:
     Production code never calls this helper.
     """
 
+    global _intraday_momentum_history_date
     with _scan_cache_lock:
         _scan_cache.clear()
         _intraday_daily_cache.clear()
@@ -431,6 +472,9 @@ def _reset_scan_cache_for_tests() -> None:
         _intraday_playbook_cache.clear()
         _intraday_plan_cache.clear()
         _intraday_deep_promotion_log.clear()
+        _intraday_momentum_history.clear()
+        _intraday_momentum_history_date = None
+        _intraday_day_ledger.clear()
         for flight in _scan_flights.values():
             if flight.error is None:
                 flight.error = OpportunityScanTimeoutError(
@@ -582,6 +626,21 @@ def _configured_intraday_watchlist() -> list[str]:
     from src.config import get_config
 
     configured = getattr(get_config(), "intraday_watchlist", None) or []
+    if isinstance(configured, str):
+        configured = configured.split(",")
+    return normalize_symbols([str(item) for item in configured])
+
+
+def _configured_intraday_pinned_tickers() -> list[str]:
+    """INTRADAY_PINNED_TICKERS：两层模式下用户钉选（始终深扫）；未配置＝无钉选。
+
+    与 INTRADAY_WATCHLIST 同一套 config 管道读取；仅两层模式消费——单层
+    （现状）路径与显式 symbols 覆写完全不受影响。
+    """
+
+    from src.config import get_config
+
+    configured = getattr(get_config(), "intraday_pinned_tickers", None) or []
     if isinstance(configured, str):
         configured = configured.split(",")
     return normalize_symbols([str(item) for item in configured])
@@ -2517,6 +2576,141 @@ def _rank_intraday_movers(
     return [row["ticker"] for row in ranked]
 
 
+def _feed_intraday_momentum_history(
+    wide_rows: list[dict[str, Any]],
+    *,
+    market_date_et: str,
+    now_epoch: float,
+) -> None:
+    """把本轮宽层快照的 last_price 追加进 mom15 滚动历史（零新增请求）。
+
+    仅常规时段调用（调用方约束）；ET 日期切换即整体清空——隔日样本对
+    「最近 15 分钟动量」毫无意义，绝不跨日比价。缺价/非法价的行不入历史。
+    """
+
+    global _intraday_momentum_history_date
+    with _scan_cache_lock:
+        if _intraday_momentum_history_date != market_date_et:
+            _intraday_momentum_history.clear()
+            _intraday_momentum_history_date = market_date_et
+        for row in wide_rows:
+            last_price = row.get("last_price")
+            if (
+                last_price is None
+                or not math.isfinite(last_price)
+                or last_price <= 0
+            ):
+                continue
+            history = _intraday_momentum_history.get(row["ticker"])
+            if history is None:
+                history = deque(maxlen=_INTRADAY_MOMENTUM_HISTORY_MAXLEN)
+                _intraday_momentum_history[row["ticker"]] = history
+            history.append((float(now_epoch), float(last_price)))
+
+
+def _intraday_mom15(
+    symbol: str,
+    last_price: Optional[float],
+    *,
+    now_epoch: float,
+) -> Optional[float]:
+    """mom15 = (last / price_15min_ago − 1)×100，取 12–18 分钟窗内最老样本。
+
+    窗内无足龄样本（重启 / 开盘冷启动 / 样本已老于 18 分钟）返回 None——
+    None 表示「无法度量」，绝不以 0 冒充「没在动」。
+    """
+
+    if last_price is None or not math.isfinite(last_price) or last_price <= 0:
+        return None
+    with _scan_cache_lock:
+        history = _intraday_momentum_history.get(symbol)
+        if not history:
+            return None
+        for sample_epoch, sample_price in history:  # 队列恒为时间升序
+            age = now_epoch - sample_epoch
+            if age > _INTRADAY_MOMENTUM_LOOKBACK_MAX_SECONDS:
+                continue  # 老于回看窗上限：跳过，继续找更新的样本。
+            if age < _INTRADAY_MOMENTUM_LOOKBACK_MIN_SECONDS:
+                return None  # 后续样本只会更年轻：窗内无足龄样本。
+            if sample_price <= 0:
+                return None
+            return (float(last_price) / float(sample_price) - 1.0) * 100.0
+    return None
+
+
+def _rank_intraday_movers_v2(
+    wide_rows: list[dict[str, Any]],
+    *,
+    exclude: set[str],
+    deep_lane_max: int,
+    now_epoch: float,
+) -> tuple[list[str], dict[str, float], bool]:
+    """异动闸门 v2 排序：动量子额度（ceil(2K/3)）优先、当日涨跌子额度兜底。
+
+    返回 (ordered_symbols, mom15_by_symbol, momentum_available)。ordered 为完整
+    确定性顺序（含额度外候选，供 mover_rank 标注与日上限跳位回补）：首段为
+    动量子额度选中者（|mom15| 降序）、中段为当日涨跌子额度选中者（|涨跌|
+    降序、已选去重）、尾段为其余候选（动量序在前、涨跌序补足）；每段内部
+    均以成交额次序、代码字典序兜底。mom15=None 的标的绝不占动量位；整批皆
+    无 mom15 时返回 momentum_available=False，调用方显式回退 v1 并警示。
+    """
+
+    eligible = [row for row in wide_rows if row["ticker"] not in exclude]
+    mom15_by_symbol: dict[str, float] = {}
+    momentum_rows: list[dict[str, Any]] = []
+    for row in eligible:
+        mom15 = _intraday_mom15(
+            row["ticker"], row.get("last_price"), now_epoch=now_epoch
+        )
+        if mom15 is not None:
+            mom15_by_symbol[row["ticker"]] = round(mom15, 6)
+            momentum_rows.append(row)
+    if not momentum_rows:
+        return [], {}, False
+
+    def _turnover_key(row: dict[str, Any]) -> float:
+        return -(row["turnover"] if row.get("turnover") is not None else -1.0)
+
+    momentum_order = sorted(
+        momentum_rows,
+        key=lambda row: (
+            -abs(mom15_by_symbol[row["ticker"]]),
+            _turnover_key(row),
+            row["ticker"],
+        ),
+    )
+    day_order = sorted(
+        (row for row in eligible if row.get("change_percent") is not None),
+        key=lambda row: (
+            -abs(row["change_percent"]),
+            _turnover_key(row),
+            row["ticker"],
+        ),
+    )
+    momentum_quota = math.ceil(2 * deep_lane_max / 3)
+    day_quota = deep_lane_max - momentum_quota
+
+    head = [row["ticker"] for row in momentum_order[:momentum_quota]]
+    chosen = set(head)
+    mid: list[str] = []
+    for row in day_order:
+        if len(mid) >= day_quota:
+            break
+        if row["ticker"] in chosen:
+            continue
+        mid.append(row["ticker"])
+        chosen.add(row["ticker"])
+    tail = [
+        row["ticker"] for row in momentum_order if row["ticker"] not in chosen
+    ]
+    tail_seen = chosen | set(tail)
+    for row in day_order:
+        if row["ticker"] not in tail_seen:
+            tail.append(row["ticker"])
+            tail_seen.add(row["ticker"])
+    return [*head, *mid, *tail], mom15_by_symbol, True
+
+
 def _execute_intraday_top_two_tier(
     watchlist: list[str],
     limit: int,
@@ -2524,14 +2718,16 @@ def _execute_intraday_top_two_tier(
     enabled: bool,
     deep_lane_max: int,
     watchlist_configured_total: int,
+    pinned_tickers: Optional[list[str]] = None,
 ) -> dict[str, Any]:
-    """watchlist v1 两层扫描：一次批量快照的宽层 + 异动闸门晋升的深度层。
+    """watchlist 两层扫描：一次批量快照的宽层 + 异动闸门晋升的深度层。
 
-    宽层每轮只发 1 次 ``get_market_snapshot``（清单 + 计划钉选 + SPY 并入
-    同一批；单次官方上限 400，本清单有界 200 恒为单请求）。深度层完全复用
-    单层模式的 v4 管线（爆发/形态/速度/异动/财报/合约面板资格），只对晋升
-    标的执行；宽层其余标的仅保留快照行，深度字段一律缺席。额度语义与每日
-    晋升护栏见模块常量 ``_INTRADAY_DEEP_DAILY_DISTINCT_CAP`` 注释。
+    宽层每轮只发 1 次 ``get_market_snapshot``（清单 + 计划钉选 + 用户钉选 +
+    SPY 并入同一批；单次官方上限 400，本清单有界 200 恒为单请求）。深度层
+    完全复用单层模式的 v4 管线（爆发/形态/速度/异动/财报/合约面板资格），
+    只对晋升标的执行；宽层其余标的仅保留快照行，深度字段一律缺席。额度
+    语义与每日晋升护栏见模块常量 ``_INTRADAY_DEEP_DAILY_DISTINCT_CAP`` 注释；
+    闸门 v2（15 分钟动量主导）语义见 ``_INTRADAY_TWO_TIER_GATE_BASIS_V2``。
     """
 
     requested_at = _intraday_now()
@@ -2539,9 +2735,12 @@ def _execute_intraday_top_two_tier(
     session_state = market_session_state(requested_at)
 
     plan_tickers_all = _todays_plan_tickers(market_date_et)
-    # 扫描 universe = 清单 ∪ 今日计划：计划标的并入同一批快照（仍 1 次请求），
-    # 即使不在清单里也能拿到深度层所需的会话快照。
-    scan_symbols = normalize_symbols([*watchlist, *plan_tickers_all])
+    pinned_tickers_all = normalize_symbols(list(pinned_tickers or []))
+    # 扫描 universe = 清单 ∪ 今日计划 ∪ 用户钉选：计划/钉选标的并入同一批
+    # 快照（仍 1 次请求），即使不在清单里也能拿到深度层所需的会话快照。
+    scan_symbols = normalize_symbols(
+        [*watchlist, *plan_tickers_all, *pinned_tickers_all]
+    )
     supported = [
         symbol for symbol in scan_symbols if is_supported_us_option_underlying(symbol)
     ]
@@ -2553,6 +2752,13 @@ def _execute_intraday_top_two_tier(
     supported_set = set(supported)
     plan_tickers = [
         symbol for symbol in plan_tickers_all if symbol in supported_set
+    ]
+    # 用户钉选与计划钉选去重：同一标的两个身份并存时计划钉选优先标注
+    # （深度位语义一致，占位只记一次）。
+    pinned_effective = [
+        symbol
+        for symbol in pinned_tickers_all
+        if symbol in supported_set and symbol not in plan_tickers
     ]
 
     # -- Tier 1：一次批量快照（SPY 并入，不新增请求次数）---------------------
@@ -2581,26 +2787,55 @@ def _execute_intraday_top_two_tier(
         if enabled and raw_quotes.get(symbol) is None
     ]
 
-    # -- 异动闸门（movers gate，v1 启发式）------------------------------------
+    # -- 异动闸门（movers gate）----------------------------------------------
     # 盘前时段常规快照字段仍指向上一常规时段：若此时按 change_percent 排序，
-    # 深度榜会复现上一时段的异动而非今晨盘前的真实异动。盘前改用 pre_* 口径；
-    # 整批无盘前字段时显式回退 + 警示，绝不静默。
+    # 深度榜会复现上一时段的异动而非今晨盘前的真实异动。盘前改用 pre_* 口径
+    # （G-12，v2 不改动）；整批无盘前字段时显式回退 + 警示，绝不静默。
+    # 非盘前时段走 v2：15 分钟动量子额度优先、当日涨跌子额度兜底（校准背景
+    # 见 _INTRADAY_TWO_TIER_GATE_BASIS_V2 常量注释）；动量历史冷启动时显式
+    # 回退 v1 当日涨跌口径并携带 warming-up 警示。
     plan_set = set(plan_tickers)
+    pinned_set = set(pinned_effective)
+    always_deep_set = plan_set | pinned_set
     session_phase_now = market_session_phase(requested_at)
+    now_epoch = requested_at.timestamp()
     premarket_gate = session_phase_now == "premarket" and any(
         row.get("pre_change_percent") is not None for row in wide_rows
     )
-    gate_basis = (
-        _INTRADAY_TWO_TIER_PREMARKET_GATE_BASIS
-        if premarket_gate
-        else _INTRADAY_TWO_TIER_GATE_BASIS
-    )
     gate_warnings: list[str] = []
-    if session_phase_now == "premarket" and not premarket_gate:
+    if premarket_gate:
+        gate_basis = _INTRADAY_TWO_TIER_PREMARKET_GATE_BASIS
+        mover_order = _rank_intraday_movers(
+            wide_rows, exclude=always_deep_set, premarket=True
+        )
+    elif session_phase_now == "premarket":
+        gate_basis = _INTRADAY_TWO_TIER_GATE_BASIS
         gate_warnings.append(_INTRADAY_PREMARKET_FIELDS_UNAVAILABLE_WARNING)
-    mover_order = _rank_intraday_movers(
-        wide_rows, exclude=plan_set, premarket=premarket_gate
-    )
+        mover_order = _rank_intraday_movers(wide_rows, exclude=always_deep_set)
+    else:
+        # 动量历史只在常规时段喂养（盘后/休市常规快照价不再前进，喂入只会
+        # 把「静止」误记为动量样本）；排序侧任何非盘前时段都先尝试 v2。
+        if session_state == "regular":
+            _feed_intraday_momentum_history(
+                wide_rows, market_date_et=market_date_et, now_epoch=now_epoch
+            )
+        mover_order, _mom15_by_symbol, momentum_available = (
+            _rank_intraday_movers_v2(
+                wide_rows,
+                exclude=always_deep_set,
+                deep_lane_max=deep_lane_max,
+                now_epoch=now_epoch,
+            )
+        )
+        if momentum_available:
+            gate_basis = _INTRADAY_TWO_TIER_GATE_BASIS_V2
+        else:
+            # 冷启动（重启/开盘/样本过期）：显式回退 v1 并警示，绝不静默。
+            gate_basis = _INTRADAY_TWO_TIER_GATE_BASIS
+            gate_warnings.append(_INTRADAY_MOMENTUM_WARMING_UP_WARNING)
+            mover_order = _rank_intraday_movers(
+                wide_rows, exclude=always_deep_set
+            )
     mover_rank_by_symbol = {
         symbol: rank for rank, symbol in enumerate(mover_order, start=1)
     }
@@ -2613,8 +2848,9 @@ def _execute_intraday_top_two_tier(
         )
         for key in [k for k in _intraday_deep_promotion_log if k != market_date_et]:
             _intraday_deep_promotion_log.pop(key, None)
-        # 计划钉选不受日上限约束，但计入当日去重集合（额度语义一致）。
+        # 计划/用户钉选不受日上限约束，但计入当日去重集合（额度语义一致）。
         promoted_today.update(plan_tickers)
+        promoted_today.update(pinned_effective)
         for symbol in mover_order:
             if len(promoted_movers) >= deep_lane_max:
                 break
@@ -2630,7 +2866,8 @@ def _execute_intraday_top_two_tier(
 
     deep_symbols = [
         *plan_tickers,
-        *[symbol for symbol in promoted_movers if symbol not in plan_set],
+        *pinned_effective,
+        *[symbol for symbol in promoted_movers if symbol not in always_deep_set],
     ]
     deep_set = set(deep_symbols)
 
@@ -2709,6 +2946,12 @@ def _execute_intraday_top_two_tier(
                 "mover_rank": None,
                 "basis": gate_basis,
             }
+        if symbol in pinned_set:
+            return {
+                "promoted_by": "user_pinned",
+                "mover_rank": None,
+                "basis": gate_basis,
+            }
         return {
             "promoted_by": "mover_rank",
             "mover_rank": mover_rank_by_symbol.get(symbol),
@@ -2720,6 +2963,41 @@ def _execute_intraday_top_two_tier(
         candidate["deep_lane_reason"] = _deep_lane_reason(
             str(candidate.get("ticker") or "")
         )
+
+    # -- 今日深扫账本（display truth）----------------------------------------
+    # 曾晋升深度层的标的被 movers 轮换出去后不得无声消失：进程内保留其最后
+    # 一次深扫的候选摘要（含分级波段），响应以 rotated_out 行 as-of 呈现。
+    # 只覆盖服务启动后的周期（重启即清空），不写数据库，不冒充实时。
+    day_ledger_rows: list[dict[str, Any]] = []
+    with _scan_cache_lock:
+        ledger = _intraday_day_ledger.setdefault(market_date_et, {})
+        for key in [k for k in _intraday_day_ledger if k != market_date_et]:
+            _intraday_day_ledger.pop(key, None)
+        for candidate in run["candidates"]:
+            symbol = str(candidate.get("ticker") or "").strip().upper()
+            if not symbol:
+                continue
+            bursts = candidate.get("session_bursts") or {}
+            setup_match = candidate.get("setup_match") or {}
+            ledger[symbol] = {
+                "ticker": symbol,
+                "last_seen_at": requested_at.isoformat(),
+                "session_bursts_legs": copy.deepcopy(
+                    list(bursts.get("legs") or [])
+                ),
+                "setup_matched_setups": list(
+                    setup_match.get("matched_setups") or []
+                ),
+                "last_change_percent": candidate.get("session_change_percent"),
+            }
+        day_ledger_rows = [
+            {**copy.deepcopy(entry), "state": "rotated_out"}
+            for symbol, entry in ledger.items()
+            if symbol not in deep_set
+        ]
+    # 最近离场的排前（同刻按代码字典序），确定性输出。
+    day_ledger_rows.sort(key=lambda row: row["ticker"])
+    day_ledger_rows.sort(key=lambda row: row["last_seen_at"], reverse=True)
 
     # 宽层剩余标的：按闸门同口径降序（标缺行恒排最后），诚实可见。
     _snapshot_sort_key = "pre_change_percent" if premarket_gate else "change_percent"
@@ -2752,10 +3030,13 @@ def _execute_intraday_top_two_tier(
             for symbol in deep_symbols
         ],
         "plan_always_include": list(plan_tickers),
+        "user_pinned": list(pinned_effective),
         "gated_out_count": len(supported) - len(deep_symbols),
         "snapshot_unresolved_symbols": snapshot_unresolved,
         "day_promotion_cap": _INTRADAY_DEEP_DAILY_DISTINCT_CAP,
         "day_promotion_cap_reached": day_cap_reached,
+        "day_ledger": day_ledger_rows,
+        "day_ledger_basis": _INTRADAY_DAY_LEDGER_BASIS,
         "snapshot_only": snapshot_only,
         "limitations": list(_INTRADAY_TWO_TIER_LIMITATIONS),
     }
@@ -3525,11 +3806,17 @@ def intraday_top(payload: IntradayTopRequest) -> IntradayTopResponse:
     if not payload.symbols and watchlist_configured:
         watchlist = watchlist_configured[:_INTRADAY_WATCHLIST_MAX_SYMBOLS]
         deep_lane_max = _configured_deep_lane_max()
+        pinned_configured = _configured_intraday_pinned_tickers()
         key = (
             "intraday_top",
             INTRADAY_TOP_SIGNAL_VERSION,
             enabled,
-            ("watchlist_two_tier", tuple(watchlist), deep_lane_max),
+            (
+                "watchlist_two_tier",
+                tuple(watchlist),
+                tuple(pinned_configured),
+                deep_lane_max,
+            ),
             int(payload.limit),
             market_date_et,
         )
@@ -3540,6 +3827,7 @@ def intraday_top(payload: IntradayTopRequest) -> IntradayTopResponse:
                 enabled=enabled,
                 deep_lane_max=deep_lane_max,
                 watchlist_configured_total=len(watchlist_configured),
+                pinned_tickers=pinned_configured,
             )
         )
     else:

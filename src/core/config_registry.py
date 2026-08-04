@@ -121,6 +121,25 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "validation": {"min": 1, "max": 20},
         "display_order": 12,
     },
+    "INTRADAY_PINNED_TICKERS": {
+        "title": "Intraday Pinned Tickers (always deep-scanned)",
+        "description": (
+            "两层模式下的用户钉选清单（逗号分隔美股代码）。钉选标的保证每轮"
+            "进入深度层（与当日冻结盘前计划同权：不占 K 名额、并入同一批快照"
+            "、按当日额度去重）。留空＝无钉选；仅在 INTRADAY_WATCHLIST 已配置"
+            "时生效。"
+        ),
+        "category": "base",
+        "data_type": "array",
+        "ui_control": "textarea",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "",
+        "options": [],
+        "validation": {},
+        "display_order": 13,
+    },
     # ------------------------------------------------------------------
     # AI Model – LiteLLM unified config
     # ------------------------------------------------------------------

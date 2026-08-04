@@ -861,14 +861,19 @@ export interface IntradaySessionBursts {
   limitations: string[];
 }
 
-/** 闸门口径：常规＝|当日涨跌|→成交额；盘前＝|盘前涨跌|→盘前成交额。 */
+/**
+ * 闸门口径：v2 常规＝15 分钟动量子额度优先、当日涨跌子额度兜底（2026-08-03
+ * 普涨跳空日校准）；v1＝|当日涨跌|→成交额（冷启动回退）；盘前＝|盘前涨跌|→
+ * 盘前成交额（不变）。
+ */
 export type IntradayGateBasis =
   | 'abs_change_percent_then_turnover_v1'
+  | 'momentum15m_then_day_change_v2'
   | 'premarket_pre_price_change_then_pre_turnover_v1';
 
-/** 两层模式下该候选进入深度层的原因：计划钉选或异动排名（v1 闸门，非信号）。 */
+/** 两层模式下该候选进入深度层的原因：计划钉选/用户钉选/异动排名（非信号）。 */
 export interface IntradayDeepLaneReason {
-  promotedBy: 'plan_always_include' | 'mover_rank';
+  promotedBy: 'plan_always_include' | 'user_pinned' | 'mover_rank';
   moverRank: number | null;
   basis: IntradayGateBasis;
 }
@@ -894,15 +899,28 @@ export interface IntradaySnapshotOnlyRow {
 /** 深度层名单单行（含未上榜候选，名单本身绝不无声截断）。 */
 export interface IntradayDeepLaneEntry {
   ticker: string;
-  promotedBy: 'plan_always_include' | 'mover_rank';
+  promotedBy: 'plan_always_include' | 'user_pinned' | 'mover_rank';
   moverRank: number | null;
+}
+
+/**
+ * 今日曾深扫账本单行：被 movers 轮换出深度层的标的以最后一次深扫摘要
+ * as-of 呈现（分级波段/形态/涨跌），不实时刷新；重启后只从当前时刻累计。
+ */
+export interface IntradayDayLedgerEntry {
+  ticker: string;
+  lastSeenAt: string;
+  sessionBurstsLegs: IntradayBurstWindow[];
+  setupMatchedSetups: IntradaySetupKey[];
+  lastChangePercent: number | null;
+  state: 'rotated_out';
 }
 
 /** watchlist 两层模式的诚实 universe 概览；单层（现状）模式恒为 null。 */
 export interface IntradayUniverseScan {
   mode: 'watchlist_two_tier';
   gateBasis: IntradayGateBasis;
-  /** 闸门降级警示（如盘前字段不可用回退常规口径）；旧载荷可省略。 */
+  /** 闸门降级警示（盘前字段不可用 / 动量历史预热中）；旧载荷可省略。 */
   gateWarnings?: string[];
   watchlistTotal: number;
   watchlistTruncated: boolean;
@@ -911,10 +929,15 @@ export interface IntradayUniverseScan {
   deepLaneMax: number;
   deepLane: IntradayDeepLaneEntry[];
   planAlwaysInclude: string[];
+  /** 用户钉选（INTRADAY_PINNED_TICKERS，additive）；旧载荷可省略。 */
+  userPinned?: string[];
   gatedOutCount: number;
   snapshotUnresolvedSymbols: string[];
   dayPromotionCap: number;
   dayPromotionCapReached: boolean;
+  /** 今日曾深扫账本（additive）；旧载荷可省略。 */
+  dayLedger?: IntradayDayLedgerEntry[];
+  dayLedgerBasis?: 'in_process_since_service_start_resets_on_restart';
   snapshotOnly: IntradaySnapshotOnlyRow[];
   limitations: string[];
 }

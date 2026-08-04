@@ -509,8 +509,13 @@ class Config:
     # api/v1/endpoints/opportunities.py 与 New-docs/phase1/06 §2.11）。
     intraday_watchlist: List[str] = field(default_factory=list)
     # INTRADAY_DEEP_LANE_MAX：异动闸门每轮晋升到深度层的标的数上限（1..20）。
-    # 只约束按 |涨跌幅|→成交额 晋升的名额；当日冻结盘前计划标的始终占深度位。
+    # 只约束按异动排名晋升的名额；当日冻结盘前计划标的始终占深度位。
     intraday_deep_lane_max: int = 12
+    # INTRADAY_PINNED_TICKERS：两层模式下的用户钉选清单（逗号分隔美股代码）。
+    # 钉选标的保证每轮进入深度层（与当日冻结盘前计划同权：不占 K 名额、
+    # 并入同一批快照、按当日额度去重，deep_lane_reason=user_pinned）。
+    # 未配置＝无钉选（现状不变）；仅两层模式（INTRADAY_WATCHLIST 已配置）消费。
+    intraday_pinned_tickers: List[str] = field(default_factory=list)
 
     # === 飞书云文档配置 ===
     feishu_app_id: Optional[str] = None
@@ -1007,6 +1012,12 @@ class Config:
             minimum=1,
             maximum=20,
         )
+        # 用户钉选（两层模式下保证深扫）：未配置＝空列表＝无钉选。
+        intraday_pinned_tickers = [
+            (c or "").strip().upper()
+            for c in os.getenv('INTRADAY_PINNED_TICKERS', '').split(',')
+            if (c or "").strip()
+        ]
         
         # === LiteLLM multi-key parsing ===
         # GEMINI_API_KEYS (comma-separated) > GEMINI_API_KEY (single)
@@ -1234,6 +1245,7 @@ class Config:
             stock_list=stock_list,
             intraday_watchlist=intraday_watchlist,
             intraday_deep_lane_max=intraday_deep_lane_max,
+            intraday_pinned_tickers=intraday_pinned_tickers,
             feishu_app_id=os.getenv('FEISHU_APP_ID'),
             feishu_app_secret=os.getenv('FEISHU_APP_SECRET'),
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),

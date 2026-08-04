@@ -19,16 +19,17 @@ import { IntradayOptionEventFeed } from '../components/opportunities/IntradayOpt
 import { IntradayTrackingPanel } from '../components/opportunities/IntradayTrackingPanel';
 import { Button } from '../components/ui';
 
-/** 自动刷新间隔：仅在页面可见且盘段为盘前/盘中时轮询（与盘中跟踪面板一致）。 */
+/** 自动刷新间隔：仅在页面可见且盘段为盘前/盘中时轮询（与今日计划跟踪面板一致）。 */
 export const INTRADAY_PAGE_POLL_INTERVAL_MS = 60_000;
 
 /**
  * 日内工作台：交易时段的单屏主界面。
  *
- * 自上而下：市场脉搏（SPY/QQQ/VIX + 盘段 + 刷新指示）→ 今日计划（冻结盘前
- * Top 5 对照，复用盘中跟踪面板）→ 日内扫描表（盘中滚动证据排名）+ 期权异动
- * feed。全部内容是盘中滚动研究：不是信号、不冻结、不进入统计；期权异动是
- * Moomoo 分类，不证明方向。周内（盘前冻结）研究仍在 /regime。
+ * 自上而下（2026-08-04 命名与主次整理）：市场脉搏（SPY/QQQ/VIX + 盘段 +
+ * 刷新指示）→ 实时扫描（现在谁在动，主表；盘中滚动证据排名 + 今日曾深扫
+ * 账本）→ 今日计划跟踪（盘前冻结计划走到哪了，冻结盘前 Top 5 对照）→
+ * 期权事件流。全部内容是盘中滚动研究：不是信号、不冻结、不进入统计；
+ * 期权异动是 Moomoo 分类，不证明方向。周内（盘前冻结）研究仍在 /regime。
  */
 const IntradayPage: React.FC = () => {
   const userTickers = useUserWatchlistStore((state) => state.tickers);
@@ -71,7 +72,7 @@ const IntradayPage: React.FC = () => {
         setTopError(null);
       } else {
         setTopError(
-          topResult.reason instanceof Error ? topResult.reason.message : '日内扫描读取失败',
+          topResult.reason instanceof Error ? topResult.reason.message : '实时扫描读取失败',
         );
       }
     } finally {
@@ -98,7 +99,7 @@ const IntradayPage: React.FC = () => {
           setPlanMessage(
             cycle.state === 'published'
               ? '今日官方盘前版本没有可对照的候选。'
-              : '今日尚无已发布的冻结盘前计划；日内扫描仍可用，但没有计划对照基准。',
+              : '今日尚无已发布的冻结盘前计划；实时扫描仍可用，但没有计划对照基准。',
           );
         }
       })
@@ -188,24 +189,31 @@ const IntradayPage: React.FC = () => {
         pollingActive={pollingActive}
       />
 
-      <section aria-label="今日计划" className="overflow-hidden rounded-ds-md border border-subtle bg-bg-1">
-        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 border-b border-subtle px-4 py-3">
-          <h2 className="text-h3 font-semibold text-text-1">今日计划 · 盘前冻结对照</h2>
-          <span className="text-caption text-text-3">
-            冻结的官方盘前 Top 5 是唯一对照基准 · 盘中不重排该计划
-          </span>
-        </div>
-        {planCandidates === null ? (
-          <div className="px-4 py-4 text-body-sm text-text-3">盘前计划读取中…</div>
-        ) : planCandidates.length > 0 ? (
-          <IntradayTrackingPanel candidates={planCandidates} />
-        ) : (
-          <div className="px-4 py-4 text-body-sm text-text-3">{planMessage}</div>
-        )}
-      </section>
-
+      {/* 主次顺序：实时扫描（现在谁在动）为主表，今日计划跟踪其后，期权事件流侧栏。 */}
       <div className="grid gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(340px,1fr)]">
-        <IntradayScanTable data={top} loading={loading} error={topError} />
+        <div className="min-w-0 space-y-4">
+          <IntradayScanTable data={top} loading={loading} error={topError} />
+          <section aria-label="今日计划" className="overflow-hidden rounded-ds-md border border-subtle bg-bg-1">
+            {planCandidates !== null && planCandidates.length > 0 ? (
+              // 面板自带「今日计划跟踪 · 盘前冻结计划走到哪了」标题与刷新控件。
+              <IntradayTrackingPanel candidates={planCandidates} />
+            ) : (
+              <>
+                <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 border-b border-subtle px-4 py-3">
+                  <h2 className="text-h3 font-semibold text-text-1">
+                    今日计划跟踪 · 盘前冻结计划走到哪了
+                  </h2>
+                  <span className="text-caption text-text-3">
+                    冻结的官方盘前 Top 5 是唯一对照基准 · 盘中不重排该计划
+                  </span>
+                </div>
+                <div className="px-4 py-4 text-body-sm text-text-3">
+                  {planCandidates === null ? '盘前计划读取中…' : planMessage}
+                </div>
+              </>
+            )}
+          </section>
+        </div>
         <IntradayOptionEventFeed
           events={top?.recentOptionEvents ?? []}
           quoteSessionLabel={top?.quoteSessionLabel ?? null}

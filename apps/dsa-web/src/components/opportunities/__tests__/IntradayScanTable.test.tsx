@@ -323,7 +323,7 @@ describe('IntradayScanTable 默认 9 列网格（v3 上下文并入）', () => {
     const response = { ...topResponse(), candidates: [v3Candidate()], universe: ['NVDA'] };
     render(<IntradayScanTable data={response} loading={false} error={null} />);
 
-    const table = screen.getByRole('table', { name: '日内扫描表' });
+    const table = screen.getByRole('table', { name: '实时扫描表' });
     // 默认网格恰好 9 列交易关键读数。
     const headers = ['排名', '标的', '涨跌%', '当前爆发', '今日波段', '速度', '形态', '波段vs大盘', '详情'];
     for (const header of headers) {
@@ -352,7 +352,7 @@ describe('IntradayScanTable 默认 9 列网格（v3 上下文并入）', () => {
 
   it('keeps unavailable context honest: 标缺 never pretends safe or aligned', () => {
     render(<IntradayScanTable data={topResponse()} loading={false} error={null} />);
-    const table = screen.getByRole('table', { name: '日内扫描表' });
+    const table = screen.getByRole('table', { name: '实时扫描表' });
     // 默认 fixture：财报日历标缺 → 标的格次行显式「财报标缺」（未知≠安全），
     // 绝不以无徽标冒充安全；大盘/速度同为标缺。
     const missingBadges = within(table).getAllByText('财报标缺');
@@ -372,7 +372,7 @@ describe('IntradayScanTable 默认 9 列网格（v3 上下文并入）', () => {
       universe: ['MU', 'NVDA'],
     };
     render(<IntradayScanTable data={response} loading={false} error={null} />);
-    const table = screen.getByRole('table', { name: '日内扫描表' });
+    const table = screen.getByRole('table', { name: '实时扫描表' });
     fireEvent.click(within(table).getByRole('button', { name: '按当前爆发排序' }));
     const bodyRows = () => within(table).getAllByRole('row').slice(1);
     const tickerOrder = () =>
@@ -450,7 +450,7 @@ describe('IntradayScanTable 今日波段分级 chips（signal v5 grade）', () =
       universe: ['NVDA'],
     };
     render(<IntradayScanTable data={response} loading={false} error={null} />);
-    const table = screen.getByRole('table', { name: '日内扫描表' });
+    const table = screen.getByRole('table', { name: '实时扫描表' });
     // 强波段＝实底警示 chip。
     const strongChip = within(table).getByText('09:45↓ 强');
     expect(strongChip).toHaveClass('text-warning');
@@ -484,7 +484,7 @@ describe('IntradayScanTable 今日波段分级 chips（signal v5 grade）', () =
       universe: ['NVDA'],
     };
     render(<IntradayScanTable data={response} loading={false} error={null} />);
-    const table = screen.getByRole('table', { name: '日内扫描表' });
+    const table = screen.getByRole('table', { name: '实时扫描表' });
     const chip = within(table).getByText('09:40↑');
     expect(chip).toHaveClass('border-subtle');
     expect(chip.textContent).not.toContain('强');
@@ -498,7 +498,7 @@ describe('IntradayScanTable 今日波段分级 chips（signal v5 grade）', () =
       universe: ['NVDA', 'MU'],
     };
     render(<IntradayScanTable data={response} loading={false} error={null} />);
-    const table = screen.getByRole('table', { name: '日内扫描表' });
+    const table = screen.getByRole('table', { name: '实时扫描表' });
     expect(within(table).getByText('本时段无记录波段')).toBeInTheDocument();
     expect(within(table).getByText('波段读数不可得')).toBeInTheDocument();
   });
@@ -547,7 +547,7 @@ describe('IntradayScanTable v4 形态列（styleMatch v1）', () => {
         error={null}
       />,
     );
-    const table = screen.getByRole('table', { name: '日内扫描表' });
+    const table = screen.getByRole('table', { name: '实时扫描表' });
     expect(within(table).getByText('形态')).toBeInTheDocument();
     // matched=实底徽标（aria-label 与共享 Tooltip 携带证据行 + 只读 Playbook 标注）。
     const matchedBadge = within(table).getByText('S1 低点抬高');
@@ -590,7 +590,7 @@ describe('IntradayScanTable v4 形态列（styleMatch v1）', () => {
         error={null}
       />,
     );
-    const table = screen.getByRole('table', { name: '日内扫描表' });
+    const table = screen.getByRole('table', { name: '实时扫描表' });
     expect(within(table).getByText('无相似形态 · 非信号')).toBeInTheDocument();
     expect(within(table).getByText('K线/快照输入不足')).toBeInTheDocument();
     // 标缺行仍完整在表：形态列绝不隐藏候选。
@@ -702,7 +702,7 @@ describe('IntradayScanTable watchlist 两层模式（universeScan）', () => {
       screen.getByText(/全清单 5 檔快照 · 深度分析前 12 檔（\|涨跌\|→成交额）· 其余仅快照/),
     ).toBeInTheDocument();
     // 深度位徽标：计划钉选 / 异动排名。
-    const table = screen.getByRole('table', { name: '日内扫描表' });
+    const table = screen.getByRole('table', { name: '实时扫描表' });
     expect(within(table).getByText('计划钉选')).toBeInTheDocument();
     expect(within(table).getByText('异动 #1')).toBeInTheDocument();
   });
@@ -777,7 +777,7 @@ describe('IntradayScanTable watchlist 两层模式（universeScan）', () => {
     expect(screen.getByText(/扫描 2 个标的/)).toBeInTheDocument();
     expect(screen.queryByLabelText('仅快照标的')).not.toBeInTheDocument();
     expect(screen.queryByText(/其余仅快照/)).not.toBeInTheDocument();
-    const table = screen.getByRole('table', { name: '日内扫描表' });
+    const table = screen.getByRole('table', { name: '实时扫描表' });
     expect(within(table).queryByText('计划钉选')).not.toBeInTheDocument();
   });
 
@@ -860,6 +860,177 @@ describe('IntradayScanTable watchlist 两层模式（universeScan）', () => {
     expect(within(section).getByText('按 |涨跌幅| 排序 · 闸门之外无爆发/形态/速度读数——缺席即缺席，不以 0 冒充')).toBeInTheDocument();
     expect(within(section).getByText('+2.31%')).toBeInTheDocument();
     expect(within(section).queryByText(/盘前/)).not.toBeInTheDocument();
+  });
+});
+
+describe('IntradayScanTable 闸门 v2 + 用户钉选 + 今日曾深扫账本', () => {
+  beforeEach(() => {
+    navigateMock.mockReset();
+    vi.mocked(fetchNearExpiryContracts).mockReset();
+    vi.mocked(fetchNearExpiryContracts).mockImplementation(
+      async (symbol: string) => nearExpiryEmpty(symbol),
+    );
+  });
+
+  function twoTierResponse(): IntradayTopResponse {
+    return {
+      ...topResponse(),
+      universe: ['NVDA', 'MU', 'AAPL'],
+      candidates: [
+        candidate({
+          scanTier: 'deep',
+          deepLaneReason: {
+            promotedBy: 'user_pinned',
+            moverRank: null,
+            basis: 'momentum15m_then_day_change_v2',
+          },
+        }),
+        candidate({
+          ticker: 'MU',
+          lastPrice: 100.5,
+          scanTier: 'deep',
+          deepLaneReason: {
+            promotedBy: 'mover_rank',
+            moverRank: 1,
+            basis: 'momentum15m_then_day_change_v2',
+          },
+        }),
+      ],
+      universeScan: {
+        mode: 'watchlist_two_tier',
+        gateBasis: 'momentum15m_then_day_change_v2',
+        gateWarnings: [],
+        watchlistTotal: 3,
+        watchlistTruncated: false,
+        scannedTotal: 3,
+        deepLaneCount: 2,
+        deepLaneMax: 12,
+        deepLane: [
+          { ticker: 'NVDA', promotedBy: 'user_pinned', moverRank: null },
+          { ticker: 'MU', promotedBy: 'mover_rank', moverRank: 1 },
+        ],
+        planAlwaysInclude: [],
+        userPinned: ['NVDA'],
+        gatedOutCount: 1,
+        snapshotUnresolvedSymbols: [],
+        dayPromotionCap: 30,
+        dayPromotionCapReached: false,
+        dayLedger: [],
+        dayLedgerBasis: 'in_process_since_service_start_resets_on_restart',
+        snapshotOnly: [
+          {
+            ticker: 'AAPL',
+            state: 'ready',
+            lastPrice: 210.1,
+            changePercent: 2.31,
+            changeBasis: 'moomoo_snapshot_prev_close',
+            sessionHigh: 211.0,
+            sessionLow: 205.2,
+            volume: 1_000_000,
+            turnover: 210_000_000,
+            quoteAsOf: '2026-08-04 10:30:04',
+            unavailableReason: null,
+          },
+        ],
+        limitations: ['两层扫描：仅晋升标的做深度分析。'],
+      },
+    };
+  }
+
+  it('renders the renamed heading with the deep-lane sub caption in two-tier mode', () => {
+    render(<IntradayScanTable data={twoTierResponse()} loading={false} error={null} />);
+    expect(screen.getByText('实时扫描 · 现在谁在动')).toBeInTheDocument();
+    expect(
+      screen.getByText('深度层实时排名，下方为今日曾深扫账本'),
+    ).toBeInTheDocument();
+  });
+
+  it('renders the 钉选 badge for user-pinned candidates and honest pin counts', () => {
+    render(<IntradayScanTable data={twoTierResponse()} loading={false} error={null} />);
+    const table = screen.getByRole('table', { name: '实时扫描表' });
+    // 用户钉选徽标（与「计划钉选」区分）；异动位徽标不受影响。
+    expect(within(table).getByText('钉选')).toBeInTheDocument();
+    expect(within(table).queryByText('计划钉选')).not.toBeInTheDocument();
+    expect(within(table).getByText('异动 #1')).toBeInTheDocument();
+    // footer 如实报告钉选占位不占 K 名额。
+    expect(
+      screen.getByText(/计划钉选 0 檔 \+ 用户钉选 1 檔始终占深度位（不占 K 名额）/),
+    ).toBeInTheDocument();
+  });
+
+  it('renders the momentum v2 gate caption in header and footer', () => {
+    render(<IntradayScanTable data={twoTierResponse()} loading={false} error={null} />);
+    // 页头 + footer 均如实声明 v2 口径（谁现在在动优先、当日涨跌兜底）。
+    expect(
+      screen.getAllByText(/15分动量优先（谁现在在动）· 当日涨跌兜底/).length,
+    ).toBe(2);
+  });
+
+  it('shows the explicit warming-up warning when momentum history is cold', () => {
+    const response = twoTierResponse();
+    response.universeScan = {
+      ...response.universeScan!,
+      gateBasis: 'abs_change_percent_then_turnover_v1',
+      gateWarnings: ['momentum_history_warming_up_ranking_by_day_change'],
+    };
+    render(<IntradayScanTable data={response} loading={false} error={null} />);
+    // 页头警示 chip + footer 各一处：预热期按当日涨跌排序，绝不静默冒充动量。
+    expect(
+      screen.getAllByText(/动量样本预热中 · 暂按当日涨跌排序/).length,
+    ).toBe(2);
+    expect(screen.queryByText(/15分动量优先/)).not.toBeInTheDocument();
+  });
+
+  it('renders day-ledger rows with waves, setups and honest as-of below the live table', () => {
+    const response = twoTierResponse();
+    response.universeScan = {
+      ...response.universeScan!,
+      dayLedger: [
+        {
+          ticker: 'ORCL',
+          lastSeenAt: '2026-08-04T13:40:00+00:00',
+          sessionBurstsLegs: [
+            {
+              startEt: '09:40',
+              endEt: '09:55',
+              thrustPercent: 2.4,
+              thrustNorm: 4.0,
+              volNorm: 3.0,
+              score: 12.0,
+              direction: 'up',
+              grade: 'strong',
+            },
+          ],
+          setupMatchedSetups: ['S1'],
+          lastChangePercent: 4.1,
+          state: 'rotated_out',
+        },
+      ],
+    };
+    render(<IntradayScanTable data={response} loading={false} error={null} />);
+    const section = screen.getByLabelText('今日曾深扫账本');
+    expect(
+      within(section).getByText('今日曾深扫 · 波段保留（1 檔）'),
+    ).toBeInTheDocument();
+    // 行内容：ticker + as-of（ET）+ 最后涨跌 + 分级波段 chip + 形态 + 状态。
+    expect(within(section).getByText('ORCL')).toBeInTheDocument();
+    expect(within(section).getByText('09:40 ET 深扫')).toBeInTheDocument();
+    expect(within(section).getByText('+4.10%')).toBeInTheDocument();
+    const chip = within(section).getByText('09:40↑ 强');
+    expect(chip).toHaveClass('text-warning');
+    expect(within(section).getByText('形态 S1')).toBeInTheDocument();
+    expect(within(section).getByText('已轮换出')).toBeInTheDocument();
+    // 诚实标注：as-of 不刷新 + 重启后从当前时刻累计。
+    expect(
+      within(section).getByText(/显示最后一次深扫读数（as-of，不实时刷新）· 重启后从当前时刻累计/),
+    ).toBeInTheDocument();
+    // 当前深度层标的不出现在账本（数据合同由服务端保证，这里锁定渲染面）。
+    expect(within(section).queryByText('NVDA')).not.toBeInTheDocument();
+  });
+
+  it('renders no ledger section when the day ledger is empty', () => {
+    render(<IntradayScanTable data={twoTierResponse()} loading={false} error={null} />);
+    expect(screen.queryByLabelText('今日曾深扫账本')).not.toBeInTheDocument();
   });
 });
 

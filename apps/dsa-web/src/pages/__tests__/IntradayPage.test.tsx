@@ -469,50 +469,53 @@ describe('IntradayPage', () => {
     // SPY 会话 VWAP 位置（累计额/量近似）。
     expect(within(pulseSection).getByText('VWAP 上方')).toBeInTheDocument();
 
-    // 今日计划：无冻结计划时的诚实空态。
-    expect(screen.getByText('今日计划 · 盘前冻结对照')).toBeInTheDocument();
+    // 今日计划跟踪：无冻结计划时的诚实空态（命名与实时扫描明确区分）。
+    expect(
+      screen.getByText('今日计划跟踪 · 盘前冻结计划走到哪了'),
+    ).toBeInTheDocument();
     expect(
       await screen.findByText(/今日尚无已发布的冻结盘前计划/),
     ).toBeInTheDocument();
 
-    // 日内扫描表：全部列头 + as-of；「当前爆发」为首个数据列，随后是速度列。
-    const table = await screen.findByRole('table', { name: '日内扫描表' });
-    for (const header of ['标的', '今日波段', 'VWAP', '研究状态']) {
+    // 实时扫描表（两级布局默认 9 列交易关键读数）。
+    expect(screen.getByText('实时扫描 · 现在谁在动')).toBeInTheDocument();
+    const table = await screen.findByRole('table', { name: '实时扫描表' });
+    const headers = ['排名', '标的', '涨跌%', '当前爆发', '今日波段', '速度', '形态', '波段vs大盘', '详情'];
+    for (const header of headers) {
       expect(within(table).getByText(header)).toBeInTheDocument();
     }
-    expect(within(table).getByText('当前爆发')).toBeInTheDocument();
-    const headerCells = within(table).getAllByRole('columnheader');
-    expect(headerCells[1].textContent).toContain('当前爆发');
-    expect(headerCells[2].textContent).toContain('速度');
-    expect(headerCells[3].textContent).toContain('今日波段');
-    expect(within(table).getByText('现价 / 当日')).toBeInTheDocument();
-    expect(within(table).getByText('缺口')).toBeInTheDocument();
-    expect(within(table).getByText('量能节奏')).toBeInTheDocument();
-    expect(within(table).getByText('波幅扩张(ATR)')).toBeInTheDocument();
-    expect(within(table).getByText('期权异动')).toBeInTheDocument();
-    // v3 上下文列：大盘 / 财报（NVDA 顺势 + 回避窗 badge；TSLA 标缺）。
-    expect(within(table).getByText('大盘')).toBeInTheDocument();
-    expect(within(table).getByText('财报')).toBeInTheDocument();
+    expect(within(table).getAllByRole('columnheader').length).toBe(9);
+    // v3 上下文（NVDA 顺势 + 财报回避窗 badge；速度加速↑）。
     expect(within(table).getByText('顺势')).toBeInTheDocument();
     expect(within(table).getByText('财报 2 天内 · 期权贵')).toBeInTheDocument();
-    expect(within(table).getByText('加速')).toBeInTheDocument();
-    expect(within(table).getAllByText('10:30:04 ET').length).toBeGreaterThan(0);
-    expect(within(table).getByText('盘中活跃')).toBeInTheDocument();
-    expect(within(table).getByText('3 笔 · 偏多 · 最大单 $250K')).toBeInTheDocument();
+    expect(within(table).getByText('加速↑')).toBeInTheDocument();
+    expect(within(table).getAllByText(/10:30:04 ET/).length).toBeGreaterThan(0);
 
-    // 当前爆发：分数 + 方向箭头 + 15 分钟推力%；今日波段摘要；标缺行诚实。
+    // 当前爆发：分数 + 15 分钟推力%；今日波段 chips；标缺行诚实。
     expect(within(table).getByText('8.6')).toBeInTheDocument();
     expect(within(table).getByText('15分 +0.95%')).toBeInTheDocument();
-    expect(within(table).getByText('2 波：09:40↓ · 15:15↑')).toBeInTheDocument();
+    expect(within(table).getByText('09:40↓')).toBeInTheDocument();
+    expect(within(table).getByText('15:15↑')).toBeInTheDocument();
     const tslaRow = within(table).getByLabelText('打开 TSLA 即时扫描详情');
     expect(within(tslaRow).getAllByText('标缺').length).toBeGreaterThan(0);
 
-    // 页头副标题：爆发分优先排名 + v3 版本号。
+    // 页头副标题：爆发分优先排名 + 版本号。
     expect(screen.getByText(/波段爆发优先排名/)).toBeInTheDocument();
     expect(screen.getByText(/intraday_session_evidence_v4/)).toBeInTheDocument();
 
-    // 期权异动 feed + 诚实边界文案。
+    // 主次顺序：实时扫描（主表）在前，今日计划跟踪其后，期权事件流最后。
+    const scanSection = screen.getByLabelText('实时扫描');
+    const planSection = screen.getByLabelText('今日计划');
     const feed = screen.getByLabelText('期权异动');
+    expect(
+      scanSection.compareDocumentPosition(planSection)
+        & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      planSection.compareDocumentPosition(feed) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    // 期权异动 feed + 诚实边界文案。
     expect(within(feed).getByText('偏多（Moomoo 分类）')).toBeInTheDocument();
     expect(
       within(feed).getByText(/不推断开平仓，不证明真实主动买卖方向，不是信号/),
@@ -521,23 +524,23 @@ describe('IntradayPage', () => {
 
   it('sorts the scan table client-side and toggles back to server rank', async () => {
     renderPage();
-    const table = await screen.findByRole('table', { name: '日内扫描表' });
+    const table = await screen.findByRole('table', { name: '实时扫描表' });
 
     const tickerOrder = () =>
       within(table)
         .getAllByRole('row')
         .slice(1)
-        .map((row) => within(row).getAllByRole('cell')[0].textContent ?? '');
+        .map((row) => within(row).getAllByRole('cell')[1].textContent ?? '');
 
     // 服务端排名：NVDA（active）在前。
     expect(tickerOrder()[0]).toContain('NVDA');
 
-    const paceHeader = within(table).getByRole('button', { name: '按量能节奏排序' });
-    fireEvent.click(paceHeader); // desc：NVDA 2.5 在前
+    const changeHeader = within(table).getByRole('button', { name: '按涨跌%排序' });
+    fireEvent.click(changeHeader); // desc：NVDA +5.24% 在前
     expect(tickerOrder()[0]).toContain('NVDA');
-    fireEvent.click(paceHeader); // asc：TSLA 1.2 在前
+    fireEvent.click(changeHeader); // asc：TSLA −0.5% 在前
     expect(tickerOrder()[0]).toContain('TSLA');
-    fireEvent.click(paceHeader); // 第三次点击回到服务端证据排名
+    fireEvent.click(changeHeader); // 第三次点击回到服务端证据排名
     expect(tickerOrder()[0]).toContain('NVDA');
 
     // 当前爆发列可排序；TSLA 爆发标缺永远排最后（升降序均如此）。
@@ -550,7 +553,7 @@ describe('IntradayPage', () => {
 
   it('navigates to the live-scan detail page on row click', async () => {
     renderPage();
-    const table = await screen.findByRole('table', { name: '日内扫描表' });
+    const table = await screen.findByRole('table', { name: '实时扫描表' });
     const row = within(table).getByLabelText('打开 NVDA 即时扫描详情');
     // MemoryRouter 无法直接断言 URL；点击不抛错并保持行可交互即可（路由跳转
     // 行为由 /regime/opportunity/:ticker 的既有测试与 E2E 覆盖）。
@@ -612,7 +615,7 @@ describe('IntradayPage', () => {
 
   it('manual refresh bypasses the server TTL with refresh=true', async () => {
     renderPage();
-    await screen.findByRole('table', { name: '日内扫描表' });
+    await screen.findByRole('table', { name: '实时扫描表' });
     fireEvent.click(screen.getByRole('button', { name: '手动刷新日内工作台' }));
     await waitFor(() => {
       expect(fetchIntradayTop).toHaveBeenLastCalledWith(
@@ -625,6 +628,6 @@ describe('IntradayPage', () => {
   it('keeps the scan table honest when the endpoint fails', async () => {
     vi.mocked(fetchIntradayTop).mockRejectedValue(new Error('scan down'));
     renderPage();
-    expect(await screen.findByText(/日内扫描暂不可用：scan down/)).toBeInTheDocument();
+    expect(await screen.findByText(/实时扫描暂不可用：scan down/)).toBeInTheDocument();
   });
 });

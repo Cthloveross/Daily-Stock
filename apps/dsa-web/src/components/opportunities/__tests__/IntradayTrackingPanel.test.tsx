@@ -214,7 +214,7 @@ describe('IntradayTrackingPanel', () => {
     render(<IntradayTrackingPanel candidates={[candidate()]} />);
 
     expect(await screen.findByText('跟踪冻结的盘前计划 · 不是信号 · 不改变盘前排名')).toBeInTheDocument();
-    expect(screen.getByRole('table', { name: '盘中跟踪表' })).toBeInTheDocument();
+    expect(screen.getByRole('table', { name: '今日计划跟踪表' })).toBeInTheDocument();
     for (const header of ['现价（as-of）', '距确认位', '距失效位', 'VWAP', '量能节奏', '盘段状态']) {
       expect(screen.getByText(header)).toBeInTheDocument();
     }
@@ -323,13 +323,13 @@ describe('IntradayTrackingPanel', () => {
     await act(async () => {
       await Promise.resolve();
     });
-    fireEvent.click(screen.getByRole('checkbox', { name: '自动刷新盘中跟踪' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: '自动刷新今日计划跟踪' }));
     await act(async () => {
       await vi.advanceTimersByTimeAsync(120_000);
     });
     expect(fetchIntradayTracking).toHaveBeenCalledTimes(1);
 
-    fireEvent.click(screen.getByRole('button', { name: '手动刷新盘中跟踪' }));
+    fireEvent.click(screen.getByRole('button', { name: '手动刷新今日计划跟踪' }));
     await act(async () => {
       await Promise.resolve();
     });

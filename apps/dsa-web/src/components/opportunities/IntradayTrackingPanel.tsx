@@ -162,7 +162,7 @@ export function IntradayTrackingPanel({ candidates }: { candidates: OpportunityC
       setError(null);
     } catch (caught) {
       if (requestSequence.current !== requestId) return;
-      setError(caught instanceof Error ? caught.message : '盘中跟踪读取失败');
+      setError(caught instanceof Error ? caught.message : '今日计划跟踪读取失败');
     } finally {
       if (requestSequence.current === requestId) setLoading(false);
     }
@@ -202,13 +202,15 @@ export function IntradayTrackingPanel({ candidates }: { candidates: OpportunityC
 
   return (
     <section
-      aria-label="盘中跟踪"
+      aria-label="今日计划跟踪"
       className="border-t border-subtle bg-bg-1"
     >
       <header className="flex flex-wrap items-start justify-between gap-3 border-b border-subtle px-4 py-3">
         <div>
           <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-            <h3 className="text-h3 font-semibold text-text-1">盘中跟踪</h3>
+            <h3 className="text-h3 font-semibold text-text-1">
+              今日计划跟踪 · 盘前冻结计划走到哪了
+            </h3>
             <span className="text-caption text-text-3">
               跟踪冻结的盘前计划 · 不是信号 · 不改变盘前排名
             </span>
@@ -231,7 +233,7 @@ export function IntradayTrackingPanel({ candidates }: { candidates: OpportunityC
               type="checkbox"
               checked={autoRefresh}
               onChange={(event) => setAutoRefresh(event.target.checked)}
-              aria-label="自动刷新盘中跟踪"
+              aria-label="自动刷新今日计划跟踪"
             />
             自动刷新（60 秒 · 仅盘前/盘中且页面可见）
           </label>
@@ -240,7 +242,7 @@ export function IntradayTrackingPanel({ candidates }: { candidates: OpportunityC
             size="sm"
             disabled={loading}
             onClick={() => void load(true)}
-            aria-label="手动刷新盘中跟踪"
+            aria-label="手动刷新今日计划跟踪"
           >
             <RefreshCw size={14} className={loading ? 'animate-spin' : undefined} />
             刷新
@@ -250,13 +252,13 @@ export function IntradayTrackingPanel({ candidates }: { candidates: OpportunityC
 
       {error && (
         <div className="border-b border-[color:var(--warn-muted)] bg-bg-0 px-4 py-2 text-caption text-warning" role="status">
-          盘中跟踪暂不可用：{error}
+          今日计划跟踪暂不可用：{error}
           {data ? `。仍显示 ${formatEtDateTime(data.generatedAt)} ET 的上一次结果。` : '。'}
         </div>
       )}
 
       <div className="overflow-auto">
-        <table className="w-full min-w-[880px] border-collapse" aria-label="盘中跟踪表">
+        <table className="w-full min-w-[880px] border-collapse" aria-label="今日计划跟踪表">
           <thead>
             <tr className="border-b border-subtle text-left text-caption text-text-3">
               <th className="px-3 py-2 font-medium">标的</th>

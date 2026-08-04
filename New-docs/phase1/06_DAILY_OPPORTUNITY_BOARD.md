@@ -278,7 +278,13 @@ Playbook 只读对应：服务端从 journal_v2 Playbook 候选表读取标题�
 
 **宽层（tier-1）**：整个清单 + 当日冻结盘前计划标的 + SPY 并入**每 60 秒周期仅 1 次** Moomoo `get_market_snapshot` 批量快照（官方单次上限 400 个代码；清单有界 200，恒为单请求，无需分片）。宽层只产出快照可得字段：现价 / 当日涨跌%（快照前收口径）/ 当日高低 / 量 / 额 / as-of。宽层行**没有**爆发、形态、速度、异动、财报字段——缺席即缺席，不以 null 占位冒充「已分析」。
 
-**异动闸门（documented v1 heuristic，`gate_basis=abs_change_percent_then_turnover_v1`）**：按 `|当日涨跌幅|` 主序、成交额次序、代码字典序兜底晋升前 K 档进入深度层。缺涨跌幅（快照未解析/缺前收）的行不可晋升——闸门绝不以 0 涨跌冒充平静。**计划钉选**：当日已冻结盘前计划的标的始终占深度位、不占 K 名额（不在清单里也会并入同一批快照）；计划标的不重复参与异动排名。闸门不是信号：晋升只决定「谁被深度分析」，不代表方向或质量结论。
+**异动闸门 v2（2026-08-04 起，非盘前时段默认，`gate_basis=momentum15m_then_day_change_v2`）**：K 个异动名额拆成两个子额度——**ceil(2K/3) 档按 `|mom15|`（最近 15 分钟动量，「谁现在在动」）降序**，其余名额按 `|当日涨跌幅|`（「谁今天最大」）降序兜底；动量侧先占位再去重，两侧各以成交额次序、代码字典序兜底（确定性）。`mom15 = (last / price_15min_ago − 1)×100`，由宽层每轮批量快照喂养的**进程内**价格滚动历史推导（零新增供应商请求）：取 12–18 分钟回看窗内「最老」样本作基准；窗内无足龄样本（服务重启 / 开盘冷启动 / 样本过期）时该标的 `mom15=None`，只能走当日涨跌子额度。整批皆无 `mom15` 时闸门**显式回退** v1 当日涨跌口径，并在 `universe_scan.gate_warnings` 携带 `momentum_history_warming_up_ranking_by_day_change`——绝不静默假装在按动量排序。动量历史仅常规时段喂养、ET 日期切换即清空（绝不跨日比价）、重启即冷启动。
+
+**v2 校准背景（2026-08-03 首个实盘日）**：当日为普涨跳空日，v1 闸门按 `|当日涨跌幅|` 排序，深度层被 +5%~+11% 的隔夜跳空标的（RBLX/CRWV/TEAM…）长期占满；用户当日唯一认定「真正能交易」的 NVDA（+2.5% 稳步爬升，10:00–10:15 中波段爆发分 5.06）整日没能晋升深度层。结论：隔夜跳空后横盘的标的当日涨跌幅恒定居高，却没有任何盘中动量——「谁今天涨得多」≠「谁现在在动」。v2 把多数名额交给 15 分钟动量（用户的「可交易」定义），保留少数名额给当日涨跌（跳空标的仍可见），两类视角互为补充而非互斥。
+
+**v1 口径（回退与休市路径，`gate_basis=abs_change_percent_then_turnover_v1`）**：按 `|当日涨跌幅|` 主序、成交额次序、代码字典序兜底晋升前 K 档。缺涨跌幅（快照未解析/缺前收）的行不可晋升——闸门绝不以 0 涨跌冒充平静。**计划钉选**：当日已冻结盘前计划的标的始终占深度位、不占 K 名额（不在清单里也会并入同一批快照）；计划标的不重复参与异动排名。**用户钉选（`INTRADAY_PINNED_TICKERS`，2026-08-04 起）**：用户显式钉选的标的与计划钉选同权——始终深扫、不占 K 名额、并入同一批快照、计入当日额度去重集合；`deep_lane_reason.promoted_by=user_pinned`（同一标的兼具计划身份时计划钉选优先标注）；未配置＝无钉选（现状不变）。闸门不是信号：晋升只决定「谁被深度分析」，不代表方向或质量结论。
+
+**今日曾深扫账本（`universe_scan.day_ledger`，display truth，2026-08-04 起）**：今天曾进入深度层、当前被 movers 轮换出去的标的**不得无声消失**（2026-08-03 实盘：ORCL 09:40 记录强波段后被挤出可见深度层，用户回看时波段整段不见）。服务端进程内按 ET 日保留每个曾深扫标的**最后一次深扫**的候选摘要，轮换出后以 `{ticker, last_seen_at, session_bursts_legs（分级波段）, setup_matched_setups, last_change_percent, state:"rotated_out"}` 行返回——as-of 数据、不实时刷新、绝不与当前深度层重复。纯展示缓存：不写数据库，重启即清空，`day_ledger_basis=in_process_since_service_start_resets_on_restart` 如实声明「重启后从当前时刻累计」。
 
 **盘前口径（ET 04:00–09:30 工作日，`gate_basis=premarket_pre_price_change_then_pre_turnover_v1`）**：盘前时段 Moomoo 常规快照字段（现价/涨跌幅/量/额）仍指向**上一常规时段**——若照常按 `change_percent` 排序，深度榜会复现昨天的异动而不是今晨盘前的真实异动。因此盘前闸门与宽层剩余行排序改用 pre_* 字段：`|pre_change_rate|`（盘前价相对上一常规收盘的百分比，可为负）主序、`pre_turnover`（盘前成交额）次序；缺盘前字段的行不可按盘前异动晋升、在宽层恒排最后——语义与常规口径一致，绝不以 0 冒充「平静」。宽层行 additive 携带 `pre_change_percent` / `pre_turnover`（快照缺列＝null，绝不 0 回填）。若整批快照都无盘前字段（如快照权限差异），闸门**显式回退**常规口径并在 `universe_scan.gate_warnings` 携带 `premarket_fields_unavailable_ranking_reflects_prior_session`——如实声明「当前排序反映上一常规时段」，绝不静默假装在按盘前排序。前端：盘前口径下页头与 footer 附「盘前异动排序（盘前价 vs 前收 · 盘前成交额次序）」，仅快照行展示「盘前 ±x%」与盘前成交额、缺盘前字段的行显式「盘前标缺」；回退时页头与 footer 显示警示「盘前字段不可用 · 当前排序反映上一常规时段」。
 
@@ -288,11 +294,11 @@ Playbook 只读对应：服务端从 journal_v2 Playbook 候选表读取标题�
 
 **每周期请求预算（两层模式，缓存全冷）**：1 次批量快照（≤清单+计划+SPY ≤ 206 codes，单请求）+ 深度层每档 1 次 5m K 线（60 秒逐标的 TTL，≤4 并发）+ 深度层每档 1 次有界异动页（30 秒 TTL 与 option-events 端点共用）+ 日线派生每档 900 秒记忆 + 财报 1 次/小时。宽层非晋升标的零 K 线、零日线加载。
 
-**响应合同（additive）**：`universe` 仍为 `list[str]`（= 宽层实际扫描的全部标的，类型不变——设计说明：原要求把 mode 等放进 `universe` 字段，但该字段既有类型为列表，改型即破坏合同，故新增 `universe_scan` 块）。`universe_scan`：`mode` / `gate_basis` / `gate_warnings[]`（闸门降级警示，见盘前口径小节）/ `watchlist_total` / `watchlist_truncated` / `scanned_total` / `deep_lane_count` / `deep_lane_max` / `deep_lane[]`（含晋升原因与异动名次，深度层名单本身绝不无声截断）/ `plan_always_include` / `gated_out_count` / `snapshot_unresolved_symbols`（供应商无返回行的标的，如实点名）/ `day_promotion_cap(_reached)` / `snapshot_only[]`（宽层行，按闸门同口径降序、标缺行恒最后；盘前口径下 additive 携带 `pre_change_percent` / `pre_turnover`）。每个深度候选带 `scan_tier="deep"` + `deep_lane_reason`（计划钉选 or 异动 #n）。
+**响应合同（additive）**：`universe` 仍为 `list[str]`（= 宽层实际扫描的全部标的，类型不变——设计说明：原要求把 mode 等放进 `universe` 字段，但该字段既有类型为列表，改型即破坏合同，故新增 `universe_scan` 块）。`universe_scan`：`mode` / `gate_basis`（v2 动量口径 / v1 回退 / 盘前口径三值）/ `gate_warnings[]`（闸门降级警示：盘前字段不可用、动量历史预热中）/ `watchlist_total` / `watchlist_truncated` / `scanned_total` / `deep_lane_count` / `deep_lane_max` / `deep_lane[]`（含晋升原因与异动名次，深度层名单本身绝不无声截断）/ `plan_always_include` / `user_pinned`（用户钉选生效清单）/ `gated_out_count` / `snapshot_unresolved_symbols`（供应商无返回行的标的，如实点名）/ `day_promotion_cap(_reached)` / `day_ledger[]` + `day_ledger_basis`（今日曾深扫账本，见上）/ `snapshot_only[]`（宽层行，按闸门同口径降序、标缺行恒最后；盘前口径下 additive 携带 `pre_change_percent` / `pre_turnover`）。每个深度候选带 `scan_tier="deep"` + `deep_lane_reason`（计划钉选 / 用户钉选 / 异动 #n）。
 
-**前端**：页头计数改为「全清单 N 檔快照 · 深度分析 K 檔」；深度行标的格附「计划钉选」/「异动 #n」徽标；表格下方新增「仅快照 · 未做深度分析（N 檔）」紧凑列表（ticker + 涨跌% + 成交额，快照未解析与日上限触顶各有显式警示行）；footer 固定附「全清单 N 檔快照 · 深度分析前 K 檔（|涨跌|→成交额）· 其余仅快照」。单层模式渲染完全不变。
+**前端（2026-08-04 命名与主次整理）**：/intraday 页顺序为 市场脉搏 → **实时扫描 · 现在谁在动**（主表，副标注「深度层实时排名，下方为今日曾深扫账本」）→ **今日计划跟踪 · 盘前冻结计划走到哪了**（原「盘中跟踪」改名，消除与扫描表的混淆）→ 期权事件流。页头计数「全清单 N 檔快照 · 深度分析 K 檔」；v2 口径附「15分动量优先（谁现在在动）· 当日涨跌兜底」，预热回退时页头/footer 显式「动量样本预热中 · 暂按当日涨跌排序」警示 chip；深度行标的格附「计划钉选」/「钉选」/「异动 #n」徽标；主表下方依次为「今日曾深扫 · 波段保留（N 檔）」账本行（ticker + as-of ET + 最后涨跌 + 分级波段 chips + 形态 + 「已轮换出」，标注「不实时刷新 · 重启后从当前时刻累计」，空账本不渲染）与「仅快照 · 未做深度分析（N 檔）」紧凑列表（ticker + 涨跌% + 成交额，快照未解析与日上限触顶各有显式警示行）；footer 固定附「全清单 N 檔快照 · 深度分析前 K 檔（口径随 gate_basis 如实切换）· 其余仅快照」。单层模式渲染完全不变。
 
-**诚实边界（响应 `limitations` 固定携带）**：两层扫描只有晋升标的做深度分析，其余仅快照、深度字段一律缺席；闸门为 v1 启发式（|涨跌幅|→成交额），不是信号，晋升不代表方向或质量结论；K 线额度为 30 天滚动去重标的数配额，日晋升护栏触顶如实标注。周内看板、市场脉搏与既有单层扫描不受任何影响。
+**诚实边界（响应 `limitations` 固定携带）**：两层扫描只有晋升标的做深度分析，其余仅快照、深度字段一律缺席；闸门为启发式（v2：15 分钟动量子额度 + 当日涨跌兜底；冷启动显式回退并警示），不是信号，晋升不代表方向或质量结论；今日曾深扫账本为进程内展示缓存（as-of、不刷新、重启清空、无 DB 写入）；K 线额度为 30 天滚动去重标的数配额，日晋升护栏触顶如实标注。周内看板、市场脉搏与既有单层扫描不受任何影响。
 
 ## 3. 数据语义修正
 

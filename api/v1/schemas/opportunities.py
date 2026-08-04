@@ -1176,15 +1176,18 @@ class IntradaySetupMatchProfile(BaseModel):
 
 
 class IntradayDeepLaneReason(BaseModel):
-    """两层模式下该候选进入深度层的原因：计划钉选或异动排名（v1 闸门）。
+    """两层模式下该候选进入深度层的原因：计划钉选/用户钉选/异动排名。
 
     闸门不是信号：晋升只决定「谁被深度分析」，不代表方向或质量结论。
+    v2 常规口径＝15 分钟动量子额度优先、当日涨跌子额度兜底（2026-08-03
+    普涨跳空日校准：|当日涨跌| 单口径会让隔夜跳空横盘标的挤掉正在动的标的）。
     """
 
-    promoted_by: Literal["plan_always_include", "mover_rank"]
+    promoted_by: Literal["plan_always_include", "user_pinned", "mover_rank"]
     mover_rank: Optional[int] = Field(default=None, ge=1)
     basis: Literal[
         "abs_change_percent_then_turnover_v1",
+        "momentum15m_then_day_change_v2",
         "premarket_pre_price_change_then_pre_turnover_v1",
     ]
 
@@ -1216,8 +1219,26 @@ class IntradayDeepLaneEntry(BaseModel):
     """深度层名单单行：含未上榜候选，保证深度层名单本身无声不了之。"""
 
     ticker: str
-    promoted_by: Literal["plan_always_include", "mover_rank"]
+    promoted_by: Literal["plan_always_include", "user_pinned", "mover_rank"]
     mover_rank: Optional[int] = Field(default=None, ge=1)
+
+
+class IntradayDayLedgerEntry(BaseModel):
+    """今日曾深扫账本单行：轮换出深度层的标的以最后一次深扫摘要 as-of 呈现。
+
+    数据取自该标的最后一次进入深度层的周期（含分级波段与形态匹配），不实时
+    刷新；进程内缓存——重启后只从当前时刻起累计（day_ledger_basis 如实声明），
+    不写数据库。
+    """
+
+    ticker: str
+    last_seen_at: str
+    session_bursts_legs: list[IntradayBurstWindow] = Field(default_factory=list)
+    setup_matched_setups: list[Literal["S1", "S2", "S3"]] = Field(
+        default_factory=list
+    )
+    last_change_percent: Optional[float] = None
+    state: Literal["rotated_out"]
 
 
 class IntradayUniverseScan(BaseModel):
@@ -1230,6 +1251,7 @@ class IntradayUniverseScan(BaseModel):
     mode: Literal["watchlist_two_tier"]
     gate_basis: Literal[
         "abs_change_percent_then_turnover_v1",
+        "momentum15m_then_day_change_v2",
         "premarket_pre_price_change_then_pre_turnover_v1",
     ]
     gate_warnings: list[str] = Field(default_factory=list)
@@ -1240,10 +1262,17 @@ class IntradayUniverseScan(BaseModel):
     deep_lane_max: int = Field(ge=1, le=20)
     deep_lane: list[IntradayDeepLaneEntry] = Field(default_factory=list)
     plan_always_include: list[str] = Field(default_factory=list)
+    # 用户钉选（INTRADAY_PINNED_TICKERS，additive）：旧载荷可省略。
+    user_pinned: list[str] = Field(default_factory=list)
     gated_out_count: int = Field(ge=0)
     snapshot_unresolved_symbols: list[str] = Field(default_factory=list)
     day_promotion_cap: int = Field(ge=1)
     day_promotion_cap_reached: bool = False
+    # 今日曾深扫账本（additive）：旧载荷可省略；重启后只从当前时刻累计。
+    day_ledger: list[IntradayDayLedgerEntry] = Field(default_factory=list)
+    day_ledger_basis: Literal[
+        "in_process_since_service_start_resets_on_restart"
+    ] = "in_process_since_service_start_resets_on_restart"
     snapshot_only: list[IntradaySnapshotOnlyRow] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
 
