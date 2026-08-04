@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -49,6 +50,47 @@ def _no_real_pinned_tickers(monkeypatch):
     monkeypatch.setattr(
         opportunities, "_configured_intraday_pinned_tickers", lambda: []
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_real_expiry_availability_reads(monkeypatch):
+    """默认车道可用性链元数据不可得；单测绝不打真实 Moomoo 到期日接口。
+
+    默认返回 None ⇒ 逐标的 unavailable ⇒ day_type=unknown（fail closed），
+    与「Moomoo 未启用」路径同形状。需要真实形状的用例显式覆写本桩。
+    """
+
+    monkeypatch.setattr(
+        opportunities,
+        "_compute_expiry_availability_moomoo",
+        lambda symbol, *, max_dte: None,
+    )
+
+
+def _stub_expiry_availability(
+    monkeypatch, expiries_by_symbol: dict[str, list[tuple[str, int]] | None]
+) -> list[str]:
+    """Replace the per-symbol expiry-metadata read with a call-recording stub."""
+
+    calls: list[str] = []
+
+    def compute(symbol: str, *, max_dte: int):
+        calls.append(symbol)
+        rows = expiries_by_symbol.get(symbol, None)
+        if rows is None:
+            return None
+        return SimpleNamespace(
+            symbol=symbol,
+            market_date="2026-08-04",
+            max_dte=max_dte,
+            expiries=tuple(rows),
+            fetched_at=datetime.now(timezone.utc),
+        )
+
+    monkeypatch.setattr(
+        opportunities, "_compute_expiry_availability_moomoo", compute
+    )
+    return calls
 
 
 def _client() -> TestClient:
@@ -829,3 +871,207 @@ def test_day_ledger_keeps_rotated_out_symbols_with_last_deep_payload(monkeypatch
     assert entry["last_change_percent"] == pytest.approx(first_change)
     # 当前深度层标的（BBB）绝不重复出现在账本。
     assert all(row["ticker"] != "BBB" for row in scan_second["day_ledger"])
+
+
+# --- 今日车道可用性（V2-E）--------------------------------------------------
+
+
+def _lane_quotes(symbols_by_price: dict[str, float]):
+    def quotes(symbols):
+        result = {
+            symbol: _quote(
+                symbol,
+                last_price=price,
+                prev_close_price=100.0,
+                turnover=1_000_000.0,
+            )
+            for symbol, price in symbols_by_price.items()
+        }
+        result["SPY"] = _quote(
+            "SPY",
+            last_price=500.0,
+            prev_close_price=490.0,
+            volume=1_000,
+            turnover=499_000.0,
+        )
+        return result
+
+    return quotes
+
+
+def _run_two_tier(monkeypatch, watchlist: list[str], prices: dict[str, float]):
+    monkeypatch.setenv("MOOMOO_OPEND_ENABLED", "true")
+    _stub_daily_loader(monkeypatch)
+    _watchlist(monkeypatch, watchlist, deep_lane_max=len(watchlist))
+    monkeypatch.setattr(
+        opportunities, "_fetch_underlying_session_quotes", _lane_quotes(prices)
+    )
+    _stub_events(monkeypatch, {})
+    _stub_earnings(monkeypatch, [])
+    response = _client().post(
+        "/api/v1/opportunities/intraday-top", json={"symbols": []}
+    )
+    assert response.status_code == 200
+    return response.json()
+
+
+def test_lane_availability_overnight_only_on_a_no_zero_dte_day(monkeypatch):
+    """2026-08-04（周二）真实形状：NVDA 1/3/6DTE、AAOI 仅 3DTE → 过夜日。
+
+    这正是 V2-E 描述的场景：日内车道关闭，不得退而买 1-3DTE。
+    """
+
+    calls = _stub_expiry_availability(
+        monkeypatch,
+        {
+            "NVDA": [("2026-08-05", 1), ("2026-08-07", 3), ("2026-08-10", 6)],
+            "AAOI": [("2026-08-07", 3)],
+        },
+    )
+    body = _run_two_tier(
+        monkeypatch, ["NVDA", "AAOI"], {"NVDA": 103.0, "AAOI": 102.0}
+    )
+
+    lane = body["lane_availability"]
+    assert lane["day_type"] == "overnight_only"
+    assert lane["basis"] == "per_ticker_option_expiry_metadata_within_0_7_dte_v1"
+    assert lane["checked_scope"] == "intraday_deep_lane_tickers"
+    assert lane["zero_dte_tickers"] == []
+    assert lane["readable_count"] == 2
+    assert lane["unavailable_count"] == 0
+    assert lane["max_dte"] == 7
+    by_ticker = {item["ticker"]: item for item in lane["tickers"]}
+    assert by_ticker["NVDA"]["available_dte_list"] == [1, 3, 6]
+    assert by_ticker["NVDA"]["has_zero_dte"] is False
+    assert by_ticker["AAOI"]["available_dte_list"] == [3]
+    # 只对深度层标的读取，不向宽层扇出。
+    assert sorted(calls) == ["AAOI", "NVDA"]
+
+
+def test_lane_availability_intraday_available_lists_zero_dte_tickers(monkeypatch):
+    _stub_expiry_availability(
+        monkeypatch,
+        {
+            "NVDA": [("2026-08-04", 0), ("2026-08-07", 3)],
+            "AAOI": [("2026-08-07", 3)],
+        },
+    )
+    body = _run_two_tier(
+        monkeypatch, ["NVDA", "AAOI"], {"NVDA": 103.0, "AAOI": 102.0}
+    )
+
+    lane = body["lane_availability"]
+    assert lane["day_type"] == "intraday_available"
+    assert lane["zero_dte_tickers"] == ["NVDA"]
+
+
+def test_lane_availability_unknown_when_any_chain_unreadable(monkeypatch):
+    """fail closed：没查到 0DTE 且有标的读不到 → unknown，不冒充过夜日。"""
+
+    _stub_expiry_availability(
+        monkeypatch,
+        {"NVDA": [("2026-08-05", 1)], "AAOI": None},
+    )
+    body = _run_two_tier(
+        monkeypatch, ["NVDA", "AAOI"], {"NVDA": 103.0, "AAOI": 102.0}
+    )
+
+    lane = body["lane_availability"]
+    assert lane["day_type"] == "unknown"
+    assert lane["unavailable_count"] == 1
+    by_ticker = {item["ticker"]: item for item in lane["tickers"]}
+    assert by_ticker["AAOI"]["has_zero_dte"] is None
+    assert by_ticker["AAOI"]["unavailable_reason"] == (
+        "option_expiry_metadata_unavailable"
+    )
+
+
+def test_lane_availability_moomoo_disabled_is_unknown_without_provider_reads(
+    monkeypatch,
+):
+    monkeypatch.delenv("MOOMOO_OPEND_ENABLED", raising=False)
+    _stub_daily_loader(monkeypatch)
+    _watchlist(monkeypatch, ["NVDA"], deep_lane_max=1)
+    # Moomoo 关闭时闸门无排序输入；用计划钉选保证深度层非空。
+    monkeypatch.setattr(
+        opportunities, "_todays_plan_tickers", lambda market_date_et: ["NVDA"]
+    )
+
+    def forbidden(symbol, *, max_dte):
+        raise AssertionError("disabled Moomoo must not trigger expiry reads")
+
+    monkeypatch.setattr(
+        opportunities, "_compute_expiry_availability_moomoo", forbidden
+    )
+    _stub_events(monkeypatch, {})
+    _stub_earnings(monkeypatch, [])
+
+    response = _client().post(
+        "/api/v1/opportunities/intraday-top", json={"symbols": []}
+    )
+    assert response.status_code == 200
+    lane = response.json()["lane_availability"]
+    assert lane["day_type"] == "unknown"
+    assert lane["tickers"][0]["unavailable_reason"] == "moomoo_opend_not_enabled"
+
+
+def test_lane_availability_caches_per_symbol_across_polls(monkeypatch):
+    """同一 ET 日内的第二轮轮询不再重复读取到期日元数据（额度护栏）。"""
+
+    calls = _stub_expiry_availability(
+        monkeypatch, {"NVDA": [("2026-08-05", 1)], "AAOI": [("2026-08-07", 3)]}
+    )
+    _run_two_tier(monkeypatch, ["NVDA", "AAOI"], {"NVDA": 103.0, "AAOI": 102.0})
+    assert sorted(calls) == ["AAOI", "NVDA"]
+
+    second = _client().post(
+        "/api/v1/opportunities/intraday-top",
+        json={"symbols": [], "refresh": True},
+    )
+    assert second.status_code == 200
+    assert second.json()["lane_availability"]["day_type"] == "overnight_only"
+    # 第二轮零新增供应商读取。
+    assert sorted(calls) == ["AAOI", "NVDA"]
+
+
+def test_lane_availability_defers_beyond_the_per_run_fetch_budget(monkeypatch):
+    """单轮新增读取超预算的标的记为 deferred（unavailable），结论退回 unknown。"""
+
+    monkeypatch.setattr(opportunities, "_LANE_AVAILABILITY_MAX_NEW_FETCHES", 1)
+    calls = _stub_expiry_availability(
+        monkeypatch, {"NVDA": [("2026-08-05", 1)], "AAOI": [("2026-08-07", 3)]}
+    )
+    body = _run_two_tier(
+        monkeypatch, ["NVDA", "AAOI"], {"NVDA": 103.0, "AAOI": 102.0}
+    )
+
+    lane = body["lane_availability"]
+    assert len(calls) == 1
+    assert lane["day_type"] == "unknown"
+    assert lane["deferred_tickers"]
+    deferred = lane["deferred_tickers"][0]
+    by_ticker = {item["ticker"]: item for item in lane["tickers"]}
+    assert by_ticker[deferred]["unavailable_reason"] == (
+        "deferred_provider_quota_budget"
+    )
+
+
+def test_single_tier_path_has_no_lane_availability_block(monkeypatch):
+    """单层（现状）模式恒为 null——lane_availability 是两层模式的 additive 字段。"""
+
+    monkeypatch.setenv("MOOMOO_OPEND_ENABLED", "true")
+    _stub_daily_loader(monkeypatch)
+    _watchlist(monkeypatch, [])
+    monkeypatch.setattr(opportunities, "_configured_symbols", lambda: ["NVDA"])
+    monkeypatch.setattr(
+        opportunities,
+        "_fetch_underlying_session_quotes",
+        lambda symbols: {"NVDA": _quote()},
+    )
+    _stub_events(monkeypatch, {"NVDA": []})
+
+    response = _client().post(
+        "/api/v1/opportunities/intraday-top", json={"symbols": []}
+    )
+    assert response.status_code == 200
+    assert response.json()["lane_availability"] is None

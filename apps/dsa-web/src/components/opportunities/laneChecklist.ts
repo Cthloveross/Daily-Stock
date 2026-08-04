@@ -1,5 +1,7 @@
 import type {
   IntradayEarningsProximity,
+  IntradayLaneAvailability,
+  IntradayLaneDayType,
   IntradayTopCandidate,
 } from '../../types/opportunities';
 import type { RuleComplianceDailyBudget } from '../../types/journal';
@@ -27,6 +29,21 @@ import { parseApiTimestamp } from '../../utils/marketTime';
  *   但剔除最好 5 笔 −4.03%）；② 4-7DTE 不得当日平掉（−4.04%，n=57，胜率 22.8%）；
  *   ③ ET 12:00 后不开 0DTE。
  * - V2-D 仓位：日内单每日最多 6 笔；同时持有的过夜单不超过 3 个。
+ * - V2-E 今日车道可用性：开盘前先看今天标的有没有 0DTE——有则日内车道可用
+ *   （V2-A），没有则日内车道关闭，只剩过夜车道（V2-B）或不做；**绝不因为没有
+ *   0DTE 就退而买 1-3DTE**。依据：按星期毛口径周一 +5.61%（n=263，0DTE 141 笔）、
+ *   周三 +7.99%（259，118）、周五 +3.29%（284，209）全部盈利，而周二 −2.61%
+ *   （271，0DTE 仅 36 而 1-3DTE 达 206）、周四 −3.74%（313，0DTE 52 / 1-3DTE 213）
+ *   为唯二亏损日——「周二周四亏钱」实为合约可用性导致的合约选择问题（主要标的
+ *   NVDA/TSLA/MU/AAPL 为周一/三/五到期，多数中小盘仅周五到期）。逐 DTE 当日平：
+ *   0DTE +3.44%（n=556，剔尾 +1.49%）而 1DTE −4.97%（313，剔尾 −8.01%，胜率
+ *   25.2%）、3DTE −5.19%（66，剔尾 −9.88%）；隔夜 4DTE +38.88%（30，胜率 60.0%）、
+ *   7DTE +33.35%（21，胜率 66.7%）。附带禁令：不得因「今天只有它有 0DTE」而交易
+ *   黑名单标的（周二/周四 0DTE 中 QQQ 占 43/88 笔，毛 −0.45%）。
+ *
+ * 车道可用性的判定输入是**当日真实期权到期日元数据**（服务端 lane_availability
+ * 区块），不是星期规则——假日与特殊到期会让星期规则失效。链读不到时显式标缺，
+ * 绝不以「读不到」冒充「今天没有 0DTE」。
  *
  * 边界：样本窗口仅 2026-04→07 一个市场状态（SPY 上行，隔夜多头天然占优），过夜
  * 车道 n=65 偏小且隔夜跳空风险在该窗口内未被充分体现。描述统计，不构成建议。
@@ -79,12 +96,15 @@ export interface LaneChecklistInput {
   budget: RuleComplianceDailyBudget | null;
   /** 额度读数不可得的原因（端点失败 / Journal 未构建）。 */
   budgetUnavailableReason: string | null;
+  /** 今日车道可用性（V2-E）；缺席＝标缺，不猜、不冒充「今天没有 0DTE」。 */
+  laneAvailability: IntradayLaneAvailability | null;
 }
 
 export interface LaneChecklistResult {
   lane: LaneId;
   etHour: number | null;
   etClock: string | null;
+  dayType: LaneDayTypeReading;
   checks: LaneCheck[];
   hardBlocks: LaneHardBlock[];
   reminders: string[];
@@ -100,6 +120,154 @@ export const OVERNIGHT_MAX_DTE = 7;
 export const OVERNIGHT_WEAK_ENTRY_ET_HOURS = [11, 13];
 /** V2-B 的提醒行：本车道的设计前提就是跨日。 */
 export const OVERNIGHT_NO_SPEED_EXIT_REMINDER = '本车道不适用速度衰竭离场（V2-B）';
+
+/**
+ * 用户自身的标的黑名单（历史净亏损标的）。
+ *
+ * 仓库内没有既有的黑名单配置项，因此在此定义为**有出处的常量**，出处即用户
+ * 自己的 Playbook 规则文本：
+ * - R3「噪音时段与标的黑名单」：PLTR（−$5.3 万）与 QQQ（−$4.1 万）历史净亏损，
+ *   进场前需额外理由；
+ * - V2-E 附带禁令：「不得因『今天只有它有 0DTE』而交易黑名单标的」——周二/周四
+ *   0DTE 中 QQQ 占 43/88 笔，毛 −0.45%；
+ * - 个人画像回灌（G-16）里同口径的「漏斗」标的：PLTR / AMD / QQQ / SMCI。
+ *
+ * 它只用于**如实标注**「今日仅黑名单标的有 0DTE」，不排序、不打分、不阻止用户
+ * 做任何事——本系统只读。
+ */
+export const BLACKLIST_TICKERS = ['PLTR', 'AMD', 'QQQ', 'SMCI'] as const;
+
+const BLACKLIST_SET = new Set<string>(BLACKLIST_TICKERS);
+
+/** V2-E 的一行证据（硬阻断与提示共用同一句，避免两处文案漂移）。 */
+export const DAY_TYPE_EVIDENCE_LINE =
+  '周二/周四历史 −2.61%/−3.74%，1DTE 当日 −4.97%（n=313，胜率 25.2%）';
+
+/** Playbook 候选标题：tooltip 与既有 V2-A/B/C/D 引用同一模式。 */
+export const V2E_RULE_TITLE =
+  'V2-E · 按合约可用性决定今天做不做日内（周二/周四＝过夜日）';
+
+/**
+ * 面板显示用的车道日类型，比服务端多一档 `blacklist_only`：
+ * 服务端只回答市场事实（今天有没有 0DTE），黑名单是用户自己的规则，
+ * 因此这一档在前端叠加。
+ */
+export type LaneDayTypeView =
+  | IntradayLaneDayType
+  | 'blacklist_only';
+
+export interface LaneDayTypeReading {
+  state: LaneDayTypeView;
+  /** 面板顶部那一行文字。 */
+  text: string;
+  /** tooltip：一律以 V2-E 标题起头，与既有检查项的引用模式一致。 */
+  tooltip: string;
+  /** 确证有 0DTE 的标的（已按服务端顺序）。 */
+  zeroDteTickers: string[];
+  /** 其中属于黑名单的标的。 */
+  blacklistedZeroDteTickers: string[];
+}
+
+function laneAvailabilityTooltip(lines: string[]): string {
+  return [`规则出处：${V2E_RULE_TITLE}`, ...lines].join('\n');
+}
+
+/**
+ * 从服务端 `lane_availability` 区块推出面板顶部那一行。
+ *
+ * 四种状态（缺区块＝标缺，与「没有 0DTE」严格区分）：
+ * 1. `intraday_available`：有非黑名单标的存在 0DTE → 日内车道可用；
+ * 2. `blacklist_only`：确证有 0DTE，但**全部**落在黑名单上（V2-E 附带禁令）；
+ * 3. `overnight_only`：全部标的都读到了链且都没有 0DTE → 日内车道关闭；
+ * 4. `unknown`：区块缺席或链读不到 → 标缺 + 原因，**未知≠「今天没有 0DTE」**。
+ */
+export function evaluateLaneDayType(
+  availability: IntradayLaneAvailability | null | undefined,
+): LaneDayTypeReading {
+  if (!availability) {
+    return {
+      state: 'unknown',
+      text: '今日：车道可用性标缺 · 未取到今日到期日读数',
+      tooltip: laneAvailabilityTooltip([
+        '盘中扫描未返回车道可用性区块（端点不可得或运行在单层扫描模式）。',
+        '未知≠「今天没有 0DTE」，也不代表日内车道可用——开仓前请自行核对券商合约列表。',
+      ]),
+      zeroDteTickers: [],
+      blacklistedZeroDteTickers: [],
+    };
+  }
+
+  const zeroDteTickers = availability.zeroDteTickers ?? [];
+  const blacklisted = zeroDteTickers.filter((ticker) =>
+    BLACKLIST_SET.has(ticker.trim().toUpperCase()));
+  const tradable = zeroDteTickers.filter((ticker) =>
+    !BLACKLIST_SET.has(ticker.trim().toUpperCase()));
+  const scopeLine = `判定范围：今日深度层 ${availability.checkedCount} 个标的`
+    + `（可读 ${availability.readableCount} / 读不到 ${availability.unavailableCount}），`
+    + '依据当日真实期权到期日，不是星期规则。';
+
+  if (availability.dayType === 'intraday_available' && tradable.length > 0) {
+    return {
+      state: 'intraday_available',
+      text: `今日：日内车道可用（${tradable.join('/')} 有 0DTE）`,
+      tooltip: laneAvailabilityTooltip([
+        '有 0DTE ⇒ 日内车道成立，按 V2-A 执行（仅 0DTE、ET 12:00 前开、当日平）。',
+        scopeLine,
+        blacklisted.length > 0
+          ? `另有黑名单标的今日也有 0DTE：${blacklisted.join('/')}——V2-E 附带禁令：不得因「只有它有 0DTE」而交易。`
+          : '',
+      ].filter(Boolean)),
+      zeroDteTickers,
+      blacklistedZeroDteTickers: blacklisted,
+    };
+  }
+
+  if (availability.dayType === 'intraday_available') {
+    // 确证有 0DTE，但全部落在黑名单上。
+    return {
+      state: 'blacklist_only',
+      text: `今日仅黑名单标的有 0DTE（${blacklisted.join('/')}）· 日内车道实际关闭（V2-E）`,
+      tooltip: laneAvailabilityTooltip([
+        'V2-E 附带禁令：不得因「今天只有它有 0DTE」而交易黑名单标的。',
+        `黑名单（出处 R3 / V2-E / 个人画像）：${BLACKLIST_TICKERS.join('、')}。`,
+        `周二/周四真做的 0DTE 中 QQQ 占 43/88 笔，毛 −0.45%。${DAY_TYPE_EVIDENCE_LINE}。`,
+        scopeLine,
+      ]),
+      zeroDteTickers,
+      blacklistedZeroDteTickers: blacklisted,
+    };
+  }
+
+  if (availability.dayType === 'overnight_only') {
+    return {
+      state: 'overnight_only',
+      text: '今日：过夜日 · 无 0DTE · 日内车道关闭（V2-E）',
+      tooltip: laneAvailabilityTooltip([
+        '今日深度层标的全部无 0DTE ⇒ 日内车道关闭，只剩过夜车道（V2-B，4-7DTE）或不做。',
+        `绝不因为没有 0DTE 就退而买 1-3DTE：${DAY_TYPE_EVIDENCE_LINE}。`,
+        scopeLine,
+      ]),
+      zeroDteTickers: [],
+      blacklistedZeroDteTickers: [],
+    };
+  }
+
+  const deferred = availability.deferredTickers ?? [];
+  return {
+    state: 'unknown',
+    text: '今日：车道可用性标缺 · 今日到期日读不到',
+    tooltip: laneAvailabilityTooltip([
+      availability.dayTypeReason,
+      '未知≠「今天没有 0DTE」，也不代表日内车道可用——开仓前请自行核对券商合约列表。',
+      deferred.length > 0
+        ? `本轮未查（供应商额度预算/名单上限）：${deferred.join('、')}——下一轮扫描会补齐。`
+        : '',
+      scopeLine,
+    ].filter(Boolean)),
+    zeroDteTickers: [],
+    blacklistedZeroDteTickers: [],
+  };
+}
 
 export const LANE_LABELS: Record<LaneId, string> = {
   intraday: '日内',
@@ -298,10 +466,36 @@ function earningsCheck(
   };
 }
 
-/** V2-C 的三条硬禁止：与所选车道无关，命中即列出，绝不因为「选了另一条车道」而消失。 */
-function hardBlocks(input: LaneChecklistInput, etHour: number | null): LaneHardBlock[] {
+/**
+ * V2-C 的三条硬禁止（与所选车道无关，命中即列出）+ V2-E 的车道可用性硬阻断
+ * （仅在选中日内车道时出现——它阻断的正是「今天不该走的那条车道」）。
+ */
+function hardBlocks(
+  input: LaneChecklistInput,
+  etHour: number | null,
+  dayType: LaneDayTypeReading,
+): LaneHardBlock[] {
   const blocks: LaneHardBlock[] = [];
   const { dte } = input;
+  if (input.lane === 'intraday' && dayType.state === 'overnight_only') {
+    blocks.push({
+      id: 'day_type_overnight_only',
+      ruleId: 'V2-E',
+      reason:
+        '今日无 0DTE，日内车道关闭：只剩过夜车道（V2-B，4-7DTE）或不做——'
+        + `绝不退而买 1-3DTE（${DAY_TYPE_EVIDENCE_LINE}）`,
+    });
+  }
+  if (input.lane === 'intraday' && dayType.state === 'blacklist_only') {
+    blocks.push({
+      id: 'day_type_blacklist_only',
+      ruleId: 'V2-E',
+      reason:
+        `今日仅黑名单标的有 0DTE（${dayType.blacklistedZeroDteTickers.join('/')}）：`
+        + '不得因「今天只有它有 0DTE」而交易黑名单标的——'
+        + `日内车道实际关闭（${DAY_TYPE_EVIDENCE_LINE}）`,
+    });
+  }
   if (dte !== null && dte >= 1 && dte <= 3) {
     blocks.push({
       id: 'dte_1_3',
@@ -430,6 +624,7 @@ function budgetReadings(input: LaneChecklistInput): LaneBudgetReading[] {
 export function evaluateLaneChecklist(input: LaneChecklistInput): LaneChecklistResult {
   const etHour = etHourFromPulse(input.pulseGeneratedAt);
   const etClock = etClockFromPulse(input.pulseGeneratedAt);
+  const dayType = evaluateLaneDayType(input.laneAvailability);
 
   const checks: LaneCheck[] = input.lane === 'intraday'
     ? [
@@ -453,8 +648,9 @@ export function evaluateLaneChecklist(input: LaneChecklistInput): LaneChecklistR
     lane: input.lane,
     etHour,
     etClock,
+    dayType,
     checks,
-    hardBlocks: hardBlocks(input, etHour),
+    hardBlocks: hardBlocks(input, etHour, dayType),
     reminders,
     budget: budgetReadings(input),
   };

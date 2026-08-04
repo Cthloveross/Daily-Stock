@@ -942,3 +942,131 @@ def test_option_wall_context_pool_leases_five_exclusive_reusable_lanes(
     finally:
         release.set()
         moomoo_options._reset_wall_context_pool_for_tests()
+
+
+# --- 今日车道可用性（V2-E）：最省额度的到期日元数据读取 ----------------------
+
+
+class _ExpiryOnlyContext(_WallQuoteContext):
+    """到期日元数据可读，但链窗口/快照一旦被调用即判定测试失败。"""
+
+    def get_option_chain(self, **kwargs):  # pragma: no cover - must not run
+        raise AssertionError("availability read must not query the option chain")
+
+    def get_market_snapshot(self, codes):  # pragma: no cover - must not run
+        raise AssertionError("availability read must not request snapshots")
+
+
+def test_expiry_availability_reads_only_expiration_metadata(monkeypatch):
+    """只发 get_option_expiration_date：不发链窗口、不取 spot、不发快照批次。"""
+
+    ctx = _ExpiryOnlyContext(
+        {},
+        pd.DataFrame(),
+        ["2026-08-05", "2026-08-07", "2026-08-10", "2026-09-18"],
+    )
+    _install_fake_moomoo(monkeypatch)
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+
+    @contextmanager
+    def lease_test_context():
+        yield ctx, moomoo_options._ctx_lock
+
+    monkeypatch.setattr(moomoo_options, "_lease_wall_context", lease_test_context)
+
+    def forbidden_spot(*_args, **_kwargs):  # pragma: no cover - must not run
+        raise AssertionError("availability read must not fetch an underlying spot")
+
+    monkeypatch.setattr(
+        moomoo_options, "_spot_with_time_from_ctx", forbidden_spot
+    )
+
+    result = moomoo_options.fetch_expiry_availability_moomoo(
+        "NVDA", max_dte=7, ref_date=date(2026, 8, 4)
+    )
+
+    assert result is not None
+    assert result.symbol == "NVDA"
+    assert result.market_date == "2026-08-04"
+    # 2026-09-18 超窗口被排除；输出按 (dte, expiry) 升序。
+    assert result.expiries == (
+        ("2026-08-05", 1),
+        ("2026-08-07", 3),
+        ("2026-08-10", 6),
+    )
+    assert ctx.chain_calls == []
+
+
+def test_expiry_availability_zero_dte_is_reported_for_same_day_expiry(monkeypatch):
+    ctx = _ExpiryOnlyContext({}, pd.DataFrame(), ["2026-08-04", "2026-08-07"])
+    _install_fake_moomoo(monkeypatch)
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+
+    @contextmanager
+    def lease_test_context():
+        yield ctx, moomoo_options._ctx_lock
+
+    monkeypatch.setattr(moomoo_options, "_lease_wall_context", lease_test_context)
+
+    result = moomoo_options.fetch_expiry_availability_moomoo(
+        "QQQ", max_dte=7, ref_date=date(2026, 8, 4)
+    )
+
+    assert result is not None
+    assert result.expiries[0] == ("2026-08-04", 0)
+
+
+def test_expiry_availability_empty_window_is_honest_empty_not_none(monkeypatch):
+    """窗口内没有到期日：空 expiries（诚实空态），不是 None（失败）。"""
+
+    ctx = _ExpiryOnlyContext({}, pd.DataFrame(), ["2026-09-18"])
+    _install_fake_moomoo(monkeypatch)
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+
+    @contextmanager
+    def lease_test_context():
+        yield ctx, moomoo_options._ctx_lock
+
+    monkeypatch.setattr(moomoo_options, "_lease_wall_context", lease_test_context)
+
+    result = moomoo_options.fetch_expiry_availability_moomoo(
+        "AAOI", max_dte=7, ref_date=date(2026, 8, 4)
+    )
+
+    assert result is not None
+    assert result.expiries == ()
+
+
+def test_expiry_availability_fails_closed_on_metadata_error(monkeypatch):
+    class _BrokenContext(_ExpiryOnlyContext):
+        def get_option_expiration_date(self, **_kwargs):
+            return 1, "rate limited"
+
+    ctx = _BrokenContext({}, pd.DataFrame(), [])
+    _install_fake_moomoo(monkeypatch)
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+
+    @contextmanager
+    def lease_test_context():
+        yield ctx, moomoo_options._ctx_lock
+
+    monkeypatch.setattr(moomoo_options, "_lease_wall_context", lease_test_context)
+
+    assert (
+        moomoo_options.fetch_expiry_availability_moomoo(
+            "MU", max_dte=7, ref_date=date(2026, 8, 4)
+        )
+        is None
+    )
+
+
+def test_expiry_availability_validates_bounds_and_enablement(monkeypatch):
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: False)
+    assert moomoo_options.fetch_expiry_availability_moomoo("MU") is None
+
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+    _install_fake_moomoo(monkeypatch)
+    with pytest.raises(ValueError):
+        moomoo_options.fetch_expiry_availability_moomoo("MU", max_dte=8)
+    with pytest.raises(ValueError):
+        moomoo_options.fetch_expiry_availability_moomoo("MU", max_dte=-1)

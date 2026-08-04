@@ -777,6 +777,13 @@ class NearExpiryExpiryGroup(BaseModel):
     contracts: list[NearExpiryContractRow] = Field(default_factory=list)
 
 
+class NearExpiryAvailabilityExpiry(BaseModel):
+    """车道可用性里的一个到期日：只有 (到期日, DTE)，不含任何报价。"""
+
+    expiry: str
+    dte: int = Field(ge=0)
+
+
 class NearExpiryStrikeWindow(BaseModel):
     percent_band: float = Field(gt=0)
     min_strikes_per_side: int = Field(ge=1)
@@ -809,6 +816,12 @@ class NearExpiryContractItem(BaseModel):
     strike_window: NearExpiryStrikeWindow
     coverage: NearExpiryCoverage
     expiries: list[NearExpiryExpiryGroup] = Field(default_factory=list)
+    # 今日车道可用性（V2-E，additive）：链已读到即由已在手的到期日分组推导，
+    # 零额外抓取。has_zero_dte=None 表示链读不到（未知），**不是**「没有
+    # 0DTE」；state="empty"（链可读、窗口内无到期日）时为 False。
+    has_zero_dte: Optional[bool] = None
+    available_dte_list: list[int] = Field(default_factory=list)
+    availability_unavailable_reason: Optional[str] = None
     # v3 财报临近：与扫描表候选同形状、同一份逐 ET 日日历缓存；日历不可得
     # 时显式 unavailable（未知≠安全），与面板自身 state 正交。
     earnings_proximity: IntradayEarningsProximity
@@ -1364,6 +1377,48 @@ class IntradayUniverseScan(BaseModel):
     limitations: list[str] = Field(default_factory=list)
 
 
+class IntradayTickerLaneAvailability(BaseModel):
+    """单个标的今日 0..max_dte 的到期日可用性读数。
+
+    ``state="unavailable"`` 时 ``has_zero_dte`` 恒为 None：**未知不等于
+    「今天没有 0DTE」**。``state="ready"`` 且 ``available_dte_list`` 为空是
+    诚实空态——链可读、窗口内确实没有到期日。
+    """
+
+    ticker: str
+    state: Literal["ready", "unavailable"]
+    has_zero_dte: Optional[bool] = None
+    available_dte_list: list[int] = Field(default_factory=list)
+    expiries: list[NearExpiryAvailabilityExpiry] = Field(default_factory=list)
+    unavailable_reason: Optional[str] = None
+
+
+class IntradayLaneAvailability(BaseModel):
+    """今日车道可用性（V2-E）：深度层标的今天有没有 0DTE 可用。
+
+    ``day_type`` 三态：``intraday_available``（≥1 个标的确证有 0DTE）/
+    ``overnight_only``（全部标的都读到了链且都没有 0DTE → 日内车道关闭）/
+    ``unknown``（一个都没查，或没查到 0DTE 但存在读不到的标的）。
+    判定输入是当日真实期权到期日元数据，**不含任何星期规则**——假日与
+    特殊到期会让星期规则失效。只描述可用性，不打分、不推荐。
+    """
+
+    formula_version: str
+    market_date_et: str
+    max_dte: int = Field(ge=0, le=7)
+    day_type: Literal["intraday_available", "overnight_only", "unknown"]
+    day_type_reason: str
+    basis: Literal["per_ticker_option_expiry_metadata_within_0_7_dte_v1"]
+    checked_scope: Literal["intraday_deep_lane_tickers"]
+    checked_count: int = Field(ge=0)
+    readable_count: int = Field(ge=0)
+    unavailable_count: int = Field(ge=0)
+    zero_dte_tickers: list[str] = Field(default_factory=list)
+    deferred_tickers: list[str] = Field(default_factory=list)
+    tickers: list[IntradayTickerLaneAvailability] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+
+
 class IntradayTopCandidate(BaseModel):
     """一行盘中滚动研究候选：每个指标要么有值+口径，要么显式标缺原因。"""
 
@@ -1463,6 +1518,9 @@ class IntradayTopResponse(BaseModel):
     universe: list[str] = Field(default_factory=list)
     # watchlist 两层模式（additive）：单层（现状）模式恒为 null。
     universe_scan: Optional[IntradayUniverseScan] = None
+    # 今日车道可用性（V2-E，additive）：仅两层模式对深度层标的判定；
+    # 单层（现状）模式恒为 null。
+    lane_availability: Optional[IntradayLaneAvailability] = None
     unsupported_symbols: list[str] = Field(default_factory=list)
     requested_limit: int = Field(ge=1, le=10)
     candidate_count: int = Field(ge=0)

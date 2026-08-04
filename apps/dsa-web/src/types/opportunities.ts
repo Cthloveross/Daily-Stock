@@ -431,6 +431,13 @@ export interface NearExpiryContractItem {
   };
   expiries: NearExpiryExpiryGroup[];
   /**
+   * 今日车道可用性（V2-E，additive）：链已读到即由已在手的到期日分组推导。
+   * `null`/缺省＝链读不到（未知），**不是**「今天没有 0DTE」。
+   */
+  hasZeroDte?: boolean | null;
+  availableDteList?: number[];
+  availabilityUnavailableReason?: string | null;
+  /**
    * v3 财报临近（additive 字段，与扫描表候选同形状、同一份日历缓存）。
    * 旧缓存载荷可能缺省 → 按「标缺 · 未知≠安全」处理，绝不冒充安全。
    */
@@ -1012,6 +1019,47 @@ export interface IntradayUniverseScan {
   limitations: string[];
 }
 
+/**
+ * 今日车道可用性（V2-E）的三态。
+ *
+ * - `intraday_available`：≥1 个深度层标的今日确证有 0DTE → 日内车道成立；
+ * - `overnight_only`：全部标的都读到了链且都没有 0DTE → 日内车道关闭；
+ * - `unknown`：一个都没查，或没查到 0DTE 但存在读不到的标的。
+ *   **未知不等于「今天没有 0DTE」**，也不等于安全。
+ */
+export type IntradayLaneDayType =
+  | 'intraday_available'
+  | 'overnight_only'
+  | 'unknown';
+
+/** 单个标的今日 0..maxDte 的到期日可用性；unavailable 时 hasZeroDte 恒为 null。 */
+export interface IntradayTickerLaneAvailability {
+  ticker: string;
+  state: 'ready' | 'unavailable';
+  hasZeroDte: boolean | null;
+  availableDteList: number[];
+  expiries: { expiry: string; dte: number }[];
+  unavailableReason: string | null;
+}
+
+/** 今日车道可用性区块：判定来自当日真实期权到期日元数据，不含星期规则。 */
+export interface IntradayLaneAvailability {
+  formulaVersion: string;
+  marketDateEt: string;
+  maxDte: number;
+  dayType: IntradayLaneDayType;
+  dayTypeReason: string;
+  basis: 'per_ticker_option_expiry_metadata_within_0_7_dte_v1';
+  checkedScope: 'intraday_deep_lane_tickers';
+  checkedCount: number;
+  readableCount: number;
+  unavailableCount: number;
+  zeroDteTickers: string[];
+  deferredTickers: string[];
+  tickers: IntradayTickerLaneAvailability[];
+  limitations: string[];
+}
+
 /** 日内 Top 候选行：每个指标要么有值+口径，要么显式标缺原因。 */
 export interface IntradayTopCandidate {
   ticker: string;
@@ -1103,6 +1151,8 @@ export interface IntradayTopResponse {
   universe: string[];
   /** watchlist 两层模式（additive）：单层（现状）模式恒为 null/缺席。 */
   universeScan?: IntradayUniverseScan | null;
+  /** 今日车道可用性（V2-E，additive）：单层（现状）模式恒为 null/缺席。 */
+  laneAvailability?: IntradayLaneAvailability | null;
   unsupportedSymbols: string[];
   requestedLimit: number;
   candidateCount: number;

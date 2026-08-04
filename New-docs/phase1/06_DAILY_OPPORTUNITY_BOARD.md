@@ -765,3 +765,110 @@ Qualification v2 进一步令方向性标的路径与实际回填合同一致：
 ### 9.7 诚实边界
 
 样本为**单一交易者、单一市场状态（2026-04→07，SPY 上行）**的描述统计，**不是因果结论、不构成建议**；过夜车道 n=65 偏小，隔夜跳空风险在该窗口内未被充分体现。车道判定是机械的结果标签，不代表进场意图。这两个面板不排序、不打分、不产生信号、不进入任何过滤，也**不下任何单**——系统全程只读。真正的检验只有一个：采纳后那一列。
+
+## 10. 今日车道可用性（day-type，V2-E，2026-08-04）
+
+### 10.1 为什么做：星期效应其实是合约可用性
+
+对用户自身**干净口径**历史（build #3，ET 入场日 ≥ 2026-04-21、仅 `fill_allocations > 0` 的明细成交回合，**n=1,407**；`gross = realized_pnl_net + total_fee`，`risk = ABS(opening_cash_flow)`，口径同 §9.1）的取证得到一个反直觉结论：**用户全部的「星期效应」都是合约可用性造成的合约选择问题。**
+
+| 星期 | 毛每美元 | n | 其中 0DTE | 其中 1-3DTE |
+| --- | --- | --- | --- | --- |
+| 周一 | **+5.61%** | 263 | 141 | — |
+| 周三 | **+7.99%** | 259 | 118 | — |
+| 周五 | **+3.29%** | 284 | 209 | — |
+| **周二** | **−2.61%** | 271 | **仅 36** | **206** |
+| **周四** | **−3.74%** | 313 | **52** | **213** |
+
+成因：用户主要标的（NVDA / TSLA / MU / AAPL 等）为**周一/三/五到期**，多数中小盘**仅周五到期**；周二/周四没有 0DTE 可用，于是**退而买 1-3DTE**。而逐 DTE 拆开后，1-3DTE 恰恰是全样本最差的一段：
+
+| 桶 | 毛每美元 | n | 剔除最好 3 笔 | 胜率 |
+| --- | --- | --- | --- | --- |
+| 0DTE 当日平 | +3.44% | 556 | +1.49% | — |
+| **1DTE 当日平** | **−4.97%** | 313 | **−8.01%** | **25.2%** |
+| 2DTE 当日平 | +5.73% | 90 | −3.15% | — |
+| 3DTE 当日平 | −5.19% | 66 | −9.88% | — |
+| 4DTE 隔夜 | **+38.88%** | 30 | +16.33% | 60.0% |
+| 7DTE 隔夜 | **+33.35%** | 21 | +21.63% | 66.7% |
+
+另外两个事实：周二/周四真做的 0DTE 中 **QQQ 占 43/88 笔**（毛 −0.45%），而 QQQ 属用户历史负边际标的（见 Playbook R3）；**行为缺口**——恰恰在过夜车道是唯一好选择的两天，用户几乎没用它：周二 1 笔、周四 11 笔 4-7DTE 隔夜单。
+
+以上已写入 Playbook 候选 **「V2-E · 按合约可用性决定今天做不做日内（周二/周四＝过夜日）」**（id 18，append-only 未晋升）。本节记录把 V2-E 落到盘面上的读数层。
+
+### 10.2 判定规则：从当日真实到期日推导，不含任何星期逻辑
+
+**星期规则是错的实现方式**：假日、节前特殊到期、标的新增周二/周四到期都会让「周二＝过夜日」失效。因此判定输入一律是**当日真实期权到期日元数据**。
+
+逐标的（`build_ticker_availability`，`src/opportunities/lane_availability.py`）：
+
+| 输入 | `state` | `has_zero_dte` | 说明 |
+| --- | --- | --- | --- |
+| 0..7 DTE 内有到期日且含 0DTE | `ready` | `true` | `available_dte_list` 去重升序 |
+| 0..7 DTE 内有到期日但无 0DTE | `ready` | `false` | 确证没有 |
+| 窗口内一个到期日都没有 | `ready` | `false` | 诚实空态，不是失败 |
+| 链读不到 | `unavailable` | **`null`** | + `unavailable_reason`；**未知 ≠「今天没有 0DTE」** |
+
+聚合 `day_type`（`derive_day_type`），顺序即优先级：
+
+1. **任一标的确证有 0DTE** → `intraday_available`。正向证据不因别的标的读不到而作废（读不到只可能再**增加** 0DTE）。
+2. 没有任何 0DTE **且全部标的都读到了链** → `overnight_only`。这就是 V2-E 的「过夜日」：日内车道关闭，只剩过夜车道（V2-B）或不做。
+3. 其余（一个都没查，或没查到 0DTE 但存在读不到的标的）→ `unknown` + 原因。**fail closed**：绝不以「读不到」冒充「今天没有 0DTE」。
+
+### 10.3 数据路径与额度护栏（零新增抓取路径）
+
+回答「今天有没有 0DTE」只需要到期日，不需要任何一张合约的报价。因此新增的
+`fetch_expiry_availability_moomoo`（`data_provider/moomoo_options.py`）**复用临期合约链读取路径的第一步**——同一个独占 wall QuoteContext lane + 同一个 `get_option_expiration_date`——拿到到期日元数据后就停下：**不发 `get_option_chain` 日期窗口、不取 underlying 快照、不发 `get_market_snapshot` 批次**，比 §2.9 的整条链读取便宜一个量级。
+
+额度护栏（对齐 §2.1 记录的 10 次链查询 / 30 秒；常量见 `api/v1/endpoints/opportunities.py` 的 `_LANE_AVAILABILITY_*`）：
+
+- **逐标的按 ET 交易日缓存 1 小时**（到期日一天最多变一次）——同一交易日内的 60 秒轮询稳态命中缓存、**零供应商请求**；失败只短缓存 5 分钟，避免一次抖动把一整天钉死在 `unknown`。
+- **单轮新增读取上限 8**（60 秒轮询周期内 ≤8 次 < 10 次/30 秒）；超出的标的本轮显式记为 `unavailable` + `deferred_provider_quota_budget` 并列入 `deferred_tickers`，**下一轮补齐**——绝不为了凑齐结论而把「没查」说成「没有 0DTE」。
+- **单轮参与判定的标的上限 12**（＝ `INTRADAY_DEEP_LANE_MAX` 默认值），**只覆盖深度层，绝不向宽层全清单扇出**。
+
+### 10.4 端点合同（additive，既有字段一字不改）
+
+**`POST /api/v1/opportunities/intraday-top`** 新增顶层 `lane_availability`（仅 **watchlist 两层模式**；单层/显式 symbols 路径恒为 `null`，行为逐字节不变）：
+
+| 字段 | 含义 |
+| --- | --- |
+| `day_type` / `day_type_reason` | `intraday_available` / `overnight_only` / `unknown` + 一行原因 |
+| `basis` | `per_ticker_option_expiry_metadata_within_0_7_dte_v1`（判定依据回显，不是星期规则） |
+| `checked_scope` / `checked_count` / `readable_count` / `unavailable_count` | 判定范围与可读性计数 |
+| `zero_dte_tickers` | **确证**有 0DTE 的标的（用户直接看到「今天是哪几个」） |
+| `deferred_tickers` | 本轮因额度预算或名单上限未查的标的 |
+| `tickers[]` | 逐标的 `state / has_zero_dte / available_dte_list / expiries[] / unavailable_reason` |
+| `formula_version` / `market_date_et` / `max_dte` / `limitations` | 口径与逐条边界 |
+
+**`POST /api/v1/opportunities/near-expiry-contracts`**（§2.9）新增三个 additive 字段，由**已在手的到期日分组**推导，**零额外抓取**：`has_zero_dte`、`available_dte_list`、`availability_unavailable_reason`。链读不到（`not_configured` / `unavailable`）时 `has_zero_dte` 显式 `null` + `near_expiry_chain_unavailable`；`state=empty`（链可读、窗口内无到期日）时为 `false`。
+
+### 10.5 消费面：车道检查清单的第一行
+
+`LaneChecklistPanel`（§9.4）新增**面板第一行**的车道日类型，它决定「今天这条车道到底开不开」，必须在用户选车道之前就看到。四种呈现：
+
+| 状态 | 文案 |
+| --- | --- |
+| `intraday_available` | 「今日：日内车道可用（NVDA/TSLA/MU 有 0DTE）」——直接点名是**哪几个**标的 |
+| `overnight_only` | 「今日：过夜日 · 无 0DTE · 日内车道关闭（V2-E）」 |
+| `blacklist_only` | 「今日仅黑名单标的有 0DTE（QQQ）· 日内车道实际关闭（V2-E）」 |
+| `unknown` | 「今日：车道可用性标缺 · …」+ 原因（区块缺席 / 链读不到 / 本轮未查） |
+
+tooltip 一律以 **`规则出处：V2-E · 按合约可用性决定今天做不做日内（周二/周四＝过夜日）`** 起头，与既有 V2-A/B/C/D 的引用模式一致。
+
+**硬阻断**：选中**日内**车道且 `day_type = overnight_only` 时给出 `V2-E` 硬阻断，一行写清证据——「绝不退而买 1-3DTE（周二/周四历史 −2.61%/−3.74%，1DTE 当日 −4.97%，n=313，胜率 25.2%）」。选中**过夜**车道不阻断——它正是今天该走的车道。
+
+**黑名单叠加**：仓库内此前没有黑名单配置项，故在 `laneChecklist.ts` 定义为**有出处的常量** `BLACKLIST_TICKERS = ['PLTR', 'AMD', 'QQQ', 'SMCI']`，出处即用户自己的规则文本——Playbook R3「标的黑名单」（PLTR −$5.3 万、QQQ −$4.1 万）、V2-E 附带禁令（周二/周四 0DTE 中 QQQ 占 43/88 笔，毛 −0.45%）、个人画像回灌 G-16 的「漏斗」标的。**黑名单是用户自己的规则，不是市场事实**，因此只在前端叠加：服务端 `day_type` 只回答「今天有没有 0DTE」。若确证有 0DTE 但**全部**落在黑名单上，面板显示 `blacklist_only` 并同样阻断日内车道（V2-E 附带禁令：不得因「今天只有它有 0DTE」而交易黑名单标的）；若同时存在非黑名单标的，则照常 `intraday_available`，黑名单标的在 tooltip 里如实提示、不静默。
+
+### 10.6 真实读数（2026-08-04 周二，TestClient 连本机 OpenD）
+
+第一轮轮询：深度层 16 个标的 → 参与判定 12 个（上限）、本轮读取 8 个（额度预算），`day_type=unknown`，4 个标的显式 `deferred_provider_quota_budget`。第二轮起全部 12 个可读、缓存命中零新增请求，**`day_type=overnight_only`**（「12 个深度层标的今日均无 0DTE 到期，日内车道关闭（V2-E）」）：
+
+| 标的 | `available_dte_list` | `has_zero_dte` |
+| --- | --- | --- |
+| NVDA / TSLA / MU / AAPL | `[1, 3, 6]`（08-05 / 08-07 / 08-10） | `false` |
+| AAOI / PLTR / LITE / MRVL / GLW / ALAB / AMKR / ASTS | `[3]`（08-07） | `false` |
+
+与用户手动核对完全一致：主力名（NVDA/TSLA/MU/AAPL）今天只有 1/3/6DTE，中小盘只有周五（3DTE）——**2026-08-04 是一个标准的「过夜日」**。同日单独探测 QQQ 得 `[0, 1, 2, 3, 6, 7]`（确有 0DTE），但 QQQ 今日不在深度层，故不影响聚合；若它进入深度层，前端会呈现 `blacklist_only` 而不是放行。
+
+### 10.7 诚实边界
+
+依据数字来自**单一交易者、单一市场状态（2026-04→07，SPY 上行）**的描述统计，4DTE / 7DTE 隔夜样本各仅 30 / 21 笔，隔夜跳空风险未充分体现——**不是因果结论，不构成建议**。车道可用性只回答「今天有没有 0DTE 可用」：不评价标的、不预测方向、不排序、不打分、不进入任何统计，也**不下任何单**。判定范围是今日深度层中有界的前若干个标的，**不代表全部 universe 今日没有 0DTE**；DTE 以 America/New_York 交易日按自然日计算，未接入交易所假日日历。链读不到时一律显式标缺——**未知不等于安全，也不等于「今天没有 0DTE」**。

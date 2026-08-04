@@ -91,6 +91,11 @@ from src.opportunities.intraday_top import (
     compute_earnings_proximity,
     compute_intraday_daily_context,
 )
+from src.opportunities.lane_availability import (
+    LANE_AVAILABILITY_MAX_DTE,
+    build_lane_availability,
+    build_ticker_availability,
+)
 from src.opportunities.near_expiry_contracts import (
     FORMULA_VERSION as NEAR_EXPIRY_FORMULA_VERSION,
     NEAR_MONEY_MIN_STRIKES_PER_SIDE,
@@ -199,6 +204,27 @@ _INTRADAY_EARNINGS_SOURCE = "finnhub_earnings_calendar"
 # here — they go through the shared 30s scan cache only.
 _INTRADAY_DAILY_CACHE_TTL_SECONDS = 900.0
 _INTRADAY_DAILY_CACHE_MAX_ENTRIES = 64
+# --- 今日车道可用性（V2-E）------------------------------------------------
+# 「今天这些标的有没有 0DTE」只需要期权到期日元数据：复用临期合约链读取
+# 路径的第一步（fetch_expiry_availability_moomoo = 同一个独占 wall lane +
+# 同一个 get_option_expiration_date），不发 get_option_chain 日期窗口、不取
+# underlying 快照、不发 get_market_snapshot 批次——比整条链读取便宜一个量级。
+# 额度护栏（对齐 §2.1 记录的 10 次链查询 / 30 秒）：
+#   ① 逐标的按 ET 交易日缓存 1 小时——到期日一天最多变一次，同一交易日内
+#      的 60 秒轮询稳态命中缓存、零供应商请求；失败只短缓存 5 分钟，避免
+#      一次抖动把一整天钉死在 unknown；
+#   ② 单轮新增读取上限 8（60 秒轮询周期内 ≤8 次 < 10 次/30 秒），超出的标的
+#      本轮显式记为 unavailable（deferred）并在下一轮补齐——绝不为了凑齐
+#      结论而把「没查」说成「没有 0DTE」；
+#   ③ 单轮参与判定的标的上限 12（＝ INTRADAY_DEEP_LANE_MAX 默认值），
+#      不向宽层全清单扇出。
+_LANE_AVAILABILITY_CACHE_TTL_SECONDS = 3600.0
+_LANE_AVAILABILITY_FAILURE_TTL_SECONDS = 300.0
+_LANE_AVAILABILITY_CACHE_MAX_ENTRIES = 64
+_LANE_AVAILABILITY_MAX_SYMBOLS = 12
+_LANE_AVAILABILITY_MAX_NEW_FETCHES = 8
+_LANE_AVAILABILITY_MAX_WORKERS = 4
+_LANE_AVAILABILITY_CHECKED_SCOPE = "intraday_deep_lane_tickers"
 # --- watchlist v1 两层扫描（INTRADAY_WATCHLIST 配置后启用；未配置零改动）---
 # 宽层（tier-1）：整个清单每个 60 秒轮询周期只发 1 次 Moomoo
 # ``get_market_snapshot`` 批量快照（官方单次上限 400 个代码）。清单上限 200
@@ -342,6 +368,8 @@ _scan_flight_generation = 0
 _intraday_daily_cache: dict[tuple[str, str], _ScanCacheEntry] = {}
 _intraday_burst_cache: dict[tuple[str, str, str], _ScanCacheEntry] = {}
 _intraday_earnings_cache: dict[str, _ScanCacheEntry] = {}
+# 车道可用性：(symbol, ET 交易日) → 到期日读数（成功 1 小时 / 失败 5 分钟）。
+_lane_availability_cache: dict[tuple[str, str], _ScanCacheEntry] = {}
 _intraday_playbook_cache: dict[str, _ScanCacheEntry] = {}
 _intraday_plan_cache: dict[str, _ScanCacheEntry] = {}
 # 每 ET 日已进入深度层的去重标的集合（额度护栏，语义见上方常量注释）。
@@ -469,6 +497,7 @@ def _reset_scan_cache_for_tests() -> None:
         _intraday_daily_cache.clear()
         _intraday_burst_cache.clear()
         _intraday_earnings_cache.clear()
+        _lane_availability_cache.clear()
         _intraday_playbook_cache.clear()
         _intraday_plan_cache.clear()
         _intraday_deep_promotion_log.clear()
@@ -1120,6 +1149,19 @@ def _compute_near_expiry_chain_moomoo(symbol: str, *, max_dte: int):
     return fetch_near_expiry_chain_moomoo(symbol, max_dte=max_dte)
 
 
+def _compute_expiry_availability_moomoo(symbol: str, *, max_dte: int):
+    """Read today's 0–max_dte 到期日元数据 through the same Quote-only lane.
+
+    与 ``_compute_near_expiry_chain_moomoo`` 共用临期合约链读取路径的第一步，
+    但不发链窗口与快照批次（详见 data_provider 侧 docstring 与本模块
+    ``_LANE_AVAILABILITY_*`` 常量的额度护栏说明）。
+    """
+
+    from data_provider.moomoo_options import fetch_expiry_availability_moomoo
+
+    return fetch_expiry_availability_moomoo(symbol, max_dte=max_dte)
+
+
 def _option_context_item(
     ticker: str,
     *,
@@ -1590,6 +1632,11 @@ def _empty_near_expiry_payload(
             "excluded_unknown_standard_type_contracts": 0,
         },
         "expiries": [],
+        # 车道可用性（V2-E，additive）：链读不到时 has_zero_dte 显式 None，
+        # 绝不以「读不到」冒充「今天没有 0DTE」。
+        "has_zero_dte": None,
+        "available_dte_list": [],
+        "availability_unavailable_reason": "near_expiry_chain_unavailable",
         "message": message,
         "limitations": list(_NEAR_EXPIRY_LIMITATIONS),
     }
@@ -1647,6 +1694,15 @@ def _near_expiry_item(
                     "临期到期日存在，但本次动态快照全部缺失；"
                     "各行显式标缺，未以 0 或旧值回填。"
                 )
+        # 车道可用性（V2-E，additive）：链已读到即可如实回答「今天这个标的
+        # 有没有 0DTE」，零额外抓取——直接由已在手的到期日分组推导。
+        # state="empty" 是诚实空态（链可读、窗口内没有到期日）→ False；
+        # 只有链本身读不到才是 None（见 _empty_near_expiry_payload）。
+        availability = build_ticker_availability(
+            ticker,
+            payload["expiries"],
+            max_dte=max_dte,
+        )
         return {
             "ticker": ticker,
             "source": _NEAR_EXPIRY_SOURCE,
@@ -1654,6 +1710,9 @@ def _near_expiry_item(
             "open_interest_as_of": open_interest_as_of,
             "open_interest_basis": "prior_clearing_session",
             **payload,
+            "has_zero_dte": availability["has_zero_dte"],
+            "available_dte_list": availability["available_dte_list"],
+            "availability_unavailable_reason": None,
             "message": message,
             "limitations": list(_NEAR_EXPIRY_LIMITATIONS),
         }
@@ -2341,6 +2400,152 @@ def _load_intraday_earnings_calendar(market_date_et: str) -> dict[str, Any]:
     return result
 
 
+def _prune_lane_availability_cache(now: float) -> None:
+    expired = [
+        key
+        for key, entry in _lane_availability_cache.items()
+        if entry.expires_at <= now
+    ]
+    for key in expired:
+        _lane_availability_cache.pop(key, None)
+    while len(_lane_availability_cache) >= _LANE_AVAILABILITY_CACHE_MAX_ENTRIES:
+        oldest = min(
+            _lane_availability_cache,
+            key=lambda item: _lane_availability_cache[item].expires_at,
+        )
+        _lane_availability_cache.pop(oldest, None)
+
+
+def _load_lane_availability(
+    tickers: list[str],
+    *,
+    enabled: bool,
+    market_date_et: str,
+) -> dict[str, Any]:
+    """今日车道可用性（V2-E）：深度层标的今天有没有 0DTE 可用。
+
+    额度护栏（逐条见 ``_LANE_AVAILABILITY_*`` 常量注释）：逐标的按 ET 交易日
+    缓存、单轮新增读取有上限、参与判定的标的数有上限——**不向宽层全清单扇出**。
+
+    fail closed 的三处：Moomoo 未启用、读取失败、本轮额度预算用尽（deferred）
+    一律记为该标的 ``unavailable`` + 原因；聚合层只有在「全部标的都读到了链
+    且都没有 0DTE」时才敢说 ``overnight_only``，否则一律 ``unknown``。
+    未知不等于「今天没有 0DTE」。
+    """
+
+    ordered = normalize_symbols(list(tickers))[:_LANE_AVAILABILITY_MAX_SYMBOLS]
+    skipped_for_cap = normalize_symbols(list(tickers))[
+        _LANE_AVAILABILITY_MAX_SYMBOLS:
+    ]
+    if not enabled:
+        items = [
+            build_ticker_availability(
+                symbol,
+                None,
+                max_dte=LANE_AVAILABILITY_MAX_DTE,
+                unavailable_reason="moomoo_opend_not_enabled",
+            )
+            for symbol in ordered
+        ]
+        return build_lane_availability(
+            items,
+            max_dte=LANE_AVAILABILITY_MAX_DTE,
+            market_date_et=market_date_et,
+            checked_scope=_LANE_AVAILABILITY_CHECKED_SCOPE,
+            skipped_tickers=skipped_for_cap,
+        )
+
+    now = _cache_now()
+    cached: dict[str, dict[str, Any]] = {}
+    misses: list[str] = []
+    with _scan_cache_lock:
+        _prune_lane_availability_cache(now)
+        for symbol in ordered:
+            entry = _lane_availability_cache.get((symbol, market_date_et))
+            if entry is not None and entry.expires_at > now:
+                cached[symbol] = copy.deepcopy(entry.result)
+            else:
+                misses.append(symbol)
+    # 单轮新增读取预算：超出的标的本轮 deferred（下一轮补齐），绝不为了
+    # 凑齐结论而把「没查」说成「没有 0DTE」。
+    to_fetch = misses[:_LANE_AVAILABILITY_MAX_NEW_FETCHES]
+    deferred = misses[_LANE_AVAILABILITY_MAX_NEW_FETCHES:]
+
+    def load_one(symbol: str) -> tuple[str, dict[str, Any], float]:
+        try:
+            snapshot = _compute_expiry_availability_moomoo(
+                symbol, max_dte=LANE_AVAILABILITY_MAX_DTE
+            )
+        except Exception as exc:  # noqa: BLE001 - availability failures degrade
+            logger.debug(
+                "[opportunities] lane availability unavailable for %s: %s",
+                symbol,
+                exc,
+            )
+            snapshot = None
+        if snapshot is None:
+            return (
+                symbol,
+                build_ticker_availability(
+                    symbol,
+                    None,
+                    max_dte=LANE_AVAILABILITY_MAX_DTE,
+                    unavailable_reason="option_expiry_metadata_unavailable",
+                ),
+                _LANE_AVAILABILITY_FAILURE_TTL_SECONDS,
+            )
+        return (
+            symbol,
+            build_ticker_availability(
+                symbol,
+                list(getattr(snapshot, "expiries", ()) or ()),
+                max_dte=LANE_AVAILABILITY_MAX_DTE,
+            ),
+            _LANE_AVAILABILITY_CACHE_TTL_SECONDS,
+        )
+
+    fetched: list[tuple[str, dict[str, Any], float]] = []
+    if to_fetch:
+        if len(to_fetch) == 1:
+            fetched.append(load_one(to_fetch[0]))
+        else:
+            with ThreadPoolExecutor(
+                max_workers=min(_LANE_AVAILABILITY_MAX_WORKERS, len(to_fetch)),
+                thread_name_prefix="lane-availability",
+            ) as pool:
+                fetched.extend(pool.map(load_one, to_fetch))
+
+    completion_time = _cache_now()
+    with _scan_cache_lock:
+        _prune_lane_availability_cache(completion_time)
+        for symbol, payload, ttl in fetched:
+            _lane_availability_cache[(symbol, market_date_et)] = _ScanCacheEntry(
+                expires_at=completion_time + ttl,
+                result=copy.deepcopy(payload),
+            )
+        for key in [
+            k for k in _lane_availability_cache if k[1] != market_date_et
+        ]:
+            _lane_availability_cache.pop(key, None)
+
+    by_symbol = {**cached, **{symbol: payload for symbol, payload, _ in fetched}}
+    for symbol in deferred:
+        by_symbol[symbol] = build_ticker_availability(
+            symbol,
+            None,
+            max_dte=LANE_AVAILABILITY_MAX_DTE,
+            unavailable_reason="deferred_provider_quota_budget",
+        )
+    items = [by_symbol[symbol] for symbol in ordered if symbol in by_symbol]
+    return build_lane_availability(
+        items,
+        max_dte=LANE_AVAILABILITY_MAX_DTE,
+        market_date_et=market_date_et,
+        checked_scope=_LANE_AVAILABILITY_CHECKED_SCOPE,
+        skipped_tickers=[*skipped_for_cap, *deferred],
+    )
+
+
 def _execute_intraday_top(
     symbols: list[str], limit: int, *, enabled: bool
 ) -> dict[str, Any]:
@@ -3019,6 +3224,16 @@ def _execute_intraday_top_two_tier(
             -abs(row.get(_snapshot_sort_key) or 0.0),
             row["ticker"],
         ),
+    )
+
+    # -- 今日车道可用性（V2-E，additive）--------------------------------------
+    # 只对深度层标的判定：它们已经是今天真正要看的名单，且数量有界；绝不向
+    # 宽层全清单扇出。判定输入是当日真实期权到期日元数据，不是星期规则——
+    # 假日与特殊到期会让星期规则失效。
+    run["lane_availability"] = _load_lane_availability(
+        deep_symbols,
+        enabled=enabled,
+        market_date_et=market_date_et,
     )
 
     # universe＝宽层实际扫描的全部标的（快照层面全部覆盖），候选＝深度层。

@@ -9,10 +9,26 @@ import {
   LANE_LABELS,
   evaluateLaneChecklist,
   type CheckStatus,
+  type LaneDayTypeView,
   type LaneId,
 } from './laneChecklist';
 
 const MISSING = '标缺';
+
+/** 车道日类型的文字标记：语义靠文字承载，不靠颜色（无障碍 + 无涨跌色）。 */
+const DAY_TYPE_MARK: Record<LaneDayTypeView, string> = {
+  intraday_available: '✓',
+  overnight_only: '✕',
+  blacklist_only: '✕',
+  unknown: '—',
+};
+
+const DAY_TYPE_CLASS: Record<LaneDayTypeView, string> = {
+  intraday_available: 'text-text-1',
+  overnight_only: 'text-warn-strong',
+  blacklist_only: 'text-warn-strong',
+  unknown: 'text-text-3',
+};
 
 const STATUS_TEXT: Record<CheckStatus, string> = {
   pass: '符合',
@@ -48,6 +64,12 @@ const STATUS_MARK: Record<CheckStatus, string> = {
  * - 额度读数取 `GET /journal/v2/personal-edge` 的 `rule_compliance.daily_budget`，
  *   它带自己的 `asOfTradingDay`：build 不含今日时显式标缺并说明，绝不显示 0。
  *
+ * 面板第一行是**今日车道可用性**（V2-E）：取日内扫描响应的 `laneAvailability`
+ * 区块（服务端按今日真实期权到期日元数据判定，**不含星期规则**）。今日无 0DTE 时
+ * 选中日内车道会得到一条引用 V2-E 的硬阻断；若确证有 0DTE 但全部落在用户自己的
+ * 黑名单上，则如实标注「今日仅黑名单标的有 0DTE」并同样阻断。区块缺席或链读不到
+ * 一律显式标缺——**未知≠「今天没有 0DTE」**。
+ *
  * V2-C 的三条硬禁止与所选车道无关：命中即列出，不会因为「选了另一条车道」而消失。
  */
 export function LaneChecklistPanel({
@@ -80,6 +102,7 @@ export function LaneChecklistPanel({
       pulseGeneratedAt: pulse?.generatedAt ?? null,
       candidates: top?.candidates ?? [],
       marketDateEt: top?.marketDateEt ?? pulse?.marketDateEt ?? null,
+      laneAvailability: top?.laneAvailability ?? null,
       budget: compliance?.dailyBudget ?? null,
       budgetUnavailableReason:
         view.state === 'unavailable'
@@ -103,6 +126,23 @@ export function LaneChecklistPanel({
       aria-label="开仓前车道检查"
       className="rounded-ds-sm border border-subtle bg-bg-1 px-4 py-2.5"
     >
+      {/*
+        今日车道可用性（V2-E）：面板第一行。它决定「今天这条车道到底开不开」，
+        必须在用户选车道之前就看到；来源是当日真实期权到期日，不是星期规则。
+      */}
+      <Tooltip content={result.dayType.tooltip} focusable contentClassName="whitespace-pre-line">
+        <p
+          data-day-type={result.dayType.state}
+          aria-label={`今日车道可用性：${result.dayType.text} · ${result.dayType.tooltip}`}
+          className={`mb-2 border-b border-subtle pb-2 text-body font-medium ${
+            DAY_TYPE_CLASS[result.dayType.state]
+          }`}
+        >
+          <span aria-hidden="true">{DAY_TYPE_MARK[result.dayType.state]} </span>
+          {result.dayType.text}
+        </p>
+      </Tooltip>
+
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <Tooltip content={limitationTooltip} focusable contentClassName="whitespace-pre-line">
           <span className="text-caption font-medium text-text-2" aria-label={limitationTooltip}>

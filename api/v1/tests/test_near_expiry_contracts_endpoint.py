@@ -563,3 +563,115 @@ def test_earnings_calendar_cache_is_shared_with_scan_lane(monkeypatch):
     assert len(calls) == 1
     assert first.json()["item"]["earnings_proximity"]["within_blackout"] is True
     assert second.json()["item"]["earnings_proximity"]["within_blackout"] is True
+
+
+# --- 今日车道可用性（V2-E）的 additive 契约 ---------------------------------
+
+
+def test_availability_fields_report_no_zero_dte_when_chain_is_readable(monkeypatch):
+    """链已读到、窗口内只有 2DTE → has_zero_dte=False（确证），零额外抓取。"""
+
+    monkeypatch.setattr(opportunities, "_moomoo_opend_enabled", lambda: True)
+    monkeypatch.setattr(
+        opportunities,
+        "_compute_near_expiry_chain_moomoo",
+        lambda symbol, *, max_dte: _chain_snapshot(),
+    )
+
+    response = _client().post(
+        "/api/v1/opportunities/near-expiry-contracts",
+        json={"symbol": "MU", "max_dte": 3},
+    )
+
+    assert response.status_code == 200
+    item = response.json()["item"]
+    assert item["has_zero_dte"] is False
+    assert item["available_dte_list"] == [2]
+    assert item["availability_unavailable_reason"] is None
+
+
+def test_availability_fields_report_zero_dte_present(monkeypatch):
+    monkeypatch.setattr(opportunities, "_moomoo_opend_enabled", lambda: True)
+    monkeypatch.setattr(
+        opportunities,
+        "_compute_near_expiry_chain_moomoo",
+        lambda symbol, *, max_dte: _chain_snapshot(
+            expiries=(("2026-08-04", 0), ("2026-08-07", 3)),
+            contracts=(
+                _contract(expiry="2026-08-04", dte=0),
+                _contract(
+                    code="US.MU260807C100000", expiry="2026-08-07", dte=3
+                ),
+            ),
+            requested_contract_count=2,
+            snapshot_received_count=2,
+        ),
+    )
+
+    response = _client().post(
+        "/api/v1/opportunities/near-expiry-contracts",
+        json={"symbol": "MU", "max_dte": 3},
+    )
+
+    assert response.status_code == 200
+    item = response.json()["item"]
+    assert item["has_zero_dte"] is True
+    assert item["available_dte_list"] == [0, 3]
+
+
+def test_availability_empty_window_is_false_not_unknown(monkeypatch):
+    """诚实空态：链可读但窗口内没有到期日 → False，不是 None。"""
+
+    monkeypatch.setattr(opportunities, "_moomoo_opend_enabled", lambda: True)
+    monkeypatch.setattr(
+        opportunities,
+        "_compute_near_expiry_chain_moomoo",
+        lambda symbol, *, max_dte: _chain_snapshot(
+            expiries=(),
+            contracts=(),
+            requested_contract_count=0,
+            snapshot_received_count=0,
+        ),
+    )
+
+    response = _client().post(
+        "/api/v1/opportunities/near-expiry-contracts",
+        json={"symbol": "MU", "max_dte": 3},
+    )
+
+    assert response.status_code == 200
+    item = response.json()["item"]
+    assert item["state"] == "empty"
+    assert item["has_zero_dte"] is False
+    assert item["available_dte_list"] == []
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_availability_is_unknown_when_chain_is_unreadable(monkeypatch, enabled):
+    """链读不到（未配置或适配器失败）→ has_zero_dte 显式 None + 原因。
+
+    绝不以「读不到」冒充「今天没有 0DTE」——那正是 V2-E 要防的误读。
+    """
+
+    monkeypatch.setattr(
+        opportunities, "_moomoo_opend_enabled", lambda: enabled
+    )
+    monkeypatch.setattr(
+        opportunities,
+        "_compute_near_expiry_chain_moomoo",
+        lambda symbol, *, max_dte: None,
+    )
+
+    response = _client().post(
+        "/api/v1/opportunities/near-expiry-contracts",
+        json={"symbol": "MU", "max_dte": 3},
+    )
+
+    assert response.status_code == 200
+    item = response.json()["item"]
+    assert item["state"] == ("unavailable" if enabled else "not_configured")
+    assert item["has_zero_dte"] is None
+    assert item["available_dte_list"] == []
+    assert item["availability_unavailable_reason"] == (
+        "near_expiry_chain_unavailable"
+    )

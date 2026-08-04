@@ -7,6 +7,7 @@ import type {
   RuleComplianceDailyBudget,
 } from '../../../types/journal';
 import type {
+  IntradayLaneAvailability,
   IntradayPulseResponse,
   IntradayTopCandidate,
   IntradayTopResponse,
@@ -57,11 +58,48 @@ function candidate(
   } as unknown as IntradayTopCandidate;
 }
 
-function top(candidates: IntradayTopCandidate[] = []): IntradayTopResponse {
+function top(
+  candidates: IntradayTopCandidate[] = [],
+  laneAvailability: IntradayLaneAvailability | null = null,
+): IntradayTopResponse {
   return {
     marketDateEt: MARKET_DATE,
     candidates,
+    laneAvailability,
   } as unknown as IntradayTopResponse;
+}
+
+/** 车道可用性区块：默认给一个「全部可读」的形状，逐用例覆写。 */
+function availability(
+  overrides: Partial<IntradayLaneAvailability> = {},
+): IntradayLaneAvailability {
+  const tickers = overrides.tickers ?? [];
+  return {
+    formulaVersion: 'lane-availability/v1',
+    marketDateEt: MARKET_DATE,
+    maxDte: 7,
+    dayType: 'overnight_only',
+    dayTypeReason: '深度层标的今日均无 0DTE 到期，日内车道关闭（V2-E）',
+    basis: 'per_ticker_option_expiry_metadata_within_0_7_dte_v1',
+    checkedScope: 'intraday_deep_lane_tickers',
+    checkedCount: tickers.length,
+    readableCount: tickers.filter((item) => item.state === 'ready').length,
+    unavailableCount: tickers.filter((item) => item.state !== 'ready').length,
+    zeroDteTickers: [],
+    deferredTickers: [],
+    limitations: [],
+    ...overrides,
+    // tickers 是必填字段：overrides 里可能没给（Partial），用上面归一化过的本地值兜底。
+    tickers,
+  };
+}
+
+function dayTypeLine() {
+  return document.querySelector('[data-day-type]') as HTMLElement | null;
+}
+
+function hardBlock(id: string) {
+  return document.querySelector(`[data-hard-block="${id}"]`) as HTMLElement | null;
 }
 
 function budget(
@@ -323,5 +361,146 @@ describe('LaneChecklistPanel', () => {
     expect(budgetCell('intraday_tickets')?.getAttribute('aria-label')).toContain(
       '不以 0 冒充额度',
     );
+  });
+  // --- 今日车道可用性（V2-E）------------------------------------------------
+
+  it('day type: 日内车道可用 names the tickers that actually have a 0DTE', async () => {
+    render(
+      <LaneChecklistPanel
+        pulse={pulse()}
+        top={top([], availability({
+          dayType: 'intraday_available',
+          zeroDteTickers: ['NVDA', 'TSLA', 'MU'],
+          tickers: [],
+        }))}
+      />,
+    );
+
+    await waitFor(() => expect(dayTypeLine()?.dataset.dayType).toBe('intraday_available'));
+    expect(dayTypeLine()).toHaveTextContent('今日：日内车道可用（NVDA/TSLA/MU 有 0DTE）');
+    // tooltip 以 V2-E 标题起头（与既有 V2-A/B/C/D 的引用模式一致）。
+    expect(dayTypeLine()?.getAttribute('aria-label')).toContain(
+      'V2-E · 按合约可用性决定今天做不做日内（周二/周四＝过夜日）',
+    );
+    // 可用日不阻断日内车道。
+    expect(hardBlock('day_type_overnight_only')).toBeNull();
+  });
+
+  it('day type: 过夜日 closes the 日内 lane with a V2-E hard block carrying the evidence', async () => {
+    render(
+      <LaneChecklistPanel
+        pulse={pulse()}
+        top={top([], availability({
+          dayType: 'overnight_only',
+          zeroDteTickers: [],
+          tickers: [
+            {
+              ticker: 'NVDA',
+              state: 'ready',
+              hasZeroDte: false,
+              availableDteList: [1, 3, 6],
+              expiries: [],
+              unavailableReason: null,
+            },
+          ],
+        }))}
+      />,
+    );
+
+    await waitFor(() => expect(dayTypeLine()?.dataset.dayType).toBe('overnight_only'));
+    expect(dayTypeLine()).toHaveTextContent('今日：过夜日 · 无 0DTE · 日内车道关闭（V2-E）');
+
+    // 选中日内车道 → 硬阻断，且一行写清证据。
+    const block = hardBlock('day_type_overnight_only');
+    expect(block).not.toBeNull();
+    expect(block).toHaveTextContent('V2-E');
+    expect(block).toHaveTextContent('周二/周四历史 −2.61%/−3.74%，1DTE 当日 −4.97%');
+    expect(block).toHaveTextContent('绝不退而买 1-3DTE');
+  });
+
+  it('day type: 过夜日 does not block the 过夜 lane（它正是今天该走的车道）', async () => {
+    render(
+      <LaneChecklistPanel
+        pulse={pulse()}
+        top={top([], availability({ dayType: 'overnight_only' }))}
+      />,
+    );
+    await waitFor(() => expect(dayTypeLine()?.dataset.dayType).toBe('overnight_only'));
+
+    fireEvent.click(screen.getByRole('button', { name: '过夜' }));
+    await waitFor(() => expect(hardBlock('day_type_overnight_only')).toBeNull());
+  });
+
+  it('day type: 仅黑名单标的有 0DTE is said out loud and still blocks the 日内 lane', async () => {
+    render(
+      <LaneChecklistPanel
+        pulse={pulse()}
+        top={top([], availability({
+          dayType: 'intraday_available',
+          zeroDteTickers: ['QQQ'],
+        }))}
+      />,
+    );
+
+    await waitFor(() => expect(dayTypeLine()?.dataset.dayType).toBe('blacklist_only'));
+    expect(dayTypeLine()).toHaveTextContent('今日仅黑名单标的有 0DTE（QQQ）');
+    const block = hardBlock('day_type_blacklist_only');
+    expect(block).not.toBeNull();
+    expect(block).toHaveTextContent('不得因「今天只有它有 0DTE」而交易黑名单标的');
+  });
+
+  it('day type: a non-blacklist ticker with 0DTE stays available even alongside QQQ', async () => {
+    render(
+      <LaneChecklistPanel
+        pulse={pulse()}
+        top={top([], availability({
+          dayType: 'intraday_available',
+          zeroDteTickers: ['QQQ', 'NVDA'],
+        }))}
+      />,
+    );
+
+    await waitFor(() => expect(dayTypeLine()?.dataset.dayType).toBe('intraday_available'));
+    expect(dayTypeLine()).toHaveTextContent('今日：日内车道可用（NVDA 有 0DTE）');
+    // 黑名单标的仍在 tooltip 里如实提示，不静默。
+    expect(dayTypeLine()?.getAttribute('aria-label')).toContain('QQQ');
+    expect(hardBlock('day_type_blacklist_only')).toBeNull();
+  });
+
+  it('day type: unknown when the chain is unreadable — never implies 「今天没有 0DTE」', async () => {
+    render(
+      <LaneChecklistPanel
+        pulse={pulse()}
+        top={top([], availability({
+          dayType: 'unknown',
+          dayTypeReason: '1 个标的的期权到期日读不到（MU），未知≠「今天没有 0DTE」',
+          tickers: [
+            {
+              ticker: 'MU',
+              state: 'unavailable',
+              hasZeroDte: null,
+              availableDteList: [],
+              expiries: [],
+              unavailableReason: 'option_expiry_metadata_unavailable',
+            },
+          ],
+        }))}
+      />,
+    );
+
+    await waitFor(() => expect(dayTypeLine()?.dataset.dayType).toBe('unknown'));
+    expect(dayTypeLine()).toHaveTextContent('标缺');
+    expect(dayTypeLine()?.getAttribute('aria-label')).toContain('未知≠「今天没有 0DTE」');
+    // 标缺绝不阻断，也绝不放行——不产生任何硬阻断。
+    expect(hardBlock('day_type_overnight_only')).toBeNull();
+    expect(hardBlock('day_type_blacklist_only')).toBeNull();
+  });
+
+  it('day type: 标缺 when the response carries no lane availability block at all', async () => {
+    render(<LaneChecklistPanel pulse={pulse()} top={top()} />);
+
+    await waitFor(() => expect(dayTypeLine()?.dataset.dayType).toBe('unknown'));
+    expect(dayTypeLine()).toHaveTextContent('车道可用性标缺');
+    expect(dayTypeLine()?.getAttribute('aria-label')).toContain('未知≠「今天没有 0DTE」');
   });
 });

@@ -23,6 +23,9 @@ Surface
   near-the-money contract rows (bid/ask/last/volume/OI/IV/delta, per-field
   nullable) for expiries within ``max_dte`` days, for the read-only
   contract-selection panel
+- :func:`fetch_expiry_availability_moomoo(symbol, max_dte, ref_date)` →
+  today's ``(expiry, dte)`` pairs only (no chain window, no snapshot batch);
+  the cheapest read that answers "does a 0DTE exist for this ticker today"
 
 All public quote helpers short-circuit to a no-op (returning empty / None) when
 ``MOOMOO_OPEND_ENABLED!=true`` so callers can do ``moomoo first → yfinance
@@ -340,6 +343,23 @@ class MoomooNearExpiryChainSnapshot:
     failed_batch_count: int
     excluded_nonstandard_count: int
     excluded_unknown_standard_type_count: int
+
+
+@dataclass(frozen=True)
+class MoomooExpiryAvailability:
+    """今日某标的在 0..``max_dte`` 天内的期权到期日（车道可用性输入）。
+
+    ``expiries`` 是按 ``(dte, expiry)`` 升序的 ``(expiry_iso, dte)`` 元组；
+    为空表示该标的今日窗口内确实没有到期日（诚实空态，不是失败——失败由
+    :func:`fetch_expiry_availability_moomoo` 返回 ``None`` 表达）。只承载
+    到期日元数据，不含任何报价、打分或推荐语义。
+    """
+
+    symbol: str
+    market_date: str
+    max_dte: int
+    expiries: tuple[tuple[str, int], ...]
+    fetched_at: datetime
 
 
 @dataclass(frozen=True)
@@ -1434,6 +1454,89 @@ def fetch_option_wall_snapshot_moomoo(
     except Exception as exc:  # noqa: BLE001 - quote failures degrade to unavailable
         logger.warning(
             "[moomoo_options] option-wall snapshot(%s) failed: %s",
+            normalized_symbol,
+            exc,
+        )
+        return None
+
+
+def fetch_expiry_availability_moomoo(
+    symbol: str,
+    max_dte: int = 7,
+    ref_date: Optional[date] = None,
+) -> Optional[MoomooExpiryAvailability]:
+    """Return today's ``(expiry, dte)`` pairs within ``max_dte`` for one symbol.
+
+    「今日车道可用性」的最省额度读法：与
+    :func:`fetch_near_expiry_chain_moomoo` **共用同一条读取路径的第一步**
+    （同一个独占 wall QuoteContext lane + 同一个
+    ``_expiration_dates_from_ctx``），但在拿到到期日元数据后就停下——
+    不发 ``get_option_chain`` 日期窗口、不取 underlying 快照、不发任何
+    ``get_market_snapshot`` 批次。回答「今天有没有 0DTE」只需要到期日，
+    不需要任何一张合约的报价。
+
+    为什么需要它（V2-E）：用户干净口径历史里「周二/周四亏钱」的星期效应
+    实为合约可用性造成的合约选择问题——主要标的（NVDA/TSLA/MU/AAPL）周
+    一/三/五到期，周二/周四没有 0DTE 时退而买 1-3DTE，而 1DTE 当日平
+    −4.97%（n=313，胜率 25.2%）是全样本最差桶。星期规则本身不可靠（假日、
+    节前特殊到期都会让它失效），因此逐日从真实链元数据推导。
+
+    fail closed：开关未启用、SDK 缺失、lane 租不到、元数据查询失败一律
+    返回 ``None``（由调用方标为 unknown）；窗口内没有到期日返回空
+    ``expiries`` 的读数（诚实空态，不是失败）。
+    """
+
+    if not isinstance(max_dte, int) or isinstance(max_dte, bool):
+        raise ValueError("max_dte must be an integer")
+    if not 0 <= max_dte <= 7:
+        raise ValueError("require 0 <= max_dte <= 7")
+    if not _enabled():
+        return None
+
+    try:
+        from moomoo import RET_OK
+    except ImportError:
+        return None
+
+    target_date = ref_date or _new_york_market_date()
+    if not isinstance(target_date, date):
+        raise ValueError("ref_date must be a date")
+    normalized_symbol = str(symbol or "").strip().upper()
+    underlying = _to_moomoo_underlying(normalized_symbol)
+    if not underlying.startswith("US."):
+        return None
+
+    try:
+        with _lease_wall_context() as leased:
+            if leased is None:
+                return None
+            ctx, _context_lock = leased
+            available_expiries = _expiration_dates_from_ctx(
+                ctx,
+                underlying,
+                RET_OK,
+            )
+        if available_expiries is None:
+            return None
+        selected: list[tuple[str, int]] = []
+        for expiry in available_expiries:
+            parsed = _safe_iso_date(expiry)
+            if parsed is None or parsed < target_date:
+                continue
+            dte = (parsed - target_date).days
+            if dte <= max_dte:
+                selected.append((expiry, dte))
+        selected.sort(key=lambda item: (item[1], item[0]))
+        return MoomooExpiryAvailability(
+            symbol=normalized_symbol,
+            market_date=target_date.isoformat(),
+            max_dte=max_dte,
+            expiries=tuple(selected),
+            fetched_at=datetime.now(timezone.utc),
+        )
+    except Exception as exc:  # noqa: BLE001 - metadata failures degrade to unknown
+        logger.warning(
+            "[moomoo_options] expiry availability(%s) failed: %s",
             normalized_symbol,
             exc,
         )
