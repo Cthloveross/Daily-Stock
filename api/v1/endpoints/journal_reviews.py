@@ -2,9 +2,17 @@
 """Explicit, append-only user reviews for immutable PositionEpisodes."""
 from __future__ import annotations
 
+import time
+from threading import Lock
+
 from fastapi import APIRouter, HTTPException, Query
 
 from api.v1.schemas.journal_reviews import (
+    PersonalEdgeDteBucketModel,
+    PersonalEdgeHoldBucketModel,
+    PersonalEdgeMonthlyBucketModel,
+    PersonalEdgeResponse,
+    PersonalEdgeUnderlyingModel,
     PlaybookCandidateCreateRequest,
     PlaybookCandidateCreateResponse,
     PlaybookCandidateItem,
@@ -45,6 +53,10 @@ from src.journal.ledger.playbook_repository import (
     retire_playbook_rule,
 )
 from src.journal.ledger.repository import DEFAULT_LEDGER_ACCOUNT_KEY
+from src.journal.personal_edge import (
+    PersonalEdgeResult,
+    get_personal_edge_stats,
+)
 from src.journal.ledger.review_insights import (
     DEFAULT_MIN_DISTINCT_TRADING_DAY_COUNT,
     DEFAULT_MIN_EPISODE_COUNT,
@@ -181,6 +193,129 @@ def get_review_insights(
         ),
         buckets=[_insight_bucket(bucket) for bucket in result.buckets],
     )
+
+
+# --- personal edge (个人画像回灌): zero-write descriptive stats --------------
+
+
+# In-process TTL cache: episodes are append-only per build, so a short cache
+# is safe; the response keeps computed_at so the as-of moment stays honest.
+_PERSONAL_EDGE_CACHE_TTL_SECONDS = 600.0
+_personal_edge_cache: dict[str, tuple[float, PersonalEdgeResponse]] = {}
+_personal_edge_cache_lock = Lock()
+
+
+def _reset_personal_edge_cache() -> None:
+    """Test hook: drop every cached personal-edge response."""
+    with _personal_edge_cache_lock:
+        _personal_edge_cache.clear()
+
+
+def _personal_edge_response(
+    account_key: str,
+    result: PersonalEdgeResult,
+) -> PersonalEdgeResponse:
+    return PersonalEdgeResponse(
+        data_state="ready",
+        account_key=result.account_key or account_key,
+        build_id=result.build_id,
+        build_key=result.build_key,
+        source_kind=result.source_kind,
+        computed_at=result.computed_at,
+        first_opened_at=result.first_opened_at,
+        last_closed_at=result.last_closed_at,
+        closed_episode_count=result.closed_episode_count,
+        excluded_open_count=result.excluded_open_count,
+        excluded_missing_pnl_count=result.excluded_missing_pnl_count,
+        underlying_min_episode_count=result.underlying_min_episode_count,
+        underlyings=[
+            PersonalEdgeUnderlyingModel(
+                underlying=item.underlying,
+                n=item.n,
+                net=item.net,
+                win_rate=item.win_rate,
+                fees=item.fees,
+            )
+            for item in result.underlyings
+        ],
+        small_sample_underlying_count=result.small_sample_underlying_count,
+        hold_time_buckets=[
+            PersonalEdgeHoldBucketModel(
+                bucket=item.bucket,
+                n=item.n,
+                net=item.net,
+                win_rate=item.win_rate,
+                avg_win=item.avg_win,
+                avg_loss=item.avg_loss,
+            )
+            for item in result.hold_time_buckets
+        ],
+        hold_unknown_count=result.hold_unknown_count,
+        dte_buckets=[
+            PersonalEdgeDteBucketModel(
+                bucket=item.bucket,
+                n=item.n,
+                net=item.net,
+                win_rate=item.win_rate,
+            )
+            for item in result.dte_buckets
+        ],
+        dte_unknown=PersonalEdgeDteBucketModel(
+            bucket=result.dte_unknown.bucket,
+            n=result.dte_unknown.n,
+            net=result.dte_unknown.net,
+            win_rate=result.dte_unknown.win_rate,
+        ),
+        monthly=[
+            PersonalEdgeMonthlyBucketModel(
+                month=item.month,
+                n=item.n,
+                net=item.net,
+                fees=item.fees,
+                win_rate=item.win_rate,
+            )
+            for item in result.monthly
+        ],
+        month_basis=result.month_basis,
+        limitations=list(result.limitations),
+    )
+
+
+@router.get("/v2/personal-edge", response_model=PersonalEdgeResponse)
+def get_personal_edge(
+    account_key: str = Query(
+        DEFAULT_LEDGER_ACCOUNT_KEY,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    ),
+) -> PersonalEdgeResponse:
+    """个人画像回灌：当前默认 build 已平仓回合的零写描述统计。
+
+    Per-underlying / hold-time / DTE / monthly buckets recomputed from the
+    same effective default build the other journal reads use, cached
+    in-process for ~10 minutes.  Descriptive only — never a signal, never a
+    filter; the endogeneity caveat ships verbatim in ``limitations``.
+    """
+    now = time.monotonic()
+    with _personal_edge_cache_lock:
+        cached = _personal_edge_cache.get(account_key)
+        if cached is not None and now - cached[0] < _PERSONAL_EDGE_CACHE_TTL_SECONDS:
+            return cached[1]
+    try:
+        result = get_personal_edge_stats(account_key)
+    except EpisodeRepositoryError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if result is None:
+        # 未构建不进缓存：导入后第一次构建完成即可立刻看到数据。
+        return PersonalEdgeResponse(
+            data_state="not_built",
+            account_key=account_key,
+        )
+    response = _personal_edge_response(account_key, result)
+    with _personal_edge_cache_lock:
+        _personal_edge_cache[account_key] = (now, response)
+    return response
 
 
 @router.get(

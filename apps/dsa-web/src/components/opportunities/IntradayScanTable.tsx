@@ -5,9 +5,16 @@ import type {
   IntradayTopCandidate,
   IntradayTopResponse,
 } from '../../types/opportunities';
+import type { PersonalEdgeUnderlyingStat } from '../../types/journal';
+import { usePersonalEdge, type PersonalEdgeView } from '../../hooks/usePersonalEdge';
 import { parseApiTimestamp } from '../../utils/marketTime';
 import { Tooltip } from '../common/Tooltip';
-import { formatCompactUsd, formatRatio, formatSignedPercent } from './intradayFormat';
+import {
+  formatCompactUsd,
+  formatRatio,
+  formatSignedCompactUsd,
+  formatSignedPercent,
+} from './intradayFormat';
 import { NearExpiryContractPanel } from './NearExpiryContractPanel';
 
 const STATE_LABELS: Record<IntradayTopCandidate['researchState'], string> = {
@@ -142,6 +149,122 @@ const MOMENTUM_WARMING_UP_CHIP = '动量样本预热中 · 暂按当日涨跌排
 /** 仅快照次级列表默认只展示前 N 檔，其余一键展开（重排可见性，不删除数据）。 */
 const SNAPSHOT_ONLY_COLLAPSED_COUNT = 5;
 
+/** 「你的战绩」亏损警示门槛：净亏损且样本 ≥20 笔才加警示（小样本不警示）。 */
+const PERSONAL_LOSS_WARN_MIN_N = 20;
+
+const PERSONAL_HEADER_TOOLTIP =
+  '你的战绩＝Journal 当前默认 build 已平仓回合按标的聚合（净盈亏 · 胜率 · 笔数）——'
+  + '系统标注，用户过滤：不隐藏行、不改排序、不是信号。样本 <5 笔显示「样本不足」，'
+  + '净亏损且 ≥20 笔加警示。持仓时长与结果存在内生性（止损单天然短），'
+  + '描述统计不是因果结论，不构成建议。';
+
+/** 「你的战绩」单元格判定结果：显式区分加载中/标缺/样本不足/有读数。 */
+type PersonalCellState =
+  | { kind: 'loading' }
+  | { kind: 'missing' }
+  | { kind: 'small_sample'; minN: number }
+  | { kind: 'ready'; stat: PersonalEdgeUnderlyingStat; warn: boolean };
+
+function personalCellState(
+  view: PersonalEdgeView,
+  ticker: string,
+): PersonalCellState {
+  if (view.state === 'loading') return { kind: 'loading' };
+  if (view.state === 'unavailable') return { kind: 'missing' };
+  const stat = view.data.underlyings.find(
+    (item) => item.underlying === ticker.toUpperCase(),
+  );
+  if (!stat) {
+    return { kind: 'small_sample', minN: view.data.underlyingMinEpisodeCount };
+  }
+  return {
+    kind: 'ready',
+    stat,
+    warn: stat.net < 0 && stat.n >= PERSONAL_LOSS_WARN_MIN_N,
+  };
+}
+
+function personalWinRateLabel(stat: PersonalEdgeUnderlyingStat): string {
+  return `${(stat.winRate * 100).toFixed(1)}%`;
+}
+
+function personalWarnTooltip(stat: PersonalEdgeUnderlyingStat): string {
+  return `你的历史亏钱标的 · ${stat.n} 笔 · 净 ${formatSignedCompactUsd(stat.net)}`
+    + ` · 胜率 ${personalWinRateLabel(stat)}`;
+}
+
+/** 「你的战绩」列内容：标缺/样本不足绝不冒充读数，亏损 ≥20 笔加警示 tooltip。 */
+function personalStatCell(view: PersonalEdgeView, ticker: string) {
+  const cell = personalCellState(view, ticker);
+  if (cell.kind === 'loading') {
+    return <div className="text-body-sm text-text-3">…</div>;
+  }
+  if (cell.kind === 'missing') {
+    return (
+      <>
+        <div className="text-body-sm text-text-3">标缺</div>
+        <div className="mt-0.5 text-caption text-text-3">个人战绩不可得</div>
+      </>
+    );
+  }
+  if (cell.kind === 'small_sample') {
+    return (
+      <>
+        <div className="text-body-sm text-text-3">样本不足</div>
+        <div className="mt-0.5 text-caption text-text-3">{`<${cell.minN} 笔`}</div>
+      </>
+    );
+  }
+  const { stat, warn } = cell;
+  const summary = `${formatSignedCompactUsd(stat.net)} · ${personalWinRateLabel(stat)}`;
+  if (warn) {
+    return (
+      <Tooltip focusable content={personalWarnTooltip(stat)}>
+        <span aria-label={personalWarnTooltip(stat)} className="inline-block">
+          <span className="inline-block rounded-ds-sm border border-[color:var(--warn-muted)] bg-bg-0 px-1.5 py-0.5 font-mono text-mono-xs font-medium text-warning">
+            {summary}
+          </span>
+          <span className="mt-0.5 block text-caption text-text-3">{stat.n} 笔</span>
+        </span>
+      </Tooltip>
+    );
+  }
+  return (
+    <>
+      <div className="font-mono text-mono-xs text-text-1">{summary}</div>
+      <div className="mt-0.5 text-caption text-text-3">{stat.n} 笔</div>
+    </>
+  );
+}
+
+/** 今日曾深扫账本行的紧凑「你的战绩」标注（同一判定，行内 chip 形态）。 */
+function personalLedgerChip(view: PersonalEdgeView, ticker: string) {
+  const cell = personalCellState(view, ticker);
+  if (cell.kind === 'loading') return null;
+  if (cell.kind === 'missing') {
+    return <span className="text-caption text-text-3">你的战绩标缺</span>;
+  }
+  if (cell.kind === 'small_sample') {
+    return <span className="text-caption text-text-3">你的战绩样本不足</span>;
+  }
+  const { stat, warn } = cell;
+  const label = `你的战绩 ${formatSignedCompactUsd(stat.net)}`
+    + ` · ${personalWinRateLabel(stat)} · ${stat.n} 笔`;
+  if (warn) {
+    return (
+      <Tooltip focusable content={personalWarnTooltip(stat)}>
+        <span
+          aria-label={personalWarnTooltip(stat)}
+          className="inline-block whitespace-nowrap rounded-ds-sm border border-[color:var(--warn-muted)] bg-bg-0 px-1.5 py-0.5 text-caption font-medium text-warning"
+        >
+          {label}
+        </span>
+      </Tooltip>
+    );
+  }
+  return <span className="text-caption text-text-2">{label}</span>;
+}
+
 const RANK_HEADER_TOOLTIP =
   '服务端排名（盘中爆发分优先，休市按最近交易时段证据计数）；点击其他列头做客户端排序时，此排名不变。';
 
@@ -154,7 +277,7 @@ const ALIGNMENT_HEADER_TOOLTIP =
  * 文本本身必须可一键展开查看。
  */
 const FULL_METHODOLOGY_TEXT =
-  '当前爆发＝最近 15 分钟（3 根 5m K 线）|收−开| ÷ 当日 5m 波幅中位 × 窗口量比（阈值按 2026-07-31 标注样本校准，盘中排序优先，不是信号）；速度＝相邻两个 15 分钟窗口爆发分之差（5m 近似，非 1m/2m 秒级；减速=你的离场信号，R1）；今日波段＝爆发分分级记录的独立窗口（强 ≥8 按 2026-07-31 暴动样本校准、中 ≥2.5 按 2026-08-03 NVDA 上午持续推升校准；起点相隔 ≥30 分钟，≤4 个，休市显示最近一个交易时段）；缺口＝开盘价对参考前收（休市时段改用快照前收并标注）；量能节奏＝当日累计 vs 20 日全日中位（未按时点折算）；大盘＝候选爆发方向 vs SPY 会话 VWAP 位置（累计额/量近似）；波幅扩张＝当日高低价差 ÷ ATR14；财报＝Finnhub 前向 5 天窗口，≤3 天标「期权贵」（你的回避规则）；期权异动＝最近一页 Moomoo 分类计数，不推断开平仓。时段/财报/大盘/速度均为 v3 上下文标注——系统标注，用户过滤：不隐藏行、不阻断操作、不参与排序。形态＝styleMatch v1（S1 低点抬高 / S2 跳空托举 / S3 高开遇阻，与你的 Playbook setup 的形状对比；「· 似」=部分相似，缺 K 线或快照输入时标缺）：形态相似度为 v1 几何检测（5m近似），不含你的进场确认帧（2m/1m 回踩8/13EMA），不是信号。缺失字段显式标缺，不以 0 冒充。';
+  '当前爆发＝最近 15 分钟（3 根 5m K 线）|收−开| ÷ 当日 5m 波幅中位 × 窗口量比（阈值按 2026-07-31 标注样本校准，盘中排序优先，不是信号）；速度＝相邻两个 15 分钟窗口爆发分之差（5m 近似，非 1m/2m 秒级；减速=你的离场信号，R1）；今日波段＝爆发分分级记录的独立窗口（强 ≥8 按 2026-07-31 暴动样本校准、中 ≥2.5 按 2026-08-03 NVDA 上午持续推升校准；起点相隔 ≥30 分钟，≤4 个，休市显示最近一个交易时段）；缺口＝开盘价对参考前收（休市时段改用快照前收并标注）；量能节奏＝当日累计 vs 20 日全日中位（未按时点折算）；大盘＝候选爆发方向 vs SPY 会话 VWAP 位置（累计额/量近似）；波幅扩张＝当日高低价差 ÷ ATR14；财报＝Finnhub 前向 5 天窗口，≤3 天标「期权贵」（你的回避规则）；期权异动＝最近一页 Moomoo 分类计数，不推断开平仓。你的战绩＝Journal 当前默认 build 已平仓回合按标的聚合（净盈亏/胜率/笔数，<5 笔样本不足，净亏损且 ≥20 笔警示；持仓时长与结果存在内生性，描述非因果、不构成建议）。时段/财报/大盘/速度/你的战绩均为上下文标注——系统标注，用户过滤：不隐藏行、不阻断操作、不参与排序。形态＝styleMatch v1（S1 低点抬高 / S2 跳空托举 / S3 高开遇阻，与你的 Playbook setup 的形状对比；「· 似」=部分相似，缺 K 线或快照输入时标缺）：形态相似度为 v1 几何检测（5m近似），不含你的进场确认帧（2m/1m 回踩8/13EMA），不是信号。缺失字段显式标缺，不以 0 冒充。';
 
 function formatBurstThrust(value: number | null): string {
   if (value === null) return '—';
@@ -476,10 +599,14 @@ function ResearchReadoutsGrid({ item }: { item: IntradayTopCandidate }) {
  * 两层模式下深度层为实时排名主表，表下依次为「今日曾深扫 · 波段保留」账本
  * （轮换出深度层的标的以最后一次深扫摘要 as-of 保留）与「仅快照」次级列表。
  *
- * 两级布局（2026-08-03 声效整理）：默认网格只保留 9 列交易关键读数
- * （排名/标的/涨跌%/当前爆发/今日波段/速度/形态/波段vs大盘/详情），
- * 次要指标移入行内展开区「研究读数」网格（临期合约面板上方）——
+ * 两级布局（2026-08-03 声效整理，2026-08-04 加「你的战绩」）：默认网格保留
+ * 10 列交易关键读数（排名/标的/涨跌%/当前爆发/今日波段/速度/形态/波段vs大盘/
+ * 你的战绩/详情），次要指标移入行内展开区「研究读数」网格（临期合约面板上方）——
  * 重排可见性 ≠ 删除，所有读数一键可达，标缺语义不变。
+ *
+ * 「你的战绩」＝个人画像回灌（personal-edge）：该标的在你 Journal 默认 build
+ * 里的净盈亏/胜率/笔数。系统标注，用户过滤——不隐藏行、不改排序、不是信号；
+ * 端点缺席显式标缺，样本 <5 笔显式「样本不足」。
  *
  * 行点击仍是既有的详情页导航（不改变肌肉记忆），行尾「详情」按钮在行
  * 下方展开研究读数 + 只读临期合约面板；同一时刻只展开一行。
@@ -494,6 +621,8 @@ export function IntradayScanTable({
   error: string | null;
 }) {
   const navigate = useNavigate();
+  // 个人画像回灌：每会话/10 分钟最多取一次；失败或未构建 → 显式标缺。
+  const personalEdge = usePersonalEdge();
   const [sort, setSort] = useState<SortState | null>(null);
   const [expandedTicker, setExpandedTicker] = useState<string | null>(null);
   const [snapshotListExpanded, setSnapshotListExpanded] = useState(false);
@@ -628,7 +757,7 @@ export function IntradayScanTable({
         </div>
       ) : (
         <div className="overflow-auto">
-          <table className="w-full min-w-[1080px] border-collapse" aria-label="实时扫描表">
+          <table className="w-full min-w-[1180px] border-collapse" aria-label="实时扫描表">
             <thead>
               <tr className="border-b border-subtle text-left text-caption text-text-3">
                 <th className="px-3 py-2 text-right font-medium">
@@ -645,6 +774,11 @@ export function IntradayScanTable({
                 <th className="px-3 py-2 font-medium">
                   <Tooltip focusable content={ALIGNMENT_HEADER_TOOLTIP}>
                     <span aria-label={ALIGNMENT_HEADER_TOOLTIP}>波段vs大盘</span>
+                  </Tooltip>
+                </th>
+                <th className="px-3 py-2 font-medium">
+                  <Tooltip focusable content={PERSONAL_HEADER_TOOLTIP}>
+                    <span aria-label={PERSONAL_HEADER_TOOLTIP}>你的战绩</span>
                   </Tooltip>
                 </th>
                 <th className="px-3 py-2 font-medium">详情</th>
@@ -782,6 +916,7 @@ export function IntradayScanTable({
                     </div>
                     <div className="mt-0.5 text-caption text-text-3">{alignmentCaption(item)}</div>
                   </td>
+                  <td className="px-3 py-2.5">{personalStatCell(personalEdge, item.ticker)}</td>
                   <td className="px-3 py-2.5">
                     <button
                       type="button"
@@ -803,7 +938,7 @@ export function IntradayScanTable({
                 </tr>
                 {expandedTicker === item.ticker && (
                   <tr className="border-b border-subtle last:border-b-0">
-                    <td colSpan={9} className="bg-bg-0 px-3 py-3">
+                    <td colSpan={10} className="bg-bg-0 px-3 py-3">
                       <ResearchReadoutsGrid item={item} />
                       <NearExpiryContractPanel symbol={item.ticker} />
                     </td>
@@ -877,6 +1012,7 @@ export function IntradayScanTable({
                 <span className="text-caption text-text-3">
                   形态 {row.setupMatchedSetups.length > 0 ? row.setupMatchedSetups.join('/') : '—'}
                 </span>
+                {personalLedgerChip(personalEdge, row.ticker)}
                 <span className="inline-block whitespace-nowrap rounded-ds-sm border border-dashed border-subtle px-1.5 py-0.5 text-caption text-text-3">
                   已轮换出
                 </span>
@@ -1012,7 +1148,7 @@ export function IntradayScanTable({
         <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
           <span>
             排序与口径说明：盘中排序＝爆发分优先（休市按最近交易时段）；今日波段分级
-            强＝爆发分 ≥8 暴动 / 中＝≥2.5 持续推升；速度/波段vs大盘/财报/形态均为上下文标注——
+            强＝爆发分 ≥8 暴动 / 中＝≥2.5 持续推升；速度/波段vs大盘/财报/形态/你的战绩均为上下文标注——
             不隐藏行、不参与排序、不是信号；缺失字段显式标缺，不以 0 冒充。
           </span>
           <button

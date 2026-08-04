@@ -315,3 +315,86 @@ class PlaybookEpisodeLinksResponse(BaseModel):
     build_id: int = Field(ge=1)
     episode_id: int = Field(ge=1)
     links: list[PlaybookEpisodeLinkItem] = Field(default_factory=list)
+
+
+# --- personal edge (个人画像回灌): zero-write descriptive stats --------------
+
+
+class PersonalEdgeUnderlyingModel(BaseModel):
+    """Per-underlying stats; only n >= threshold entries are returned."""
+
+    underlying: str
+    n: int = Field(ge=1)
+    net: float
+    win_rate: float = Field(ge=0, le=1)
+    fees: float
+
+
+class PersonalEdgeHoldBucketModel(BaseModel):
+    """One hold-duration bucket; empty buckets keep n=0 and null ratios."""
+
+    bucket: str
+    n: int = Field(ge=0)
+    net: float
+    win_rate: Optional[float] = Field(default=None, ge=0, le=1)
+    avg_win: Optional[float] = None
+    avg_loss: Optional[float] = None
+
+
+class PersonalEdgeDteBucketModel(BaseModel):
+    bucket: str
+    n: int = Field(ge=0)
+    net: float
+    win_rate: Optional[float] = Field(default=None, ge=0, le=1)
+
+
+class PersonalEdgeMonthlyBucketModel(BaseModel):
+    month: str = Field(pattern=r"^\d{4}-\d{2}$")
+    n: int = Field(ge=0)
+    net: float
+    fees: float
+    win_rate: Optional[float] = Field(default=None, ge=0, le=1)
+
+
+class PersonalEdgeResponse(BaseModel):
+    """Descriptive personal stats over the current default episode build.
+
+    ``data_state`` is ``not_built`` when the account has no episode build;
+    every numeric block is recomputed from the build at (cached) request
+    time and stamped with ``build_id`` + date range + ``computed_at`` so the
+    as-of moment is always explicit.  Ratios and buckets are descriptive
+    statistics only — the endogeneity caveat ships in ``limitations``.
+    """
+
+    schema_version: Literal["journal-personal-edge/1.0"] = (
+        "journal-personal-edge/1.0"
+    )
+    data_state: Literal["ready", "not_built"]
+    account_key: str
+    build_id: Optional[int] = Field(default=None, ge=1)
+    build_key: Optional[str] = None
+    source_kind: Optional[str] = None
+    computed_at: Optional[datetime] = None
+    first_opened_at: Optional[datetime] = None
+    last_closed_at: Optional[datetime] = None
+    closed_episode_count: int = Field(default=0, ge=0)
+    excluded_open_count: int = Field(default=0, ge=0)
+    excluded_missing_pnl_count: int = Field(default=0, ge=0)
+    underlying_min_episode_count: int = Field(default=5, ge=1)
+    underlyings: list[PersonalEdgeUnderlyingModel] = Field(
+        default_factory=list
+    )
+    small_sample_underlying_count: int = Field(default=0, ge=0)
+    hold_time_buckets: list[PersonalEdgeHoldBucketModel] = Field(
+        default_factory=list
+    )
+    hold_unknown_count: int = Field(default=0, ge=0)
+    dte_buckets: list[PersonalEdgeDteBucketModel] = Field(
+        default_factory=list
+    )
+    dte_unknown: Optional[PersonalEdgeDteBucketModel] = None
+    monthly: list[PersonalEdgeMonthlyBucketModel] = Field(
+        default_factory=list
+    )
+    month_basis: Optional[str] = None
+    limitations: list[str] = Field(default_factory=list)

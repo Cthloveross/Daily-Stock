@@ -1,7 +1,9 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { IntradayScanTable } from '../IntradayScanTable';
 import { fetchNearExpiryContracts } from '../../../api/opportunities';
+import { fetchPersonalEdge } from '../../../api/journal';
+import type { PersonalEdgeResponse } from '../../../types/journal';
 import type {
   IntradaySetupKey,
   IntradaySetupMatch,
@@ -83,6 +85,67 @@ vi.mock('../../../api/opportunities', async (importOriginal) => {
     fetchNearExpiryContracts: vi.fn(),
   };
 });
+
+// 个人画像回灌（你的战绩列）：默认「Journal 未构建」→ 单元格显式标缺。
+const { personalEdgeNotBuilt } = vi.hoisted(() => ({
+  personalEdgeNotBuilt: () => ({
+    schemaVersion: 'journal-personal-edge/1.0',
+    dataState: 'not_built' as const,
+    accountKey: 'default_moomoo_us',
+    buildId: null,
+    buildKey: null,
+    sourceKind: null,
+    computedAt: null,
+    firstOpenedAt: null,
+    lastClosedAt: null,
+    closedEpisodeCount: 0,
+    excludedOpenCount: 0,
+    excludedMissingPnlCount: 0,
+    underlyingMinEpisodeCount: 5,
+    underlyings: [],
+    smallSampleUnderlyingCount: 0,
+    holdTimeBuckets: [],
+    holdUnknownCount: 0,
+    dteBuckets: [],
+    dteUnknown: null,
+    monthly: [],
+    monthBasis: null,
+    limitations: [],
+  }),
+}));
+
+vi.mock('../../../api/journal', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../api/journal')>();
+  return {
+    ...actual,
+    fetchPersonalEdge: vi.fn(async () => personalEdgeNotBuilt()),
+  };
+});
+
+function personalEdgeReady(
+  underlyings: PersonalEdgeResponse['underlyings'],
+): PersonalEdgeResponse {
+  return {
+    ...personalEdgeNotBuilt(),
+    dataState: 'ready',
+    buildId: 3,
+    buildKey: 'fixture-build-key',
+    sourceKind: 'canonical_evidence_set',
+    computedAt: '2026-08-04T14:00:00+00:00',
+    firstOpenedAt: '2026-03-04T14:31:57+00:00',
+    lastClosedAt: '2026-07-31T17:39:18+00:00',
+    closedEpisodeCount: 1653,
+    underlyings,
+    monthly: [
+      { month: '2026-03', n: 37, net: 4934, fees: 654, winRate: 0.3514 },
+      { month: '2026-07', n: 543, net: -11914, fees: 77223, winRate: 0.3043 },
+    ],
+    monthBasis: 'opened_at_utc_minus_4_approximation',
+    limitations: [
+      '持仓时长与结果存在内生性（止损单天然短），描述统计不是因果结论，不构成建议',
+    ],
+  };
+}
 
 function candidate(overrides: Partial<IntradayTopCandidate> = {}): IntradayTopCandidate {
   return {
@@ -261,7 +324,7 @@ function nearExpiryEmpty(ticker: string): NearExpiryContractResponse {
   };
 }
 
-describe('IntradayScanTable 默认 9 列网格（v3 上下文并入）', () => {
+describe('IntradayScanTable 默认 10 列网格（v3 上下文并入）', () => {
   beforeEach(() => {
     navigateMock.mockReset();
     vi.mocked(fetchNearExpiryContracts).mockReset();
@@ -324,12 +387,12 @@ describe('IntradayScanTable 默认 9 列网格（v3 上下文并入）', () => {
     render(<IntradayScanTable data={response} loading={false} error={null} />);
 
     const table = screen.getByRole('table', { name: '实时扫描表' });
-    // 默认网格恰好 9 列交易关键读数。
-    const headers = ['排名', '标的', '涨跌%', '当前爆发', '今日波段', '速度', '形态', '波段vs大盘', '详情'];
+    // 默认网格恰好 10 列交易关键读数（含个人画像回灌「你的战绩」）。
+    const headers = ['排名', '标的', '涨跌%', '当前爆发', '今日波段', '速度', '形态', '波段vs大盘', '你的战绩', '详情'];
     for (const header of headers) {
       expect(within(table).getByText(header)).toBeInTheDocument();
     }
-    expect(within(table).getAllByRole('columnheader').length).toBe(9);
+    expect(within(table).getAllByRole('columnheader').length).toBe(10);
     // 次要指标移出默认网格（展开行「研究读数」一键可达，不是删除）。
     for (const moved of ['缺口', '量能节奏', 'VWAP', '波幅扩张(ATR)', '财报', '期权异动', '研究状态']) {
       expect(within(table).queryByText(moved)).not.toBeInTheDocument();
@@ -1130,5 +1193,152 @@ describe('IntradayScanTable footer 口径两级展示', () => {
     // 再次点击收起。
     fireEvent.click(toggle);
     expect(screen.queryByText(/当前爆发＝最近 15 分钟（3 根 5m K 线）/)).not.toBeInTheDocument();
+  });
+});
+
+describe('IntradayScanTable 「你的战绩」列（个人画像回灌）', () => {
+  beforeEach(() => {
+    navigateMock.mockReset();
+    vi.mocked(fetchNearExpiryContracts).mockReset();
+    vi.mocked(fetchNearExpiryContracts).mockImplementation(
+      async (symbol: string) => nearExpiryEmpty(symbol),
+    );
+    vi.mocked(fetchPersonalEdge).mockReset();
+  });
+
+  afterEach(() => {
+    // 恢复默认「未构建」实现，避免污染其他 describe。
+    vi.mocked(fetchPersonalEdge).mockImplementation(
+      async () => personalEdgeNotBuilt(),
+    );
+  });
+
+  it('renders profitable stats plainly and losing n>=20 with the warning tooltip', async () => {
+    vi.mocked(fetchPersonalEdge).mockResolvedValue(personalEdgeReady([
+      { underlying: 'NVDA', n: 191, net: 5490, winRate: 0.293, fees: 33189 },
+      { underlying: 'MU', n: 92, net: -52550, winRate: 0.217, fees: 13882 },
+    ]));
+    render(<IntradayScanTable data={topResponse()} loading={false} error={null} />);
+
+    const table = screen.getByRole('table', { name: '实时扫描表' });
+    await waitFor(() => {
+      expect(within(table).getByText('+$5K · 29.3%')).toBeInTheDocument();
+    });
+    expect(within(table).getByText('191 笔')).toBeInTheDocument();
+    // 盈利标的：普通展示，无警示语义。
+    expect(
+      within(table).getByText('+$5K · 29.3%').getAttribute('aria-label'),
+    ).toBeNull();
+
+    // 亏损且 n≥20：警示 tint + tooltip（标注不过滤——行仍在、排序不变）。
+    const losing = within(table).getByText('−$53K · 21.7%');
+    expect(losing).toHaveClass('text-warning');
+    expect(
+      within(table).getByLabelText('你的历史亏钱标的 · 92 笔 · 净 −$53K · 胜率 21.7%'),
+    ).toBeInTheDocument();
+    expect(within(table).getByLabelText('打开 MU 即时扫描详情')).toBeInTheDocument();
+  });
+
+  it('renders losing stats without warning below the n>=20 threshold', async () => {
+    vi.mocked(fetchPersonalEdge).mockResolvedValue(personalEdgeReady([
+      { underlying: 'NVDA', n: 19, net: -5449, winRate: 0.476, fees: 2083 },
+    ]));
+    render(<IntradayScanTable data={topResponse()} loading={false} error={null} />);
+
+    const table = screen.getByRole('table', { name: '实时扫描表' });
+    await waitFor(() => {
+      expect(within(table).getByText('−$5K · 47.6%')).toBeInTheDocument();
+    });
+    expect(within(table).getByText('−$5K · 47.6%')).not.toHaveClass('text-warning');
+    expect(within(table).queryByLabelText(/你的历史亏钱标的/)).not.toBeInTheDocument();
+  });
+
+  it('renders 样本不足 for tickers below the n>=5 gate', async () => {
+    vi.mocked(fetchPersonalEdge).mockResolvedValue(personalEdgeReady([
+      { underlying: 'NVDA', n: 191, net: 5490, winRate: 0.293, fees: 33189 },
+    ]));
+    render(<IntradayScanTable data={topResponse()} loading={false} error={null} />);
+
+    const table = screen.getByRole('table', { name: '实时扫描表' });
+    // MU 不在 n≥5 名单：显式「样本不足」，绝不以 0 冒充战绩。
+    await waitFor(() => {
+      expect(within(table).getByText('样本不足')).toBeInTheDocument();
+    });
+    expect(within(table).getByText('<5 笔')).toBeInTheDocument();
+  });
+
+  it('renders 标缺 when the personal-edge endpoint is absent', async () => {
+    vi.mocked(fetchPersonalEdge).mockRejectedValue(new Error('endpoint down'));
+    render(<IntradayScanTable data={topResponse()} loading={false} error={null} />);
+
+    const table = screen.getByRole('table', { name: '实时扫描表' });
+    await waitFor(() => {
+      expect(within(table).getAllByText('标缺').length).toBeGreaterThanOrEqual(2);
+    });
+    expect(within(table).getAllByText('个人战绩不可得').length).toBe(2);
+    // 端点缺席绝不隐藏行。
+    expect(within(table).getByLabelText('打开 NVDA 即时扫描详情')).toBeInTheDocument();
+    expect(within(table).getByLabelText('打开 MU 即时扫描详情')).toBeInTheDocument();
+  });
+
+  it('renders 标缺 when the journal has no episode build (not_built)', async () => {
+    vi.mocked(fetchPersonalEdge).mockResolvedValue(personalEdgeNotBuilt() as PersonalEdgeResponse);
+    render(<IntradayScanTable data={topResponse()} loading={false} error={null} />);
+
+    const table = screen.getByRole('table', { name: '实时扫描表' });
+    await waitFor(() => {
+      expect(within(table).getAllByText('个人战绩不可得').length).toBe(2);
+    });
+  });
+
+  it('annotates day-ledger rows with the same personal stat semantics', async () => {
+    vi.mocked(fetchPersonalEdge).mockResolvedValue(personalEdgeReady([
+      { underlying: 'ORCL', n: 92, net: -52550, winRate: 0.217, fees: 13882 },
+    ]));
+    const response = {
+      ...topResponse(),
+      universeScan: {
+        mode: 'watchlist_two_tier' as const,
+        gateBasis: 'momentum15m_then_day_change_v2' as const,
+        gateWarnings: [],
+        watchlistTotal: 3,
+        watchlistTruncated: false,
+        scannedTotal: 3,
+        deepLaneCount: 2,
+        deepLaneMax: 12,
+        deepLane: [],
+        planAlwaysInclude: [],
+        userPinned: [],
+        gatedOutCount: 1,
+        snapshotUnresolvedSymbols: [],
+        dayPromotionCap: 30,
+        dayPromotionCapReached: false,
+        dayLedger: [
+          {
+            ticker: 'ORCL',
+            lastSeenAt: '2026-08-04T13:40:00+00:00',
+            sessionBurstsLegs: [],
+            setupMatchedSetups: [],
+            lastChangePercent: 4.1,
+            state: 'rotated_out' as const,
+          },
+        ],
+        dayLedgerBasis: 'in_process_since_service_start_resets_on_restart' as const,
+        snapshotOnly: [],
+        limitations: [],
+      },
+    };
+    render(<IntradayScanTable data={response} loading={false} error={null} />);
+
+    const section = screen.getByLabelText('今日曾深扫账本');
+    await waitFor(() => {
+      expect(
+        within(section).getByText('你的战绩 −$53K · 21.7% · 92 笔'),
+      ).toBeInTheDocument();
+    });
+    expect(
+      within(section).getByLabelText('你的历史亏钱标的 · 92 笔 · 净 −$53K · 胜率 21.7%'),
+    ).toBeInTheDocument();
+    expect(within(section).getByText('已轮换出')).toBeInTheDocument();
   });
 });

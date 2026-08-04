@@ -300,6 +300,18 @@ Playbook 只读对应：服务端从 journal_v2 Playbook 候选表读取标题�
 
 **诚实边界（响应 `limitations` 固定携带）**：两层扫描只有晋升标的做深度分析，其余仅快照、深度字段一律缺席；闸门为启发式（v2：15 分钟动量子额度 + 当日涨跌兜底；冷启动显式回退并警示），不是信号，晋升不代表方向或质量结论；今日曾深扫账本为进程内展示缓存（as-of、不刷新、重启清空、无 DB 写入）；K 线额度为 30 天滚动去重标的数配额，日晋升护栏触顶如实标注。周内看板、市场脉搏与既有单层扫描不受任何影响。
 
+### 2.12 个人画像回灌（personal-edge：你的战绩标注，2026-08-04 起）
+
+盘面上第一次出现**用户自己的历史**：`GET /api/v1/journal/v2/personal-edge` 把 Journal **当前默认 episode build**（与其他 journal 读取完全同一套 `_resolve_effective_episode_build` 解析——有激活用激活，无激活回退最新 CSV build；激活新 build 后此端点自动跟随）的已平仓回合做零写描述统计：(a) 按标的 `{n, net, win_rate, fees}`（仅 n≥5，样本不足只报计数）；(b) 持仓时长桶 `<10m/10-30m/30-60m/1-3h/3-6h/6h-1d/>1d` `{n, net, win_rate, avg_win, avg_loss}`；(c) 进场 DTE 桶 `0/1-3/4-7/8-30/>30`（DTE 缺失单独报 `dte_unknown`，不折进 0DTE）；(d) 月度 `{n, net, fees, win_rate}`。响应固定携带 `build_id` + 日期范围（`first_opened_at`/`last_closed_at`）+ `computed_at`（as-of 诚实），服务端进程内缓存约 10 分钟（回合按 build 追加不可变，缓存安全），前端 fetch 层同口径 10 分钟 sessionCache——每会话最多一次网络请求。月度口径按 **ET≈UTC−4 近似**换算 UTC `opened_at` 并以 `month_basis` 如实声明（3 月初 EST 为 UTC−5，边界样本可能偏移 ±1 小时，limitations 原文携带）。
+
+**消费面（标注不过滤——系统标注，用户过滤）**：
+
+- **实时扫描表「你的战绩」列**（深度行 + 今日曾深扫账本行）：该标的的个人 `净盈亏 · 胜率 · 笔数`；净亏损且 n≥20 加警示 tint + tooltip「你的历史亏钱标的 · n 笔 · 净 −$X · 胜率 Y%」；n<5 显式「样本不足」；端点失败或 Journal 未构建显式「标缺」。绝不隐藏行、不改排序、不是信号。
+- **临期合约面板 DTE 提示行**：头部下方一行「你的 DTE 战绩：0DTE +$…(x%) · 1-3DTE −$…(x%) · 4-7DTE +$…(x%) · 样本 YYYY-MM→YYYY-MM · 描述非因果」，数值全部来自端点实时重算（绝不硬编码），空档位显式「无样本」；tooltip 原文携带内生性 caveat。面板服务 0–7 DTE 合约选择，这一行在决策瞬间给出用户自己的 DTE 分层真相。
+- **Playbook R4 候选**（经既有 `POST /v2/playbook/candidates` 路径显式创建，free-form 证据快照、幂等）：「R4 · 持仓时间纪律（30分钟-3小时是你的盈利区）」，rule_text 内嵌创建时端点返回的持仓时长分层数字 + 进场质量读数（<10 分钟单极低胜率对应「追高进场/速度不足强做」）+ 内生性提醒，定位为数据描述供本人复核，不是建议。
+
+**诚实边界**：持仓时长/DTE 与结果存在内生性（止损单天然短），全部为描述统计、非因果结论、不构成建议（`limitations` 原文携带，前端 tooltip 透出）；开仓中与缺净盈亏的回合只计数不入统计；缺失字段显式标缺，不以 0 冒充。
+
 ## 3. 数据语义修正
 
 Moomoo 官方明确说明 [`get_option_chain`](https://openapi.moomoo.com/moomoo-api-doc/en/quote/get-option-chain.html) 只返回静态合约资料。动态 bid/ask、成交量、OI、IV 和 Greeks 必须用合约 code 再调用 [`get_market_snapshot`](https://openapi.moomoo.com/moomoo-api-doc/en/quote/get-market-snapshot.html)。当前适配器已改为分批（每批最多 400 个 code）合并快照；严格检查 `option_valid` 和有限数，缺任一必要动态字段就省略该合约，不再把静态行或缺失值伪装成全 0 实时行情。最近到期 ATM Call IV 仍先用静态链与 spot 锁定单一合约再读取快照；它不是 IV Rank/Percentile，也不代表异常期权大单或买卖方向。

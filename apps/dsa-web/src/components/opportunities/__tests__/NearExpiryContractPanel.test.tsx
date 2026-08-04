@@ -5,6 +5,8 @@ import {
   SPREAD_ILLIQUID_THRESHOLD_PERCENT,
 } from '../NearExpiryContractPanel';
 import { fetchNearExpiryContracts } from '../../../api/opportunities';
+import { fetchPersonalEdge } from '../../../api/journal';
+import type { PersonalEdgeResponse } from '../../../types/journal';
 import type {
   IntradayEarningsProximity,
   NearExpiryContractItem,
@@ -19,6 +21,72 @@ vi.mock('../../../api/opportunities', async (importOriginal) => {
     fetchNearExpiryContracts: vi.fn(),
   };
 });
+
+// 个人画像回灌（DTE 提示行）：默认「Journal 未构建」→ 显式标缺行。
+const { personalEdgeNotBuilt } = vi.hoisted(() => ({
+  personalEdgeNotBuilt: () => ({
+    schemaVersion: 'journal-personal-edge/1.0',
+    dataState: 'not_built' as const,
+    accountKey: 'default_moomoo_us',
+    buildId: null,
+    buildKey: null,
+    sourceKind: null,
+    computedAt: null,
+    firstOpenedAt: null,
+    lastClosedAt: null,
+    closedEpisodeCount: 0,
+    excludedOpenCount: 0,
+    excludedMissingPnlCount: 0,
+    underlyingMinEpisodeCount: 5,
+    underlyings: [],
+    smallSampleUnderlyingCount: 0,
+    holdTimeBuckets: [],
+    holdUnknownCount: 0,
+    dteBuckets: [],
+    dteUnknown: null,
+    monthly: [],
+    monthBasis: null,
+    limitations: [],
+  }),
+}));
+
+vi.mock('../../../api/journal', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../api/journal')>();
+  return {
+    ...actual,
+    fetchPersonalEdge: vi.fn(async () => personalEdgeNotBuilt()),
+  };
+});
+
+function personalEdgeReady(): PersonalEdgeResponse {
+  return {
+    ...personalEdgeNotBuilt(),
+    dataState: 'ready',
+    buildId: 3,
+    buildKey: 'fixture-build-key',
+    sourceKind: 'canonical_evidence_set',
+    computedAt: '2026-08-04T14:00:00+00:00',
+    firstOpenedAt: '2026-03-04T14:31:57+00:00',
+    lastClosedAt: '2026-07-31T17:39:18+00:00',
+    closedEpisodeCount: 1653,
+    dteBuckets: [
+      { bucket: '0', n: 613, net: 131345, winRate: 0.3333 },
+      { bucket: '1-3', n: 735, net: -110275, winRate: 0.2912 },
+      { bucket: '4-7', n: 169, net: 147608, winRate: 0.4375 },
+      { bucket: '8-30', n: 63, net: 1707, winRate: 0.4127 },
+      { bucket: '>30', n: 51, net: 2568, winRate: 0.3333 },
+    ],
+    dteUnknown: { bucket: 'unknown', n: 22, net: -22590, winRate: 0.3182 },
+    monthly: [
+      { month: '2026-03', n: 37, net: 4934, fees: 654, winRate: 0.3514 },
+      { month: '2026-07', n: 543, net: -11914, fees: 77223, winRate: 0.3043 },
+    ],
+    monthBasis: 'opened_at_utc_minus_4_approximation',
+    limitations: [
+      '持仓时长与结果存在内生性（止损单天然短），描述统计不是因果结论，不构成建议',
+    ],
+  };
+}
 
 function contractRow(overrides: Partial<NearExpiryContractRow> = {}): NearExpiryContractRow {
   return {
@@ -130,6 +198,10 @@ function response(item: NearExpiryContractItem): NearExpiryContractResponse {
 describe('NearExpiryContractPanel', () => {
   beforeEach(() => {
     vi.mocked(fetchNearExpiryContracts).mockReset();
+    vi.mocked(fetchPersonalEdge).mockReset();
+    vi.mocked(fetchPersonalEdge).mockImplementation(
+      async () => personalEdgeNotBuilt(),
+    );
   });
 
   it('renders expiry groups with the honesty header, spot as-of and quote as-of', async () => {
@@ -347,6 +419,64 @@ describe('NearExpiryContractPanel', () => {
 
     await waitFor(() => {
       expect(screen.getByText('财报日历标缺 · 未知≠安全')).toBeInTheDocument();
+    });
+  });
+
+  it('renders the personal DTE caption from endpoint values with the endogeneity tooltip', async () => {
+    vi.mocked(fetchNearExpiryContracts).mockResolvedValue(response(panelItem()));
+    vi.mocked(fetchPersonalEdge).mockResolvedValue(personalEdgeReady());
+
+    render(<NearExpiryContractPanel symbol="MU" />);
+
+    // 数值全部来自 personal-edge 端点（净盈亏紧凑格式 + 取整胜率 + 样本期）。
+    const caption = await screen.findByText(
+      '你的 DTE 战绩：0DTE +$131K(33%) · 1-3DTE −$110K(29%) · 4-7DTE +$148K(44%) · 样本 2026-03→2026-07 · 描述非因果',
+    );
+    expect(caption).toBeInTheDocument();
+    // tooltip / aria-label 原文携带 build 标识与内生性 caveat。
+    expect(caption.getAttribute('aria-label')).toContain('build #3');
+    expect(caption.getAttribute('aria-label')).toContain(
+      '持仓时长与结果存在内生性（止损单天然短），描述统计不是因果结论，不构成建议',
+    );
+  });
+
+  it('marks an empty personal DTE bucket as 无样本 instead of zero-filling', async () => {
+    vi.mocked(fetchNearExpiryContracts).mockResolvedValue(response(panelItem()));
+    const ready = personalEdgeReady();
+    ready.dteBuckets = ready.dteBuckets.map((bucket) => (
+      bucket.bucket === '4-7' ? { ...bucket, n: 0, net: 0, winRate: null } : bucket
+    ));
+    vi.mocked(fetchPersonalEdge).mockResolvedValue(ready);
+
+    render(<NearExpiryContractPanel symbol="MU" />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/4-7DTE 无样本/)).toBeInTheDocument();
+    });
+  });
+
+  it('renders an explicit 标缺 caption when the personal-edge endpoint is absent', async () => {
+    vi.mocked(fetchNearExpiryContracts).mockResolvedValue(response(panelItem()));
+    vi.mocked(fetchPersonalEdge).mockRejectedValue(new Error('endpoint down'));
+
+    render(<NearExpiryContractPanel symbol="MU" />);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText('你的 DTE 战绩：标缺（个人战绩不可得 · Journal 未构建或读取失败）'),
+      ).toBeInTheDocument();
+    });
+  });
+
+  it('renders the same explicit 标缺 caption for the not_built journal state', async () => {
+    vi.mocked(fetchNearExpiryContracts).mockResolvedValue(response(panelItem()));
+
+    render(<NearExpiryContractPanel symbol="MU" />);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText('你的 DTE 战绩：标缺（个人战绩不可得 · Journal 未构建或读取失败）'),
+      ).toBeInTheDocument();
     });
   });
 });

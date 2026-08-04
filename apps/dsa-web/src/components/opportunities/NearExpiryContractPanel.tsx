@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
 import { fetchNearExpiryContracts } from '../../api/opportunities';
+import { usePersonalEdge, type PersonalEdgeView } from '../../hooks/usePersonalEdge';
 import type {
   IntradayEarningsProximity,
   NearExpiryContractItem,
   NearExpiryContractRow,
   NearExpiryExpiryGroup,
 } from '../../types/opportunities';
+import { Tooltip } from '../common/Tooltip';
+import { formatSignedCompactUsd } from './intradayFormat';
 
 /**
  * 点差 > 15% 标「流动性差」。这是 v1 启发式展示阈值（未经交易结果验证），
@@ -66,6 +69,63 @@ function EarningsProximityBadge({
         ? '今日财报 · 期权贵 · 你的回避规则'
         : `财报 ${proximity.daysToEarnings} 天内 · 期权贵 · 你的回避规则`}
     </span>
+  );
+}
+
+/** DTE 提示只展示临期决策相关的前三档；数值全部来自 personal-edge 端点。 */
+const PERSONAL_DTE_CAPTION_BUCKETS = ['0', '1-3', '4-7'] as const;
+
+const PERSONAL_DTE_BUCKET_LABELS: Record<string, string> = {
+  '0': '0DTE',
+  '1-3': '1-3DTE',
+  '4-7': '4-7DTE',
+};
+
+function personalDteSampleLabel(view: Extract<PersonalEdgeView, { state: 'ready' }>): string {
+  const months = view.data.monthly;
+  if (months.length === 0) return '';
+  const first = months[0]?.month;
+  const last = months[months.length - 1]?.month;
+  if (!first || !last) return '';
+  return first === last ? ` · 样本 ${first}` : ` · 样本 ${first}→${last}`;
+}
+
+/**
+ * 个人 DTE 战绩提示行（个人画像回灌）：在看临期合约的瞬间给出你自己的
+ * DTE 分层历史（净盈亏 + 胜率 + 样本期），数值全部来自 personal-edge 端点
+ * 的实时重算，绝不硬编码；空档位显式「无样本」，端点缺席显式「标缺」。
+ * tooltip 原文携带服务端 limitations（内生性 caveat），描述非因果、非建议。
+ */
+function PersonalDteCaption({ view }: { view: PersonalEdgeView }) {
+  if (view.state === 'loading') return null;
+  if (view.state === 'unavailable') {
+    return (
+      <div className="border-b border-subtle bg-bg-0 px-3 py-1.5 text-caption text-text-3">
+        你的 DTE 战绩：标缺（个人战绩不可得 · Journal 未构建或读取失败）
+      </div>
+    );
+  }
+  const byBucket = new Map(view.data.dteBuckets.map((bucket) => [bucket.bucket, bucket]));
+  const parts = PERSONAL_DTE_CAPTION_BUCKETS.map((key) => {
+    const bucket = byBucket.get(key);
+    const label = PERSONAL_DTE_BUCKET_LABELS[key] ?? key;
+    if (!bucket || bucket.n === 0 || bucket.winRate === null) {
+      return `${label} 无样本`;
+    }
+    return `${label} ${formatSignedCompactUsd(bucket.net)}(${Math.round(bucket.winRate * 100)}%)`;
+  });
+  const tooltip = `你的历史已平仓回合按进场 DTE 分层（build #${view.data.buildId ?? '—'}）。`
+    + `${view.data.limitations.join('；')}`;
+  return (
+    <div className="border-b border-subtle bg-bg-0 px-3 py-1.5 text-caption text-text-3">
+      <Tooltip focusable content={tooltip}>
+        <span aria-label={tooltip}>
+          你的 DTE 战绩：{parts.join(' · ')}
+          {personalDteSampleLabel(view)}
+          {' · 描述非因果'}
+        </span>
+      </Tooltip>
+    </div>
   );
 }
 
@@ -158,6 +218,8 @@ export function NearExpiryContractPanel({
   const [item, setItem] = useState<NearExpiryContractItem | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // 个人画像回灌：DTE 提示行数据；失败/未构建显式标缺（10 分钟会话缓存）。
+  const personalEdge = usePersonalEdge();
 
   const load = useCallback(async (refresh: boolean) => {
     setLoading(true);
@@ -211,6 +273,8 @@ export function NearExpiryContractPanel({
           </button>
         </div>
       </header>
+
+      <PersonalDteCaption view={personalEdge} />
 
       {error && (
         <div className="border-b border-[color:var(--warn-muted)] bg-bg-0 px-3 py-2 text-caption text-warning" role="status">

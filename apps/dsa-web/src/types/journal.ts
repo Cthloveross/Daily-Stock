@@ -997,3 +997,66 @@ export interface ChatMessage {
   content: string;
   ts: string; // ISO 8601
 }
+
+// --- personal edge (个人画像回灌): zero-write descriptive stats --------------
+
+export interface PersonalEdgeUnderlyingStat {
+  underlying: string;
+  n: number;
+  net: number;
+  winRate: number;
+  fees: number;
+}
+
+export interface PersonalEdgeHoldBucket {
+  bucket: string;
+  n: number;
+  net: number;
+  winRate: number | null;
+  avgWin: number | null;
+  avgLoss: number | null;
+}
+
+export interface PersonalEdgeDteBucket {
+  bucket: string;
+  n: number;
+  net: number;
+  winRate: number | null;
+}
+
+export interface PersonalEdgeMonthlyBucket {
+  month: string;
+  n: number;
+  net: number;
+  fees: number;
+  winRate: number | null;
+}
+
+/**
+ * 个人画像回灌：当前默认 build 已平仓回合的描述统计（build_id + 日期范围 +
+ * computed_at 全程可见）。描述不是因果——内生性 caveat 在 limitations 原文携带。
+ */
+export interface PersonalEdgeResponse {
+  schemaVersion: string;
+  dataState: 'ready' | 'not_built';
+  accountKey: string;
+  buildId: number | null;
+  buildKey: string | null;
+  sourceKind: string | null;
+  computedAt: string | null;
+  firstOpenedAt: string | null;
+  lastClosedAt: string | null;
+  closedEpisodeCount: number;
+  excludedOpenCount: number;
+  excludedMissingPnlCount: number;
+  underlyingMinEpisodeCount: number;
+  underlyings: PersonalEdgeUnderlyingStat[];
+  smallSampleUnderlyingCount: number;
+  holdTimeBuckets: PersonalEdgeHoldBucket[];
+  holdUnknownCount: number;
+  dteBuckets: PersonalEdgeDteBucket[];
+  dteUnknown: PersonalEdgeDteBucket | null;
+  monthly: PersonalEdgeMonthlyBucket[];
+  monthBasis: string | null;
+  limitations: string[];
+}

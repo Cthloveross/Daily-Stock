@@ -7,6 +7,15 @@ export function formatCompactUsd(value: number | null): string {
   return `$${value.toFixed(0)}`;
 }
 
+/** 带符号的紧凑美元：+$88K / −$53K / $0；null 显式 —（不以 0 冒充）。 */
+export function formatSignedCompactUsd(value: number | null): string {
+  if (value === null) return '—';
+  const compact = formatCompactUsd(Math.abs(value));
+  if (value > 0) return `+${compact}`;
+  if (value < 0) return `−${compact}`;
+  return compact;
+}
+
 export function formatSignedPercent(value: number | null): string {
   if (value === null) return '—';
   const sign = value > 0 ? '+' : value < 0 ? '−' : '';

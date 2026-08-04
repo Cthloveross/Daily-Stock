@@ -446,6 +446,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] /intraday 命名与主次整理：扫描表标题改「实时扫描 · 现在谁在动」（两层模式附「深度层实时排名，下方为今日曾深扫账本」副标注），原「盘中跟踪」面板改名「今日计划跟踪 · 盘前冻结计划走到哪了」，页面顺序调整为 市场脉搏 → 实时扫描（主表）→ 今日计划跟踪 → 期权事件流；v2 口径页头/footer 附「15分动量优先（谁现在在动）· 当日涨跌兜底」，预热回退显式「动量样本预热中 · 暂按当日涨跌排序」警示 chip。
 - [测试] 两层扫描契约测试 +6（钉选去重/不占 K/并入同批快照、清单未配置时钉选零影响回归、mom15 12–18 分钟窗数学（假时钟）、ET 日切换清空动量历史、冷启动回退警示 → 15 分钟后 v2 双子额度排名（动量位不给横盘标的）、账本轮换保留最后深扫载荷且不与当前深度层重复）；常规时段回归用例更新为断言冷启动警示；前端 IntradayScanTable +6（改名页头与副标注、「钉选」徽标与钉选计数、v2 口径标注、预热警示 chip、账本行渲染与空账本不渲染）、IntradayPage 组合顺序与 9 列布局断言更新、IntradayTrackingPanel 改名断言更新。
 - [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` §2.11 更新（闸门 v2 规则与 2026-08-03 NVDA/跳空日校准背景、用户钉选、今日曾深扫账本、前端命名与主次整理、additive 响应合同）；`.env.example` 新增 `INTRADAY_PINNED_TICKERS` 中文说明并补充闸门 v2 注释；根 README 不承载日内闸门细节，故未改动。
+- [新功能] 个人画像回灌（personal-edge）：新增只读 `GET /api/v1/journal/v2/personal-edge`（`src/journal/personal_edge.py` 零写聚合），对 Journal 当前默认 episode build（复用既有 `_resolve_effective_episode_build` 解析，激活新 build 自动跟随）的已平仓回合做描述统计——按标的（仅 n≥5）`{n, net, win_rate, fees}`、持仓时长桶（<10m/10-30m/30-60m/1-3h/3-6h/6h-1d/>1d，含 avg_win/avg_loss）、进场 DTE 桶（0/1-3/4-7/8-30/>30，DTE 缺失单独报 `dte_unknown`）与月度 `{n, net, fees, win_rate}`；响应固定携带 build_id + 日期范围 + computed_at（as-of 诚实），服务端进程内缓存约 10 分钟；月度按 ET≈UTC−4 近似换算并以 `month_basis` 与 limitations（内生性 caveat + 时区注记）原文声明。
+- [新功能] 实时扫描表新增第 10 列「你的战绩」（深度行 + 今日曾深扫账本行）：该标的的个人净盈亏（紧凑 $ 格式）· 胜率 · 笔数，净亏损且 n≥20 加警示 tint + tooltip「你的历史亏钱标的 · n 笔 · 净 −$X · 胜率 Y%」，n<5 显式「样本不足」，端点失败或 Journal 未构建显式「标缺」——系统标注，用户过滤：不隐藏行、不改排序、不是信号；前端经 `usePersonalEdge` hook 读取（fetch 层 10 分钟 sessionCache，每会话最多一次请求）。
+- [新功能] 临期合约面板头部下方新增个人 DTE 提示行「你的 DTE 战绩：0DTE ±$…(x%) · 1-3DTE … · 4-7DTE … · 样本 YYYY-MM→YYYY-MM · 描述非因果」：数值全部来自 personal-edge 端点实时重算（绝不硬编码），空档位显式「无样本」、端点缺席显式「标缺」，tooltip 原文携带内生性 caveat——在 0–7 DTE 合约选择的决策瞬间给出用户自己的 DTE 分层历史。
+- [新功能] 经既有 Playbook 候选路径显式创建「R4 · 持仓时间纪律（30分钟-3小时是你的盈利区）」候选（free-form 证据快照、幂等）：rule_text 内嵌创建时 personal-edge 端点返回的持仓时长分层数字、进场质量读数（<10 分钟单极低胜率对应「追高进场/速度不足强做」）与内生性提醒，定位为数据描述供本人复核，不构成建议。
+- [测试] personal-edge 单元测试（无 build → None、持仓/DTE/标的/月度桶数学、n≥5 门槛、开仓中与缺净盈亏回合只计数不入统计、UTC−4 月度边界、非法阈值拒绝）+ 端点契约测试（not_built 诚实空态、ready 合同、10 分钟缓存命中与重置、非法 account_key 422）；前端 IntradayScanTable +6（盈利普通展示、亏损 n≥20 警示 tooltip、亏损 n<20 不警示、样本不足、端点缺席/not_built 标缺、账本行同语义标注）、NearExpiryContractPanel +4（DTE 提示行数值与内生性 tooltip、空档位无样本、端点缺席与 not_built 显式标缺）、既有 10 列布局断言更新。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` 新增 §2.12「个人画像回灌」（端点合同、build 解析与 as-of 语义、三个消费面、诚实边界）；根 README 不承载日内列级细节，故未改动。
 
 ## [3.11.0] - 2026-03-27
 

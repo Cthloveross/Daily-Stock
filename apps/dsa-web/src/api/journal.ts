@@ -28,6 +28,7 @@ import type {
   PositionEpisodeAiReviewUserContext,
   PositionEpisodeFilters,
   PositionEpisodeListResponse,
+  PersonalEdgeResponse,
   PositionEpisodeReviewAnnotationHistoryResponse,
   PositionEpisodeReviewAnnotationLatestResponse,
   EpisodePlaybookLinksResponse,
@@ -284,6 +285,25 @@ export async function fetchPositionEpisodeReviewAnnotationHistory(
 export async function fetchReviewInsights(): Promise<ReviewInsightsResponse> {
   const { data } = await apiClient.get(`${BASE}/v2/review-insights`);
   return toCamelCase<ReviewInsightsResponse>(data);
+}
+
+/**
+ * 个人画像回灌（你的战绩）：默认 build 已平仓回合的描述统计。
+ * sessionCache 默认 10 分钟 TTL，与服务端进程内缓存同一口径——
+ * 每会话/10 分钟最多一次网络请求；not_built 不缓存（构建完成立即可见）。
+ */
+export async function fetchPersonalEdge(refresh = false): Promise<PersonalEdgeResponse> {
+  const key = 'journal:personal-edge';
+  if (!refresh) {
+    const cached = sessionCache.get<PersonalEdgeResponse>(key);
+    if (cached) return cached;
+  }
+  const { data } = await apiClient.get(`${BASE}/v2/personal-edge`);
+  const camel = toCamelCase<PersonalEdgeResponse>(data);
+  if (camel.dataState === 'ready') {
+    sessionCache.set(key, camel);
+  }
+  return camel;
 }
 
 export async function fetchPlaybook(): Promise<PlaybookListResponse> {

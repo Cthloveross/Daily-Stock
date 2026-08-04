@@ -26,6 +26,38 @@ vi.mock('../../api/opportunities', async (importOriginal) => {
   };
 });
 
+// 个人画像回灌（你的战绩列）：页面级测试固定「Journal 未构建」→ 列显式标缺。
+vi.mock('../../api/journal', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../api/journal')>();
+  return {
+    ...actual,
+    fetchPersonalEdge: vi.fn(async () => ({
+      schemaVersion: 'journal-personal-edge/1.0',
+      dataState: 'not_built' as const,
+      accountKey: 'default_moomoo_us',
+      buildId: null,
+      buildKey: null,
+      sourceKind: null,
+      computedAt: null,
+      firstOpenedAt: null,
+      lastClosedAt: null,
+      closedEpisodeCount: 0,
+      excludedOpenCount: 0,
+      excludedMissingPnlCount: 0,
+      underlyingMinEpisodeCount: 5,
+      underlyings: [],
+      smallSampleUnderlyingCount: 0,
+      holdTimeBuckets: [],
+      holdUnknownCount: 0,
+      dteBuckets: [],
+      dteUnknown: null,
+      monthly: [],
+      monthBasis: null,
+      limitations: [],
+    })),
+  };
+});
+
 // 稳定引用：store mock 每次渲染必须返回同一数组，否则页面会因 symbols 身份
 // 变化而无限重跑加载 effect（真实 zustand store 本身就是稳定引用）。
 const MOCK_WATCHLIST_STATE = { tickers: ['NVDA', 'TSLA'] };
@@ -477,14 +509,14 @@ describe('IntradayPage', () => {
       await screen.findByText(/今日尚无已发布的冻结盘前计划/),
     ).toBeInTheDocument();
 
-    // 实时扫描表（两级布局默认 9 列交易关键读数）。
+    // 实时扫描表（两级布局默认 10 列交易关键读数，含「你的战绩」）。
     expect(screen.getByText('实时扫描 · 现在谁在动')).toBeInTheDocument();
     const table = await screen.findByRole('table', { name: '实时扫描表' });
-    const headers = ['排名', '标的', '涨跌%', '当前爆发', '今日波段', '速度', '形态', '波段vs大盘', '详情'];
+    const headers = ['排名', '标的', '涨跌%', '当前爆发', '今日波段', '速度', '形态', '波段vs大盘', '你的战绩', '详情'];
     for (const header of headers) {
       expect(within(table).getByText(header)).toBeInTheDocument();
     }
-    expect(within(table).getAllByRole('columnheader').length).toBe(9);
+    expect(within(table).getAllByRole('columnheader').length).toBe(10);
     // v3 上下文（NVDA 顺势 + 财报回避窗 badge；速度加速↑）。
     expect(within(table).getByText('顺势')).toBeInTheDocument();
     expect(within(table).getByText('财报 2 天内 · 期权贵')).toBeInTheDocument();
