@@ -603,18 +603,33 @@ function displacementCell(item: IntradayTopCandidate) {
     : net > 0
       ? 'text-up-strong font-medium'
       : 'text-down-strong font-medium';
+  // ATR 是抽象刻度，盘面上看不见——同时给出可直接对照的美元与百分比。
+  const atr = displacement.atrBasis === 'atr14_daily' ? item.atr14 : null;
+  const price = item.lastPrice;
+  const moneyMove = atr !== null && atr > 0 ? net * atr : null;
+  const moneyNeeded = atr !== null && atr > 0 ? line * atr : null;
+  const pctNeeded =
+    moneyNeeded !== null && price !== null && price > 0
+      ? (moneyNeeded / price) * 100
+      : null;
+  const money = (value: number) =>
+    `${value < 0 ? '−' : '+'}$${Math.abs(value).toFixed(2)}`;
   const caption = reached
     ? `高 ${formatSignedAtr(displacement.highExcursionAtr)} · 低 ${formatSignedAtr(
       displacement.lowExcursionAtr,
     )}`
-    : `不足 ${line} ATR`;
+    : moneyNeeded !== null
+      ? `需 $${moneyNeeded.toFixed(2)}${pctNeeded !== null ? `（${pctNeeded.toFixed(1)}%）` : ''}`
+      : `不足 ${line} ATR`;
   return (
     <Tooltip focusable content={<span className="whitespace-pre-line">{tooltip}</span>}>
       <span aria-label={tooltip} className="inline-block">
         <span className={`block font-mono text-mono-sm ${valueClass}`}>
-          {formatSignedAtr(net)}
+          {moneyMove !== null ? money(moneyMove) : formatSignedAtr(net)}
         </span>
-        <span className="mt-0.5 block text-caption text-text-3">{caption}</span>
+        <span className="mt-0.5 block text-caption text-text-3">
+          {moneyMove !== null ? `${formatSignedAtr(net)} · ${caption}` : caption}
+        </span>
       </span>
     </Tooltip>
   );
@@ -1075,8 +1090,25 @@ export function IntradayScanTable({
                             {DIRECTION_ARROWS[item.sessionBursts.current.direction]}
                           </span>
                         </div>
+                        {/* 量比是「暴不暴量」的直读：<1 比平时还清淡，≥2 才算放量。 */}
                         <div className="mt-0.5 text-caption text-text-3">
                           15分 {formatBurstThrust(item.sessionBursts.current.thrustPercent)}
+                          {item.sessionBursts.current.volNorm !== null && (
+                            <>
+                              {' · 量比 '}
+                              <span
+                                className={
+                                  item.sessionBursts.current.volNorm >= 2
+                                    ? 'text-warning font-medium'
+                                    : item.sessionBursts.current.volNorm < 1
+                                      ? 'text-text-3'
+                                      : 'text-text-2'
+                                }
+                              >
+                                {item.sessionBursts.current.volNorm.toFixed(2)}×
+                              </span>
+                            </>
+                          )}
                         </div>
                         {fizzleMarker(item)}
                       </>

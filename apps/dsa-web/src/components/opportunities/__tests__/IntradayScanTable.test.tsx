@@ -1254,12 +1254,15 @@ describe('IntradayScanTable 近30分位移列（v6 recent displacement）', () =
       />,
     );
     const table = screen.getByRole('table', { name: '实时扫描表' });
-    const value = within(table).getByText('+0.72 ATR');
+    // 主行改为可直接对照盘面的美元（0.72 ATR × ATR14 1.5 = $1.08），
+    // ATR 刻度退到副行——「0.5 ATR」在盘面上看不见，美元看得见。
+    const value = within(table).getByText('+$1.08');
     expect(value).toHaveClass('text-up-strong');
     expect(value).toHaveClass('font-medium');
-    // 越线时副标题给出区间（本次 MFE/MAE 类比），不显示「未达」。
-    expect(within(table).getByText('高 +0.91 ATR · 低 −0.14 ATR')).toBeInTheDocument();
-    expect(within(table).queryByText('不足 0.5 ATR')).not.toBeInTheDocument();
+    expect(
+      within(table).getByText('+0.72 ATR · 高 +0.91 ATR · 低 −0.14 ATR'),
+    ).toBeInTheDocument();
+    expect(within(table).queryByText(/不足 0.5 ATR/)).not.toBeInTheDocument();
     // tooltip 原文：v8 循环性更正打头 + 口径 + 实际 ATR 基准。
     const tooltip = within(displacementCellOf(table))
       .getByLabelText(/区间：最高/)
@@ -1361,12 +1364,15 @@ describe('IntradayScanTable 近30分位移列（v6 recent displacement）', () =
       />,
     );
     const table = screen.getByRole('table', { name: '实时扫描表' });
-    const value = within(table).getByText('+0.18 ATR');
+    const value = within(table).getByText('+$0.27');
     expect(value).toHaveClass('text-text-3');
     expect(value).not.toHaveClass('text-up-strong');
-    expect(within(table).getByText('不足 0.5 ATR')).toBeInTheDocument();
+    // 差多少也换算成美元与百分比：0.5 × ATR14 1.5 = $0.75，现价 130.5 → 0.6%。
+    expect(
+      within(table).getByText('+0.18 ATR · 需 $0.75（0.6%）'),
+    ).toBeInTheDocument();
     // v8：「未达」隐含「本该达到」的存活框架，必须已经消失。
-    expect(within(table).queryByText('未达 0.5')).not.toBeInTheDocument();
+    expect(within(table).queryByText(/未达 0.5/)).not.toBeInTheDocument();
   });
 
   it('marks 标缺 for insufficient bars, unavailable ATR unit and missing payload', () => {
