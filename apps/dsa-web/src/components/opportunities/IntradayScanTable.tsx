@@ -1268,6 +1268,27 @@ export function IntradayScanTable({
         </div>
       )}
 
+      {/* 因 8 行硬顶被挤出深度层的标的：必须可见，否则「披露」形同虚设。 */}
+      {(data?.universeScan?.trimmedByTotalCap?.length ?? 0) > 0 && (
+        <div
+          data-testid="trimmed-by-total-cap"
+          aria-label="因总行数上限未进扫描表的标的"
+          className="border-t border-subtle bg-bg-0 px-4 py-2 text-caption text-text-3"
+        >
+          {`因 ${data?.universeScan?.deepLaneTotalMax ?? 8} 行上限未进扫描表：`}
+          {(data?.universeScan?.trimmedByTotalCap ?? [])
+            .map((row) => row.ticker)
+            .join('、')}
+          {'（'}
+          {(data?.universeScan?.trimmedByTotalCap ?? []).some(
+            (row) => row.wouldBePromotedBy === 'plan_always_include',
+          )
+            ? '盘前计划标的见下方「今日计划跟踪」；'
+            : ''}
+          {'仍在全清单快照覆盖内，未被丢弃）'}
+        </div>
+      )}
+
       {data?.universeScan && (
         <div
           aria-label="仅快照标的"

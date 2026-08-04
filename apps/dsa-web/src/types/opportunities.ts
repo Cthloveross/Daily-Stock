@@ -1074,7 +1074,20 @@ export interface IntradayUniverseScan {
   dayLedger?: IntradayDayLedgerEntry[];
   dayLedgerBasis?: 'in_process_since_service_start_resets_on_restart';
   snapshotOnly: IntradaySnapshotOnlyRow[];
+  /** 深度层总行数硬顶与被挤掉的标的（additive）；旧载荷可省略。 */
+  deepLaneTotalMax?: number;
+  trimmedByTotalCap?: IntradayTrimmedLaneEntry[];
   limitations: string[];
+}
+
+/** 因总行数上限未进深度层的标的：必须在界面上可见，否则等同静默丢弃。 */
+export interface IntradayTrimmedLaneEntry {
+  ticker: string;
+  wouldBePromotedBy:
+    | 'plan_always_include'
+    | 'user_pinned'
+    | 'user_focus'
+    | 'mover_rank';
 }
 
 /**
