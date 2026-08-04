@@ -5,6 +5,7 @@ import { fetchNearExpiryContracts } from '../../../api/opportunities';
 import { fetchPersonalEdge } from '../../../api/journal';
 import type { PersonalEdgeResponse } from '../../../types/journal';
 import type {
+  IntradayRecentDisplacement,
   IntradaySetupKey,
   IntradaySetupMatch,
   IntradaySetupMatchProfile,
@@ -64,6 +65,28 @@ function setupMatchProfile(
     basis: 'session_5m_bars_aggregated_to_15m_grid_plus_session_quote_geometry',
     unavailableReason: null,
     limitations: [],
+    ...overrides,
+  };
+}
+
+/**
+ * v6 近 30 分钟位移 fixture：默认 K 线不足（标缺），各用例按需覆盖。
+ * 0.5 ATR 是用户自己 766 笔样本的经验线——描述统计，非预测、非信号。
+ */
+function displacementProfile(
+  overrides: Partial<IntradayRecentDisplacement> = {},
+): IntradayRecentDisplacement {
+  return {
+    state: 'insufficient_bars',
+    windowMinutes: 30,
+    netMoveAtr: null,
+    highExcursionAtr: null,
+    lowExcursionAtr: null,
+    absRangeAtr: null,
+    atrBasis: null,
+    survivalLineAtr: 0.5,
+    barCount: 3,
+    unavailableReason: 'fewer_than_6_session_bars',
     ...overrides,
   };
 }
@@ -221,6 +244,7 @@ function candidate(overrides: Partial<IntradayTopCandidate> = {}): IntradayTopCa
       unavailableReason: 'burst_direction_unavailable',
     },
     setupMatch: setupMatchProfile(),
+    recentDisplacement: displacementProfile(),
     optionActivity: {
       state: 'empty',
       count: 0,
@@ -277,7 +301,7 @@ function topResponse(): IntradayTopResponse {
       source: 'moomoo_openapi',
       unavailableReason: 'spy_quote_unavailable',
     },
-    signalVersion: 'intraday_session_evidence_v4',
+    signalVersion: 'intraday_session_evidence_v6',
     rankingMethod: 'burst_score_first_then_evidence_count',
     statisticsTrack: 'none_intraday_v1_unscored',
     moomooEnabled: true,
@@ -379,6 +403,16 @@ describe('IntradayScanTable 默认 10 列网格（v3 上下文并入）', () => 
         basis: 'candidate_current_burst_direction_vs_spy_session_vwap_position',
         unavailableReason: null,
       },
+      recentDisplacement: displacementProfile({
+        state: 'ready',
+        netMoveAtr: 0.72,
+        highExcursionAtr: 0.91,
+        lowExcursionAtr: -0.14,
+        absRangeAtr: 1.05,
+        atrBasis: 'atr14_daily',
+        barCount: 40,
+        unavailableReason: null,
+      }),
     });
   }
 
@@ -387,14 +421,14 @@ describe('IntradayScanTable 默认 10 列网格（v3 上下文并入）', () => 
     render(<IntradayScanTable data={response} loading={false} error={null} />);
 
     const table = screen.getByRole('table', { name: '实时扫描表' });
-    // 默认网格恰好 10 列交易关键读数（含个人画像回灌「你的战绩」）。
-    const headers = ['排名', '标的', '涨跌%', '当前爆发', '今日波段', '速度', '形态', '波段vs大盘', '你的战绩', '详情'];
+    // 默认网格恰好 10 列交易关键读数（v6 起含「近30分位移」，「波段vs大盘」下沉）。
+    const headers = ['排名', '标的', '涨跌%', '当前爆发', '今日波段', '速度', '近30分位移', '形态', '你的战绩', '详情'];
     for (const header of headers) {
       expect(within(table).getByText(header)).toBeInTheDocument();
     }
     expect(within(table).getAllByRole('columnheader').length).toBe(10);
     // 次要指标移出默认网格（展开行「研究读数」一键可达，不是删除）。
-    for (const moved of ['缺口', '量能节奏', 'VWAP', '波幅扩张(ATR)', '财报', '期权异动', '研究状态']) {
+    for (const moved of ['缺口', '量能节奏', 'VWAP', '波幅扩张(ATR)', '财报', '期权异动', '研究状态', '波段vs大盘']) {
       expect(within(table).queryByText(moved)).not.toBeInTheDocument();
     }
     // 排名列显示服务端排名。
@@ -402,15 +436,25 @@ describe('IntradayScanTable 默认 10 列网格（v3 上下文并入）', () => 
     // 财报回避窗内：警示徽标并入标的格次行，回避规则口径随 aria-label 附带。
     const blackoutBadge = within(table).getByText('财报 2 天内 · 期权贵');
     expect(blackoutBadge.getAttribute('aria-label')).toContain('你的回避规则（≤3 天）');
-    // 波段vs大盘：顺势 + 明确的两侧口径；列头 tooltip 澄清「波段方向 vs SPY VWAP」。
-    expect(within(table).getByText('顺势')).toBeInTheDocument();
-    expect(within(table).getByText('爆发↑ · SPY VWAP上')).toBeInTheDocument();
-    expect(
-      within(table).getByLabelText(/不是个股自身涨跌方向/),
-    ).toBeInTheDocument();
     // 速度：加速↑ + Δ 值。
     expect(within(table).getByText('加速↑')).toBeInTheDocument();
     expect(within(table).getByText('Δ +4.3')).toBeInTheDocument();
+  });
+
+  it('moves 波段vs大盘 into the expanded 研究读数 grid without losing its 口径', async () => {
+    const response = { ...topResponse(), candidates: [v3Candidate()], universe: ['NVDA'] };
+    render(<IntradayScanTable data={response} loading={false} error={null} />);
+    const table = screen.getByRole('table', { name: '实时扫描表' });
+    fireEvent.click(
+      within(table).getByRole('button', { name: '展开 NVDA 研究读数与临期合约' }),
+    );
+    const readouts = await screen.findByLabelText('NVDA 研究读数');
+    expect(within(readouts).getByText('波段vs大盘')).toBeInTheDocument();
+    expect(within(readouts).getByText('顺势')).toBeInTheDocument();
+    expect(within(readouts).getByText('爆发↑ · SPY VWAP上')).toBeInTheDocument();
+    expect(
+      within(readouts).getByLabelText(/不是个股自身涨跌方向/),
+    ).toBeInTheDocument();
   });
 
   it('keeps unavailable context honest: 标缺 never pretends safe or aligned', () => {
@@ -421,7 +465,8 @@ describe('IntradayScanTable 默认 10 列网格（v3 上下文并入）', () => 
     const missingBadges = within(table).getAllByText('财报标缺');
     expect(missingBadges.length).toBe(2);
     expect(missingBadges[0].getAttribute('aria-label')).toContain('未知≠安全');
-    expect(within(table).getAllByText('SPY 或爆发方向标缺').length).toBe(2);
+    // 位移同为标缺（K 线不足），绝不以 0 冒充「没动」。
+    expect(within(table).getAllByText('K线不足 30 分钟').length).toBe(2);
     // 全部行仍在表中：上下文标注绝不隐藏行。
     expect(within(table).getByLabelText('打开 NVDA 即时扫描详情')).toBeInTheDocument();
     expect(within(table).getByLabelText('打开 MU 即时扫描详情')).toBeInTheDocument();
@@ -1163,6 +1208,175 @@ describe('IntradayScanTable 展开行（研究读数 + 临期合约）', () => {
   });
 });
 
+describe('IntradayScanTable 近30分位移列（v6 recent displacement）', () => {
+  beforeEach(() => {
+    navigateMock.mockReset();
+    vi.mocked(fetchNearExpiryContracts).mockReset();
+    vi.mocked(fetchNearExpiryContracts).mockImplementation(
+      async (symbol: string) => nearExpiryEmpty(symbol),
+    );
+  });
+
+  function displacementResponse(
+    displacement: IntradayRecentDisplacement | undefined,
+  ): IntradayTopResponse {
+    return {
+      ...topResponse(),
+      candidates: [candidate({ recentDisplacement: displacement })],
+      universe: ['NVDA'],
+      candidateCount: 1,
+    };
+  }
+
+  /** 位移单元格＝默认网格第 7 列（排名/标的/涨跌/爆发/波段/速度/位移/…）。 */
+  function displacementCellOf(table: HTMLElement): HTMLElement {
+    const row = within(table).getByLabelText('打开 NVDA 即时扫描详情');
+    return within(row).getAllByRole('cell')[6] as HTMLElement;
+  }
+
+  it('emphasises an up move at or above the user 0.5 ATR survival line', () => {
+    render(
+      <IntradayScanTable
+        data={displacementResponse(
+          displacementProfile({
+            state: 'ready',
+            netMoveAtr: 0.72,
+            highExcursionAtr: 0.91,
+            lowExcursionAtr: -0.14,
+            absRangeAtr: 1.05,
+            atrBasis: 'atr14_daily',
+            barCount: 40,
+            unavailableReason: null,
+          }),
+        )}
+        loading={false}
+        error={null}
+      />,
+    );
+    const table = screen.getByRole('table', { name: '实时扫描表' });
+    const value = within(table).getByText('+0.72 ATR');
+    expect(value).toHaveClass('text-up-strong');
+    expect(value).toHaveClass('font-medium');
+    // 越线时副标题给出区间（本次 MFE/MAE 类比），不显示「未达」。
+    expect(within(table).getByText('高 +0.91 ATR · 低 −0.14 ATR')).toBeInTheDocument();
+    expect(within(table).queryByText('未达 0.5')).not.toBeInTheDocument();
+    // tooltip 原文：口径 + 用户自己的经验线来源 + 实际 ATR 基准。
+    const tooltip = within(displacementCellOf(table))
+      .getByLabelText(/区间：最高/)
+      .getAttribute('aria-label') ?? '';
+    expect(tooltip).toContain('近 30 分钟（6×5m）净位移 ÷ ATR');
+    expect(tooltip).toContain('0.5 ATR 是你自己 766 笔样本里「活下来」的经验线');
+    expect(tooltip).toContain('描述统计，非预测、非信号');
+    expect(tooltip).toContain('基准：ATR14 日线');
+  });
+
+  it('emphasises a down move beyond the survival line with the 跌 color', () => {
+    render(
+      <IntradayScanTable
+        data={displacementResponse(
+          displacementProfile({
+            state: 'ready',
+            netMoveAtr: -0.83,
+            highExcursionAtr: 0.05,
+            lowExcursionAtr: -0.95,
+            absRangeAtr: 1.0,
+            atrBasis: 'intraday_20bar_proxy_x3',
+            barCount: 18,
+            unavailableReason: null,
+          }),
+        )}
+        loading={false}
+        error={null}
+      />,
+    );
+    const table = screen.getByRole('table', { name: '实时扫描表' });
+    const value = within(table).getByText('−0.83 ATR');
+    expect(value).toHaveClass('text-down-strong');
+    // 回退基准如实标注为盘中代理，不冒充 ATR14。
+    expect(
+      within(displacementCellOf(table))
+        .getByLabelText(/区间：最高/)
+        .getAttribute('aria-label'),
+    ).toContain('基准：盘中代理（最近 20 根 5m 波幅均值 ×3）');
+  });
+
+  it('mutes a move inside ±0.5 ATR and says 未达 0.5 instead of pretending', () => {
+    render(
+      <IntradayScanTable
+        data={displacementResponse(
+          displacementProfile({
+            state: 'ready',
+            netMoveAtr: 0.18,
+            highExcursionAtr: 0.24,
+            lowExcursionAtr: -0.31,
+            absRangeAtr: 0.55,
+            atrBasis: 'atr14_daily',
+            barCount: 26,
+            unavailableReason: null,
+          }),
+        )}
+        loading={false}
+        error={null}
+      />,
+    );
+    const table = screen.getByRole('table', { name: '实时扫描表' });
+    const value = within(table).getByText('+0.18 ATR');
+    expect(value).toHaveClass('text-text-3');
+    expect(value).not.toHaveClass('text-up-strong');
+    expect(within(table).getByText('未达 0.5')).toBeInTheDocument();
+  });
+
+  it('marks 标缺 for insufficient bars, unavailable ATR unit and missing payload', () => {
+    const table = () => screen.getByRole('table', { name: '实时扫描表' });
+
+    const { unmount } = render(
+      <IntradayScanTable
+        data={displacementResponse(displacementProfile({ barCount: 4 }))}
+        loading={false}
+        error={null}
+      />,
+    );
+    const insufficient = displacementCellOf(table());
+    expect(within(insufficient).getByText('标缺')).toBeInTheDocument();
+    expect(within(insufficient).getByText('K线不足 30 分钟')).toBeInTheDocument();
+    expect(
+      within(insufficient).getByLabelText(/仅 4 根 5m K 线，不足 6 根/),
+    ).toBeInTheDocument();
+    unmount();
+
+    const { unmount: unmountUnavailable } = render(
+      <IntradayScanTable
+        data={displacementResponse(
+          displacementProfile({
+            state: 'unavailable',
+            barCount: 30,
+            unavailableReason: 'no_usable_atr_unit_atr14_missing_and_intraday_proxy_zero',
+          }),
+        )}
+        loading={false}
+        error={null}
+      />,
+    );
+    const unavailable = displacementCellOf(table());
+    expect(within(unavailable).getByText('标缺')).toBeInTheDocument();
+    expect(within(unavailable).getByText('ATR 标尺/K线不可得')).toBeInTheDocument();
+    expect(
+      within(unavailable)
+        .getByLabelText(/读数不可得/)
+        .getAttribute('aria-label'),
+    ).toContain('no_usable_atr_unit_atr14_missing_and_intraday_proxy_zero');
+    unmountUnavailable();
+
+    // 旧载荷（无 recent_displacement 字段）同样显式标缺，不发明读数。
+    render(
+      <IntradayScanTable data={displacementResponse(undefined)} loading={false} error={null} />,
+    );
+    const missing = displacementCellOf(table());
+    expect(within(missing).getByText('标缺')).toBeInTheDocument();
+    expect(within(missing).getByText('ATR 标尺/K线不可得')).toBeInTheDocument();
+  });
+});
+
 describe('IntradayScanTable footer 口径两级展示', () => {
   beforeEach(() => {
     navigateMock.mockReset();
@@ -1178,6 +1392,10 @@ describe('IntradayScanTable footer 口径两级展示', () => {
     // 默认只有一行简短口径说明（含 v5 波段分级图例），公式墙收起。
     expect(screen.getByText(/排序与口径说明：盘中排序＝爆发分优先/)).toBeInTheDocument();
     expect(screen.getByText(/强＝爆发分 ≥8 暴动 \/ 中＝≥2.5 持续推升/)).toBeInTheDocument();
+    // v6：位移一行也在默认简短口径里（含 0.5 ATR 经验线与「非预测」声明）。
+    expect(
+      screen.getByText(/0.5 ATR 是你自己 766 笔样本的经验「活下来」线/),
+    ).toBeInTheDocument();
     expect(screen.queryByText(/当前爆发＝最近 15 分钟（3 根 5m K 线）/)).not.toBeInTheDocument();
 
     // 一键展开完整口径：原文逐字可见（隐藏 ≠ 删除）。
@@ -1189,6 +1407,11 @@ describe('IntradayScanTable footer 口径两级展示', () => {
     expect(screen.getByText(/减速=你的离场信号，R1/)).toBeInTheDocument();
     expect(screen.getByText(/系统标注，用户过滤：不隐藏行、不阻断操作、不参与排序/)).toBeInTheDocument();
     expect(screen.getByText(/期权异动＝最近一页 Moomoo 分类计数，不推断开平仓/)).toBeInTheDocument();
+    // 完整口径逐字携带取证数字与全部 caveat。
+    expect(screen.getByText(/仅 18.3% 达到 ≥0.5 ATR/)).toBeInTheDocument();
+    expect(screen.getByText(/71.2% 达到 ≥0.5 ATR/)).toBeInTheDocument();
+    expect(screen.getByText(/84% 的合约 ≤1DTE/)).toBeInTheDocument();
+    expect(screen.getByText(/样本窗口恰是你最差的两个月/)).toBeInTheDocument();
 
     // 再次点击收起。
     fireEvent.click(toggle);

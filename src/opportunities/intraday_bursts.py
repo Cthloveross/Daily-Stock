@@ -42,6 +42,39 @@ before it fully clears the leg bar (NVDA's 09:35 run-up window scored 6.3).
 Both are documented v2 heuristics for research prioritisation — not validated
 edges, not signals; changing either must bump the intraday-top
 ``signal_version``.
+
+近 30 分钟位移（recent displacement, v6）
+----------------------------------------
+
+同一批 5m K 线还回答另一个问题：**这个标的现在到底有没有在动**。
+
+证据来源是用户自己的 766 笔期权回合（2026-06-08→07-31，Journal build #3
+取证分析）：进场**几何**（追高 vs 回调）对结果没有预测力，真正把结果分开
+的是进场之后的**位移**——
+
+===============================  ==========  ==========  =====================
+分组                             30 分钟前向  30 分钟前向  达到 ≥0.5 ATR 有利位移
+                                 MFE 中位     MAE 中位
+===============================  ==========  ==========  =====================
+速死亏损单（持仓 <30 分钟）        0.18 ATR    −0.49 ATR   18.3%
+走出来的赢家（持仓 30 分钟–3 小时） 0.69 ATR    −0.13 ATR   71.2%
+===============================  ==========  ==========  =====================
+
+该样本 **84% 的合约 ≤1DTE**：进场后 30 分钟还不动的仓位在结构上已经死了，
+时间价值不会等人。因此工作台按标的给出「它**已经**在不在动」，并且用与那份
+取证分析**同一把 ATR 标尺**度量，把 0.5 ATR 画成用户自己的经验「活下来」线。
+
+口径（:func:`compute_recent_displacement`）：取当前时段（休市取最近一个交易
+时段）最后 :data:`DISPLACEMENT_WINDOW_BARS` 根 5m K 线，以窗口首根 K 线开盘价
+作为「30 分钟前的价格」参考点，输出 ``high_excursion`` /``low_excursion`` /
+``net_move`` /``abs_range`` 四个 ATR 归一化读数。ATR 标尺优先用日线 ATR14
+（``atr14_daily``，与取证分析同源）；缺失时回退取证分析用过的盘中代理
+（最近 20 根 5m K 线波幅均值 × 3，``intraday_20bar_proxy_x3``）并显式标注用了
+哪一种；两者都不可得时显式 ``unavailable`` + 原因，绝不 0 回填。
+
+诚实边界：这是对**过去 30 分钟已经发生的事**的描述统计——不是预测、不是买卖
+信号；0.5 这条线来自用户自己**最差两个月**的回溯样本，且分组本身按持仓时长
+定义（与结果存在循环性）；K 线为非官方 5m 聚合。
 """
 from __future__ import annotations
 
@@ -85,6 +118,41 @@ MEDIAN_BASIS_PRIOR = "prior_session_fallback"
 # 本仓库的 K 线是 5 分钟粒度，诚实 v1 只能给出 5m 窗口级的加速/减速近似，
 # 不是 1m/2m 秒级速度；减速标签是用户自己的离场提示，不是系统信号。
 SPEED_BASIS = "consecutive_rolling_15m_window_burst_score_delta_5m_bars"
+
+# ---------------------------------------------------------------------------
+# v6 近 30 分钟位移（recent displacement）。
+#
+# 校准依据（用户自己的 766 笔期权回合，2026-06-08→07-31，Journal build #3
+# 取证分析；详见模块 docstring 的表格）：进场几何无预测力，进场后 30 分钟的
+# 位移把结果分得很开——速死亏损单（<30 分钟）前向 MFE 中位 0.18 ATR /
+# MAE −0.49 ATR，仅 18.3% 达到 ≥0.5 ATR 的有利位移；走出来的赢家
+# （30 分钟–3 小时）MFE 0.69 / MAE −0.13，71.2% 达到 ≥0.5 ATR。样本 84%
+# 的合约 ≤1DTE，对「不动」零容忍。
+#
+# 因此 DISPLACEMENT_SURVIVAL_LINE_ATR = 0.5 —— 它是**用户自己样本里的经验
+# 分界线**，不是市场常数、不是胜率模型、不是买卖信号；样本窗口正好是他最差
+# 的两个月，分组按持仓时长定义（与结果存在循环性）。改这两个常数必须同时
+# 重新校准并升 intraday-top 的 signal_version。
+# ---------------------------------------------------------------------------
+DISPLACEMENT_WINDOW_BARS = 6
+DISPLACEMENT_SURVIVAL_LINE_ATR = 0.5
+DISPLACEMENT_WINDOW_MINUTES = DISPLACEMENT_WINDOW_BARS * BURST_BAR_MINUTES
+# ATR 标尺回退代理：取证分析在缺日线 ATR14 时用的正是「最近 20 根 5m K 线
+# 波幅均值 × 3」；这里逐字复用同一口径，并在 atr_basis 里如实标注。
+DISPLACEMENT_PROXY_BARS = 20
+DISPLACEMENT_PROXY_MULTIPLIER = 3.0
+DISPLACEMENT_ATR_BASIS_DAILY = "atr14_daily"
+DISPLACEMENT_ATR_BASIS_PROXY = "intraday_20bar_proxy_x3"
+
+DISPLACEMENT_LIMITATION_LINE = (
+    f"近 {DISPLACEMENT_WINDOW_MINUTES} 分钟位移＝最近 {DISPLACEMENT_WINDOW_BARS} 根 5m K 线相对"
+    "「30 分钟前价格」（窗口首根开盘）的净位移与最高/最低偏移 ÷ ATR 标尺（优先日线 ATR14，"
+    "缺失时回退取证分析同款盘中代理「最近 20 根 5m 波幅均值 ×3」并显式标注基准）："
+    f"它描述过去 {DISPLACEMENT_WINDOW_MINUTES} 分钟已经发生的事，不是预测、不是买卖信号；"
+    f"{DISPLACEMENT_SURVIVAL_LINE_ATR} ATR 是你自己 766 笔回合（2026-06-08→07-31，"
+    "恰为最差两个月）的经验「活下来」线，分组按持仓时长定义、与结果存在循环性，"
+    "K 线为非官方 5m 聚合；不足 6 根或标尺不可得时显式标缺，不以 0 冒充。"
+)
 
 BURST_LIMITATIONS = (
     "波段爆发＝15 分钟推力（|收−开| ÷ 当日 5 分钟 K 线波幅中位数）×量比"
@@ -475,3 +543,124 @@ def compute_session_burst_profile(
     base["legs"] = select_distinct_legs(windows)
     base["speed"] = compute_speed_state(windows)
     return base
+
+
+# ---------------------------------------------------------------------------
+# v6 近 30 分钟位移（recent displacement）——校准说明见模块 docstring 与上方
+# 常量注释。零新增请求：复用 burst 通道已取回的同一批 5m K 线。
+# ---------------------------------------------------------------------------
+
+
+def unavailable_recent_displacement(
+    reason: str,
+    *,
+    state: str = "unavailable",
+    bar_count: int = 0,
+) -> dict[str, Any]:
+    """Fail-closed displacement reading: an explicit state + reason, never 0."""
+
+    return {
+        "state": state,
+        "window_minutes": DISPLACEMENT_WINDOW_MINUTES,
+        "net_move_atr": None,
+        "high_excursion_atr": None,
+        "low_excursion_atr": None,
+        "abs_range_atr": None,
+        "atr_basis": None,
+        "survival_line_atr": DISPLACEMENT_SURVIVAL_LINE_ATR,
+        "bar_count": bar_count,
+        "unavailable_reason": reason,
+    }
+
+
+def _intraday_atr_proxy(session_bars: Sequence[Mapping[str, Any]]) -> Optional[float]:
+    """取证分析用过的盘中 ATR 代理：最近 20 根 5m K 线波幅均值 × 3。
+
+    当日 K 线不足 20 根时用已有的全部（调用方已保证 ≥
+    :data:`DISPLACEMENT_WINDOW_BARS` 根），口径标签不变——``bar_count`` 会如实
+    暴露样本大小。全部波幅为 0（停牌样本）时返回 ``None`` 而不是 0 分母。
+    """
+
+    tail = list(session_bars)[-DISPLACEMENT_PROXY_BARS:]
+    ranges = [
+        bar["high"] - bar["low"]
+        for bar in tail
+        if _finite(bar.get("high")) is not None and _finite(bar.get("low")) is not None
+    ]
+    if not ranges:
+        return None
+    mean_range = sum(ranges) / len(ranges)
+    proxy = mean_range * DISPLACEMENT_PROXY_MULTIPLIER
+    return proxy if proxy > 0 else None
+
+
+def compute_recent_displacement(
+    bars: Sequence[Mapping[str, Any]],
+    *,
+    market_date_et: str,
+    quote_session_scope: str,
+    atr14: Optional[float] = None,
+) -> dict[str, Any]:
+    """「它现在有没有在动」：最近 30 分钟的 ATR 归一化位移，确定性且 fail-closed。
+
+    窗口＝该时段最后 :data:`DISPLACEMENT_WINDOW_BARS` 根常规时段 5m K 线；
+    参考点 ``close_30m_ago`` 取窗口首根 K 线的**开盘价**（即 30 分钟前的成交
+    价，与 burst 窗口 ``thrust`` 的 ``open_start`` 同一口径），因此恰好 6 根
+    K 线的时段起点边界即可给出读数，而不必等到第 7 根。
+
+    - ``high_excursion_atr = (窗口最高价 − close_30m_ago) / atr_unit``
+    - ``low_excursion_atr  = (窗口最低价 − close_30m_ago) / atr_unit``
+    - ``net_move_atr       = (窗口末收盘 − close_30m_ago) / atr_unit``
+    - ``abs_range_atr      = (窗口最高价 − 窗口最低价) / atr_unit``
+
+    ``atr_unit`` 优先取调用方注入的日线 ``atr14``（``atr14_daily``，与 766 笔
+    取证分析同一把尺）；缺失/非正时回退盘中代理（``intraday_20bar_proxy_x3``）
+    并在 ``atr_basis`` 标注；两者都不可得时 ``state="unavailable"`` + 原因。
+    K 线不足 6 根时 ``state="insufficient_bars"`` 并带上实际根数。
+
+    休市（``quote_session_scope="latest_prior_session"``）落在最近一个交易时段
+    的最后 30 分钟上，与该时段的 as-of 标注一致。
+    """
+
+    _target_date, session_bars, _prior_bars = split_burst_session_bars(
+        bars,
+        market_date_et=market_date_et,
+        quote_session_scope=quote_session_scope,
+    )
+    bar_count = len(session_bars)
+    if bar_count < DISPLACEMENT_WINDOW_BARS:
+        return unavailable_recent_displacement(
+            f"fewer_than_{DISPLACEMENT_WINDOW_BARS}_session_bars",
+            state="insufficient_bars",
+            bar_count=bar_count,
+        )
+
+    atr_unit = _finite(atr14)
+    if atr_unit is not None and atr_unit > 0:
+        atr_basis = DISPLACEMENT_ATR_BASIS_DAILY
+    else:
+        atr_unit = _intraday_atr_proxy(session_bars)
+        atr_basis = DISPLACEMENT_ATR_BASIS_PROXY
+    if atr_unit is None or atr_unit <= 0:
+        return unavailable_recent_displacement(
+            "no_usable_atr_unit_atr14_missing_and_intraday_proxy_zero",
+            bar_count=bar_count,
+        )
+
+    window = session_bars[-DISPLACEMENT_WINDOW_BARS:]
+    reference = window[0]["open"]
+    window_high = max(bar["high"] for bar in window)
+    window_low = min(bar["low"] for bar in window)
+    last_close = window[-1]["close"]
+    return {
+        "state": "ready",
+        "window_minutes": DISPLACEMENT_WINDOW_MINUTES,
+        "net_move_atr": round((last_close - reference) / atr_unit, 6),
+        "high_excursion_atr": round((window_high - reference) / atr_unit, 6),
+        "low_excursion_atr": round((window_low - reference) / atr_unit, 6),
+        "abs_range_atr": round((window_high - window_low) / atr_unit, 6),
+        "atr_basis": atr_basis,
+        "survival_line_atr": DISPLACEMENT_SURVIVAL_LINE_ATR,
+        "bar_count": bar_count,
+        "unavailable_reason": None,
+    }

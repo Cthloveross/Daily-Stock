@@ -312,6 +312,34 @@ Playbook 只读对应：服务端从 journal_v2 Playbook 候选表读取标题�
 
 **诚实边界**：持仓时长/DTE 与结果存在内生性（止损单天然短），全部为描述统计、非因果结论、不构成建议（`limitations` 原文携带，前端 tooltip 透出）；开仓中与缺净盈亏的回合只计数不入统计；缺失字段显式标缺，不以 0 冒充。
 
+### 2.13 近 30 分钟位移（recent displacement：它「已经」在不在动，2026-08-04 起）
+
+**为什么加这一列**：对用户自己的 766 笔期权回合（样本窗口 2026-06-08→2026-07-31，Journal build #3）做取证分析后得到一个反直觉的结论——**进场几何（追高 vs 回调）对结果没有预测力**，而**进场之后的位移**把结果分得很开：
+
+| 分组 | 进场后 30 分钟前向 MFE 中位 | MAE 中位 | 达到 ≥0.5 ATR 有利位移 |
+| --- | --- | --- | --- |
+| 速死亏损单（持仓 <30 分钟） | 0.18 ATR | −0.49 ATR | **18.3%** |
+| 走出来的赢家（持仓 30 分钟–3 小时） | 0.69 ATR | −0.13 ATR | **71.2%** |
+
+该样本 **84% 的合约 ≤1DTE**：时间价值对「不动」零容忍，进场后 30 分钟还不动的仓位在结构上已经死了。因此工作台按标的直接回答「它**现在**到底有没有在动」，并且用与那份取证分析**同一把 ATR 标尺**度量，把 **0.5 ATR** 画成用户自己的经验「活下来」线。
+
+**口径**（`src/opportunities/intraday_bursts.py` 的 `compute_recent_displacement`，纯函数、零新增请求——复用波段爆发通道已取回的同一批 5m K 线）：取当前时段（休市取最近一个交易时段，沿用既有 as-of 标注）最后 `DISPLACEMENT_WINDOW_BARS = 6` 根常规时段 5m K 线，以**窗口首根 K 线开盘价**作为「30 分钟前的价格」参考点：
+
+- `high_excursion_atr = (窗口最高价 − 30 分钟前价格) / atr_unit`
+- `low_excursion_atr = (窗口最低价 − 30 分钟前价格) / atr_unit`
+- `net_move_atr = (窗口末收盘 − 30 分钟前价格) / atr_unit`
+- `abs_range_atr = (窗口最高价 − 窗口最低价) / atr_unit`
+
+`atr_unit` 优先取共享日线加载器已注入的 **ATR14**（`atr_basis = atr14_daily`，与取证分析同源）；缺失或非正时回退取证分析用过的**盘中代理**（最近 20 根 5m K 线波幅均值 × 3，`atr_basis = intraday_20bar_proxy_x3`）并显式标注用了哪一种；两者都不可得时 `state = unavailable` + 原因（如 `no_usable_atr_unit_atr14_missing_and_intraday_proxy_zero`）。K 线不足 6 根（时段起点）时 `state = insufficient_bars` 并带上实际 `bar_count`——**绝不 0 回填冒充「没动」**。
+
+**响应合同**（additive，`signal_version` 升到 `intraday_session_evidence_v6`）：候选行新增 `recent_displacement`（`IntradayRecentDisplacement`：`state / window_minutes / net_move_atr / high_excursion_atr / low_excursion_atr / abs_range_atr / atr_basis / survival_line_atr / bar_count / unavailable_reason`）。它是**标注**：不进 `supporting_evidence_count`、不参与排序、不隐藏行、不产生 evidence 条目。
+
+**前端**：实时扫描表默认网格新增第 7 列「近30分位移」（紧跟「速度」，交易关键顺序＝涨跌/爆发/波段/速度/位移/形态）；为保持默认网格 10 列，「波段vs大盘」下沉到展开行「研究读数」区（重排可见性 ≠ 删除，口径与 tooltip 原样保留）。单元格：带符号 ATR 净位移（如 `+0.72 ATR`）；`≥ +0.5` 或 `≤ −0.5` 用涨跌色强调并给出区间「高 +0.91 ATR · 低 −0.14 ATR」；介于 ±0.5 之间用弱化色 +「未达 0.5」；不足/不可得显式「标缺」。tooltip 原文：「近 30 分钟（6×5m）净位移 ÷ ATR。0.5 ATR 是你自己 766 笔样本里「活下来」的经验线（描述统计，非预测、非信号）；基准：ATR14 日线 / 盘中代理」并附**实际使用的基准**与区间读数。
+
+**Playbook R5 候选**（经既有 `POST /v2/playbook/candidates` 路径显式创建，free-form 证据快照、幂等）：「R5 · 进场要求「已经在动」（近30分钟位移 ≥0.5 ATR）」，`rule_text` 内嵌上表全部取证数字（18.3% vs 71.2%、MFE/MAE 中位、84% ≤1DTE 零容忍、进场几何无预测力）与全部 caveat，定位为数据描述供本人复核，不是建议。
+
+**诚实边界**：这是对**过去 30 分钟已经发生的事**的描述统计——不是预测、不是买卖信号；0.5 ATR 来自用户自己**最差两个月**的回溯样本，且分组本身按持仓时长定义（止损单天然短、赢家天然长，与结果存在循环性，不是因果证明）；K 线为非官方 5m 聚合；ATR 基准逐行如实标注，缺失显式标缺。
+
 ## 3. 数据语义修正
 
 Moomoo 官方明确说明 [`get_option_chain`](https://openapi.moomoo.com/moomoo-api-doc/en/quote/get-option-chain.html) 只返回静态合约资料。动态 bid/ask、成交量、OI、IV 和 Greeks 必须用合约 code 再调用 [`get_market_snapshot`](https://openapi.moomoo.com/moomoo-api-doc/en/quote/get-market-snapshot.html)。当前适配器已改为分批（每批最多 400 个 code）合并快照；严格检查 `option_valid` 和有限数，缺任一必要动态字段就省略该合约，不再把静态行或缺失值伪装成全 0 实时行情。最近到期 ATM Call IV 仍先用静态链与 spot 锁定单一合约再读取快照；它不是 IV Rank/Percentile，也不代表异常期权大单或买卖方向。

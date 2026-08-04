@@ -11,7 +11,12 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from src.opportunities.intraday_bursts import BURST_SUPPORT_MIN
+from src.opportunities.intraday_bursts import (
+    BURST_SUPPORT_MIN,
+    DISPLACEMENT_ATR_BASIS_DAILY,
+    DISPLACEMENT_ATR_BASIS_PROXY,
+    DISPLACEMENT_SURVIVAL_LINE_ATR,
+)
 from src.opportunities.intraday_top import (
     ACTIVE_SUPPORT_MIN,
     EARNINGS_BLACKOUT_DAYS,
@@ -338,7 +343,7 @@ class TestRunAssembly:
         run = self._run()
         assert run["schema_version"] == "intraday-top/1.0"
         assert run["signal_version"] == INTRADAY_TOP_SIGNAL_VERSION
-        assert run["signal_version"] == "intraday_session_evidence_v5"
+        assert run["signal_version"] == "intraday_session_evidence_v6"
         # 盘中（current_session scope）＝爆发分优先；休市退回证据计数。
         assert run["ranking_method"] == RANKING_METHOD_BURST_FIRST
         assert self._run(session_state="closed")["ranking_method"] == (
@@ -645,6 +650,118 @@ class TestSetupMatchWiring:
         )
         profile = run["candidates"][0]["setup_match"]
         assert profile["quote_session_scope"] == "latest_prior_session"
+
+
+class TestRecentDisplacementWiring:
+    """v6 近 30 分钟位移：候选行携带 recent_displacement（additive 标注）。
+
+    它复用 styleMatch 已注入的同一批 5m K 线（零新增请求）与日线 ATR14，
+    绝不进入 supports 计数、绝不改变排序。
+    """
+
+    @staticmethod
+    def _bars(closes, *, date_text="2026-07-28", start_minutes=9 * 60 + 30):
+        rows = []
+        previous_close = closes[0]
+        for index, close in enumerate(closes):
+            open_ = previous_close
+            minutes = start_minutes + index * 5
+            rows.append(
+                {
+                    "date": (
+                        f"{date_text}T{minutes // 60:02d}:{minutes % 60:02d}:00-04:00"
+                    ),
+                    "open": open_,
+                    "high": max(open_, close) + 0.1,
+                    "low": min(open_, close) - 0.1,
+                    "close": close,
+                    "volume": 1_000.0,
+                }
+            )
+            previous_close = close
+        return rows
+
+    def test_candidate_carries_displacement_on_the_daily_atr14_scale(self):
+        # 6 根 K 线：窗口首根开盘 100.0 → 末收 102.0，ATR14=2.0 → +1.0 ATR，
+        # 越过用户自己 766 笔样本的 0.5 ATR 经验线。
+        candidate = _candidate(
+            setup_bars=self._bars([100.0, 100.5, 101.0, 101.2, 101.6, 102.0]),
+            market_date_et="2026-07-28",
+        )
+        displacement = candidate["recent_displacement"]
+        assert displacement["state"] == "ready"
+        assert displacement["atr_basis"] == DISPLACEMENT_ATR_BASIS_DAILY
+        assert displacement["net_move_atr"] == pytest.approx(1.0)
+        assert displacement["window_minutes"] == 30
+        assert displacement["survival_line_atr"] == DISPLACEMENT_SURVIVAL_LINE_ATR
+        assert displacement["bar_count"] == 6
+        # 纯标注：既不加 supports 计数，也不出现在 evidence 列表里。
+        assert candidate["supporting_evidence_count"] == 5
+        assert all(
+            item["metric"] != "recent_displacement" for item in candidate["evidence"]
+        )
+
+    def test_missing_atr14_falls_back_to_intraday_proxy_with_label(self):
+        candidate = _candidate(
+            daily=_daily(atr14=None, atr14_unavailable_reason="insufficient_bars"),
+            setup_bars=self._bars([100.0, 100.5, 101.0, 101.2, 101.6, 102.0]),
+            market_date_et="2026-07-28",
+        )
+        displacement = candidate["recent_displacement"]
+        assert displacement["state"] == "ready"
+        assert displacement["atr_basis"] == DISPLACEMENT_ATR_BASIS_PROXY
+        assert displacement["net_move_atr"] is not None
+
+    def test_without_bars_it_is_insufficient_not_zero(self):
+        displacement = _candidate()["recent_displacement"]
+        assert displacement["state"] == "insufficient_bars"
+        assert displacement["bar_count"] == 0
+        assert displacement["net_move_atr"] is None
+        assert displacement["atr_basis"] is None
+
+    def test_closed_session_evaluates_the_latest_prior_session(self):
+        run = build_intraday_top_run(
+            symbols=["NVDA"],
+            unsupported_symbols=[],
+            quotes={"NVDA": _quote()},
+            dailies={"NVDA": _daily()},
+            option_event_items={},
+            as_of=_AS_OF,
+            market_date_et="2026-08-01",  # 周六休市
+            session_state="closed",
+            session_state_basis="america_new_york_clock_v1",
+            limit=5,
+            moomoo_enabled=True,
+            setup_bars={
+                "NVDA": self._bars(
+                    [100.0, 100.5, 101.0, 101.2, 101.6, 102.0],
+                    date_text="2026-07-31",
+                )
+            },
+        )
+        displacement = run["candidates"][0]["recent_displacement"]
+        assert run["quote_session_scope"] == "latest_prior_session"
+        assert displacement["state"] == "ready"
+        assert displacement["net_move_atr"] == pytest.approx(1.0)
+
+    def test_run_limitations_carry_the_displacement_disclosure(self):
+        run = build_intraday_top_run(
+            symbols=["NVDA"],
+            unsupported_symbols=[],
+            quotes={"NVDA": _quote()},
+            dailies={"NVDA": _daily()},
+            option_event_items={},
+            as_of=_AS_OF,
+            market_date_et="2026-07-28",
+            session_state="regular",
+            session_state_basis="america_new_york_clock_v1",
+            limit=5,
+            moomoo_enabled=True,
+        )
+        joined = "".join(run["limitations"])
+        assert "近 30 分钟位移" in joined
+        assert "不是预测、不是买卖信号" in joined
+        assert "766 笔" in joined
 
 
 class TestDailyContext:

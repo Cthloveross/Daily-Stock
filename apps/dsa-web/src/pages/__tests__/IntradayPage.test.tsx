@@ -236,6 +236,19 @@ function topCandidate(overrides: Partial<IntradayTopCandidate> = {}): IntradayTo
       basis: 'candidate_current_burst_direction_vs_spy_session_vwap_position',
       unavailableReason: null,
     },
+    // v6 近 30 分钟位移：越过用户自己的 0.5 ATR 经验线（描述统计，非信号）。
+    recentDisplacement: {
+      state: 'ready',
+      windowMinutes: 30,
+      netMoveAtr: 0.72,
+      highExcursionAtr: 0.91,
+      lowExcursionAtr: -0.14,
+      absRangeAtr: 1.05,
+      atrBasis: 'atr14_daily',
+      survivalLineAtr: 0.5,
+      barCount: 40,
+      unavailableReason: null,
+    },
     setupMatch: {
       state: 'ready',
       styleMatchVersion: 'style_match_v1',
@@ -364,6 +377,19 @@ function topResponse(
         basis: 'candidate_current_burst_direction_vs_spy_session_vwap_position',
         unavailableReason: 'burst_direction_unavailable',
       },
+      // K 线不可得 → 位移同样显式标缺，绝不以 0 冒充「没动」。
+      recentDisplacement: {
+        state: 'unavailable',
+        windowMinutes: 30,
+        netMoveAtr: null,
+        highExcursionAtr: null,
+        lowExcursionAtr: null,
+        absRangeAtr: null,
+        atrBasis: null,
+        survivalLineAtr: 0.5,
+        barCount: 0,
+        unavailableReason: 'fewer_than_6_session_bars',
+      },
       optionActivity: {
         state: 'empty',
         count: 0,
@@ -408,7 +434,7 @@ function topResponse(
       source: 'moomoo_openapi',
       unavailableReason: null,
     },
-    signalVersion: 'intraday_session_evidence_v4',
+    signalVersion: 'intraday_session_evidence_v6',
     rankingMethod:
       sessionState === 'closed'
         ? 'rule_based_evidence_count'
@@ -509,16 +535,19 @@ describe('IntradayPage', () => {
       await screen.findByText(/今日尚无已发布的冻结盘前计划/),
     ).toBeInTheDocument();
 
-    // 实时扫描表（两级布局默认 10 列交易关键读数，含「你的战绩」）。
+    // 实时扫描表（两级布局默认 10 列交易关键读数，v6 起含「近30分位移」，
+    // 「波段vs大盘」下沉到展开区「研究读数」）。
     expect(screen.getByText('实时扫描 · 现在谁在动')).toBeInTheDocument();
     const table = await screen.findByRole('table', { name: '实时扫描表' });
-    const headers = ['排名', '标的', '涨跌%', '当前爆发', '今日波段', '速度', '形态', '波段vs大盘', '你的战绩', '详情'];
+    const headers = ['排名', '标的', '涨跌%', '当前爆发', '今日波段', '速度', '近30分位移', '形态', '你的战绩', '详情'];
     for (const header of headers) {
       expect(within(table).getByText(header)).toBeInTheDocument();
     }
     expect(within(table).getAllByRole('columnheader').length).toBe(10);
-    // v3 上下文（NVDA 顺势 + 财报回避窗 badge；速度加速↑）。
-    expect(within(table).getByText('顺势')).toBeInTheDocument();
+    expect(within(table).queryByText('波段vs大盘')).not.toBeInTheDocument();
+    // v6 位移：NVDA 越过 0.5 ATR 经验线。
+    expect(within(table).getByText('+0.72 ATR')).toBeInTheDocument();
+    // v3 上下文（财报回避窗 badge；速度加速↑）。
     expect(within(table).getByText('财报 2 天内 · 期权贵')).toBeInTheDocument();
     expect(within(table).getByText('加速↑')).toBeInTheDocument();
     expect(within(table).getAllByText(/10:30:04 ET/).length).toBeGreaterThan(0);
@@ -533,7 +562,7 @@ describe('IntradayPage', () => {
 
     // 页头副标题：爆发分优先排名 + 版本号。
     expect(screen.getByText(/波段爆发优先排名/)).toBeInTheDocument();
-    expect(screen.getByText(/intraday_session_evidence_v4/)).toBeInTheDocument();
+    expect(screen.getByText(/intraday_session_evidence_v6/)).toBeInTheDocument();
 
     // 主次顺序：实时扫描（主表）在前，今日计划跟踪其后，期权事件流最后。
     const scanSection = screen.getByLabelText('实时扫描');

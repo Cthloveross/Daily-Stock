@@ -452,6 +452,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] 经既有 Playbook 候选路径显式创建「R4 · 持仓时间纪律（30分钟-3小时是你的盈利区）」候选（free-form 证据快照、幂等）：rule_text 内嵌创建时 personal-edge 端点返回的持仓时长分层数字、进场质量读数（<10 分钟单极低胜率对应「追高进场/速度不足强做」）与内生性提醒，定位为数据描述供本人复核，不构成建议。
 - [测试] personal-edge 单元测试（无 build → None、持仓/DTE/标的/月度桶数学、n≥5 门槛、开仓中与缺净盈亏回合只计数不入统计、UTC−4 月度边界、非法阈值拒绝）+ 端点契约测试（not_built 诚实空态、ready 合同、10 分钟缓存命中与重置、非法 account_key 422）；前端 IntradayScanTable +6（盈利普通展示、亏损 n≥20 警示 tooltip、亏损 n<20 不警示、样本不足、端点缺席/not_built 标缺、账本行同语义标注）、NearExpiryContractPanel +4（DTE 提示行数值与内生性 tooltip、空档位无样本、端点缺席与 not_built 显式标缺）、既有 10 列布局断言更新。
 - [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` 新增 §2.12「个人画像回灌」（端点合同、build 解析与 as-of 语义、三个消费面、诚实边界）；根 README 不承载日内列级细节，故未改动。
+- [新功能] 日内候选新增「近 30 分钟位移」纯函数读数 `recent_displacement`（`src/opportunities/intraday_bursts.py::compute_recent_displacement`，复用波段爆发通道已取回的同一批 5m K 线，零新增请求）：取当前时段（休市取最近一个交易时段）最后 6 根 5m K 线，以窗口首根开盘价为「30 分钟前价格」参考点，输出 ATR 归一化的 `net_move / high_excursion / low_excursion / abs_range`；ATR 标尺优先日线 ATR14（`atr14_daily`），缺失时回退取证分析同款盘中代理「最近 20 根 5m 波幅均值 ×3」（`intraday_20bar_proxy_x3`）并显式标注基准，两者都不可得显式 `unavailable`，K 线不足 6 根显式 `insufficient_bars` + 实际根数，绝不 0 回填。
+- [新功能] `POST /api/v1/opportunities/intraday-top` 候选行新增 additive `recent_displacement` 字段（`IntradayRecentDisplacement`），`signal_version` 升至 `intraday_session_evidence_v6`，并新增一条位移口径 limitations：它是标注，不进证据计数、不参与排序、不隐藏行。
+- [新功能] 实时扫描表默认网格新增「近30分位移」列（紧跟「速度」，交易关键顺序＝涨跌/爆发/波段/速度/位移/形态）：`≥ +0.5` 或 `≤ −0.5 ATR` 用涨跌色强调并给出区间高低偏移，介于 ±0.5 之间弱化显示 +「未达 0.5」，K 线不足或 ATR 标尺不可得显式「标缺」；tooltip 原文携带 0.5 ATR 经验线的来源与实际使用的 ATR 基准；为保持默认 10 列，「波段vs大盘」下沉到展开行「研究读数」区（口径与 tooltip 原样保留）。
+- [新功能] 经既有 Playbook 候选路径显式创建「R5 · 进场要求「已经在动」（近30分钟位移 ≥0.5 ATR）」候选（free-form 证据快照、幂等）：rule_text 内嵌 766 笔回合取证数字（进场几何无预测力、速死单 18.3% vs 赢家 71.2% 达到 ≥0.5 ATR、MFE/MAE 中位、84% 合约 ≤1DTE 零容忍）与全部 caveat（样本恰为最差两个月、按持仓时长分组的循环性、非官方 5m K 线、描述统计非建议）。
+- [测试] 位移纯函数测试 +9（恰好 6 根 K 线边界窗口数学、窗口只取最后 6 根不吃早盘涨幅、负向/横盘保号、ATR14 与盘中代理基准选择及标注、非正 ATR14 回退、不足 6 根/零 K 线显式 insufficient、零波幅无 ATR14 显式 unavailable、休市按最近交易时段且与同日盘中口径一致）、builder 接线测试 +5（ATR14 标尺读数、代理回退、无 K 线不足、休市时段、run limitations 携带口径）、端点契约测试补 v6 版本与 `recent_displacement` 全字段断言；前端 IntradayScanTable +5（越线强调 up/down、未达 0.5 弱化、三类标缺、tooltip 基准原文、「波段vs大盘」下沉后仍在研究读数区可达）与默认 10 列断言更新，IntradayPage 列表断言同步。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` 新增 §2.13「近 30 分钟位移」（取证证据表、窗口与 ATR 标尺口径、additive 响应合同、前端列与降列决策、R5 候选、诚实边界）；根 README 不承载日内列级细节，故未改动。
 
 ## [3.11.0] - 2026-03-27
 

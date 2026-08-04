@@ -242,7 +242,7 @@ def test_contract_regular_session_full_row(monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert body["schema_version"] == "intraday-top/1.0"
-    assert body["signal_version"] == "intraday_session_evidence_v5"
+    assert body["signal_version"] == "intraday_session_evidence_v6"
     # 盘中主排序 = 波段爆发分优先。
     assert body["ranking_method"] == "burst_score_first_then_evidence_count"
     # 不冻结、不入统计的显式标记。
@@ -322,6 +322,28 @@ def test_contract_regular_session_full_row(monkeypatch):
         "S3": "not_matched",
     }
     assert setup_match["bar_count_15m"] == 4
+    # v6 近 30 分钟位移：复用同一批 5m K 线，ATR 标尺＝日线 ATR14（1.5）。
+    # 窗口＝当日 12 根 K 线的最后 6 根：首根开盘 100.0（30 分钟前的价格）、
+    # 末收 103.0、窗口最高 103.5、最低 99.5。
+    displacement = item["recent_displacement"]
+    assert displacement["state"] == "ready"
+    assert displacement["window_minutes"] == 30
+    assert displacement["bar_count"] == 12
+    assert displacement["atr_basis"] == "atr14_daily"
+    assert displacement["survival_line_atr"] == 0.5
+    assert displacement["net_move_atr"] == pytest.approx(3.0 / 1.5, abs=1e-4)
+    assert displacement["high_excursion_atr"] == pytest.approx(3.5 / 1.5, abs=1e-4)
+    assert displacement["low_excursion_atr"] == pytest.approx(-0.5 / 1.5, abs=1e-4)
+    assert displacement["abs_range_atr"] == pytest.approx(4.0 / 1.5, abs=1e-4)
+    assert displacement["unavailable_reason"] is None
+    # 位移是 additive 标注：不进 supports 计数，也不出现在 evidence 列表里。
+    assert all(
+        entry["metric"] != "recent_displacement" for entry in item["evidence"]
+    )
+    assert any("0.5 ATR 是你自己 766 笔回合" in text for text in body["limitations"])
+    assert any(
+        "不是预测、不是买卖信号" in text for text in item["limitations"]
+    )
     # Playbook 对应关系默认 stub 为空：徽标如实缺 Playbook 标注。
     assert all(row["playbook"] is None for row in setup_match["setups"])
     assert any("形态相似 ≠ 可交易" in text for text in body["limitations"])

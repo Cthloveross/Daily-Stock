@@ -35,6 +35,8 @@ from src.opportunities.intraday_bursts import (
     BURST_BASIS,
     BURST_LIMITATIONS,
     BURST_SUPPORT_MIN,
+    DISPLACEMENT_LIMITATION_LINE,
+    compute_recent_displacement,
     unavailable_burst_profile,
 )
 from src.opportunities.intraday_setups import (
@@ -52,7 +54,11 @@ from src.opportunities.intraday_setups import (
 # Playbook setup（S1 低点抬高突破 / S2 跳空托举 / S3 高开遇阻）做纯形状对比，
 # 输出 matched/partial/not_matched/unavailable 四态标注（src/opportunities/
 # intraday_setups.py）。同样只是标注：不参与排序、不隐藏行、不是信号。
-INTRADAY_TOP_SIGNAL_VERSION = "intraday_session_evidence_v5"
+# v6: 近 30 分钟位移（recent_displacement）——复用同一批 5m K 线，按用户自己
+# 766 笔回合取证分析的同一把 ATR 标尺回答「它已经在不在动」，0.5 ATR 是他自己
+# 样本里的经验「活下来」线（描述统计，非预测、非信号）。additive 字段：
+# 不参与 supports 计数、不参与排序、不隐藏行。
+INTRADAY_TOP_SIGNAL_VERSION = "intraday_session_evidence_v6"
 INTRADAY_TOP_SCHEMA_VERSION = "intraday-top/1.0"
 
 # ---------------------------------------------------------------------------
@@ -147,6 +153,7 @@ INTRADAY_TOP_LIMITATIONS = (
     "回踩企稳细节；形态相似 ≠ 可交易，只是标注：不参与排序、不隐藏行、不是信号。",
     "形态标签的 Playbook 对应关系（候选/已晋升）为只读展示；Playbook 规则不反哺"
     "任何评分、排序或提示词。",
+    DISPLACEMENT_LIMITATION_LINE,
 )
 
 _RECENT_EVENT_FIELDS = (
@@ -1011,6 +1018,16 @@ def build_intraday_top_candidate(
         playbook_refs=playbook_refs,
     )
 
+    # -- 10. v6 近 30 分钟位移：同一批 5m K 线（零新增请求）+ 已注入的日线
+    # ATR14（与 766 笔取证分析同一把尺，缺失时回退盘中代理并标注基准）。
+    # 描述过去 30 分钟已经发生的事，additive 标注：不进 supports、不参与排序。
+    recent_displacement = compute_recent_displacement(
+        setup_bars or (),
+        market_date_et=resolved_market_date_et,
+        quote_session_scope=quote_session_scope,
+        atr14=daily.atr14,
+    )
+
     supporting_count = sum(
         1
         for item in evidence
@@ -1077,6 +1094,8 @@ def build_intraday_top_candidate(
         "market_alignment": compute_market_alignment(bursts, market_context),
         # v4 styleMatch v1：与你的 S1/S2/S3 setup 的形状相似度，仅作标注。
         "setup_match": setup_match,
+        # v6 近 30 分钟位移：它已经在不在动（ATR 归一化，描述非预测）。
+        "recent_displacement": recent_displacement,
         "option_activity": {
             "state": events["state"],
             "count": events["count"],

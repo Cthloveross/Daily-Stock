@@ -862,6 +862,28 @@ export interface IntradaySessionBursts {
 }
 
 /**
+ * v6 近 30 分钟位移：它「已经」在不在动，按 ATR 归一化（additive 标注）。
+ *
+ * 证据来自用户自己的 766 笔期权回合（2026-06-08→07-31，build #3 取证分析）：
+ * 进场几何没有预测力，进场后 30 分钟的位移把结果分得很开——速死亏损单
+ * （<30 分钟）MFE 中位 0.18 ATR / MAE −0.49 ATR，仅 18.3% 达到 ≥0.5 ATR；
+ * 走出来的赢家（30 分钟–3 小时）MFE 0.69 / MAE −0.13，71.2% 达到 ≥0.5 ATR。
+ * `survivalLineAtr` 因此是用户自己的经验线：描述统计，非预测、非信号。
+ */
+export interface IntradayRecentDisplacement {
+  state: 'ready' | 'insufficient_bars' | 'unavailable';
+  windowMinutes: number;
+  netMoveAtr: number | null;
+  highExcursionAtr: number | null;
+  lowExcursionAtr: number | null;
+  absRangeAtr: number | null;
+  atrBasis: 'atr14_daily' | 'intraday_20bar_proxy_x3' | null;
+  survivalLineAtr: number;
+  barCount: number;
+  unavailableReason: string | null;
+}
+
+/**
  * 闸门口径：v2 常规＝15 分钟动量子额度优先、当日涨跌子额度兜底（2026-08-03
  * 普涨跳空日校准）；v1＝|当日涨跌|→成交额（冷启动回退）；盘前＝|盘前涨跌|→
  * 盘前成交额（不变）。
@@ -978,6 +1000,8 @@ export interface IntradayTopCandidate {
   earningsProximity: IntradayEarningsProximity;
   marketAlignment: IntradayMarketAlignment;
   setupMatch: IntradaySetupMatchProfile;
+  /** v6 近 30 分钟位移（additive）：旧载荷可省略，缺席时不发明读数。 */
+  recentDisplacement?: IntradayRecentDisplacement;
   optionActivity: IntradayTopOptionActivity;
   priorDayContext: IntradayTopPriorDayContext;
   evidence: OpportunityEvidence[];
@@ -1022,7 +1046,7 @@ export interface IntradayTopResponse {
   quoteSessionScope: 'current_session' | 'latest_prior_session';
   quoteSessionLabel: string;
   marketContext: IntradayMarketContext;
-  signalVersion: 'intraday_session_evidence_v4';
+  signalVersion: 'intraday_session_evidence_v6';
   rankingMethod: 'burst_score_first_then_evidence_count' | 'rule_based_evidence_count';
   statisticsTrack: 'none_intraday_v1_unscored';
   moomooEnabled: boolean;

@@ -12,6 +12,7 @@ import { Tooltip } from '../common/Tooltip';
 import {
   formatCompactUsd,
   formatRatio,
+  formatSignedAtr,
   formatSignedCompactUsd,
   formatSignedPercent,
 } from './intradayFormat';
@@ -268,6 +269,11 @@ function personalLedgerChip(view: PersonalEdgeView, ticker: string) {
 const RANK_HEADER_TOOLTIP =
   '服务端排名（盘中爆发分优先，休市按最近交易时段证据计数）；点击其他列头做客户端排序时，此排名不变。';
 
+const DISPLACEMENT_HEADER_TOOLTIP =
+  '近 30 分钟（6×5m）净位移 ÷ ATR。0.5 ATR 是你自己 766 笔样本里「活下来」的经验线'
+  + '（描述统计，非预测、非信号）；基准：ATR14 日线 / 盘中代理，逐行 tooltip 标注实际使用的一种。'
+  + '它只说过去 30 分钟已经发生了什么——不隐藏行、不参与排序。';
+
 const ALIGNMENT_HEADER_TOOLTIP =
   '顺势/逆势＝候选当前波段（爆发）方向 vs SPY 会话 VWAP 位置，不是个股自身涨跌方向：'
   + '上涨股在 SPY 处于 VWAP 下方时同样标「逆势」。任一侧标缺时显示标缺。';
@@ -277,7 +283,7 @@ const ALIGNMENT_HEADER_TOOLTIP =
  * 文本本身必须可一键展开查看。
  */
 const FULL_METHODOLOGY_TEXT =
-  '当前爆发＝最近 15 分钟（3 根 5m K 线）|收−开| ÷ 当日 5m 波幅中位 × 窗口量比（阈值按 2026-07-31 标注样本校准，盘中排序优先，不是信号）；速度＝相邻两个 15 分钟窗口爆发分之差（5m 近似，非 1m/2m 秒级；减速=你的离场信号，R1）；今日波段＝爆发分分级记录的独立窗口（强 ≥8 按 2026-07-31 暴动样本校准、中 ≥2.5 按 2026-08-03 NVDA 上午持续推升校准；起点相隔 ≥30 分钟，≤4 个，休市显示最近一个交易时段）；缺口＝开盘价对参考前收（休市时段改用快照前收并标注）；量能节奏＝当日累计 vs 20 日全日中位（未按时点折算）；大盘＝候选爆发方向 vs SPY 会话 VWAP 位置（累计额/量近似）；波幅扩张＝当日高低价差 ÷ ATR14；财报＝Finnhub 前向 5 天窗口，≤3 天标「期权贵」（你的回避规则）；期权异动＝最近一页 Moomoo 分类计数，不推断开平仓。你的战绩＝Journal 当前默认 build 已平仓回合按标的聚合（净盈亏/胜率/笔数，<5 笔样本不足，净亏损且 ≥20 笔警示；持仓时长与结果存在内生性，描述非因果、不构成建议）。时段/财报/大盘/速度/你的战绩均为上下文标注——系统标注，用户过滤：不隐藏行、不阻断操作、不参与排序。形态＝styleMatch v1（S1 低点抬高 / S2 跳空托举 / S3 高开遇阻，与你的 Playbook setup 的形状对比；「· 似」=部分相似，缺 K 线或快照输入时标缺）：形态相似度为 v1 几何检测（5m近似），不含你的进场确认帧（2m/1m 回踩8/13EMA），不是信号。缺失字段显式标缺，不以 0 冒充。';
+  '当前爆发＝最近 15 分钟（3 根 5m K 线）|收−开| ÷ 当日 5m 波幅中位 × 窗口量比（阈值按 2026-07-31 标注样本校准，盘中排序优先，不是信号）；速度＝相邻两个 15 分钟窗口爆发分之差（5m 近似，非 1m/2m 秒级；减速=你的离场信号，R1）；今日波段＝爆发分分级记录的独立窗口（强 ≥8 按 2026-07-31 暴动样本校准、中 ≥2.5 按 2026-08-03 NVDA 上午持续推升校准；起点相隔 ≥30 分钟，≤4 个，休市显示最近一个交易时段）；缺口＝开盘价对参考前收（休市时段改用快照前收并标注）；量能节奏＝当日累计 vs 20 日全日中位（未按时点折算）；大盘＝候选爆发方向 vs SPY 会话 VWAP 位置（累计额/量近似）；波幅扩张＝当日高低价差 ÷ ATR14；财报＝Finnhub 前向 5 天窗口，≤3 天标「期权贵」（你的回避规则）；期权异动＝最近一页 Moomoo 分类计数，不推断开平仓。你的战绩＝Journal 当前默认 build 已平仓回合按标的聚合（净盈亏/胜率/笔数，<5 笔样本不足，净亏损且 ≥20 笔警示；持仓时长与结果存在内生性，描述非因果、不构成建议）。时段/财报/大盘/速度/你的战绩均为上下文标注——系统标注，用户过滤：不隐藏行、不阻断操作、不参与排序。形态＝styleMatch v1（S1 低点抬高 / S2 跳空托举 / S3 高开遇阻，与你的 Playbook setup 的形状对比；「· 似」=部分相似，缺 K 线或快照输入时标缺）：形态相似度为 v1 几何检测（5m近似），不含你的进场确认帧（2m/1m 回踩8/13EMA），不是信号。近30分位移＝最近 30 分钟（6 根 5m K 线）相对「30 分钟前价格」（窗口首根开盘）的净位移 ÷ ATR 标尺，同时给出区间最高/最低偏移；ATR 标尺优先日线 ATR14（与取证分析同源），缺失时回退盘中代理（最近 20 根 5m 波幅均值 ×3）并逐行标注实际基准，两者都不可得时显式标缺。0.5 ATR 这条线来自你自己 766 笔期权回合（2026-06-08→07-31，Journal build #3）的取证分析：进场几何（追高 vs 回调）对结果没有预测力，而进场后 30 分钟的位移把结果分得很开——速死亏损单（持仓<30分钟）前向 MFE 中位 0.18 ATR / MAE −0.49 ATR，仅 18.3% 达到 ≥0.5 ATR；走出来的赢家（30分钟-3小时）MFE 0.69 / MAE −0.13，71.2% 达到 ≥0.5 ATR；该样本 84% 的合约 ≤1DTE，对「不动」零容忍。诚实边界：这是对已经发生的事的描述统计，不是预测、不是买卖信号；样本窗口恰是你最差的两个月，分组按持仓时长定义（与结果存在循环性），K 线为非官方 5m 聚合。缺失字段显式标缺，不以 0 冒充。';
 
 function formatBurstThrust(value: number | null): string {
   if (value === null) return '—';
@@ -428,6 +434,93 @@ function speedCaption(item: IntradayTopCandidate): string {
   return `Δ ${sign}${Math.abs(speed.delta).toFixed(1)}`;
 }
 
+/**
+ * v6 近 30 分钟位移：ATR 标尺文案。缺席时如实写「标缺」，不假装知道用了哪把尺。
+ */
+const DISPLACEMENT_BASIS_LABELS: Record<string, string> = {
+  atr14_daily: 'ATR14 日线',
+  intraday_20bar_proxy_x3: '盘中代理（最近 20 根 5m 波幅均值 ×3）',
+};
+
+/**
+ * 位移列 tooltip：口径 + 用户自己的经验线来源 + 实际使用的 ATR 基准。
+ * 这是**描述统计**——它只说过去 30 分钟已经发生了什么，不预测下一分钟。
+ */
+function displacementTooltip(item: IntradayTopCandidate): string {
+  const displacement = item.recentDisplacement;
+  const minutes = displacement?.windowMinutes ?? 30;
+  const line = displacement?.survivalLineAtr ?? 0.5;
+  const basis = displacement?.atrBasis
+    ? DISPLACEMENT_BASIS_LABELS[displacement.atrBasis] ?? displacement.atrBasis
+    : '标缺（ATR14 日线 / 盘中代理均不可得）';
+  const parts = [
+    `近 ${minutes} 分钟（6×5m）净位移 ÷ ATR。${line} ATR 是你自己 766 笔样本里「活下来」的`
+    + '经验线（描述统计，非预测、非信号）；基准：'
+    + basis,
+  ];
+  if (displacement?.state === 'ready') {
+    parts.push(
+      `区间：最高 ${formatSignedAtr(displacement.highExcursionAtr)}`
+      + ` · 最低 ${formatSignedAtr(displacement.lowExcursionAtr)}`
+      + ` · 幅度 ${formatSignedAtr(displacement.absRangeAtr)}`
+      + `（${displacement.barCount} 根 5m K 线）`,
+    );
+  } else if (displacement?.state === 'insufficient_bars') {
+    parts.push(`当前时段仅 ${displacement.barCount} 根 5m K 线，不足 6 根（30 分钟）。`);
+  } else {
+    parts.push(
+      `读数不可得：${displacement?.unavailableReason ?? '载荷未提供 recent_displacement'}。`,
+    );
+  }
+  return parts.join('\n');
+}
+
+/**
+ * 位移单元格：≥ +0.5 / ≤ −0.5 用涨跌色强调（越过用户自己的经验线），
+ * 之间用弱化色 +「未达 0.5」说明，K 线不足或标尺不可得显式「标缺」。
+ * 三态都不隐藏行、不参与排序——系统标注，用户过滤。
+ */
+function displacementCell(item: IntradayTopCandidate) {
+  const displacement = item.recentDisplacement;
+  const tooltip = displacementTooltip(item);
+  if (!displacement || displacement.state !== 'ready' || displacement.netMoveAtr === null) {
+    const caption = displacement?.state === 'insufficient_bars'
+      ? 'K线不足 30 分钟'
+      : 'ATR 标尺/K线不可得';
+    return (
+      <Tooltip focusable content={<span className="whitespace-pre-line">{tooltip}</span>}>
+        <span aria-label={tooltip} className="inline-block">
+          <span className="block font-mono text-mono-sm text-text-3">标缺</span>
+          <span className="mt-0.5 block text-caption text-text-3">{caption}</span>
+        </span>
+      </Tooltip>
+    );
+  }
+  const net = displacement.netMoveAtr;
+  const line = displacement.survivalLineAtr;
+  const reached = Math.abs(net) >= line;
+  const valueClass = !reached
+    ? 'text-text-3'
+    : net > 0
+      ? 'text-up-strong font-medium'
+      : 'text-down-strong font-medium';
+  const caption = reached
+    ? `高 ${formatSignedAtr(displacement.highExcursionAtr)} · 低 ${formatSignedAtr(
+      displacement.lowExcursionAtr,
+    )}`
+    : `未达 ${line}`;
+  return (
+    <Tooltip focusable content={<span className="whitespace-pre-line">{tooltip}</span>}>
+      <span aria-label={tooltip} className="inline-block">
+        <span className={`block font-mono text-mono-sm ${valueClass}`}>
+          {formatSignedAtr(net)}
+        </span>
+        <span className="mt-0.5 block text-caption text-text-3">{caption}</span>
+      </span>
+    </Tooltip>
+  );
+}
+
 function gapCaption(item: IntradayTopCandidate): string {
   if (item.gapPercent === null) return '标缺';
   if (item.gapAtrMultiple !== null) {
@@ -510,9 +603,12 @@ function setupMatchCell(item: IntradayTopCandidate) {
 }
 
 /**
- * 展开行「研究读数」网格：从默认网格移出的次要指标（量能节奏/缺口/波幅/
- * VWAP/期权异动/财报全文/研究状态），一键可达——重排可见性，不删除任何读数；
- * 缺失字段照旧显式标缺，不以 0 冒充。
+ * 展开行「研究读数」网格：从默认网格移出的次要指标（波段vs大盘/量能节奏/缺口/
+ * 波幅/VWAP/期权异动/财报全文/研究状态），一键可达——重排可见性，不删除任何
+ * 读数；缺失字段照旧显式标缺，不以 0 冒充。
+ *
+ * v6 起「波段vs大盘」也在这里：默认网格让位给「近30分位移」（你自己 766 笔
+ * 样本里唯一把结果分开的读数），大盘对齐仍是上下文标注，一键可达。
  */
 function ResearchReadoutsGrid({ item }: { item: IntradayTopCandidate }) {
   const earnings = earningsLabel(item);
@@ -524,7 +620,22 @@ function ResearchReadoutsGrid({ item }: { item: IntradayTopCandidate }) {
           次要指标 · 缺失显式标缺，不以 0 冒充
         </span>
       </div>
-      <dl className="mt-2 grid grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-4 lg:grid-cols-7">
+      <dl className="mt-2 grid grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-4 lg:grid-cols-8">
+        <div>
+          <dt className="text-caption text-text-3">
+            <Tooltip focusable content={ALIGNMENT_HEADER_TOOLTIP}>
+              <span aria-label={ALIGNMENT_HEADER_TOOLTIP}>波段vs大盘</span>
+            </Tooltip>
+          </dt>
+          <dd
+            className={`mt-0.5 text-body-sm ${
+              item.marketAlignment.state === 'unknown' ? 'text-text-3' : 'text-text-1'
+            }`}
+          >
+            {ALIGNMENT_LABELS[item.marketAlignment.state]}
+          </dd>
+          <dd className="text-caption text-text-3">{alignmentCaption(item)}</dd>
+        </div>
         <div>
           <dt className="text-caption text-text-3">量能节奏</dt>
           <dd className="mt-0.5 font-mono text-mono-xs text-text-1">
@@ -599,10 +710,16 @@ function ResearchReadoutsGrid({ item }: { item: IntradayTopCandidate }) {
  * 两层模式下深度层为实时排名主表，表下依次为「今日曾深扫 · 波段保留」账本
  * （轮换出深度层的标的以最后一次深扫摘要 as-of 保留）与「仅快照」次级列表。
  *
- * 两级布局（2026-08-03 声效整理，2026-08-04 加「你的战绩」）：默认网格保留
- * 10 列交易关键读数（排名/标的/涨跌%/当前爆发/今日波段/速度/形态/波段vs大盘/
- * 你的战绩/详情），次要指标移入行内展开区「研究读数」网格（临期合约面板上方）——
- * 重排可见性 ≠ 删除，所有读数一键可达，标缺语义不变。
+ * 两级布局（2026-08-03 声效整理，2026-08-04 加「你的战绩」与「近30分位移」）：
+ * 默认网格保留 10 列交易关键读数（排名/标的/涨跌%/当前爆发/今日波段/速度/
+ * 近30分位移/形态/你的战绩/详情），次要指标移入行内展开区「研究读数」网格
+ * （临期合约面板上方）——重排可见性 ≠ 删除，所有读数一键可达，标缺语义不变。
+ * v6 为给「近30分位移」腾出默认位，「波段vs大盘」下沉到研究读数区。
+ *
+ * 「近30分位移」＝该标的最近 30 分钟（6×5m）的 ATR 归一化净位移。证据：用户
+ * 自己 766 笔回合（2026-06-08→07-31）的取证分析显示进场几何无预测力，而进场后
+ * 30 分钟位移把结果分得很开（速死单 18.3% 达到 ≥0.5 ATR，走出来的赢家 71.2%）。
+ * 0.5 ATR 因此是**他自己样本里的经验线**：描述统计，非预测、非信号。
  *
  * 「你的战绩」＝个人画像回灌（personal-edge）：该标的在你 Journal 默认 build
  * 里的净盈亏/胜率/笔数。系统标注，用户过滤——不隐藏行、不改排序、不是信号；
@@ -703,7 +820,7 @@ export function IntradayScanTable({
             {data?.quoteSessionScope === 'latest_prior_session'
               ? '休市 · 按最近交易时段最强波段排序'
               : '波段爆发优先排名'}
-            （{data?.signalVersion ?? 'intraday_session_evidence_v4'}）· 不冻结 · 不入统计
+            （{data?.signalVersion ?? 'intraday_session_evidence_v6'}）· 不冻结 · 不入统计
           </span>
           {data?.universeScan && (
             <span className="text-caption text-text-3">
@@ -770,12 +887,12 @@ export function IntradayScanTable({
                 <th className="px-3 py-2 text-right">{sortableHeader('burst', '当前爆发')}</th>
                 <th className="px-3 py-2 font-medium">今日波段</th>
                 <th className="px-3 py-2 font-medium">速度</th>
-                <th className="px-3 py-2 font-medium">形态</th>
                 <th className="px-3 py-2 font-medium">
-                  <Tooltip focusable content={ALIGNMENT_HEADER_TOOLTIP}>
-                    <span aria-label={ALIGNMENT_HEADER_TOOLTIP}>波段vs大盘</span>
+                  <Tooltip focusable content={DISPLACEMENT_HEADER_TOOLTIP}>
+                    <span aria-label={DISPLACEMENT_HEADER_TOOLTIP}>近30分位移</span>
                   </Tooltip>
                 </th>
+                <th className="px-3 py-2 font-medium">形态</th>
                 <th className="px-3 py-2 font-medium">
                   <Tooltip focusable content={PERSONAL_HEADER_TOOLTIP}>
                     <span aria-label={PERSONAL_HEADER_TOOLTIP}>你的战绩</span>
@@ -909,13 +1026,8 @@ export function IntradayScanTable({
                     </div>
                     <div className="mt-0.5 text-caption text-text-3">{speedCaption(item)}</div>
                   </td>
+                  <td className="px-3 py-2.5">{displacementCell(item)}</td>
                   <td className="px-3 py-2.5">{setupMatchCell(item)}</td>
-                  <td className="px-3 py-2.5">
-                    <div className={`text-body-sm ${item.marketAlignment.state === 'unknown' ? 'text-text-3' : 'text-text-1'}`}>
-                      {ALIGNMENT_LABELS[item.marketAlignment.state]}
-                    </div>
-                    <div className="mt-0.5 text-caption text-text-3">{alignmentCaption(item)}</div>
-                  </td>
                   <td className="px-3 py-2.5">{personalStatCell(personalEdge, item.ticker)}</td>
                   <td className="px-3 py-2.5">
                     <button
@@ -1148,7 +1260,9 @@ export function IntradayScanTable({
         <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
           <span>
             排序与口径说明：盘中排序＝爆发分优先（休市按最近交易时段）；今日波段分级
-            强＝爆发分 ≥8 暴动 / 中＝≥2.5 持续推升；速度/波段vs大盘/财报/形态/你的战绩均为上下文标注——
+            强＝爆发分 ≥8 暴动 / 中＝≥2.5 持续推升；近30分位移＝最近 6 根 5m K 线净位移 ÷ ATR，
+            0.5 ATR 是你自己 766 笔样本的经验「活下来」线（描述过去 30 分钟，非预测、非信号）；
+            速度/位移/波段vs大盘/财报/形态/你的战绩均为上下文标注——
             不隐藏行、不参与排序、不是信号；缺失字段显式标缺，不以 0 冒充。
           </span>
           <button

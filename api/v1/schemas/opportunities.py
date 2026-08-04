@@ -1175,6 +1175,34 @@ class IntradaySetupMatchProfile(BaseModel):
     limitations: list[str] = Field(default_factory=list)
 
 
+class IntradayRecentDisplacement(BaseModel):
+    """v6 近 30 分钟位移：它「已经」在不在动，按 ATR 归一化（additive 标注）。
+
+    证据来源是用户自己的 766 笔期权回合（2026-06-08→07-31，Journal build #3
+    取证分析）：进场几何（追高 vs 回调）没有预测力，进场后 30 分钟的位移把
+    结果分得很开——速死亏损单（<30 分钟）前向 MFE 中位 0.18 ATR /
+    MAE −0.49 ATR，仅 18.3% 达到 ≥0.5 ATR；走出来的赢家（30 分钟–3 小时）
+    MFE 0.69 / MAE −0.13，71.2% 达到 ≥0.5 ATR；样本 84% 的合约 ≤1DTE。
+
+    因此 ``survival_line_atr = 0.5`` 是**用户自己样本里的经验线**——描述统计，
+    不是预测、不是买卖信号，样本窗口恰是他最差的两个月且分组按持仓时长定义
+    （与结果存在循环性）。K 线不足或 ATR 标尺不可得时显式标缺，绝不 0 回填。
+    """
+
+    state: Literal["ready", "insufficient_bars", "unavailable"]
+    window_minutes: int = Field(30, ge=1)
+    net_move_atr: Optional[float] = None
+    high_excursion_atr: Optional[float] = None
+    low_excursion_atr: Optional[float] = None
+    abs_range_atr: Optional[float] = Field(default=None, ge=0)
+    atr_basis: Optional[
+        Literal["atr14_daily", "intraday_20bar_proxy_x3"]
+    ] = None
+    survival_line_atr: float = Field(0.5, gt=0)
+    bar_count: int = Field(0, ge=0)
+    unavailable_reason: Optional[str] = None
+
+
 class IntradayDeepLaneReason(BaseModel):
     """两层模式下该候选进入深度层的原因：计划钉选/用户钉选/异动排名。
 
@@ -1317,6 +1345,7 @@ class IntradayTopCandidate(BaseModel):
     earnings_proximity: IntradayEarningsProximity
     market_alignment: IntradayMarketAlignment
     setup_match: IntradaySetupMatchProfile
+    recent_displacement: IntradayRecentDisplacement
     option_activity: IntradayTopOptionActivity
     prior_day_context: IntradayTopPriorDayContext
     evidence: list[EvidenceItem] = Field(default_factory=list)
@@ -1363,7 +1392,7 @@ class IntradayTopResponse(BaseModel):
     quote_session_scope: Literal["current_session", "latest_prior_session"]
     quote_session_label: str
     market_context: IntradayMarketContext
-    signal_version: Literal["intraday_session_evidence_v5"]
+    signal_version: Literal["intraday_session_evidence_v6"]
     ranking_method: Literal[
         "burst_score_first_then_evidence_count",
         "rule_based_evidence_count",

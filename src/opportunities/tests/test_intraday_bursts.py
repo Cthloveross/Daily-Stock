@@ -21,6 +21,12 @@ import pytest
 
 from src.opportunities.intraday_bursts import (
     BURST_SUPPORT_MIN,
+    DISPLACEMENT_ATR_BASIS_DAILY,
+    DISPLACEMENT_ATR_BASIS_PROXY,
+    DISPLACEMENT_PROXY_MULTIPLIER,
+    DISPLACEMENT_SURVIVAL_LINE_ATR,
+    DISPLACEMENT_WINDOW_BARS,
+    DISPLACEMENT_WINDOW_MINUTES,
     LEG_MAX_COUNT,
     LEG_MEDIUM_MIN_SCORE,
     LEG_MIN_GAP_MINUTES,
@@ -28,6 +34,7 @@ from src.opportunities.intraday_bursts import (
     MEDIAN_BASIS_CURRENT,
     MEDIAN_BASIS_PRIOR,
     SPEED_BASIS,
+    compute_recent_displacement,
     compute_session_burst_profile,
     compute_speed_state,
     filter_regular_session_bars,
@@ -460,3 +467,215 @@ class TestSpeedState:
         unavailable = unavailable_burst_profile("no_regular_session_bars")
         assert unavailable["speed"]["state"] == "unknown"
         assert unavailable["speed"]["unavailable_reason"] == "fewer_than_2_windows"
+
+
+class TestRecentDisplacement:
+    """v6 近 30 分钟位移：窗口数学、ATR 标尺选择与 fail-closed 三态。
+
+    校准背景（见模块 docstring）：用户自己 766 笔回合的取证分析显示进场几何
+    没有预测力，而进场后 30 分钟位移把结果分得很开——0.5 ATR 是他自己样本里
+    的经验线。这里断言的是**口径的确定性**，不是任何胜率主张。
+    """
+
+    @staticmethod
+    def _ramp_bars(closes, *, date="2026-07-28", start_hhmm="09:30", spread=0.1):
+        """按给定收盘序列生成连续 5m K 线（open=上一根 close，高低各留 spread）。"""
+
+        bars = []
+        base_minutes = int(start_hhmm[:2]) * 60 + int(start_hhmm[3:])
+        previous_close = closes[0]
+        for index, close in enumerate(closes):
+            open_ = previous_close
+            minutes = base_minutes + index * 5
+            bars.append(
+                _bar(
+                    f"{date}T{minutes // 60:02d}:{minutes % 60:02d}:00-04:00",
+                    open_=open_,
+                    high=max(open_, close) + spread,
+                    low=min(open_, close) - spread,
+                    close=close,
+                    volume=1_000.0,
+                )
+            )
+            previous_close = close
+        return bars
+
+    def test_exact_six_bar_window_math_with_atr14(self):
+        # 6 根 K 线，窗口首根开盘 = 100.0（＝30 分钟前的价格），末收 101.0，
+        # 窗口最高 101.2（100.8+0.1... 见下），最低 99.9。ATR14=2.0。
+        bars = self._ramp_bars([100.0, 100.4, 100.2, 100.6, 100.8, 101.0])
+        displacement = compute_recent_displacement(
+            bars,
+            market_date_et="2026-07-28",
+            quote_session_scope="current_session",
+            atr14=2.0,
+        )
+        assert displacement["state"] == "ready"
+        assert displacement["bar_count"] == DISPLACEMENT_WINDOW_BARS
+        assert displacement["window_minutes"] == DISPLACEMENT_WINDOW_MINUTES == 30
+        assert displacement["atr_basis"] == DISPLACEMENT_ATR_BASIS_DAILY
+        assert displacement["survival_line_atr"] == DISPLACEMENT_SURVIVAL_LINE_ATR
+        window_high = max(bar["high"] for bar in bars)
+        window_low = min(bar["low"] for bar in bars)
+        assert displacement["net_move_atr"] == pytest.approx((101.0 - 100.0) / 2.0)
+        assert displacement["high_excursion_atr"] == pytest.approx(
+            (window_high - 100.0) / 2.0
+        )
+        assert displacement["low_excursion_atr"] == pytest.approx(
+            (window_low - 100.0) / 2.0
+        )
+        assert displacement["abs_range_atr"] == pytest.approx(
+            (window_high - window_low) / 2.0
+        )
+
+    def test_window_is_only_the_last_six_bars(self):
+        # 前段大涨、后 30 分钟横盘：位移必须只反映最后 6 根，不吃掉早盘涨幅。
+        bars = self._ramp_bars(
+            [100.0, 104.0, 108.0, 110.0, 110.0, 110.0, 110.0, 110.0, 110.0]
+        )
+        displacement = compute_recent_displacement(
+            bars,
+            market_date_et="2026-07-28",
+            quote_session_scope="current_session",
+            atr14=2.0,
+        )
+        assert displacement["bar_count"] == 9
+        # 窗口首根（第 4 根）开盘 = 108.0，末收 110.0 → 净位移 1.0 ATR。
+        assert displacement["net_move_atr"] == pytest.approx((110.0 - 108.0) / 2.0)
+        assert displacement["net_move_atr"] < (110.0 - 100.0) / 2.0
+
+    def test_negative_and_flat_moves_keep_their_sign(self):
+        down = compute_recent_displacement(
+            self._ramp_bars([100.0, 99.0, 98.5, 98.0, 97.5, 97.0]),
+            market_date_et="2026-07-28",
+            quote_session_scope="current_session",
+            atr14=2.0,
+        )
+        assert down["net_move_atr"] == pytest.approx((97.0 - 100.0) / 2.0)
+        assert down["net_move_atr"] < 0
+        assert down["low_excursion_atr"] < 0
+        assert down["abs_range_atr"] > 0
+
+        flat = compute_recent_displacement(
+            [_flat_bar(hhmm) for hhmm in ("09:30", "09:35", "09:40", "09:45", "09:50", "09:55")],
+            market_date_et="2026-07-28",
+            quote_session_scope="current_session",
+            atr14=2.0,
+        )
+        # 完全横盘：净位移恰好 0，且远低于 0.5 ATR 经验线——如实报 0，不报「动了」。
+        assert flat["net_move_atr"] == pytest.approx(0.0)
+        assert abs(flat["net_move_atr"]) < DISPLACEMENT_SURVIVAL_LINE_ATR
+
+    def test_missing_atr14_falls_back_to_labeled_intraday_proxy(self):
+        bars = self._ramp_bars([100.0, 100.4, 100.2, 100.6, 100.8, 101.0])
+        displacement = compute_recent_displacement(
+            bars,
+            market_date_et="2026-07-28",
+            quote_session_scope="current_session",
+            atr14=None,
+        )
+        assert displacement["atr_basis"] == DISPLACEMENT_ATR_BASIS_PROXY
+        ranges = [bar["high"] - bar["low"] for bar in bars]
+        proxy = sum(ranges) / len(ranges) * DISPLACEMENT_PROXY_MULTIPLIER
+        assert displacement["net_move_atr"] == pytest.approx((101.0 - 100.0) / proxy)
+
+    def test_non_positive_atr14_falls_back_instead_of_dividing_by_zero(self):
+        bars = self._ramp_bars([100.0, 100.4, 100.2, 100.6, 100.8, 101.0])
+        for bad_atr in (0.0, -1.0):
+            displacement = compute_recent_displacement(
+                bars,
+                market_date_et="2026-07-28",
+                quote_session_scope="current_session",
+                atr14=bad_atr,
+            )
+            assert displacement["state"] == "ready"
+            assert displacement["atr_basis"] == DISPLACEMENT_ATR_BASIS_PROXY
+
+    def test_fewer_than_six_bars_is_insufficient_with_the_count(self):
+        bars = [_flat_bar(hhmm) for hhmm in ("09:30", "09:35", "09:40", "09:45", "09:50")]
+        displacement = compute_recent_displacement(
+            bars,
+            market_date_et="2026-07-28",
+            quote_session_scope="current_session",
+            atr14=2.0,
+        )
+        assert displacement["state"] == "insufficient_bars"
+        assert displacement["bar_count"] == 5
+        assert displacement["unavailable_reason"] == (
+            f"fewer_than_{DISPLACEMENT_WINDOW_BARS}_session_bars"
+        )
+        # 缺读数时四个数值全部 None——绝不 0 回填冒充「没动」。
+        for key in (
+            "net_move_atr",
+            "high_excursion_atr",
+            "low_excursion_atr",
+            "abs_range_atr",
+            "atr_basis",
+        ):
+            assert displacement[key] is None
+        # 经验线常量仍然回显，方便前端一致渲染。
+        assert displacement["survival_line_atr"] == DISPLACEMENT_SURVIVAL_LINE_ATR
+
+    def test_no_bars_at_all_is_insufficient_not_zero(self):
+        displacement = compute_recent_displacement(
+            [],
+            market_date_et="2026-07-28",
+            quote_session_scope="current_session",
+            atr14=2.0,
+        )
+        assert displacement["state"] == "insufficient_bars"
+        assert displacement["bar_count"] == 0
+        assert displacement["net_move_atr"] is None
+
+    def test_zero_range_bars_without_atr14_are_unavailable_not_zero_division(self):
+        bars = [
+            _bar(
+                f"2026-07-28T09:{minute:02d}:00-04:00",
+                open_=100.0,
+                high=100.0,
+                low=100.0,
+                close=100.0,
+                volume=10.0,
+            )
+            for minute in (30, 35, 40, 45, 50, 55)
+        ]
+        displacement = compute_recent_displacement(
+            bars,
+            market_date_et="2026-07-28",
+            quote_session_scope="current_session",
+            atr14=None,
+        )
+        assert displacement["state"] == "unavailable"
+        assert displacement["bar_count"] == 6
+        assert displacement["unavailable_reason"] == (
+            "no_usable_atr_unit_atr14_missing_and_intraday_proxy_zero"
+        )
+        assert displacement["atr_basis"] is None
+
+    def test_closed_session_uses_the_latest_prior_session_as_of(self, labeled_bars):
+        # 周六休市：口径落在 2026-07-31 的最后 30 分钟，与既有 as-of 标注一致。
+        bars = labeled_bars["symbols"]["NVDA"]["bars"]
+        closed = compute_recent_displacement(
+            bars,
+            market_date_et="2026-08-01",
+            quote_session_scope="latest_prior_session",
+            atr14=3.0,
+        )
+        same_session = compute_recent_displacement(
+            bars,
+            market_date_et="2026-07-31",
+            quote_session_scope="current_session",
+            atr14=3.0,
+        )
+        assert closed["state"] == "ready"
+        assert closed["bar_count"] == 78
+        assert closed == same_session
+        # 盘中口径下的「今天」（08-03）尚无 K 线 → 显式不足，不借用上一时段。
+        premarket = compute_recent_displacement(
+            bars,
+            market_date_et="2026-08-03",
+            quote_session_scope="current_session",
+            atr14=3.0,
+        )
+        assert premarket["state"] == "insufficient_bars"
+        assert premarket["bar_count"] == 0

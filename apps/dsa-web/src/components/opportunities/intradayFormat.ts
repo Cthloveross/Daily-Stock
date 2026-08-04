@@ -22,6 +22,13 @@ export function formatSignedPercent(value: number | null): string {
   return `${sign}${Math.abs(value).toFixed(2)}%`;
 }
 
+/** 带符号的 ATR 归一化位移：+0.72 ATR / −0.31 ATR / 0.00 ATR；null 显式 —。 */
+export function formatSignedAtr(value: number | null): string {
+  if (value === null) return '—';
+  const sign = value > 0 ? '+' : value < 0 ? '−' : '';
+  return `${sign}${Math.abs(value).toFixed(2)} ATR`;
+}
+
 export function formatRatio(value: number | null): string {
   if (value === null) return '—';
   return `${value.toLocaleString('en-US', { maximumFractionDigits: 2 })}×`;
