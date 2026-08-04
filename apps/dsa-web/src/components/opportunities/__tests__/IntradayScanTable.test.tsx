@@ -1375,6 +1375,33 @@ describe('IntradayScanTable 近30分位移列（v6 recent displacement）', () =
     expect(within(table).queryByText(/未达 0.5/)).not.toBeInTheDocument();
   });
 
+  it('summarises how many rows reached the 0.5 ATR line and the median volume ratio', () => {
+    render(
+      <IntradayScanTable
+        data={displacementResponse(
+          displacementProfile({
+            state: 'ready',
+            netMoveAtr: 0.18,
+            highExcursionAtr: 0.24,
+            lowExcursionAtr: -0.31,
+            absRangeAtr: 0.55,
+            atrBasis: 'atr14_daily',
+            barCount: 26,
+            unavailableReason: null,
+          }),
+        )}
+        loading={false}
+        error={null}
+      />,
+    );
+    const summary = screen.getByTestId('scan-live-summary');
+    // 一行看完「今天有没有货」：0.18 ATR 未达线 → 1 檔中 0 檔达标。
+    expect(summary).toHaveTextContent('深度层 1 檔中 0 檔近30分位移达 0.5 ATR');
+    // 本 fixture 的爆发读数为 unavailable → 没有量比可算，摘要就不写量比，
+    // 绝不以 0 或 1.00× 冒充（缺席即缺席）。
+    expect(summary).not.toHaveTextContent('量比中位');
+  });
+
   it('marks 标缺 for insufficient bars, unavailable ATR unit and missing payload', () => {
     const table = () => screen.getByRole('table', { name: '实时扫描表' });
 

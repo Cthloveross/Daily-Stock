@@ -866,6 +866,27 @@ export function IntradayScanTable({
   const [methodologyExpanded, setMethodologyExpanded] = useState(false);
 
   // 盘前口径：闸门/宽层排序按盘前字段；回退时携带显式警示，绝不静默。
+  /** 今日概览：达 0.5 ATR 的檔数与量比中位（描述统计，缺读数的不计入分母）。 */
+  const liveSummary = useMemo(() => {
+    const rows = data?.candidates ?? [];
+    if (rows.length === 0) return null;
+    const displacements = rows
+      .map((row) => row.recentDisplacement)
+      .filter((d) => d && d.state === 'ready' && d.netMoveAtr !== null);
+    if (displacements.length === 0) return null;
+    const reached = displacements.filter(
+      (d) => Math.abs(d!.netMoveAtr as number) >= (d!.survivalLineAtr ?? 0.5),
+    ).length;
+    const vols = rows
+      .map((row) => row.sessionBursts?.current?.volNorm)
+      .filter((v): v is number => typeof v === 'number')
+      .sort((a, b) => a - b);
+    const medianVolNorm = vols.length > 0
+      ? vols[Math.floor((vols.length - 1) / 2)]
+      : null;
+    return { total: displacements.length, reached, medianVolNorm };
+  }, [data]);
+
   const premarketBasis = data?.universeScan?.gateBasis === PREMARKET_GATE_BASIS;
   const premarketFieldsUnavailable = (data?.universeScan?.gateWarnings ?? []).includes(
     PREMARKET_FIELDS_UNAVAILABLE_WARNING,
@@ -948,6 +969,24 @@ export function IntradayScanTable({
             </span>
           )}
         </div>
+        {/* 一行看完「今天到底有没有货」：达标数 + 量比中位。全是描述统计，
+            不预测方向——0.5 ATR 只是参考刻度（见位移列口径）。 */}
+        {liveSummary && (
+          <div
+            data-testid="scan-live-summary"
+            className="mt-1.5 text-body-sm text-text-2"
+          >
+            <span className={liveSummary.reached > 0 ? 'font-medium text-text-1' : ''}>
+              {`深度层 ${liveSummary.total} 檔中 ${liveSummary.reached} 檔近30分位移达 0.5 ATR`}
+            </span>
+            {liveSummary.medianVolNorm !== null && (
+              <span className="text-text-3">
+                {` · 量比中位 ${liveSummary.medianVolNorm.toFixed(2)}×`}
+                {liveSummary.medianVolNorm < 1 ? '（比平时清淡）' : ''}
+              </span>
+            )}
+          </div>
+        )}
         {data && (
           <span className="flex flex-wrap items-baseline gap-x-2 gap-y-1 text-caption text-text-3">
             <span>
