@@ -1402,6 +1402,115 @@ describe('IntradayScanTable 近30分位移列（v6 recent displacement）', () =
     expect(summary).not.toHaveTextContent('量比中位');
   });
 
+  it('labels the summary denominator as rows with readings and counts the missing rows', () => {
+    // 2 檔深度层，只有 1 檔有位移读数：分母必须写「有位移读数的 1 檔」，
+    // 并把标缺的那檔如实计数——「未读」绝不并进「未达」。
+    const response = {
+      ...topResponse(),
+      candidates: [
+        candidate({
+          recentDisplacement: displacementProfile({
+            state: 'ready',
+            netMoveAtr: 0.72,
+            highExcursionAtr: 0.91,
+            lowExcursionAtr: -0.14,
+            absRangeAtr: 1.05,
+            atrBasis: 'atr14_daily',
+            barCount: 26,
+            unavailableReason: null,
+          }),
+        }),
+        candidate({ ticker: 'MU', lastPrice: 100.5 }),
+      ],
+    };
+    render(<IntradayScanTable data={response} loading={false} error={null} />);
+    const summary = screen.getByTestId('scan-live-summary');
+    expect(summary).toHaveTextContent(
+      '有位移读数的 1 檔中 1 檔近30分位移达 0.5 ATR（另 1 檔标缺）',
+    );
+    expect(summary).not.toHaveTextContent('深度层 2 檔');
+  });
+
+  it('computes a proper median volume ratio (even count averages the middle pair)', () => {
+    const withVol = (ticker: string, volNorm: number) => {
+      const base = candidate();
+      return candidate({
+        ticker,
+        sessionBursts: {
+          ...base.sessionBursts,
+          state: 'ready',
+          sessionDateEt: '2026-08-04',
+          barCount: 12,
+          current: {
+            startEt: '10:15',
+            endEt: '10:30',
+            thrustPercent: 1.2,
+            thrustNorm: 3.0,
+            volNorm,
+            score: 9.0,
+            direction: 'up',
+          },
+          unavailableReason: null,
+        },
+        recentDisplacement: displacementProfile({
+          state: 'ready',
+          netMoveAtr: 0.72,
+          highExcursionAtr: 0.91,
+          lowExcursionAtr: -0.14,
+          absRangeAtr: 1.05,
+          atrBasis: 'atr14_daily',
+          barCount: 26,
+          unavailableReason: null,
+        }),
+      });
+    };
+    const response = {
+      ...topResponse(),
+      candidates: [withVol('NVDA', 1.0), withVol('MU', 2.0)],
+    };
+    render(<IntradayScanTable data={response} loading={false} error={null} />);
+    // 偶数个：取中间两值平均 (1.0+2.0)/2 = 1.50，而不是下位中值 1.00。
+    expect(screen.getByTestId('scan-live-summary')).toHaveTextContent('量比中位 1.50×');
+  });
+
+  it('says 版本未声明 instead of asserting a hardcoded signal version', () => {
+    const response = {
+      ...topResponse(),
+      signalVersion: undefined,
+    } as unknown as IntradayTopResponse;
+    render(<IntradayScanTable data={response} loading={false} error={null} />);
+    expect(document.body.textContent).toContain('版本未声明');
+    // 绝不把硬编码版本冒充成载荷声明的版本。
+    expect(document.body.textContent).not.toContain('intraday_session_evidence_v8');
+  });
+
+  it('annotates a gapped displacement window instead of claiming a clean 30 minutes', () => {
+    render(
+      <IntradayScanTable
+        data={displacementResponse(
+          displacementProfile({
+            state: 'ready',
+            netMoveAtr: 0.72,
+            highExcursionAtr: 0.91,
+            lowExcursionAtr: -0.14,
+            absRangeAtr: 1.05,
+            atrBasis: 'atr14_daily',
+            barCount: 26,
+            windowSpanMinutes: 40,
+            unavailableReason: null,
+          }),
+        )}
+        loading={false}
+        error={null}
+      />,
+    );
+    const table = screen.getByRole('table', { name: '实时扫描表' });
+    const cell = displacementCellOf(table);
+    expect(within(cell).getByText(/含断档 · 跨 40 分钟/)).toBeInTheDocument();
+    const label = within(cell).getByLabelText(/断档提示/).getAttribute('aria-label') ?? '';
+    expect(label).toContain('实际跨 40 分钟');
+  });
+
   it('marks 标缺 for insufficient bars, unavailable ATR unit and missing payload', () => {
     const table = () => screen.getByRole('table', { name: '实时扫描表' });
 

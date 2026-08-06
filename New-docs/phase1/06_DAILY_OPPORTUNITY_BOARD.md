@@ -722,7 +722,7 @@ Qualification v2 进一步令方向性标的路径与实际回填合同一致：
 
 ### 9.3 端点合同（additive，既有字段一字不改）
 
-`GET /api/v1/journal/v2/personal-edge` 新增 `rule_compliance` 区块，并新增可选 query `since=YYYY-MM-DD`（默认＝规则采纳日 `RULE_SET_V2_ADOPTED_AT = "2026-08-05"`，用户的下一个交易日 ET）。`since` **只**移动前向切片，不影响全历史切片与任何既有字段；进程内 TTL 缓存的键相应改为 `(account_key, since)`，不同 `since` 不共用条目。`data_state = not_built` 时该区块为 `null`。
+`GET /api/v1/journal/v2/personal-edge` 新增 `rule_compliance` 区块，并新增可选 query `since=YYYY-MM-DD`（默认＝规则采纳日 `RULE_SET_V2_ADOPTED_AT = "2026-08-05"`，用户的下一个交易日 ET）。`since` **只**移动前向切片，不影响全历史切片与任何既有字段；进程内 TTL 缓存的键相应改为 `(account_key, since, 解析后的默认 build id)`，不同 `since` 不共用条目，且 build 激活会因 build id 变化自然使旧缓存失效（rules-evidence 同理）。`data_state = not_built` 时该区块为 `null`。
 
 | 字段 | 含义 |
 | --- | --- |
@@ -732,12 +732,12 @@ Qualification v2 进一步令方向性标的路径与实际回填合同一致：
 | `exclude_top_n` / `exclude_top_n_min_episode_count` | 剔尾的 N（=5）与门槛（n≥15），与规模与频率同一实现 |
 | `intraday_lane_dte` / `intraday_lane_et_cutoff_hour` / `overnight_lane_min_dte` / `overnight_lane_max_dte` / `overnight_lane_weak_entry_et_hours` | 车道阈值真源（前端不硬编码数值） |
 | `all_history` / `since_adoption` | 两个切片，结构相同 |
-| `daily_budget` | V2-D 的两个额度读数 |
+| ~~`daily_budget`~~ | **已于 2026-08 移除**（V2-D 额度读数）：Journal 永远不含「今天」，该读数的 as-of 恒落在过去、恒为过期；当日额度由前端手动计数承载（见 §11.6 修正 4） |
 | `limitations` | 单一 regime / n=65 / 跳空 / 非建议 / 只读不下单，逐条原文 |
 
 每个切片：`state`（`ready` / `no_episodes` / `no_episodes_since_adoption`）+ `state_reason` + `start_date` + `n` + `lanes[]` + `verdicts[]`。`lanes[]` 逐条携带 `verdict` 与 `rule_id`——**不下发以车道 id 为键的字典**，因为 Web 层的深层 camelCase 会改写字典键，规则 id 必须只以「值」的形式过网。每个桶给出 `n / risk / net / gross / gross_pct / toll_pct / win_rate / gross_pct_excluding_top_n / excluding_top_n_count`，任何分母不足的比率为 `null` + `ratio_reason` / `excluding_top_n_reason`（空桶是「无样本」，**不是 0%**）。`verdicts[]` 是同一套算法在 `compliant / violation / uncovered / unknown` 上的汇总，因此**合规单 vs 违规单**可直接对比。
 
-`daily_budget`：`as_of_trading_day`（build 内最后一个有入场的 ET 自然日）、`intraday_ticket_count` / `intraday_ticket_limit`（V2-D③ 每日最多 6 笔；计数含 ET 12:00 后开的违规单，它们同样占用额度）、`overnight_open_count` / `overnight_concurrent_limit`（同时持有的过夜单不超过 3 个，取该 build 内仍未平仓的 4-7DTE 回合）、`overnight_unknown_dte_open_count`（未平仓但缺 DTE 的回合单独计缺席）。
+`daily_budget` 区块已移除（2026-08）：它按 build 内最后一个交易日给出 V2-D 额度读数，但 Journal 只有导入的历史成交、永远不含今天，该读数因此恒为过期——一个永远过期的读数等于没有。当日「日内单 x/6 / 过夜持仓 y/3」由前端手动计数（`useIntradayManualBudgetStore`，按 ET 日作用域）承载，见 §11.6 修正 4。
 
 **剔尾机制复用**：`_exclude_top_n_readings` 由规模与频率与车道遵守度共用——分子分母取同一子集（风险金额已知的回合），按净盈亏排序去掉最好的 5 笔，样本 <15 笔时返回 `null` + 原因；剩余回合中任一缺 `total_fee` 时净口径仍成立而毛口径缺席（过路费绝不以 0 冒充）。
 
@@ -748,7 +748,7 @@ Qualification v2 进一步令方向性标的路径与实际回填合同一致：
 - **日内车道**：① DTE 必须为 0（V2-A）；② ET 时钟必须 < 12:00（V2-A / V2-C③）——时钟取**市场脉搏端点的 `generatedAt`**，与脉搏条「数据时点」同一口径，**不另起时钟源**；③ 标的不在财报回避窗——复用日内扫描**深度层候选上已有的 `earningsProximity`**，标的不在深度层或日历不可得时**标缺**（未知≠安全，绝不以「没查到」冒充合规）。
 - **过夜车道**：① DTE 必须在 4-7（V2-B）；② ET 小时不得为 11 或 13（V2-B 的两个偏弱时段）；③ 提醒行「**本车道不适用速度衰竭离场（V2-B）**」+「进场时必须能说清『为什么今天不一定走完』」。V2-B 不含财报条款，因此过夜车道**不渲染**财报检查——不凭空发明规则。
 - **硬禁止（V2-C，与所选车道无关，命中即列出）**：① 1-3DTE 一律不开新仓；② 4-7DTE 且用户勾选「打算今天就平掉」；③ DTE 0 且 ET ≥ 12:00。
-- **额度读数**：「今日日内单 x/6」「当前过夜持仓 y/3」取自 `rule_compliance.daily_budget`。它是**证据 build 的读数**，带自己的 `as_of_trading_day`——build 的最后一个交易日不是今天（或端点不可得、市场日无法确定）时**显式标缺并说明原因，绝不显示 0**：0 会被读成「今天还没开过单」，而事实是「这个系统还不知道今天」。
+- **额度读数**：「今日日内单 x/6」「当前过夜持仓 y/3」为**用户手动计数**（`useIntradayManualBudgetStore`，按 ET 日作用域，明标「手动维护 · 按 ET 交易日自动归零」）。原 `rule_compliance.daily_budget` 读数因 Journal 永远不含今天而恒为过期，已于 2026-08 移除（见 §11.6 修正 4）。
 
 面板正文写明：这是对照**你自己那套规则**的检查清单，不是推荐、不含概率；本系统只读，**不会下单**；并原文携带单一 regime / n=65 / 跳空风险的边界。
 
@@ -938,3 +938,39 @@ MU 不在清单里也被并入同一批快照并深扫，且没有挤掉异动�
 ### 11.7 诚实边界
 
 引用的每个数字都带样本量与口径（build #3 干净口径，n=1,407，2026-04-21→07-31）。样本窗口仅 2026-04→07 一个市场状态（SPY 上行），规则由同一份样本内推出（in-sample），前向验证见 `/journal` 的规则遵守度。盘中计划只做**机械核对**：不排序、不打分、不给概率或胜率、不生成进出场价位，也不下任何单。
+
+## 12. 16 分钟悬挂缺陷链修复：单飞截止时间 + Moomoo 断路器（2026-08-07）
+
+2026-08 实盘复现的一次 16 分钟前端「转圈」由一整条缺陷链构成，经对抗性验证逐条确认（file:line 为修复前坐标），本节记录修复后的并发合同。
+
+### 12.1 单飞（single-flight）新合同（`_get_or_compute_scan`）
+
+| # | 缺陷（修复前） | 修复后合同 |
+| --- | --- | --- |
+| 1 | leader 无截止时间（`opportunities.py:617`）：45 秒租约只 504 跟随者，leader 自己可悬挂 16 分钟 | 工厂在共享有界线程池（16 workers）执行；**发起方与跟随方一样只等到租约到点**，随后抛 `OpportunityScanTimeoutError` → 可重试 504，孤儿计算继续在后台跑 |
+| 2 | 迟到结果被丢弃（`opportunities.py:630`）：超租约完成的扫描被扔掉再抛 504——慢供应商下「永远算、永远丢」的活锁 | **迟到的成功结果一律发布**进完成态缓存并清账（`_finish_scan_flight`），下一次轮询直接命中；成功算出的扫描绝不丢弃 |
+| 3 | 重复 leader（`opportunities.py:575`）：过期 flight 被逐出并接纳新 leader，旧工厂仍在跑，重复扫描自我放大 | **每个 key 同时至多一个工厂**：在途计算存续期间（哪怕租约已过期）后到请求只会有界等待或 504，绝不启动第二个工厂；在途计算完成后为所有人发布 |
+
+配套：完成态缓存上限 32 → 128（逐标的 key 在 20 标的清单下互相挤兑）；此前不含 504 翻译的期权端点（overview/context/walls/daily-snapshot/events）补上统一的 `opportunity_scan_timeout` 504。
+
+### 12.2 Moomoo 共享断路器（`src/services/moomoo_runtime.py`）
+
+一台「卡死」的 OpenD（TCP 可连、RPC 悬挂）会让每次调用烧满 SDK 内部 12–20 秒上限。`MOOMOO_RPC_BREAKER`（进程级，无新增环境变量）：连续 **3** 次传输类失败（RPC 异常、连接/握手失败、错误详情含超时/断连标记）后打开，**60 秒**冷却期内所有热路径快速失败（快照 / 异动 / 到期日 / wall lane 获取 / history kline），冷却结束放行一个探针（探针自带 30 秒租约防悬挂半开态），成功即闭合。业务型拒绝（如 Unknown stock）不计入失败。调用方既有的 unavailable + reason fail-closed 语义原样保留。
+
+### 12.3 车道可用性的 lane 获取短等待（G-5）
+
+到期日读取只发生在日内榜单飞 leader 内，旧实现每个标的可在 wall lane 上排 30 秒队（8 × 30s 独占整个租约）。现在 lane 获取等待收紧为 2.5 秒；lane 正忙抛 `MoomooWallLaneBusyError` → 该标的以 `deferred_wall_lane_busy` 推迟到下一轮（**不缓存失败**，`deferred_tickers` 机制照常如实呈现），结论保持 unknown。
+
+### 12.4 Tier-1 批量快照的未知代码恢复（G-6，LIVE 复现）
+
+清单里 1 个 `Unknown stock` 会让整批（实测 69 个）代码全部失败。现在识别到未知代码型拒绝时：错误详情点名代码就过滤后重试，没点名就二分重试；额外调用 ≤3 次硬顶，预算内未解析的代码如实缺席——端点的 `snapshot_unresolved_symbols` 既有口径自动披露，绝不把单个坏代码的失败扩大成整批失败。传输类失败仍整批 fail closed（语义不变）。
+
+### 12.5 其余修复（G-7a–e）
+
+- **7a** 当日晋升账本只在总数硬顶裁剪后提交「真正深扫」的标的；被 `trimmed_by_total_cap` 挤掉的标的不再消耗当日/30 天配额记录。
+- **7b** mom15 动量历史改为**时间制保留**（回看上限 + 2 分钟缓冲；240 条硬性兜底），且单层/两层路径的每轮 tier-1 快照都喂养同一份历史——工厂每分钟跑 >2 次时不再动量饥饿、闸门不再静默退回 v1。
+- **7c** 扫描完成态缓存上限 32 → 128（见 §12.1）。
+- **7d** `StockService` 历史/实时读取改用进程级共享 `DataFetcherManager`（按类身份缓存，测试 monkeypatch 自动重建）；5m 波段爆发车道不再每标的每轮新开 OpenD 连接。
+- **7e** `MoomooFetcher` 的每笔 RPC 与健康检查 `close()` 持同一把生命周期锁，close 不再能在 RPC 执行中途拆连接。
+
+以上并发行为均有确定性测试（慢工厂 + 短租约、假时钟断路器、混合有效/未知代码批次），见 `api/v1/tests/test_opportunities_endpoint.py`、`api/v1/tests/test_intraday_top_two_tier.py`、`tests/test_moomoo_runtime.py`、`tests/test_moomoo_options_snapshots.py`、`tests/test_moomoo_intraday_pagination.py`。

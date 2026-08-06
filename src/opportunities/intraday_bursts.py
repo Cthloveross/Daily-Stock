@@ -233,6 +233,11 @@ SPEED_BASIS = "consecutive_rolling_15m_window_burst_score_delta_5m_bars"
 DISPLACEMENT_WINDOW_BARS = 6
 DISPLACEMENT_SURVIVAL_LINE_ATR = 0.5
 DISPLACEMENT_WINDOW_MINUTES = DISPLACEMENT_WINDOW_BARS * BURST_BAR_MINUTES
+# 断档诚实化：「近 30 分钟」只有在 6 根 K 线连续时才成立。窗口实际跨度＝
+# 末根开始 + 5 分钟 − 首根开始；含断档（停牌/缺 K 线）时如实带上
+# ``window_span_minutes``，跨度超过 45 分钟则整个读数按 fail-closed 标缺——
+# 一个横跨一小时的「30 分钟位移」不是位移读数，是文字游戏。
+DISPLACEMENT_MAX_WINDOW_SPAN_MINUTES = 45
 # ATR 标尺回退代理：取证分析在缺日线 ATR14 时用的正是「最近 20 根 5m K 线
 # 波幅均值 × 3」；这里逐字复用同一口径，并在 atr_basis 里如实标注。
 DISPLACEMENT_PROXY_BARS = 20
@@ -320,6 +325,10 @@ DISPLACEMENT_LIMITATION_LINE = (
     f"{DISPLACEMENT_SURVIVAL_LINE_ATR} ATR 仍按你自己 766 笔回合（2026-06-08→07-31，"
     "恰为最差两个月）的经验值保留为**参考刻度**，"
     "K 线为非官方 5m 聚合；不足 6 根或标尺不可得时显式标缺，不以 0 冒充。"
+    "断档口径：6 根 K 线不保证连续（停牌/缺 K 线），窗口实际跨度以 "
+    "window_span_minutes 如实带出——超过 "
+    f"{DISPLACEMENT_MAX_WINDOW_SPAN_MINUTES} 分钟时整个读数按标缺处理（一个横跨"
+    "更久的窗口不再是「近 30 分钟」），30–45 分钟之间保留读数并须标注「含断档」。"
 )
 
 ATR_SCALE_LIMITATION_LINE = (
@@ -966,11 +975,20 @@ def compute_session_burst_profile(
     base["speed"] = compute_speed_state(windows)
     # v7 哑火形态：只描述**当前这个 15 分钟窗口**（进行中的窗口），不是整段
     # 时段的结论；效率用的正是该窗口那 3 根 K 线的最高/最低。
-    base["fizzle_flag"] = compute_fizzle_flag(
-        session_bars[-BURST_WINDOW_BARS:],
-        median_basis=median_basis,
-        vol_norm=windows[-1].get("vol_norm"),
-    )
+    if len(session_bars) < MEDIAN_FALLBACK_MIN_BARS and not prior_bars:
+        # 当日不足 6 根 K 线且无上一时段可回退：中位数分母由 3–5 根开盘
+        # K 线自证（退化基准），据它算出的量比不可判读——哑火形态按标缺
+        # 处理，绝不在退化基准上「硬算」出一个命中/未命中。
+        base["fizzle_flag"] = unavailable_fizzle_flag(
+            "median_basis_insufficient",
+            vol_norm=_finite(windows[-1].get("vol_norm")),
+        )
+    else:
+        base["fizzle_flag"] = compute_fizzle_flag(
+            session_bars[-BURST_WINDOW_BARS:],
+            median_basis=median_basis,
+            vol_norm=windows[-1].get("vol_norm"),
+        )
     return base
 
 
@@ -985,8 +1003,13 @@ def unavailable_recent_displacement(
     *,
     state: str = "unavailable",
     bar_count: int = 0,
+    window_span_minutes: Optional[int] = None,
 ) -> dict[str, Any]:
-    """Fail-closed displacement reading: an explicit state + reason, never 0."""
+    """Fail-closed displacement reading: an explicit state + reason, never 0.
+
+    ``window_span_minutes`` 仅在「窗口跨度超限」这类原因下携带实际跨度，
+    让消费端能把「为什么标缺」的数字如实展示出来。
+    """
 
     return {
         "state": state,
@@ -1001,6 +1024,7 @@ def unavailable_recent_displacement(
         "atr_prior_session_count": None,
         "survival_line_atr": DISPLACEMENT_SURVIVAL_LINE_ATR,
         "bar_count": bar_count,
+        "window_span_minutes": window_span_minutes,
         "unavailable_reason": reason,
     }
 
@@ -1122,6 +1146,28 @@ def compute_recent_displacement(
             bar_count=bar_count,
         )
 
+    # 断档检测：6 根 K 线不保证连续（停牌/供应商缺 K 线）。实际跨度 =
+    # 末根开始 + 5 分钟 − 首根开始；== 30 分钟才是无断档的「近 30 分钟」。
+    # 跨度超过 45 分钟时这个读数已经不是「近 30 分钟位移」，按 fail-closed
+    # 标缺并附上实际跨度；30 < 跨度 ≤ 45 时保留读数，但 additive 字段
+    # ``window_span_minutes`` 如实带出，消费端必须据此标注「含断档」。
+    window = session_bars[-DISPLACEMENT_WINDOW_BARS:]
+    window_span_minutes = (
+        int(
+            (window[-1]["start_et"] - window[0]["start_et"]).total_seconds()
+            // 60
+        )
+        + BURST_BAR_MINUTES
+    )
+    if window_span_minutes > DISPLACEMENT_MAX_WINDOW_SPAN_MINUTES:
+        return unavailable_recent_displacement(
+            "window_bars_not_contiguous_span_"
+            f"{window_span_minutes}m_exceeds_"
+            f"{DISPLACEMENT_MAX_WINDOW_SPAN_MINUTES}m",
+            bar_count=bar_count,
+            window_span_minutes=window_span_minutes,
+        )
+
     prior_session_count = 0
     atr_unit = _finite(atr14)
     if atr_unit is not None and atr_unit > 0:
@@ -1145,7 +1191,6 @@ def compute_recent_displacement(
             bar_count=bar_count,
         )
 
-    window = session_bars[-DISPLACEMENT_WINDOW_BARS:]
     reference = window[0]["open"]
     window_high = max(bar["high"] for bar in window)
     window_low = min(bar["low"] for bar in window)
@@ -1163,5 +1208,7 @@ def compute_recent_displacement(
         "atr_prior_session_count": prior_session_count or None,
         "survival_line_atr": DISPLACEMENT_SURVIVAL_LINE_ATR,
         "bar_count": bar_count,
+        # 断档诚实化（additive）：窗口实际跨度；== window_minutes 即无断档。
+        "window_span_minutes": window_span_minutes,
         "unavailable_reason": None,
     }

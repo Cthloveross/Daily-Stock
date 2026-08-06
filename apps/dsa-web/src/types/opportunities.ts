@@ -982,6 +982,13 @@ export interface IntradayRecentDisplacement {
   atrPriorSessionCount?: number | null;
   survivalLineAtr: number;
   barCount: number;
+  /**
+   * 断档诚实化（additive）：窗口实际跨度（末根开始 + 5 分钟 − 首根开始）。
+   * == windowMinutes 即无断档；> windowMinutes 表示 6 根 K 线含断档
+   * （停牌/缺 K 线），消费端须标注「含断档，跨 X 分钟」；超过 45 分钟时
+   * 服务端已把整个读数标缺。旧载荷可省略。
+   */
+  windowSpanMinutes?: number | null;
   unavailableReason: string | null;
 }
 

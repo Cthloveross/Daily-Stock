@@ -187,6 +187,9 @@ export const RulesPage: React.FC = () => {
   const [playbook, setPlaybook] = useState<PlaybookListResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<ParsedApiError | null>(null);
+  // 最近一次成功读取的本机时刻：刷新失败仍显示旧表时，页面必须说明
+  // 「显示的是上次成功读取的数据」——旧数据不加标注就是冒充新数据。
+  const [lastLoadedAt, setLastLoadedAt] = useState<Date | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -198,6 +201,7 @@ export const RulesPage: React.FC = () => {
       ]);
       setEvidence(evidenceResult);
       setPlaybook(playbookResult);
+      setLastLoadedAt(new Date());
     } catch (e) {
       setError(parseApiError(e));
     } finally {
@@ -261,6 +265,20 @@ export const RulesPage: React.FC = () => {
       {error && (
         <p className="text-body-sm text-down-strong" role="alert">
           {error.message}
+        </p>
+      )}
+
+      {/* 刷新失败但仍有旧表：显式声明数据的 as-of，绝不让旧表冒充新读取。 */}
+      {error && evidence && (
+        <p className="text-caption text-text-3" role="status">
+          显示的是上次成功读取（
+          {lastLoadedAt
+            ? lastLoadedAt.toLocaleTimeString('en-GB', {
+              hour: '2-digit',
+              minute: '2-digit',
+            })
+            : '时点未记录'}
+          ）的数据，本次刷新未成功。
         </p>
       )}
 
@@ -592,7 +610,8 @@ export const RulesPage: React.FC = () => {
               排除计数：干净口径起点前 {evidence.excludedBeforeCleanBasis} · 汇总/不可判定口径{' '}
               {evidence.excludedAggregateOrUnknownBasis} · 缺开仓现金流{' '}
               {evidence.excludedMissingPremium} · 未平仓或缺净盈亏{' '}
-              {evidence.excludedNotClosedOrMissingPnl}
+              {evidence.excludedNotClosedOrMissingPnl} · 缺 total_fee（不入毛口径/费率）{' '}
+              {evidence.feeUnknownCount ?? 0}
             </p>
           </Section>
         </>

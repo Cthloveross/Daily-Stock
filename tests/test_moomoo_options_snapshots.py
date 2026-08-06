@@ -10,6 +10,16 @@ import pandas as pd
 import pytest
 
 from data_provider import moomoo_options
+from src.services.moomoo_runtime import MOOMOO_RPC_BREAKER
+
+
+@pytest.fixture(autouse=True)
+def _reset_moomoo_breaker():
+    """共享断路器状态不得跨用例泄漏（含用桩故意制造的失败）。"""
+
+    MOOMOO_RPC_BREAKER.reset_for_tests()
+    yield
+    MOOMOO_RPC_BREAKER.reset_for_tests()
 
 
 class _QuoteContext:
@@ -108,7 +118,7 @@ def _prepare_wall_context(monkeypatch, ctx, *, spot: float = 181.0):
     monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
 
     @contextmanager
-    def lease_test_context():
+    def lease_test_context(*_args, **_kwargs):
         yield ctx, moomoo_options._ctx_lock
 
     monkeypatch.setattr(
@@ -969,7 +979,7 @@ def test_expiry_availability_reads_only_expiration_metadata(monkeypatch):
     monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
 
     @contextmanager
-    def lease_test_context():
+    def lease_test_context(*_args, **_kwargs):
         yield ctx, moomoo_options._ctx_lock
 
     monkeypatch.setattr(moomoo_options, "_lease_wall_context", lease_test_context)
@@ -1003,7 +1013,7 @@ def test_expiry_availability_zero_dte_is_reported_for_same_day_expiry(monkeypatc
     monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
 
     @contextmanager
-    def lease_test_context():
+    def lease_test_context(*_args, **_kwargs):
         yield ctx, moomoo_options._ctx_lock
 
     monkeypatch.setattr(moomoo_options, "_lease_wall_context", lease_test_context)
@@ -1024,7 +1034,7 @@ def test_expiry_availability_empty_window_is_honest_empty_not_none(monkeypatch):
     monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
 
     @contextmanager
-    def lease_test_context():
+    def lease_test_context(*_args, **_kwargs):
         yield ctx, moomoo_options._ctx_lock
 
     monkeypatch.setattr(moomoo_options, "_lease_wall_context", lease_test_context)
@@ -1047,7 +1057,7 @@ def test_expiry_availability_fails_closed_on_metadata_error(monkeypatch):
     monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
 
     @contextmanager
-    def lease_test_context():
+    def lease_test_context(*_args, **_kwargs):
         yield ctx, moomoo_options._ctx_lock
 
     monkeypatch.setattr(moomoo_options, "_lease_wall_context", lease_test_context)
@@ -1070,3 +1080,160 @@ def test_expiry_availability_validates_bounds_and_enablement(monkeypatch):
         moomoo_options.fetch_expiry_availability_moomoo("MU", max_dte=8)
     with pytest.raises(ValueError):
         moomoo_options.fetch_expiry_availability_moomoo("MU", max_dte=-1)
+
+
+# --- Tier-1 批量快照的未知代码恢复（一个坏代码不再拖垮整批）-----------------
+
+
+class _UnknownCodeContext:
+    """Reject any batch containing a bad code; name it only when asked to."""
+
+    def __init__(self, frame: pd.DataFrame, bad_codes: set[str], *, name_codes: bool):
+        self.frame = frame
+        self.bad_codes = bad_codes
+        self.name_codes = name_codes
+        self.calls: list[list[str]] = []
+
+    def get_market_snapshot(self, codes):
+        requested = list(codes)
+        self.calls.append(requested)
+        bad = [code for code in requested if code in self.bad_codes]
+        if bad:
+            if self.name_codes:
+                return 1, f"ret != RET_OK. Unknown stock: {','.join(bad)}"
+            return 1, "ret != RET_OK. Unknown stock"
+        return 0, self.frame[self.frame["code"].isin(requested)]
+
+
+def _session_frame(*symbols: str) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "code": f"US.{symbol}",
+                "last_price": 100.0 + index,
+                "prev_close_price": 99.0 + index,
+            }
+            for index, symbol in enumerate(symbols)
+        ]
+    )
+
+
+def test_session_snapshot_filters_named_unknown_code_and_keeps_valid(monkeypatch):
+    """错误详情点名未知代码：过滤后一次重试，有效代码全部照常返回。
+
+    2026-08 LIVE 复现：清单里 1 个 'Unknown stock' 让整批 69 个代码全部
+    失败——修复后未知代码只影响它自己。
+    """
+
+    _install_fake_moomoo(monkeypatch)
+    ctx = _UnknownCodeContext(
+        _session_frame("NVDA", "MU"), {"US.BADX"}, name_codes=True
+    )
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+    monkeypatch.setattr(moomoo_options, "_get_ctx", lambda: ctx)
+
+    result = moomoo_options.fetch_underlying_session_quotes_moomoo(
+        ["NVDA", "BADX", "MU"]
+    )
+
+    assert set(result) == {"NVDA", "MU"}
+    # 1 次原始调用 + 1 次过滤重试（≤3 次额外调用的硬顶之内）。
+    assert ctx.calls == [
+        ["US.NVDA", "US.BADX", "US.MU"],
+        ["US.NVDA", "US.MU"],
+    ]
+    # 业务型拒绝不得触发断路器。
+    assert MOOMOO_RPC_BREAKER.is_open() is False
+
+
+def test_session_snapshot_binary_splits_unnamed_unknown_code(monkeypatch):
+    """错误详情不点名代码：二分重试，额外调用有界（≤3），有效代码尽量解析。"""
+
+    _install_fake_moomoo(monkeypatch)
+    ctx = _UnknownCodeContext(
+        _session_frame("AAA", "BBB", "DDD"), {"US.CCC"}, name_codes=False
+    )
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+    monkeypatch.setattr(moomoo_options, "_get_ctx", lambda: ctx)
+
+    result = moomoo_options.fetch_underlying_session_quotes_moomoo(
+        ["AAA", "BBB", "CCC", "DDD"]
+    )
+
+    # 前半批 [AAA, BBB] 解析成功；坏代码所在的后半批在预算内继续二分，
+    # 预算耗尽的代码如实缺席（端点按 snapshot_unresolved 披露），绝不整批失败。
+    assert {"AAA", "BBB"} <= set(result)
+    assert "CCC" not in result
+    # 1 次原始调用 + 至多 3 次额外调用。
+    assert len(ctx.calls) <= 4
+    assert MOOMOO_RPC_BREAKER.is_open() is False
+
+
+def test_session_snapshot_transport_failure_still_fails_closed(monkeypatch):
+    """非未知代码型失败：整批 fail closed 返回空 mapping（既有语义不变）。"""
+
+    _install_fake_moomoo(monkeypatch)
+
+    class _TransportFail:
+        def __init__(self):
+            self.calls = 0
+
+        def get_market_snapshot(self, codes):
+            self.calls += 1
+            return 1, "request timeout"
+
+    ctx = _TransportFail()
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+    monkeypatch.setattr(moomoo_options, "_get_ctx", lambda: ctx)
+
+    assert moomoo_options.fetch_underlying_session_quotes_moomoo(["NVDA"]) == {}
+    assert ctx.calls == 1  # 传输失败不做未知代码恢复重试
+
+
+def test_session_snapshot_fails_fast_while_breaker_is_open(monkeypatch):
+    """断路器打开：不再触碰 ctx，直接返回空 mapping（调用方 fail closed）。"""
+
+    _install_fake_moomoo(monkeypatch)
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+    monkeypatch.setattr(
+        moomoo_options,
+        "_get_ctx",
+        lambda: pytest.fail("open breaker must not reach the quote context"),
+    )
+    for _ in range(3):
+        MOOMOO_RPC_BREAKER.record_failure("request timeout")
+
+    assert moomoo_options.fetch_underlying_session_quotes_moomoo(["NVDA"]) == {}
+
+
+def test_expiry_availability_short_wait_raises_busy_instead_of_failure(
+    monkeypatch,
+):
+    """lane 正忙 + 有界短等待：抛 MoomooWallLaneBusyError（推迟），不是 None（失败）。"""
+
+    _install_fake_moomoo(monkeypatch)
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+    waits: list[float] = []
+
+    def busy_claim(wait_seconds=None):
+        waits.append(wait_seconds)
+        return None
+
+    monkeypatch.setattr(
+        moomoo_options, "_claim_wall_context_lane", busy_claim
+    )
+
+    with pytest.raises(moomoo_options.MoomooWallLaneBusyError):
+        moomoo_options.fetch_expiry_availability_moomoo(
+            "NVDA", max_dte=7, ref_date=date(2026, 8, 4), lane_wait_seconds=2.5
+        )
+    assert waits == [2.5]
+
+    # 未传短等待（默认路径）：保持既有 fail-closed None 语义。
+    assert (
+        moomoo_options.fetch_expiry_availability_moomoo(
+            "NVDA", max_dte=7, ref_date=date(2026, 8, 4)
+        )
+        is None
+    )
+    assert waits == [2.5, None]

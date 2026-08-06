@@ -11,9 +11,10 @@
 * **幂等**：``(market_date_et, ticker)`` 一个槽位。重复调用第一次写入生效，
   之后返回 ``duplicate=True`` 且**不**覆盖——表本身也由 deny trigger 拒绝
   UPDATE/DELETE，两道防线。
-* **fail closed**：``state`` 不是 ``ready``/``partial``、或 spot 不可用时
-  **什么都不写**（``skipped`` + 原因），绝不以 0 冒充一次观测。部分覆盖如实
-  写入并带上它自己的 ``coverage_percent``。
+* **fail closed**：``state`` 不是 ``ready``/``partial``、spot 不可用、或
+  ``coverage.coverage_percent`` 缺席时**什么都不写**（``skipped`` + 原因），
+  绝不以 0 冒充一次观测。部分覆盖（有真实覆盖率读数）如实写入并带上它
+  自己的 ``coverage_percent``。
 """
 from __future__ import annotations
 
@@ -139,24 +140,31 @@ def _parse_fetched_at(value: Any) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def _project(item: Mapping[str, Any]) -> Optional[dict[str, Any]]:
-    """Project one wall payload item into row values, or ``None`` to skip.
+def _project(
+    item: Mapping[str, Any],
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Project one wall payload item into ``(row values, skip reason)``.
 
-    Returning ``None`` is the fail-closed path: a failed, disabled, or
-    spot-less read records nothing at all rather than a row of zeros.
+    ``(None, reason)`` is the fail-closed path: a failed, disabled,
+    spot-less, or coverage-less read records nothing at all rather than a
+    row of zeros — the table is append-only, so a zero-filled row could
+    never be corrected later.
     """
 
     state = str(item.get("state") or "").strip()
     if state not in _RECORDABLE_STATES:
-        return None
+        return None, (
+            f"该标的本次未取得可用墙位观测（state={state or 'unknown'}），"
+            "按 fail-closed 不写入任何行"
+        )
     spot = _finite(item.get("spot"))
     if spot is None or spot <= 0:
-        return None
+        return None, "该次响应缺可用 spot，按 fail-closed 不写入任何行"
 
     totals = item.get("totals")
     ratios = item.get("ratios")
     if not isinstance(totals, Mapping) or not isinstance(ratios, Mapping):
-        return None
+        return None, "该次响应缺 totals/ratios 区块，按 fail-closed 不写入任何行"
 
     def _total(key: str) -> Optional[float]:
         value = _finite(totals.get(key))
@@ -167,7 +175,7 @@ def _project(item: Mapping[str, Any]) -> Optional[dict[str, Any]]:
     call_volume = _total("call_volume")
     put_volume = _total("put_volume")
     if None in (call_oi, put_oi, call_volume, put_volume):
-        return None
+        return None, "该次响应 OI/量合计不完整，按 fail-closed 不写入任何行"
 
     def _ratio(key: str) -> tuple[Optional[float], Optional[str]]:
         block = ratios.get(key)
@@ -199,9 +207,15 @@ def _project(item: Mapping[str, Any]) -> Optional[dict[str, Any]]:
         if isinstance(coverage, Mapping)
         else None
     )
-    # 部分覆盖如实记录；覆盖率不可得时按 0 记并保持 state 可见，
-    # 但绝不因此把「没读到」写成「读到了 0 张合约」——那由 state/spot 守住。
-    coverage_percent = max(0.0, min(100.0, coverage_percent or 0.0))
+    # 覆盖率缺席 ≠ 覆盖率 0：这张表 append-only、写错无法更正，缺
+    # coverage.coverage_percent 时整行拒写（fail closed），绝不 0 回填成
+    # 「读到了 0% 覆盖」这样一条假观测。部分覆盖（有读数）仍如实记录。
+    if coverage_percent is None:
+        return None, (
+            "该次响应缺 coverage.coverage_percent：不可变快照拒绝以 0 冒充"
+            "覆盖率，按 fail-closed 不写入任何行"
+        )
+    coverage_percent = max(0.0, min(100.0, coverage_percent))
 
     return {
         "spot": spot,
@@ -228,7 +242,7 @@ def _project(item: Mapping[str, Any]) -> Optional[dict[str, Any]]:
             else None
         ),
         "fetched_at": _parse_fetched_at(item.get("fetched_at")),
-    }
+    }, None
 
 
 def record_wall_snapshots(
@@ -288,7 +302,7 @@ def record_wall_snapshots(
     with db.session_scope() as session:
         for ticker, item in selected:
             state = str(item.get("state") or "unknown")
-            values = _project(item)
+            values, skip_reason = _project(item)
             if values is None:
                 results.append(
                     SnapshotWriteResult(
@@ -298,8 +312,9 @@ def record_wall_snapshots(
                         written=False,
                         duplicate=False,
                         reason=(
-                            "该标的本次未取得可用墙位观测（state="
-                            f"{state}），按 fail-closed 不写入任何行"
+                            skip_reason
+                            or "该标的本次未取得可用墙位观测，"
+                            "按 fail-closed 不写入任何行"
                         ),
                     )
                 )

@@ -346,7 +346,8 @@ class TestRunAssembly:
         assert run["schema_version"] == "intraday-top/1.0"
         assert run["signal_version"] == INTRADAY_TOP_SIGNAL_VERSION
         assert run["signal_version"] == "intraday_session_evidence_v8"
-        # 盘中（current_session scope）＝爆发分优先；休市退回证据计数。
+        # 盘中（current_session scope）＝爆发分优先；休市＝最近交易时段的
+        # 最强波段分（缺波段读数的行退回证据计数序）。
         assert run["ranking_method"] == RANKING_METHOD_BURST_FIRST
         assert self._run(session_state="closed")["ranking_method"] == (
             RANKING_METHOD_BURST_FIRST
@@ -358,6 +359,13 @@ class TestRunAssembly:
         assert any("波段爆发" in text for text in run["limitations"])
         # v3 设计规则随响应携带：系统标注，用户过滤。
         assert any("系统标注，用户过滤" in text for text in run["limitations"])
+        # 休市排序口径文案与实际实现一致（v2 起按最近时段最强波段分），
+        # 不得再声称「休市退回证据计数排序」。
+        assert not any("休市退回证据计数排序" in text for text in run["limitations"])
+        assert any(
+            "休市按最近交易时段的最强波段分排序" in text
+            for text in run["limitations"]
+        )
 
     def test_run_session_phase_from_as_of_clock(self):
         # _AS_OF = 2026-07-28（周二）14:30 UTC = 10:30 ET → prime（主战场）。

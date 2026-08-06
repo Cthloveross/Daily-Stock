@@ -253,4 +253,62 @@ describe('IntradayPlanPanel', () => {
     expect(row.dataset.priceBand).toBe('unknown');
     expect(within(row).getAllByText('标缺').length).toBeGreaterThanOrEqual(3);
   });
+
+  it('renders a per-row quote as-of so bid/ask never masquerade as now', async () => {
+    useIntradayPlanStore.getState().promote('NVDA');
+    vi.mocked(fetchNearExpiryContracts).mockResolvedValue(contractsResponse([
+      contractRow({ code: 'SWEET', bid: 3.9, ask: 4.1, mid: 4, spreadPercent: 5 }),
+      contractRow({ code: 'NOASOF', strike: 105, bid: 1.9, ask: 2.1, mid: 2, spreadPercent: 10, quoteAsOf: null }),
+    ]));
+    renderPanel();
+
+    const sweet = await findContractRow('SWEET');
+    expect(within(sweet).getByText('09:30:00 ET')).toBeInTheDocument();
+    // 缺时点＝标缺，不冒充「现在」。
+    const noAsOf = await findContractRow('NOASOF');
+    expect(within(noAsOf).getAllByText('标缺').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText(/报价以逐行 as-of 时点为准/)).toBeInTheDocument();
+  });
+
+  it('shows both compliant DTE windows when the lane is unknown — never a silent 0DTE default', async () => {
+    useIntradayPlanStore.getState().promote('NVDA');
+    const base = contractsResponse([contractRow({ code: 'ZERO', dte: 0 })], 7);
+    base.item.expiries = [
+      {
+        expiry: '2026-08-05',
+        dte: 0,
+        state: 'ready',
+        contractCount: 1,
+        observedQuoteCount: 1,
+        contracts: [contractRow({ code: 'ZERO', dte: 0 })],
+      },
+      {
+        expiry: '2026-08-07',
+        dte: 2,
+        state: 'ready',
+        contractCount: 1,
+        observedQuoteCount: 1,
+        contracts: [contractRow({ code: 'FORBIDDEN13', dte: 2, expiry: '2026-08-07' })],
+      },
+      {
+        expiry: '2026-08-10',
+        dte: 5,
+        state: 'ready',
+        contractCount: 1,
+        observedQuoteCount: 1,
+        contracts: [contractRow({ code: 'OVERNIGHT', dte: 5, expiry: '2026-08-10' })],
+      },
+    ];
+    vi.mocked(fetchNearExpiryContracts).mockResolvedValue(base);
+    renderPanel({ top: top({ laneAvailability: null }) });
+
+    // 车道未知：请求 0..7 全窗口，而不是默认 0DTE。
+    await waitFor(() =>
+      expect(fetchNearExpiryContracts).toHaveBeenCalledWith('NVDA', 7, { refresh: false }));
+    expect(await screen.findByText(/今日车道未知/)).toBeInTheDocument();
+    // 两个合规窗口都显示；1-3DTE 与车道无关地绝不显示（V2-C①）。
+    await findContractRow('ZERO');
+    await findContractRow('OVERNIGHT');
+    expect(document.querySelector('[data-contract-code="FORBIDDEN13"]')).toBeNull();
+  });
 });

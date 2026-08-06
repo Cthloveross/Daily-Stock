@@ -376,6 +376,32 @@ describe('RulesPage', () => {
     expect(section).toHaveTextContent('单一行情段');
   });
 
+  it('reports the missing-fee exclusion count in the caveats footer', async () => {
+    mocks.fetchRulesEvidence.mockResolvedValue({ ...EVIDENCE, feeUnknownCount: 3 });
+
+    renderPage();
+
+    const section = await screen.findByLabelText('口径与告警');
+    expect(section).toHaveTextContent('缺 total_fee（不入毛口径/费率） 3');
+  });
+
+  it('marks stale tables with the last successful read time when a refresh fails', async () => {
+    renderPage();
+    await screen.findByLabelText('合约价格甜蜜区');
+
+    // 第二次刷新失败：旧表仍在，但必须声明这是上次成功读取的数据。
+    mocks.fetchRulesEvidence.mockRejectedValueOnce(new Error('boom'));
+    fireEvent.click(screen.getByRole('button', { name: '刷新' }));
+
+    expect(
+      await screen.findByText(/显示的是上次成功读取（/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/本次刷新未成功/)).toBeInTheDocument();
+    // 旧表仍然可见（配合上面的 as-of 声明，而不是无声地冒充新数据）。
+    expect(screen.getByLabelText('合约价格甜蜜区')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toBeInTheDocument();
+  });
+
   it('states an unbuilt account instead of rendering empty tables', async () => {
     mocks.fetchRulesEvidence.mockResolvedValue({
       ...EVIDENCE,

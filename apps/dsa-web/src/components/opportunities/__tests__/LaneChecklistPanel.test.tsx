@@ -11,6 +11,11 @@ import type {
 
 const MARKET_DATE = '2026-08-05';
 
+/** 「现在」＝脉搏后 1 分钟：新鲜时点（测试注入，避免真实时钟把脉搏判成过时）。 */
+function freshNow(generatedAt = '2026-08-05T13:30:00Z'): number {
+  return Date.parse(generatedAt) + 60_000;
+}
+
 /** 2026-08-05 13:30Z = 09:30 ET（EDT）。 */
 function pulse(generatedAt = '2026-08-05T13:30:00Z'): IntradayPulseResponse {
   return {
@@ -154,6 +159,7 @@ describe('LaneChecklistPanel', () => {
     render(
       <LaneChecklistPanel
         pulse={pulse()}
+        nowMs={freshNow()}
         top={top([], availability({
           dayType: 'intraday_available',
           zeroDteTickers: ['NVDA'],
@@ -165,11 +171,46 @@ describe('LaneChecklistPanel', () => {
     expect(check('clock')?.getAttribute('aria-label')).toContain('ET 09:30–12:00');
   });
 
+  it('downgrades a stale-pulse clock pass to 标缺 and annotates the corner clock', async () => {
+    // 脉搏 09:30 ET，「现在」已是 20 分钟后：09:30 的「仍在 12:00 前」不可再断言。
+    render(
+      <LaneChecklistPanel
+        pulse={pulse()}
+        nowMs={Date.parse('2026-08-05T13:50:00Z')}
+        top={top([], availability({
+          dayType: 'intraday_available',
+          zeroDteTickers: ['NVDA'],
+        }))}
+      />,
+    );
+    await waitFor(() => expect(check('clock')?.dataset.checkStatus).toBe('missing'));
+    expect(check('clock')?.getAttribute('aria-label')).toContain('已过时');
+    // 角落时钟同样声明这是过时的服务端时点，不冒充「现在」。
+    expect(screen.getByText(/09:30 ET（约 20 分钟前的服务端时点，已过时）/)).toBeInTheDocument();
+  });
+
+  it('keeps the after-cutoff fail even on a stale pulse（单调事实不受过时影响）', async () => {
+    // 脉搏 12:05 ET 且已过时 30 分钟：时间只会前进，「已过 12:00」仍然成立。
+    render(
+      <LaneChecklistPanel
+        pulse={pulse('2026-08-05T16:05:00Z')}
+        nowMs={Date.parse('2026-08-05T16:35:00Z')}
+        top={top([], availability({
+          dayType: 'intraday_available',
+          zeroDteTickers: ['NVDA'],
+        }))}
+      />,
+    );
+    await waitFor(() => expect(check('clock')?.dataset.checkStatus).toBe('fail'));
+    expect(check('clock')?.getAttribute('aria-label')).toContain('V2-C③');
+  });
+
   it('fails the clock row after the 12:00 ET cutoff citing V2-C③', async () => {
     // 2026-08-05 16:05Z = 12:05 ET。
     render(
       <LaneChecklistPanel
         pulse={pulse('2026-08-05T16:05:00Z')}
+        nowMs={freshNow('2026-08-05T16:05:00Z')}
         top={top([], availability({
           dayType: 'intraday_available',
           zeroDteTickers: ['NVDA'],
@@ -187,14 +228,22 @@ describe('LaneChecklistPanel', () => {
     });
     // 15:59Z = 11:59 ET。
     const { unmount } = render(
-      <LaneChecklistPanel pulse={pulse('2026-08-05T15:59:00Z')} top={top([], dayAvailable)} />,
+      <LaneChecklistPanel
+        pulse={pulse('2026-08-05T15:59:00Z')}
+        nowMs={freshNow('2026-08-05T15:59:00Z')}
+        top={top([], dayAvailable)}
+      />,
     );
     await waitFor(() => expect(check('clock')?.dataset.checkStatus).toBe('pass'));
     unmount();
 
     // 16:00Z = 12:00 ET。
     render(
-      <LaneChecklistPanel pulse={pulse('2026-08-05T16:00:00Z')} top={top([], dayAvailable)} />,
+      <LaneChecklistPanel
+        pulse={pulse('2026-08-05T16:00:00Z')}
+        nowMs={freshNow('2026-08-05T16:00:00Z')}
+        top={top([], dayAvailable)}
+      />,
     );
     await waitFor(() => expect(check('clock')?.dataset.checkStatus).toBe('fail'));
   });
@@ -292,6 +341,39 @@ describe('LaneChecklistPanel', () => {
     await waitFor(() => expect(dayTypeLine()?.dataset.dayType).toBe('blacklist_only'));
     expect(dayTypeLine()).toHaveTextContent('今日仅黑名单标的有 0DTE（QQQ）· 日内车道关闭');
     expect(await screen.findByRole('button', { name: /日内 · 今日关闭/ })).toBeDisabled();
+  });
+
+  it('day type: unread non-blacklist tickers block the blacklist_only claim（未读 ≠ 无 0DTE）', async () => {
+    render(
+      <LaneChecklistPanel
+        pulse={pulse()}
+        top={top([], availability({
+          dayType: 'intraday_available',
+          zeroDteTickers: ['QQQ'],
+          deferredTickers: ['MU'],
+          tickers: [
+            {
+              ticker: 'NVDA',
+              state: 'unavailable',
+              hasZeroDte: null,
+              availableDteList: [],
+              expiries: [],
+              unavailableReason: 'option_expiry_metadata_unavailable',
+            },
+          ],
+        }))}
+      />,
+    );
+
+    // NVDA 读不到、MU 本轮未查：不能断言「今日仅黑名单标的有 0DTE」。
+    await waitFor(() => expect(dayTypeLine()?.dataset.dayType).toBe('unknown'));
+    expect(dayTypeLine()).toHaveTextContent('已确证 0DTE 仅见于黑名单标的（QQQ）');
+    expect(dayTypeLine()).toHaveTextContent('2 檔非黑名单标的未读');
+    expect(dayTypeLine()).toHaveTextContent('车道可用性标缺');
+    expect(dayTypeLine()?.getAttribute('aria-label')).toContain('未读 ≠ 无 0DTE');
+    // 未知不关车道，也不触发 blacklist_only 硬阻断——不猜。
+    expect(hardBlock('day_type_blacklist_only')).toBeNull();
+    expect(screen.getByRole('button', { name: '日内' })).not.toBeDisabled();
   });
 
   it('day type: a non-blacklist ticker with 0DTE stays available even alongside QQQ', async () => {

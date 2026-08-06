@@ -107,8 +107,9 @@ MARKET_CONTEXT_TICKER = "SPY"
 _NEW_YORK_TZ = ZoneInfo("America/New_York")
 
 # 盘中（盘前/盘中/盘后，quote_session_scope=current_session）：按当前爆发分
-# 优先排序；休市（closed）：退回 v1 证据计数排序，但仍附带最近一个交易时段
-# 的波段列表（晚间复盘可见「今日走了几波」）。
+# 优先排序；休市（closed）：v2 起按「最近交易时段的最强波段分」排序（复盘视角：
+# 今天谁走出过最强的波），缺波段读数的行退回证据计数序，并仍附带最近一个交易
+# 时段的波段列表（晚间复盘可见「今日走了几波」）。
 RANKING_METHOD_BURST_FIRST = "burst_score_first_then_evidence_count"
 RANKING_METHOD_EVIDENCE_COUNT = "rule_based_evidence_count"
 
@@ -164,7 +165,8 @@ INTRADAY_TOP_LIMITATIONS = (
     "不写入机会快照、qualification 或 5D/20D 结果统计（statistics_track=none_intraday_v1_unscored）。",
     "期权异动为 Moomoo 分类计数：不推断开平仓，不证明真实主动买卖方向。",
     "盘中排序以 15 分钟波段爆发分（推力×量比，v2 启发式阈值按 2026-07-31 标注样本校准）优先，"
-    "证据计数次之；休市退回证据计数排序。两者都不是胜率或预期收益模型，不是买卖信号。",
+    "证据计数次之；休市按最近交易时段的最强波段分排序（缺波段读数的行退回证据计数序）。"
+    "两者都不是胜率或预期收益模型，不是买卖信号。",
     "量能节奏对比 20 个交易日全日中位数，未按盘中时点折算；VWAP 为累计额/量近似。",
     "v3 上下文信号（时段/财报/大盘/速度）只是标注，不参与排序、不隐藏行、不阻断操作：系统标注，用户过滤。",
     "时段提示为用户自身 1,653 笔已平仓交易统计的硬编码 v1 文案（Playbook 候选 R1/R3），不是市场统计或买卖信号；"

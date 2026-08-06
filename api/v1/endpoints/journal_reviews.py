@@ -42,7 +42,6 @@ from api.v1.schemas.journal_reviews import (
     ReviewInsightThresholds,
     ReviewInsightUnreviewed,
     ReviewInsightsResponse,
-    RuleComplianceDailyBudgetModel,
     RuleComplianceLaneStatModel,
     RuleComplianceSliceModel,
     RuleComplianceStatModel,
@@ -56,7 +55,10 @@ from api.v1.schemas.journal_reviews import (
     RulesEvidenceResponse,
     RulesEvidenceWeekdayModel,
 )
-from src.journal.ledger.episode_repository import EpisodeRepositoryError
+from src.journal.ledger.episode_repository import (
+    EpisodeRepositoryError,
+    _latest_build,
+)
 from src.journal.ledger.playbook_repository import (
     PlaybookConflictError,
     PlaybookEpisodeLink,
@@ -71,7 +73,10 @@ from src.journal.ledger.playbook_repository import (
     promote_candidate_to_rule,
     retire_playbook_rule,
 )
-from src.journal.ledger.repository import DEFAULT_LEDGER_ACCOUNT_KEY
+from src.journal.ledger.repository import (
+    DEFAULT_LEDGER_ACCOUNT_KEY,
+    init_ledger_schema,
+)
 from src.journal.personal_edge import (
     PersonalEdgeResult,
     RULE_SET_V2_ADOPTED_AT,
@@ -97,6 +102,7 @@ from src.journal.ledger.review_repository import (
     get_latest_review_annotation,
     list_review_annotation_history,
 )
+from src.storage import get_db
 
 
 router = APIRouter()
@@ -226,10 +232,29 @@ def get_review_insights(
 # In-process TTL cache: episodes are append-only per build, so a short cache
 # is safe; the response keeps computed_at so the as-of moment stays honest.
 _PERSONAL_EDGE_CACHE_TTL_SECONDS = 600.0
-# Key is (account_key, rule-compliance `since`): the forward slice is the only
-# request-controlled input, so it must not share a cache entry with another one.
-_personal_edge_cache: dict[tuple[str, str], tuple[float, PersonalEdgeResponse]] = {}
+# Key is (account_key, rule-compliance `since`, resolved default build id):
+# the forward slice is request-controlled, and the resolved build id makes a
+# build activation bust the cache naturally — without it, activating a new
+# build kept serving the old build's numbers for up to 10 minutes.
+_personal_edge_cache: dict[
+    tuple[str, str, Optional[int]],
+    tuple[float, PersonalEdgeResponse],
+] = {}
 _personal_edge_cache_lock = Lock()
+
+
+def _resolved_default_build_id(account_key: str) -> Optional[int]:
+    """Cheaply resolve the current default episode build id.
+
+    与其余 journal 读数同一解析（已激活 build，缺激活记录回落最新 CSV
+    build）。只发一次轻量 SELECT——把结果并入缓存键后，build 激活会让旧
+    缓存键自然失效，无需任何跨模块失效钩子。
+    """
+    init_ledger_schema()
+    db = get_db()
+    with db.session_scope() as session:
+        build = _latest_build(session, account_key)
+        return int(build.id) if build is not None else None
 
 
 def _reset_personal_edge_cache() -> None:
@@ -240,9 +265,12 @@ def _reset_personal_edge_cache() -> None:
 
 # --- 交易纪律证据页（/rules）: same clean basis, same zero-write contract ----
 _RULES_EVIDENCE_CACHE_TTL_SECONDS = 600.0
-# Key is (account_key, build_id, ticket_usd, daily_breaker_usd, max_concurrent):
-# every request-controlled input changes the arithmetic, so none of them may
-# share a cache entry with another value.
+# Key is (account_key, resolved build_id, ticket_usd, daily_breaker_usd,
+# max_concurrent): every request-controlled input changes the arithmetic, so
+# none of them may share a cache entry with another value.  An omitted
+# ``build_id`` is resolved to the effective default **before** the cache
+# lookup, so activating another build busts the cache instead of serving the
+# old build for up to 10 minutes.
 _rules_evidence_cache: dict[
     tuple[str, Optional[int], int, int, int],
     tuple[float, RulesEvidenceResponse],
@@ -389,9 +417,6 @@ def _personal_edge_response(
             since_adoption=_compliance_slice(
                 result.rule_compliance.since_adoption
             ),
-            daily_budget=RuleComplianceDailyBudgetModel(
-                **asdict(result.rule_compliance.daily_budget)
-            ),
             limitations=list(result.rule_compliance.limitations),
         ),
         month_basis=result.month_basis,
@@ -428,8 +453,14 @@ def get_personal_edge(
     filter, and no order is ever placed; the endogeneity, reconstructed-fill,
     single-regime and fail-closed caveats ship verbatim in ``limitations``.
     """
+    # 便宜地先解析默认 build：激活另一个 build 会改变这个 id，从而天然
+    # 换到新的缓存键——绝不让旧 build 的数字在激活后再被端上来。
+    try:
+        resolved_build_id = _resolved_default_build_id(account_key)
+    except EpisodeRepositoryError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     now = time.monotonic()
-    cache_key = (account_key, since)
+    cache_key = (account_key, since, resolved_build_id)
     with _personal_edge_cache_lock:
         cached = _personal_edge_cache.get(cache_key)
         if cached is not None and now - cached[0] < _PERSONAL_EDGE_CACHE_TTL_SECONDS:
@@ -475,6 +506,7 @@ def _rules_evidence_response(
         excluded_not_closed_or_missing_pnl=(
             result.excluded_not_closed_or_missing_pnl
         ),
+        fee_unknown_count=result.fee_unknown_count,
         first_trading_day=result.first_trading_day,
         last_trading_day=result.last_trading_day,
         banner=result.banner,
@@ -545,8 +577,22 @@ def get_rules_evidence_endpoint(
     参数)`` 缓存 ~10 分钟。纯描述统计——不是建议、不是信号、不参与任何排序或
     下单；单一 regime、样本内拟合与 fail-closed 的告警随 ``limitations`` 原样下发。
     """
+    # 缺省 build_id 先解析成当前默认 build 再查缓存：激活另一个 build 会
+    # 改变解析结果，缓存键随之更换——激活即失效，无需失效钩子。
+    resolved_build_id = build_id
+    if resolved_build_id is None:
+        try:
+            resolved_build_id = _resolved_default_build_id(account_key)
+        except EpisodeRepositoryError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
     now = time.monotonic()
-    cache_key = (account_key, build_id, ticket_usd, daily_breaker_usd, max_concurrent)
+    cache_key = (
+        account_key,
+        resolved_build_id,
+        ticket_usd,
+        daily_breaker_usd,
+        max_concurrent,
+    )
     with _rules_evidence_cache_lock:
         cached = _rules_evidence_cache.get(cache_key)
         if cached is not None and now - cached[0] < _RULES_EVIDENCE_CACHE_TTL_SECONDS:

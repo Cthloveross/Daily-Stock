@@ -15,20 +15,31 @@ import {
 import { Tooltip } from '../common/Tooltip';
 import { LANE_SAMPLE_CAVEAT } from './LaneChecklistPanel';
 import { SPREAD_ILLIQUID_THRESHOLD_PERCENT } from './NearExpiryContractPanel';
+import { quoteTimeLabel } from './intradayFormat';
 import {
   DEFAULT_STANDARD_SIZE_USD,
   ROUND_TURN_FEE_PER_CONTRACT_USD,
   classifyContractPrice,
   computeContractSizing,
 } from './intradayContractSizing';
-import { evaluatePlanTicker, type PlanCheckRow } from './intradayPlanChecks';
-import type { CheckStatus } from './laneChecklist';
+import {
+  evaluatePlanTicker,
+  type PlanCheckRow,
+  type PlanTickerView,
+} from './intradayPlanChecks';
+import {
+  OVERNIGHT_MAX_DTE,
+  OVERNIGHT_MIN_DTE,
+  type CheckStatus,
+} from './laneChecklist';
 
 const STATUS_TEXT: Record<CheckStatus, string> = {
   pass: '符合',
   fail: '不符合',
   missing: '标缺',
   requirement: '要求',
+  // 纯描述读数：达线/未达线不是判定（v8 循环性更正，见 laneChecklist）。
+  neutral: '读数',
 };
 
 const STATUS_MARK: Record<CheckStatus, string> = {
@@ -36,6 +47,7 @@ const STATUS_MARK: Record<CheckStatus, string> = {
   fail: '✕',
   missing: '—',
   requirement: '▸',
+  neutral: '·',
 };
 
 const STATUS_CLASS: Record<CheckStatus, string> = {
@@ -43,6 +55,7 @@ const STATUS_CLASS: Record<CheckStatus, string> = {
   fail: 'text-warn-strong',
   missing: 'text-text-3',
   requirement: 'text-text-2',
+  neutral: 'text-text-2',
 };
 
 /** 面板唯一的定位行（用户明确要求：不要满屏「只读/不下单」样板话）。 */
@@ -105,12 +118,14 @@ function PlanContracts({
   ticker,
   minDte,
   maxDte,
+  windowMode,
   dteLabel,
   standardSizeUsd,
 }: {
   ticker: string;
   minDte: number;
   maxDte: number;
+  windowMode: PlanTickerView['contractWindowMode'];
   dteLabel: string;
   standardSizeUsd: number;
 }) {
@@ -135,7 +150,14 @@ function PlanContracts({
     void load(false);
   }, [load]);
 
-  const groups = (item?.expiries ?? []).filter((group) => group.dte >= minDte);
+  // 车道未知时同时显示两个合规窗口（0DTE 与 4-7DTE），1-3DTE 与车道无关地
+  // 绝不显示（V2-C①）——「车道读不到」绝不静默降级成「默认日内」。
+  const groups = (item?.expiries ?? []).filter((group) => (
+    windowMode === 'unknown'
+      ? group.dte === 0
+        || (group.dte >= OVERNIGHT_MIN_DTE && group.dte <= OVERNIGHT_MAX_DTE)
+      : group.dte >= minDte
+  ));
 
   return (
     <div className="mt-2 rounded-ds-sm border border-subtle bg-bg-0 p-2">
@@ -183,14 +205,16 @@ function PlanContracts({
         <p className="mt-1 text-caption text-text-3">{item.message}</p>
       ) : groups.length === 0 ? (
         <p className="mt-1 text-caption text-text-3">
-          {minDte > 0
-            ? `链内 0–${maxDte}DTE 中没有 ${minDte}DTE 及以上的到期日（今日车道要求 ${dteLabel}）。`
-            : '链内没有符合今日车道的到期日。'}
+          {windowMode === 'unknown'
+            ? `链内 0–${maxDte}DTE 中没有 0DTE 或 ${OVERNIGHT_MIN_DTE}-${OVERNIGHT_MAX_DTE}DTE 的到期日（今日车道未知，仅显示这两个合规窗口）。`
+            : minDte > 0
+              ? `链内 0–${maxDte}DTE 中没有 ${minDte}DTE 及以上的到期日（今日车道要求 ${dteLabel}）。`
+              : '链内没有符合今日车道的到期日。'}
         </p>
       ) : (
         <div className="mt-1.5 overflow-x-auto">
           <table
-            className="w-full min-w-[720px] border-collapse"
+            className="w-full min-w-[780px] border-collapse"
             aria-label={`${ticker} 合约候选表`}
           >
             <thead>
@@ -203,6 +227,7 @@ function PlanContracts({
                 <th className="px-2 py-1 text-right font-medium">可买张数</th>
                 <th className="px-2 py-1 text-right font-medium">手续费估算</th>
                 <th className="px-2 py-1 text-right font-medium">费/本金%</th>
+                <th className="px-2 py-1 text-right font-medium">as-of</th>
               </tr>
             </thead>
             <tbody>
@@ -272,6 +297,10 @@ function PlanContracts({
                         ? '标缺'
                         : `${sizing.feePercentOfPremium.toFixed(2)}%`}
                     </td>
+                    {/* 报价时点：bid/ask/点差是这一刻的观测，不是「现在」。 */}
+                    <td className="px-2 py-1 text-right text-caption text-text-3">
+                      {quoteTimeLabel(row.quoteAsOf)}
+                    </td>
                   </tr>
                 );
               }))}
@@ -284,6 +313,8 @@ function PlanContracts({
         可买张数 = ⌊标准仓位 ÷ (参考价×100)⌋ · 手续费估算 = 张数 × {formatUsd(ROUND_TURN_FEE_PER_CONTRACT_USD)}
         （你实测的每张往返，区间 $3.29–3.31）· 费/本金% 的本金＝张数×参考价×100，与历史「费用占权利金」同口径
         · 点差 &gt;{SPREAD_ILLIQUID_THRESHOLD_PERCENT}% 标「流动性差」
+        · 报价以逐行 as-of 时点为准（缺时点＝标缺），不代表此刻盘口
+        {item?.fetchedAt ? ` · 本次读取 ${quoteTimeLabel(item.fetchedAt)}` : ''}
       </p>
     </div>
   );
@@ -449,6 +480,7 @@ export function IntradayPlanPanel({
                 ticker={view.ticker}
                 minDte={view.contractMinDte}
                 maxDte={view.contractMaxDte}
+                windowMode={view.contractWindowMode}
                 dteLabel={view.contractDteLabel}
                 standardSizeUsd={standardSizeUsd}
               />

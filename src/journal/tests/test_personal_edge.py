@@ -23,11 +23,9 @@ from src.journal.personal_edge import (
     DISCIPLINE_BODY_MIN_EPISODE_COUNT,
     DISCIPLINE_EXCLUDE_TOP_N,
     FILL_DETAILED_GOVERNS,
-    INTRADAY_LANE_DAILY_TICKET_LIMIT,
     INTRADAY_LANE_DTE,
     INTRADAY_LANE_ET_CUTOFF_HOUR,
     MONTH_BASIS_UTC_MINUS_4,
-    OVERNIGHT_LANE_CONCURRENT_LIMIT,
     OVERNIGHT_LANE_MAX_DTE,
     OVERNIGHT_LANE_MIN_DTE,
     OVERNIGHT_LANE_WEAK_ENTRY_ET_HOURS,
@@ -1223,52 +1221,14 @@ def test_rule_compliance_since_rejects_a_non_date_cutoff():
         get_personal_edge_stats(rule_compliance_since="not-a-date")
 
 
-def test_rule_compliance_daily_budget_counts_from_the_build_last_day():
-    """V2-D 额度读数带明确 as-of 交易日；午后 0DTE 同样占用当日额度。"""
-    _seed_build(
-        [
-            # 最后一个交易日（ET 2026-05-11）：3 笔 0DTE，其中 1 笔为午后违规单。
-            _compliance_spec(_may(11), "10", dte=0),
-            _compliance_spec(_may(11), "10", dte=0),
-            _compliance_spec(_may(11, 17), "10", dte=0),
-            # 更早的一天不进入当日额度。
-            _compliance_spec(_may(8), "10", dte=0),
-            # 仍未平仓的 4-7DTE＝当前过夜持仓。
-            {
-                "underlying": "AAA",
-                "opened_at": _may(11),
-                "lifecycle_status": "open",
-                "realized_pnl_net": None,
-                "dte_at_entry": 5,
-            },
-            # 未平仓但 DTE 不在 4-7：不计入过夜持仓。
-            {
-                "underlying": "AAA",
-                "opened_at": _may(11),
-                "lifecycle_status": "open",
-                "realized_pnl_net": None,
-                "dte_at_entry": 30,
-            },
-            # 未平仓且缺 DTE：单独计缺席，绝不悄悄算作 0。
-            {
-                "underlying": "AAA",
-                "opened_at": _may(11),
-                "lifecycle_status": "open",
-                "realized_pnl_net": None,
-                "dte_at_entry": None,
-            },
-        ]
-    )
+def test_rule_compliance_daily_budget_block_is_removed():
+    """daily_budget（V2-D 额度读数）已移除：Journal 永远不含「今天」，该读数
+    的 as-of 恒落在过去、恒为过期；当日额度由前端手动计数承载。这里断言
+    结果结构上不再存在该字段，防止它被无消费方地悄悄加回来。"""
+    _seed_build([_compliance_spec(_may(11), "10", dte=0)])
     result = get_personal_edge_stats()
     assert result is not None
-    budget = result.rule_compliance.daily_budget
-    assert budget.as_of_trading_day == "2026-05-11"
-    assert budget.intraday_ticket_count == 3
-    assert budget.intraday_ticket_limit == INTRADAY_LANE_DAILY_TICKET_LIMIT == 6
-    assert budget.intraday_reason is None
-    assert budget.overnight_open_count == 1
-    assert budget.overnight_concurrent_limit == OVERNIGHT_LANE_CONCURRENT_LIMIT == 3
-    assert budget.overnight_unknown_dte_open_count == 1
+    assert not hasattr(result.rule_compliance, "daily_budget")
 
 
 def test_rule_compliance_constants_match_the_adopted_rule_set():
@@ -1279,8 +1239,6 @@ def test_rule_compliance_constants_match_the_adopted_rule_set():
     assert INTRADAY_LANE_ET_CUTOFF_HOUR == 12
     assert (OVERNIGHT_LANE_MIN_DTE, OVERNIGHT_LANE_MAX_DTE) == (4, 7)
     assert OVERNIGHT_LANE_WEAK_ENTRY_ET_HOURS == (11, 13)
-    assert INTRADAY_LANE_DAILY_TICKET_LIMIT == 6
-    assert OVERNIGHT_LANE_CONCURRENT_LIMIT == 3
     # 单一 regime / n=65 / 跳空风险 / 非建议：四条边界必须原文在场。
     joined = "".join(RULE_COMPLIANCE_LIMITATIONS)
     assert "n=65" in joined

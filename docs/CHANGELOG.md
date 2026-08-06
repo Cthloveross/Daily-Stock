@@ -312,47 +312,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] data-health（journal refresh status）对激活的 fence build 按其冻结目标事实集对齐：目标集即最新 canonical set 时不再要求重复 activate 最新 canonical build，其余水位与阶段判定不变；激活响应消息按 build 来源标注 canonical / snapshot-fence future。
 - [改进] Web「仓位复盘」显式查看 canonical / snapshot-fence build 时新增独立「设为默认复盘构建」卡片：按目标 build 实际口径强制 assumed-flat / 组费 / left-censored 勾选，确认区明示「激活后默认视图切换，可再激活其他构建切回，但无法回到零激活的 CSV 默认状态」；future build 写入成功提示同步改为「激活前默认复盘视图不变，需显式打开该构建后单独激活」。
 - [测试] 新增 fence build 激活回归：happy path 默认读取切换与幂等重放、缺 left-censored 确认零写拒绝、陈旧 CAS 拒绝、fence link 指纹篡改在激活与默认读取双向 fail closed、激活前 CSV fallback 不变、data-health 三阶段对齐；API 补新 flag 透传与 409 映射；前端补两处激活卡片的勾选门禁、请求载荷与文案回归。
-
-### 发布亮点
-
-- 📊 **回测页新增"次日验证"视图** — 可按股票与日期范围查看 AI 预测 vs 次日实际涨跌，复用历史分析与 1 日回测结果，快速验证分析准确率。
-- 🔧 **LLM 接入体验简化** — 用户侧文案统一收口为"主模型 / 备选模型 / 模型渠道"，不再把 LiteLLM 当作普通用户必学概念，现有配置键保持兼容。
-- 🐳 **Docker / WebUI 运行时稳态补强** — 修复系统设置保存后配置不生效、启动早期日志缺失、预构建静态资源复用等问题，降低容器化部署的运维摩擦。
-- 🔒 **安全与并发稳定性同步增强** — Discord 入站 Webhook 补齐 Ed25519 验签，修复并发执行时共享状态未加锁、单股推送模式通知并发复用等问题。
-- 🖥️ **桌面端与定时任务细节打磨** — Windows 安装器支持自选安装目录，内置定时调度器感知运行中 SCHEDULE_TIME 变更，断点续传改按市场时区判断。
-
-### 新功能
-
-- 📊 **回测页新增"次日验证 / 1 日窗口"视图** — 可按股票代码与分析日期范围查看 AI 预测、次日实际涨跌及筛选区间准确率，复用历史分析与 1 日回测结果实现。
-- 🏷️ **Web 设置页新增版本信息卡片** — `apps/dsa-web` 现在会在构建时注入前端包版本与构建时间，系统设置页新增只读"版本信息"区块，展示 `WebUI 版本 / 构建标识 / 构建时间`；当 `package.json` 仍为占位版本 `0.0.0` 时，会自动回退为构建标识，方便 Docker 重建后快速确认当前静态资源是否已经生效。
-- 🪟 **Windows 桌面安装器支持自选安装目录** — 安装器改为支持在安装向导中自定义安装目录，安装到非默认盘符后仍沿用现有打包态目录逻辑在安装目录旁读写 `.env`、`data/stock_analysis.db` 和 `logs/desktop.log`，同时保留 `win-unpacked` 免安装分发方式。安装器仅支持当前用户安装、已禁用管理员提权（`allowElevation: false`），并通过 NSIS `.onVerifyInstDir` 阻止选择系统保护目录。
-
-### 改进
-
-- 🔎 **SerpAPI 正文补抓范围收敛** — 自然搜索结果不再逐条同步抓取网页正文；现在仅对极少数高位且摘要明显不足的结果，在更短超时预算内做延迟补抓，并优先复用 SerpAPI 已返回的结构化摘要，降低搜索链路尾延迟与慢站点放大风险。
-- 🤖 **LLM 接入体验简化** — 面向用户的 AI 模型接入文案已统一收口为"主模型 / Agent 主模型 / 备选模型 / 模型渠道 / 高级模型路由配置"；Web 设置页、配置元数据、校验提示与中英文文档不再把 LiteLLM 当作普通用户默认必学概念，现有 `LITELLM_*` / `LLM_CHANNELS` 配置键仍保持兼容。
-
-### 修复
-
-- 🚀 **启动早期失败时暴露真实根因** — `python main.py` 现在通过 stderr 暴露真实根因，bootstrap 阶段不再向硬编码 `logs/` 目录写入文件日志，文件日志推迟到 `config.log_dir` 可用后创建，避免健康启动在非预期路径残留日志文件。
-- 🐳 **Docker WebUI 运行时优先复用预构建静态资源** — `prepare_webui_frontend_assets()` 现在会先检查镜像内已有的 `static/index.html` 是否可直接复用；当容器运行时不包含 `apps/dsa-web` 源码目录且未安装 `npm` 时，也不会误报"未找到前端项目，无法自动构建"，从而恢复 Docker 部署后的 WebUI 打开能力。
-- 🐳 **Docker WebUI 系统设置保存后配置生效** — Docker 场景下 WebUI 保存 `STOCK_LIST`、`SCHEDULE_ENABLED`、`SCHEDULE_TIME`、`SCHEDULE_RUN_IMMEDIATELY`、`RUN_IMMEDIATELY` 后，`Config` 会优先读取持久化 `.env` 中的新值，避免被容器创建时注入的旧环境变量覆盖。
-- 📈 **市场复盘 LLM max_tokens 提升** — 市场复盘生成链路将 LLM `max_tokens` 从 `2048` 提升到 `8192`，降低长复盘输出因 `MAX_TOKENS` 提前截断导致内容未完成的概率。
-- ⏰ **内置定时调度器感知 SCHEDULE_TIME 运行时变更** — 调度器现在会在运行中感知 WebUI 保存后的 `SCHEDULE_TIME` 变化，并在下一轮检查时重绑 daily job。
-- 🪟 **Windows Release 渠道编辑器保留 MiniMax 模型前缀** — 渠道模式下填写 `minimax/<模型名>` 时，后端归一化与 Web 设置页运行时模型列表都会保留该值原样，不再误改写成 `openai/minimax/<模型名>`。
-- 🤖 **Discord 入站 Webhook 补齐 Ed25519 验签** — `DiscordPlatform` 现在会基于 `X-Signature-Ed25519`、`X-Signature-Timestamp` 和原始请求体校验 Discord Interaction 签名；缺失签名头、公钥格式非法或签名不匹配时直接拒绝请求，同时对 timestamp 做 ±5 分钟时效窗口校验以防御重放攻击。
-- ⚙️ **STOCK_GROUP_N / EMAIL_GROUP_N 配置关系明确化** — 明确与 `STOCK_LIST` 的关系，并在配置校验中对超出 `STOCK_LIST` 的邮件分组给出 warning。
-- 🗓️ **断点续传改按市场时区和交易日历判断**（fixes #880）— 股票数据存在性检查不再直接使用服务器自然日，而是按 A 股 / 港股 / 美股各自市场时区解析"最新可复用交易日"。
-- 📨 **单股推送模式不再并发复用共享通知实例** — `StockAnalysisPipeline.run()` 现在会保留个股分析并发，但把 `SINGLE_STOCK_NOTIFY=true` 下的即时通知挪到结果收集侧串行发送。
-- 🔇 **实时行情降级提示收口为单次告警** — 分析主流程获取股票名称时不再提前触发一次实时行情查询，只有在全部数据源都不可用时才提示已降级为历史收盘价继续分析。
-- 🔍 **A 股中文资讯搜索恢复中文优先** — `search_stock_news()` 现在会在首个 provider 主要返回英文资讯时继续尝试后续引擎，并将同批结果中的中文资讯排到前面。
-- 🔒 **并发执行时共享状态补齐统一加锁** — 修复并发执行时共享状态缺少统一加锁的问题，避免多线程场景下的数据竞争。
-
-### 测试
-
-- 🧪 **补充设置页版本信息回归测试** — 新增 Web 设置页版本信息渲染断言，并覆盖占位版本 `0.0.0` 自动回退为构建标识的逻辑。
-- 🧪 **UI 治理与关键路径回归补强** — 补充 `SidebarNav`、`ChatPage`、`BacktestPage` 等组件测试，并新增 UI governance 守卫，持续防止交互元素重新引入原生 `title` 属性或旧 `input-terminal` 样式回流。同步更新 smoke / markdown drawer 相关验证，覆盖主题升级后的关键主链路。
-
+- [新功能] 发布亮点：📊 **回测页新增"次日验证"视图** — 可按股票与日期范围查看 AI 预测 vs 次日实际涨跌，复用历史分析与 1 日回测结果，快速验证分析准确率。
+- [改进] 发布亮点：🔧 **LLM 接入体验简化** — 用户侧文案统一收口为"主模型 / 备选模型 / 模型渠道"，不再把 LiteLLM 当作普通用户必学概念，现有配置键保持兼容。
+- [修复] 发布亮点：🐳 **Docker / WebUI 运行时稳态补强** — 修复系统设置保存后配置不生效、启动早期日志缺失、预构建静态资源复用等问题，降低容器化部署的运维摩擦。
+- [修复] 发布亮点：🔒 **安全与并发稳定性同步增强** — Discord 入站 Webhook 补齐 Ed25519 验签，修复并发执行时共享状态未加锁、单股推送模式通知并发复用等问题。
+- [改进] 发布亮点：🖥️ **桌面端与定时任务细节打磨** — Windows 安装器支持自选安装目录，内置定时调度器感知运行中 SCHEDULE_TIME 变更，断点续传改按市场时区判断。
+- [新功能] 📊 **回测页新增"次日验证 / 1 日窗口"视图** — 可按股票代码与分析日期范围查看 AI 预测、次日实际涨跌及筛选区间准确率，复用历史分析与 1 日回测结果实现。
+- [新功能] 🏷️ **Web 设置页新增版本信息卡片** — `apps/dsa-web` 现在会在构建时注入前端包版本与构建时间，系统设置页新增只读"版本信息"区块，展示 `WebUI 版本 / 构建标识 / 构建时间`；当 `package.json` 仍为占位版本 `0.0.0` 时，会自动回退为构建标识，方便 Docker 重建后快速确认当前静态资源是否已经生效。
+- [新功能] 🪟 **Windows 桌面安装器支持自选安装目录** — 安装器改为支持在安装向导中自定义安装目录，安装到非默认盘符后仍沿用现有打包态目录逻辑在安装目录旁读写 `.env`、`data/stock_analysis.db` 和 `logs/desktop.log`，同时保留 `win-unpacked` 免安装分发方式。安装器仅支持当前用户安装、已禁用管理员提权（`allowElevation: false`），并通过 NSIS `.onVerifyInstDir` 阻止选择系统保护目录。
+- [改进] 🔎 **SerpAPI 正文补抓范围收敛** — 自然搜索结果不再逐条同步抓取网页正文；现在仅对极少数高位且摘要明显不足的结果，在更短超时预算内做延迟补抓，并优先复用 SerpAPI 已返回的结构化摘要，降低搜索链路尾延迟与慢站点放大风险。
+- [改进] 🤖 **LLM 接入体验简化** — 面向用户的 AI 模型接入文案已统一收口为"主模型 / Agent 主模型 / 备选模型 / 模型渠道 / 高级模型路由配置"；Web 设置页、配置元数据、校验提示与中英文文档不再把 LiteLLM 当作普通用户默认必学概念，现有 `LITELLM_*` / `LLM_CHANNELS` 配置键仍保持兼容。
+- [修复] 🚀 **启动早期失败时暴露真实根因** — `python main.py` 现在通过 stderr 暴露真实根因，bootstrap 阶段不再向硬编码 `logs/` 目录写入文件日志，文件日志推迟到 `config.log_dir` 可用后创建，避免健康启动在非预期路径残留日志文件。
+- [修复] 🐳 **Docker WebUI 运行时优先复用预构建静态资源** — `prepare_webui_frontend_assets()` 现在会先检查镜像内已有的 `static/index.html` 是否可直接复用；当容器运行时不包含 `apps/dsa-web` 源码目录且未安装 `npm` 时，也不会误报"未找到前端项目，无法自动构建"，从而恢复 Docker 部署后的 WebUI 打开能力。
+- [修复] 🐳 **Docker WebUI 系统设置保存后配置生效** — Docker 场景下 WebUI 保存 `STOCK_LIST`、`SCHEDULE_ENABLED`、`SCHEDULE_TIME`、`SCHEDULE_RUN_IMMEDIATELY`、`RUN_IMMEDIATELY` 后，`Config` 会优先读取持久化 `.env` 中的新值，避免被容器创建时注入的旧环境变量覆盖。
+- [修复] 📈 **市场复盘 LLM max_tokens 提升** — 市场复盘生成链路将 LLM `max_tokens` 从 `2048` 提升到 `8192`，降低长复盘输出因 `MAX_TOKENS` 提前截断导致内容未完成的概率。
+- [修复] ⏰ **内置定时调度器感知 SCHEDULE_TIME 运行时变更** — 调度器现在会在运行中感知 WebUI 保存后的 `SCHEDULE_TIME` 变化，并在下一轮检查时重绑 daily job。
+- [修复] 🪟 **Windows Release 渠道编辑器保留 MiniMax 模型前缀** — 渠道模式下填写 `minimax/<模型名>` 时，后端归一化与 Web 设置页运行时模型列表都会保留该值原样，不再误改写成 `openai/minimax/<模型名>`。
+- [修复] 🤖 **Discord 入站 Webhook 补齐 Ed25519 验签** — `DiscordPlatform` 现在会基于 `X-Signature-Ed25519`、`X-Signature-Timestamp` 和原始请求体校验 Discord Interaction 签名；缺失签名头、公钥格式非法或签名不匹配时直接拒绝请求，同时对 timestamp 做 ±5 分钟时效窗口校验以防御重放攻击。
+- [修复] ⚙️ **STOCK_GROUP_N / EMAIL_GROUP_N 配置关系明确化** — 明确与 `STOCK_LIST` 的关系，并在配置校验中对超出 `STOCK_LIST` 的邮件分组给出 warning。
+- [修复] 🗓️ **断点续传改按市场时区和交易日历判断**（fixes #880）— 股票数据存在性检查不再直接使用服务器自然日，而是按 A 股 / 港股 / 美股各自市场时区解析"最新可复用交易日"。
+- [修复] 📨 **单股推送模式不再并发复用共享通知实例** — `StockAnalysisPipeline.run()` 现在会保留个股分析并发，但把 `SINGLE_STOCK_NOTIFY=true` 下的即时通知挪到结果收集侧串行发送。
+- [修复] 🔇 **实时行情降级提示收口为单次告警** — 分析主流程获取股票名称时不再提前触发一次实时行情查询，只有在全部数据源都不可用时才提示已降级为历史收盘价继续分析。
+- [修复] 🔍 **A 股中文资讯搜索恢复中文优先** — `search_stock_news()` 现在会在首个 provider 主要返回英文资讯时继续尝试后续引擎，并将同批结果中的中文资讯排到前面。
+- [修复] 🔒 **并发执行时共享状态补齐统一加锁** — 修复并发执行时共享状态缺少统一加锁的问题，避免多线程场景下的数据竞争。
+- [测试] 🧪 **补充设置页版本信息回归测试** — 新增 Web 设置页版本信息渲染断言，并覆盖占位版本 `0.0.0` 自动回退为构建标识的逻辑。
+- [测试] 🧪 **UI 治理与关键路径回归补强** — 补充 `SidebarNav`、`ChatPage`、`BacktestPage` 等组件测试，并新增 UI governance 守卫，持续防止交互元素重新引入原生 `title` 属性或旧 `input-terminal` 样式回流。同步更新 smoke / markdown drawer 相关验证，覆盖主题升级后的关键主链路。
 - [修复] 🐳 **Docker WebUI 运行时优先复用预构建静态资源** — `prepare_webui_frontend_assets()` 现在会先检查镜像内已有的 `static/index.html` 是否可直接复用；当容器运行时不包含 `apps/dsa-web` 源码目录且未安装 `npm` 时，也不会误报“未找到前端项目，无法自动构建”，从而恢复 Docker 部署后的 WebUI 打开能力。
 - [改进] 🔎 **SerpAPI 正文补抓范围收敛** — 自然搜索结果不再逐条同步抓取网页正文；现在仅对极少数高位且摘要明显不足的结果，在更短超时预算内做延迟补抓，并优先复用 SerpAPI 已返回的结构化摘要，降低搜索链路尾延迟与慢站点放大风险。
 - [修复] A 股和中文股票名称场景下的相关资讯搜索恢复中文优先策略：`search_stock_news()` 现在会在首个 provider 主要返回英文资讯时继续尝试后续引擎，并将同批结果中的中文资讯排到前面；同时非美股查询不再默认沿用 Brave 的 `en/US` 区域语言偏好，避免更新后被英文新闻结果占满。
@@ -517,6 +501,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] `POST /opportunities/intraday-top` additive 新增 `focus_symbols`（≤8）：与既有用户钉选同语义并入深度层（不占异动额度、与计划/钉选去重、并入同一批快照、进缓存 key），标注 `deep_lane_reason.promoted_by="user_focus"`；不参与 universe 解析，单层路径不受影响。
 - [改进] 开仓前车道检查改为零输入可用：新增「要求」态直接写出今天只能开的期限与 ET 约束窗口（不再显示标缺），今日无 0DTE 时整块大字警示并禁用日内车道，冷启动显示「读取中」而非标缺，删除无标的的财报行，额度改为按 ET 日归零的手动计数，正文样板话收敛为一行、长口径 caveat 移入 tooltip。
 - [测试] 新增计划清单/手动计数按 ET 日作用域与不劫持两层扫描、`focus_symbols` 并入去重/上界/off-quota/缓存 key/单层不变、逐标的规则四态、合约分档与张数手续费算术、页面区块顺序等用例。
+- [修复] 机会扫描单飞并发合同重写（16 分钟悬挂缺陷链）：工厂改在共享有界线程池执行，发起方与跟随方一样在租约到点得到可重试 504；超租约完成的结果不再丢弃而是发布进完成态缓存供下一次轮询命中；在途计算存续期间绝不接纳第二个 leader（重复扫描不再自我放大）；此前缺 504 翻译的期权端点（overview/context/walls/daily-snapshot/events）补上统一超时响应。
+- [修复] 新增 Moomoo 进程级断路器（无新增环境变量）：连续 3 次传输类失败（RPC 异常/连接失败/超时断连详情）后打开，60 秒冷却期内快照、期权异动、到期日可用性、wall lane 获取与 history kline 全部快速失败并保持既有 unavailable+reason 语义，冷却后放行单个带租约的探针；业务型拒绝不计入失败。
+- [修复] Tier-1 批量快照的未知代码恢复：单个 `Unknown stock` 不再拖垮整批（实测 69 码全败）——点名代码即过滤重试、未点名则二分重试（额外调用 ≤3 次硬顶），未解析代码经既有 `snapshot_unresolved_symbols` 如实披露；传输类失败仍整批 fail closed。
+- [修复] `MoomooFetcher` 每笔 RPC 与健康检查 `close()` 改持同一把生命周期锁，杜绝 RPC 执行中途连接被拆的竞态。
+- [改进] 车道可用性在日内榜 leader 内改用 2.5 秒 wall lane 短等待，lane 正忙以 `deferred_wall_lane_busy` 推迟到下一轮且不缓存失败；当日晋升账本只提交真正深扫的标的（被总数硬顶挤掉的不再消耗配额记录）；mom15 动量历史改时间制保留并由单层/两层每轮 tier-1 快照共同喂养；扫描完成态缓存上限 32→128；`StockService` 改用进程级共享 `DataFetcherManager`，5m 波段车道不再每标的每轮新建 OpenD 连接。
+- [测试] 新增确定性并发/断路器/批量拆分回归：慢工厂＋短租约证明 leader 按租约 504、迟到结果发布、同 key 不启动第二工厂、失败清账可重算；假时钟断路器覆盖三连败打开、冷却单探针、失败探针重冷却、探针租约自愈与传输/业务分类；混合有效/未知代码批次的点名过滤与二分重试、lane 忙推迟不缓存、账本只记深扫、动量时间制保留、共享 manager 复用与 close-RPC 互斥。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` 新增 §12，记录单飞截止时间/迟到发布/单 leader 合同、Moomoo 断路器语义、lane 短等待推迟、未知代码批量恢复与 G-7a–e 修复及其确定性测试位置。
+
+- [修复] 盘中车道可用性「今日仅黑名单标的有 0DTE」判定收紧：仍有非黑名单标的未读（链读不到/本轮延后未查）时不再断言日内车道关闭，改为显式标缺（未读 ≠ 无 0DTE）。
+- [修复] 日内榜休市排序口径文案与实现对齐：v2 起休市按最近交易时段最强波段分排序（缺波段读数的行退回证据计数序），limitations 不再声称「休市退回证据计数排序」。
+- [修复] 近 30 分位移断档诚实化：additive `window_span_minutes` 报告 6 根 5m K 线窗口的实际跨度，超过 45 分钟按 fail-closed 标缺；前端在单元格与 tooltip 标注「含断档，跨 X 分钟」。
+- [修复] 实时扫描概览行分母改为「有位移读数的 N 檔」并如实计数标缺檔（未读不并入未达）；量比中位改为标准中位数（偶数个取中间两值平均）。
+- [修复] 实时扫描表头在载荷缺 signal_version 时显示「版本未声明」，不再回退硬编码的 intraday_session_evidence_v8。
+- [改进] 盘中计划合约候选表新增逐行报价 as-of 列与「报价以逐行 as-of 时点为准」脚注，bid/ask/点差不再冒充此刻盘口。
+- [改进] 盘中计划位移行改为中性描述态（达/未达 0.5 ATR 参考线 + v8 循环性更正随行携带），不再渲染成符合/不符合；今日车道未知时合约区同时显示 0DTE 与 4-7DTE 两个合规窗口（绝不 1-3DTE），不再默认 0DTE。
+- [修复] 交易纪律证据（rules-evidence）缺 total_fee 的回合不再按 0 费用进毛口径/费率：从两个比率的分子分母中排除，以 `fee_unknown_count` + limitations 报告排除口径；DTE×持有方式剔尾读数补上其声称的 n≥15 门槛（低于门槛 null + 原因）。
+- [修复] journal personal-edge / rules-evidence 进程内缓存键并入解析后的默认 build id：build 激活即自然失效，不再把旧 build 的数字多端上最长 10 分钟；Web 侧 personal-edge 会话缓存 TTL 收紧为 2 分钟。
+- [修复] 期权墙逐日快照写入器在缺 coverage.coverage_percent 时整行拒写（fail-closed + 原因），不再把缺席 0 回填进 append-only 的不可变行。
+- [chore] 移除 personal-edge `rule_compliance.daily_budget` 区块（V2-D 额度读数，本周新增的 additive 字段）：Journal 永远不含「今天」，该读数的 as-of 恒落在过去、恒为过期，且已无任何前端消费方；当日额度由前端手动计数（useIntradayManualBudgetStore）承载。
+- [修复] styleMatch S2/S3 的 not_matched 原因只陈述观测到的失败，标缺输入如实写「标缺」，不再断言未观测的事实；当日 <6 根 5m K 线且无上一时段可回退时，哑火形态按标缺（median_basis_insufficient）处理，不再基于退化中位数硬算。
+- [修复] 开仓前车道检查的 ET 时钟增加 5 分钟过时界：过时脉搏不再给出「符合」（「已过 12:00 截止线」这类单调事实保留为不符合），角落时钟标注「约 N 分钟前的服务端时点，已过时」；/rules 页刷新失败仍显示旧表时新增「显示的是上次成功读取（时间）」标注。
+- [文档] docs/CHANGELOG.md [Unreleased] 段的分类标题（### 发布亮点/新功能/改进/修复/测试）整理为扁平 `- [类型]` 行，符合 AGENTS.md 硬规则。
 
 ## [3.11.0] - 2026-03-27
 

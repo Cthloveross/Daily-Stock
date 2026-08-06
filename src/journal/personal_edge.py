@@ -174,10 +174,8 @@ __all__ = [
     "DISCIPLINE_WINDOW_TRADING_DAYS",
     "DTE_BUCKETS",
     "FILL_DETAILED_GOVERNS",
-    "INTRADAY_LANE_DAILY_TICKET_LIMIT",
     "INTRADAY_LANE_DTE",
     "INTRADAY_LANE_ET_CUTOFF_HOUR",
-    "OVERNIGHT_LANE_CONCURRENT_LIMIT",
     "OVERNIGHT_LANE_MAX_DTE",
     "OVERNIGHT_LANE_MIN_DTE",
     "OVERNIGHT_LANE_WEAK_ENTRY_ET_HOURS",
@@ -193,7 +191,6 @@ __all__ = [
     "RULE_SET_V2_ADOPTED_AT",
     "RULE_SET_V2_ID",
     "RULE_VERDICTS",
-    "RuleComplianceDailyBudget",
     "RuleComplianceLaneStat",
     "RuleComplianceSlice",
     "RuleComplianceStat",
@@ -298,9 +295,11 @@ OVERNIGHT_LANE_MIN_DTE = 4
 OVERNIGHT_LANE_MAX_DTE = 7
 # V2-B：隔夜单在这两个 ET 小时明显偏弱（−1.76% / −2.99%），其余时段 +21%…+36%。
 OVERNIGHT_LANE_WEAK_ENTRY_ET_HOURS: tuple[int, ...] = (11, 13)
-# V2-D③：日内单每日最多 6 笔；同时持有的过夜单不超过 3 个。
-INTRADAY_LANE_DAILY_TICKET_LIMIT = 6
-OVERNIGHT_LANE_CONCURRENT_LIMIT = 3
+# V2-D 的两个额度上限（日内 6 笔/日、过夜并发 3 个）不再由本模块下发：
+# Journal 只有导入的历史成交，永远不含「今天」，据它算出的当日额度读数
+# 恒为过期（as_of 永远落在过去）——一个永远过期的读数等于没有。当日计数
+# 由前端手动维护（useIntradayManualBudgetStore，按 ET 日作用域），
+# 原 daily_budget 区块已于 2026-08 移除（additive 字段，无历史消费方）。
 
 # 车道标识（合规两条 + 违规三条 + 规则未覆盖 + 不可判定）。
 RULE_LANES: tuple[str, ...] = (
@@ -614,24 +613,6 @@ class RuleComplianceSlice:
 
 
 @dataclass(frozen=True)
-class RuleComplianceDailyBudget:
-    """V2-D 的两个额度读数，取自同一 build（因此带明确的 as-of 日）。
-
-    ``as_of_trading_day`` 是 build 内最后一个有入场的 ET 自然日。消费端必须把它
-    和「今天」对照：build 不含今日时读数是**过期**的，应显式标缺而不是显示 0。
-    """
-
-    as_of_trading_day: Optional[str]
-    intraday_ticket_count: Optional[int]
-    intraday_ticket_limit: int
-    intraday_reason: Optional[str]
-    overnight_open_count: Optional[int]
-    overnight_concurrent_limit: int
-    overnight_reason: Optional[str]
-    overnight_unknown_dte_open_count: int
-
-
-@dataclass(frozen=True)
 class PersonalEdgeRuleCompliance:
     """车道遵守度：把本人规则 v2 变成可前向证伪的记账。"""
 
@@ -652,7 +633,6 @@ class PersonalEdgeRuleCompliance:
     overnight_lane_weak_entry_et_hours: tuple[int, ...]
     all_history: RuleComplianceSlice
     since_adoption: RuleComplianceSlice
-    daily_budget: RuleComplianceDailyBudget
     limitations: tuple[str, ...]
 
 
@@ -1322,7 +1302,6 @@ def _build_rule_compliance(
     excluded_before_clean_basis_count: int,
     excluded_aggregate_or_unknown_basis_count: int,
     excluded_missing_premium_count: int,
-    daily_budget: RuleComplianceDailyBudget,
 ) -> PersonalEdgeRuleCompliance:
     """All-history + since-adoption slices over the same clean-basis rows."""
     forward = [
@@ -1368,7 +1347,6 @@ def _build_rule_compliance(
                 "前向样本为空是事实，不以 0 冒充读数"
             ),
         ),
-        daily_budget=daily_budget,
         limitations=RULE_COMPLIANCE_LIMITATIONS,
     )
 
@@ -1472,43 +1450,15 @@ def get_personal_edge_stats(
     discipline_episodes: list[_DisciplineEpisode] = []
     closed_episode_count = 0
 
-    # --- 车道遵守度累加器（干净口径子集 + V2-D 额度读数）--------------------
+    # --- 车道遵守度累加器（干净口径子集）------------------------------------
     compliance_episodes: list[_ComplianceEpisode] = []
     compliance_excluded_before_clean_basis = 0
     compliance_excluded_basis = 0
     compliance_excluded_missing_premium = 0
-    budget_last_trading_day: Optional[str] = None
-    # 逐日 0DTE 开仓笔数（含 ET 12:00 后开的违规单——它们同样占用当日额度）。
-    budget_intraday_by_day: dict[str, int] = {}
-    budget_overnight_open = 0
-    budget_overnight_unknown_dte_open = 0
 
     for row in rows:
         if str(row.lifecycle_status) != "closed":
             excluded_open_count += 1
-            # V2-D③ 的「当前过夜持仓」＝该 build 内仍未平仓的 4-7DTE 回合。
-            if row.dte_at_entry is None:
-                budget_overnight_unknown_dte_open += 1
-            elif (
-                OVERNIGHT_LANE_MIN_DTE
-                <= int(row.dte_at_entry)
-                <= OVERNIGHT_LANE_MAX_DTE
-            ):
-                budget_overnight_open += 1
-            if row.opened_at is not None:
-                open_day = _trading_day_utc_minus_4(_utc(row.opened_at))
-                if (
-                    budget_last_trading_day is None
-                    or open_day > budget_last_trading_day
-                ):
-                    budget_last_trading_day = open_day
-                if (
-                    row.dte_at_entry is not None
-                    and int(row.dte_at_entry) == INTRADAY_LANE_DTE
-                ):
-                    budget_intraday_by_day[open_day] = (
-                        budget_intraday_by_day.get(open_day, 0) + 1
-                    )
             continue
         if row.realized_pnl_net is None:
             excluded_missing_pnl_count += 1
@@ -1587,16 +1537,6 @@ def get_personal_edge_stats(
         dte_value = (
             int(row.dte_at_entry) if row.dte_at_entry is not None else None
         )
-        if dte_value == INTRADAY_LANE_DTE:
-            budget_intraday_by_day[opened_trading_day] = (
-                budget_intraday_by_day.get(opened_trading_day, 0) + 1
-            )
-        if (
-            budget_last_trading_day is None
-            or opened_trading_day > budget_last_trading_day
-        ):
-            budget_last_trading_day = opened_trading_day
-
         if opened_trading_day < RULE_COMPLIANCE_CLEAN_BASIS_START:
             compliance_excluded_before_clean_basis += 1
         elif fill_detailed_from_evidence_summary(row.evidence_summary_json) is not True:
@@ -1714,34 +1654,6 @@ def get_personal_edge_stats(
             ),
             excluded_aggregate_or_unknown_basis_count=compliance_excluded_basis,
             excluded_missing_premium_count=compliance_excluded_missing_premium,
-            daily_budget=RuleComplianceDailyBudget(
-                as_of_trading_day=budget_last_trading_day,
-                intraday_ticket_count=(
-                    budget_intraday_by_day.get(budget_last_trading_day, 0)
-                    if budget_last_trading_day is not None
-                    else None
-                ),
-                intraday_ticket_limit=INTRADAY_LANE_DAILY_TICKET_LIMIT,
-                intraday_reason=(
-                    None
-                    if budget_last_trading_day is not None
-                    else "该 build 内没有任何带入场时间的回合，无法定位最后一个交易日"
-                ),
-                overnight_open_count=(
-                    budget_overnight_open
-                    if budget_last_trading_day is not None
-                    else None
-                ),
-                overnight_concurrent_limit=OVERNIGHT_LANE_CONCURRENT_LIMIT,
-                overnight_reason=(
-                    None
-                    if budget_last_trading_day is not None
-                    else "该 build 内没有任何带入场时间的回合，无法定位最后一个交易日"
-                ),
-                overnight_unknown_dte_open_count=(
-                    budget_overnight_unknown_dte_open
-                ),
-            ),
         ),
         month_basis=MONTH_BASIS_UTC_MINUS_4,
         limitations=PERSONAL_EDGE_LIMITATIONS,

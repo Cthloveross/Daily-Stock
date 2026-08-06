@@ -7,7 +7,7 @@ import type { PersonalEdgeResponse } from '../types/journal';
  * - `loading`：请求进行中；
  * - `unavailable`：端点失败或 Journal 尚未构建（not_built）→ 消费方显式
  *   「标缺」，绝不以 0 冒充；
- * - `ready`：默认 build 的描述统计（fetch 层带 10 分钟 sessionCache）。
+ * - `ready`：默认 build 的描述统计（fetch 层带 2 分钟 sessionCache，激活新 build 后旧数最多存活 2 分钟）。
  */
 export type PersonalEdgeView =
   | { state: 'loading' }

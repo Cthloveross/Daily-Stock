@@ -1378,6 +1378,11 @@ class IntradayRecentDisplacement(BaseModel):
     atr_prior_session_count: Optional[int] = Field(default=None, ge=1)
     survival_line_atr: float = Field(0.5, gt=0)
     bar_count: int = Field(0, ge=0)
+    # additive（断档诚实化）：窗口实际跨度（末根开始 + 5 分钟 − 首根开始）。
+    # == window_minutes 即无断档；> window_minutes 表示 6 根 K 线含断档
+    # （停牌/缺 K 线），消费端必须标注「含断档，跨 X 分钟」；超过 45 分钟时
+    # 读数本身已按 fail-closed 标缺。旧载荷可省略。
+    window_span_minutes: Optional[int] = Field(default=None, ge=1)
     unavailable_reason: Optional[str] = None
 
 

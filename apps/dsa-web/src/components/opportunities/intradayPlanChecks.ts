@@ -26,8 +26,10 @@ import {
  * 2. 扫描已经算好的读数（近 30 分位移 / 速度 / 哑火 / 形态 / 波段 vs 大盘 /
  *    今日波段）——原样透出，不重算、不打分、不排序。
  *
- * 四种状态：`pass` / `fail` / `missing`（查过了拿不到）/ `requirement`（系统
- * 已知的硬性要求，例如「今日只能 4-7DTE」）。**没有概率、没有胜率、没有目标价**。
+ * 五种状态：`pass` / `fail` / `missing`（查过了拿不到）/ `requirement`（系统
+ * 已知的硬性要求，例如「今日只能 4-7DTE」）/ `neutral`（纯描述读数——近 30 分
+ * 位移对 0.5 ATR 参考线只描述、不判定，v8 循环性更正后不再有「符合/不符合」
+ * 框架）。**没有概率、没有胜率、没有目标价**。
  *
  * 引用的历史数字一律带样本量与口径（build #3 干净口径，n=1,407，
  * 2026-04-21→07-31）；边界：样本仅 2026-04→07 一个市场状态，规则由同一份
@@ -58,10 +60,16 @@ export interface PlanTickerView {
   checks: PlanCheckRow[];
   /** 今日波段 chips：原样透出服务端读数。 */
   legs: IntradayBurstWindow[];
-  /** 合约区请求的 DTE 上界（日内＝0，过夜＝7）。 */
+  /** 合约区请求的 DTE 上界（日内＝0，过夜＝7，车道未知＝7）。 */
   contractMaxDte: number;
-  /** 合约区只看这个下界及以上的到期（过夜＝4，日内＝0）。 */
+  /** 合约区只看这个下界及以上的到期（过夜＝4，日内＝0，车道未知＝0）。 */
   contractMinDte: number;
+  /**
+   * 合约窗口口径：`unknown`＝今日车道标缺/读取中——**不默认日内**，同时
+   * 显示 0DTE（V2-A）与 4-7DTE（V2-B）两个窗口，1-3DTE 仍然绝不显示
+   * （V2-C① 与车道无关）。
+   */
+  contractWindowMode: 'intraday' | 'overnight' | 'unknown';
   contractDteLabel: string;
   /** 失效位参考（只给已有观测值，不算任何目标价）。 */
   invalidationReference: string | null;
@@ -72,13 +80,17 @@ export const DISPLACEMENT_SURVIVAL_LINE_ATR = 0.5;
 
 const DISPLACEMENT_BASIS =
   '你自己 766 笔回合（2026-06-08→07-31）：速死单仅 18.3% 达到 ≥0.5 ATR，'
-  + '走出来的赢家 71.2% 达到——描述统计，非预测';
+  + '走出来的赢家 71.2% 达到。【v8 更正】该分层按持仓时长分组，而持仓时长由'
+  + '结果决定——分层按构造就是循环的；只从第 15 分钟检查点向前计分后，差距从'
+  + ' 37.6pp 塌到 0.1pp（n=3,492）。因此 0.5 只是参考刻度，本行是纯描述读数：'
+  + '不含前向信息、非判定、非预测、非信号';
 
 function laneRuleChecks(
   lane: LaneId,
   pulseGeneratedAt: string | null,
   laneAvailability: IntradayLaneAvailability | null,
   loading: boolean,
+  nowMs?: number,
 ): PlanCheckRow[] {
   // 直接复用车道清单的判定（dte 留空 → 输出「今天的要求」而不是标缺）。
   const result = evaluateLaneChecklist({
@@ -88,6 +100,7 @@ function laneRuleChecks(
     pulseGeneratedAt,
     laneAvailability,
     loading,
+    nowMs,
   });
   return result.checks.map((check) => ({
     id: check.id,
@@ -118,13 +131,22 @@ function displacementRow(item: IntradayTopCandidate | null): PlanCheckRow {
   const comparability = reading.atrScaleComparability === 'intraday_scale_not_comparable'
     ? ' · ATR 标尺为盘中代理，与日线 ATR14 不可横向比较'
     : '';
+  // 断档诚实化：窗口实际跨度 > 名义 30 分钟时如实标注，不冒充连续窗口。
+  const span = reading.windowSpanMinutes ?? null;
+  const gapNote = span !== null && span > reading.windowMinutes
+    ? `（最近 ${reading.windowMinutes / 5} 根 5m K 线含断档，跨 ${span} 分钟）`
+    : '';
+  // v8：0.5 这条线的分层循环性已被量化推翻——达线/未达线只是**描述**，
+  // 不是判定（neutral），永不渲染成「符合/不符合」。
   return {
     ...base,
-    status: abs >= DISPLACEMENT_SURVIVAL_LINE_ATR ? 'pass' : 'fail',
+    status: 'neutral',
     reason:
-      `近 ${reading.windowMinutes} 分净位移 ${value >= 0 ? '+' : ''}${value.toFixed(2)} ATR`
-      + `（${abs >= DISPLACEMENT_SURVIVAL_LINE_ATR ? '已越过' : '未到'} `
-      + `${DISPLACEMENT_SURVIVAL_LINE_ATR} ATR 存活线）${comparability}`,
+      `近 ${reading.windowMinutes} 分净位移 ${value >= 0 ? '+' : ''}${value.toFixed(2)} ATR${gapNote}`
+      + `（${abs >= DISPLACEMENT_SURVIVAL_LINE_ATR ? '达' : '未达'} `
+      + `${DISPLACEMENT_SURVIVAL_LINE_ATR} ATR 参考线——v8 更正：原分层按持仓时长`
+      + '定义、循环性成立，此线不含前向信息，仅作刻度）'
+      + comparability,
   };
 }
 
@@ -298,6 +320,8 @@ export interface PlanTickerInput {
   laneAvailability: IntradayLaneAvailability | null;
   pulseGeneratedAt: string | null;
   loading?: boolean;
+  /** 「现在」的毫秒时戳（测试注入用）；缺省取 `Date.now()`。 */
+  nowMs?: number;
 }
 
 /** 逐标的核对：车道规则（复用车道清单）+ 财报回避 + 扫描读数，四态如实。 */
@@ -314,7 +338,13 @@ export function evaluatePlanTicker(input: PlanTickerInput): PlanTickerView {
   // 车道可用性状态——绝不因为读不到就默认日内成立。
   const effectiveLane: LaneId = lane ?? 'intraday';
   const checks: PlanCheckRow[] = [
-    ...laneRuleChecks(effectiveLane, input.pulseGeneratedAt, input.laneAvailability, loading),
+    ...laneRuleChecks(
+      effectiveLane,
+      input.pulseGeneratedAt,
+      input.laneAvailability,
+      loading,
+      input.nowMs,
+    ),
     (() => {
       const check = earningsCheck(wanted, input.candidates);
       return {
@@ -334,7 +364,12 @@ export function evaluatePlanTicker(input: PlanTickerInput): PlanTickerView {
     legsRow(item),
   ];
 
+  // 合约窗口跟随今日车道；车道未知（标缺/读取中）时**不默认日内**：
+  // 同时显示 0DTE 与 4-7DTE 两个窗口，并把「今日车道未知」写在标题上
+  // （1-3DTE 与车道无关地绝不显示，V2-C①）。
   const overnight = isIntradayLaneClosed(dayType) || lane === 'overnight';
+  const contractWindowMode: PlanTickerView['contractWindowMode'] =
+    lane === null ? 'unknown' : overnight ? 'overnight' : 'intraday';
   return {
     ticker: wanted,
     lane,
@@ -343,11 +378,17 @@ export function evaluatePlanTicker(input: PlanTickerInput): PlanTickerView {
     inDeepLane: item !== null,
     checks,
     legs: item && item.sessionBursts.state === 'ready' ? item.sessionBursts.legs : [],
-    contractMaxDte: overnight ? OVERNIGHT_MAX_DTE : 0,
-    contractMinDte: overnight ? OVERNIGHT_MIN_DTE : 0,
-    contractDteLabel: overnight
-      ? `${OVERNIGHT_MIN_DTE}-${OVERNIGHT_MAX_DTE}DTE（V2-B 过夜车道）`
-      : '0DTE（V2-A 日内车道）',
+    contractMaxDte: contractWindowMode === 'intraday' ? 0 : OVERNIGHT_MAX_DTE,
+    contractMinDte: contractWindowMode === 'overnight' ? OVERNIGHT_MIN_DTE : 0,
+    contractWindowMode,
+    contractDteLabel:
+      contractWindowMode === 'overnight'
+        ? `${OVERNIGHT_MIN_DTE}-${OVERNIGHT_MAX_DTE}DTE（V2-B 过夜车道）`
+        : contractWindowMode === 'intraday'
+          ? '0DTE（V2-A 日内车道）'
+          : `今日车道未知 · 同时显示 0DTE（V2-A）与 `
+            + `${OVERNIGHT_MIN_DTE}-${OVERNIGHT_MAX_DTE}DTE（V2-B）两个窗口`
+            + '——绝不 1-3DTE（V2-C①）',
     invalidationReference: invalidationReference(item),
   };
 }

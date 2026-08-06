@@ -33,3 +33,13 @@ export function formatRatio(value: number | null): string {
   if (value === null) return '—';
   return `${value.toLocaleString('en-US', { maximumFractionDigits: 2 })}×`;
 }
+
+/**
+ * 报价时点标签（临期合约面板与盘中计划合约表共用，同一 as-of 口径）：
+ * 缺时点＝标缺，不冒充「现在」。
+ */
+export function quoteTimeLabel(value: string | null): string {
+  if (!value) return '标缺';
+  const match = value.match(/\d{2}:\d{2}(?::\d{2})?/);
+  return match ? `${match[0]} ET` : value;
+}

@@ -46,6 +46,8 @@ const STATUS_TEXT: Record<CheckStatus, string> = {
   fail: '不符合',
   missing: MISSING,
   requirement: '要求',
+  // 纯描述读数（本面板当前不产出，为状态全集补齐渲染）。
+  neutral: '读数',
 };
 
 const STATUS_CLASS: Record<CheckStatus, string> = {
@@ -53,14 +55,16 @@ const STATUS_CLASS: Record<CheckStatus, string> = {
   fail: 'text-warn-strong',
   missing: 'text-text-3',
   requirement: 'text-text-2',
+  neutral: 'text-text-2',
 };
 
-/** 四态标记用文字而非颜色承载语义（无障碍 + 无涨跌色）。 */
+/** 状态标记用文字而非颜色承载语义（无障碍 + 无涨跌色）。 */
 const STATUS_MARK: Record<CheckStatus, string> = {
   pass: '✓',
   fail: '✕',
   missing: '—',
   requirement: '▸',
+  neutral: '·',
 };
 
 /** 长口径 caveat：不再占正文，改挂 tooltip（内容一字不删）。 */
@@ -93,10 +97,13 @@ export function LaneChecklistPanel({
   pulse,
   top,
   loading = false,
+  nowMs,
 }: {
   pulse: IntradayPulseResponse | null;
   top: IntradayTopResponse | null;
   loading?: boolean;
+  /** 「现在」的毫秒时戳（测试注入用）；缺省取 `Date.now()`。 */
+  nowMs?: number;
 }) {
   const [laneOverride, setLaneOverride] = useState<LaneId | null>(null);
   const [dteText, setDteText] = useState('');
@@ -114,7 +121,8 @@ export function LaneChecklistPanel({
     pulseGeneratedAt: pulse?.generatedAt ?? null,
     laneAvailability: top?.laneAvailability ?? null,
     loading: loading && !top,
-  }), [pulse, top, loading]);
+    nowMs,
+  }), [pulse, top, loading, nowMs]);
 
   const intradayClosed = isIntradayLaneClosed(preview.dayType);
   // 今日只剩过夜车道时默认就落在过夜（不让用户先撞一堵失败墙）；用户仍可
@@ -134,8 +142,9 @@ export function LaneChecklistPanel({
       pulseGeneratedAt: pulse?.generatedAt ?? null,
       laneAvailability: top?.laneAvailability ?? null,
       loading: loading && !top,
+      nowMs,
     });
-  }, [lane, dteText, intendsToCloseToday, pulse, top, loading]);
+  }, [lane, dteText, intendsToCloseToday, pulse, top, loading, nowMs]);
 
   const budgetRows = [
     {
@@ -271,7 +280,11 @@ export function LaneChecklistPanel({
 
         <span className="ml-auto text-caption text-text-3">
           {result.etClock
-            ? `${result.etClock} ET`
+            ? `${result.etClock} ET${
+              result.pulseStaleMinutes !== null
+                ? `（约 ${result.pulseStaleMinutes} 分钟前的服务端时点，已过时）`
+                : ''
+            }`
             : loading && !pulse
               ? 'ET 时钟读取中…'
               : `ET 时钟 ${MISSING}`}

@@ -178,6 +178,23 @@ def test_partial_coverage_is_recorded_with_its_own_coverage_percent(isolated_db)
     assert stored[0]["coverage_percent"] == pytest.approx(41.5)
 
 
+def test_missing_coverage_percent_records_nothing_not_zero(isolated_db):
+    """缺 coverage.coverage_percent：不可变行拒写 + 原因，绝不 0 回填。"""
+    without_block = _item()
+    without_block.pop("coverage")
+    without_value = _item()
+    without_value["coverage"] = {"coverage_percent": None}
+
+    for item in (without_block, without_value):
+        results = record_wall_snapshots(_payload(item), db_manager=isolated_db)
+        assert results[0].written is False
+        assert results[0].duplicate is False
+        assert "coverage_percent" in results[0].reason
+        assert "fail-closed" in results[0].reason
+
+    assert list_wall_snapshots(db_manager=isolated_db) == ()
+
+
 def test_undefined_ratio_is_stored_as_null_plus_reason(isolated_db):
     record_wall_snapshots(
         _payload(

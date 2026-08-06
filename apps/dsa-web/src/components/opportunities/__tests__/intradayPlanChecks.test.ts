@@ -8,6 +8,8 @@ import { evaluatePlanTicker } from '../intradayPlanChecks';
 const MARKET_DATE = '2026-08-05';
 /** 2026-08-05 13:30Z = 09:30 ET（EDT）。 */
 const PULSE_AT = '2026-08-05T13:30:00Z';
+/** 「现在」＝脉搏后 1 分钟：新鲜时点（测试注入，避免真实时钟把脉搏判成过时）。 */
+const NOW_MS = Date.parse(PULSE_AT) + 60_000;
 
 function availability(
   overrides: Partial<IntradayLaneAvailability> = {},
@@ -148,6 +150,7 @@ describe('evaluatePlanTicker', () => {
       candidates: [candidate()],
       laneAvailability: availability(),
       pulseGeneratedAt: PULSE_AT,
+      nowMs: NOW_MS,
     });
 
     expect(view.ticker).toBe('NVDA');
@@ -165,8 +168,11 @@ describe('evaluatePlanTicker', () => {
     expect(byId(view, 'clock')?.ruleId).toBe('V2-A/C③');
 
     expect(byId(view, 'earnings')?.status).toBe('pass');
-    expect(byId(view, 'displacement')?.status).toBe('pass');
-    expect(byId(view, 'displacement')?.reason).toContain('0.5 ATR 存活线');
+    // v8：位移是纯描述读数（neutral），达线不是「符合」，也不再有存活框架。
+    expect(byId(view, 'displacement')?.status).toBe('neutral');
+    expect(byId(view, 'displacement')?.reason).toContain('0.5 ATR 参考线');
+    expect(byId(view, 'displacement')?.reason).toContain('不含前向信息');
+    expect(byId(view, 'displacement')?.reason).not.toContain('存活线');
     expect(byId(view, 'speed')?.status).toBe('pass');
     expect(byId(view, 'fizzle')?.status).toBe('pass');
     expect(byId(view, 'setup')?.status).toBe('pass');
@@ -217,12 +223,15 @@ describe('evaluatePlanTicker', () => {
       })],
       laneAvailability: availability(),
       pulseGeneratedAt: PULSE_AT,
+      nowMs: NOW_MS,
     });
 
     expect(byId(view, 'earnings')?.status).toBe('fail');
     expect(byId(view, 'earnings')?.reason).toContain('回避窗');
-    expect(byId(view, 'displacement')?.status).toBe('fail');
-    expect(byId(view, 'displacement')?.reason).toContain('未到');
+    // v8：未达参考线同样是 neutral 描述，不是「不符合」——达线/未达线不构成判定。
+    expect(byId(view, 'displacement')?.status).toBe('neutral');
+    expect(byId(view, 'displacement')?.reason).toContain('未达');
+    expect(byId(view, 'displacement')?.reason).toContain('参考线');
     expect(byId(view, 'alignment')?.status).toBe('fail');
   });
 
@@ -232,6 +241,7 @@ describe('evaluatePlanTicker', () => {
       candidates: [candidate()],
       laneAvailability: availability(),
       pulseGeneratedAt: PULSE_AT,
+      nowMs: NOW_MS,
     });
 
     expect(view.inDeepLane).toBe(false);
@@ -251,6 +261,7 @@ describe('evaluatePlanTicker', () => {
       candidates: [candidate()],
       laneAvailability: availability({ dayType: 'overnight_only', zeroDteTickers: [] }),
       pulseGeneratedAt: PULSE_AT,
+      nowMs: NOW_MS,
     });
 
     expect(view.lane).toBe('overnight');
@@ -276,6 +287,59 @@ describe('evaluatePlanTicker', () => {
     expect(byId(view, 'dte')?.reason).toContain('今日车道可用性读取中');
   });
 
+  it('downgrades a stale-pulse clock pass to 标缺 instead of a fresh 符合', () => {
+    // 脉搏是 20 分钟前的服务端时点：09:30 的「仍在 12:00 前」不可再断言。
+    const view = evaluatePlanTicker({
+      ticker: 'NVDA',
+      candidates: [candidate()],
+      laneAvailability: availability(),
+      pulseGeneratedAt: PULSE_AT,
+      nowMs: Date.parse(PULSE_AT) + 20 * 60_000,
+    });
+
+    expect(byId(view, 'clock')?.status).toBe('missing');
+    expect(byId(view, 'clock')?.reason).toContain('已过时');
+  });
+
+  it('shows both compliant DTE windows when the lane is unknown — never a silent 0DTE default', () => {
+    const view = evaluatePlanTicker({
+      ticker: 'NVDA',
+      candidates: [candidate()],
+      laneAvailability: null,
+      pulseGeneratedAt: PULSE_AT,
+      nowMs: NOW_MS,
+    });
+
+    expect(view.lane).toBeNull();
+    expect(view.contractWindowMode).toBe('unknown');
+    // 请求 0..7 全窗口，由渲染层只保留 0DTE 与 4-7DTE 两组。
+    expect(view.contractMinDte).toBe(0);
+    expect(view.contractMaxDte).toBe(7);
+    expect(view.contractDteLabel).toContain('今日车道未知');
+    expect(view.contractDteLabel).toContain('0DTE');
+    expect(view.contractDteLabel).toContain('4-7DTE');
+    expect(view.contractDteLabel).toContain('绝不 1-3DTE');
+  });
+
+  it('annotates a gapped displacement window with its true span', () => {
+    const base = candidate();
+    const view = evaluatePlanTicker({
+      ticker: 'NVDA',
+      candidates: [candidate({
+        recentDisplacement: {
+          ...base.recentDisplacement!,
+          windowSpanMinutes: 40,
+        },
+      })],
+      laneAvailability: availability(),
+      pulseGeneratedAt: PULSE_AT,
+      nowMs: NOW_MS,
+    });
+
+    expect(byId(view, 'displacement')?.reason).toContain('含断档');
+    expect(byId(view, 'displacement')?.reason).toContain('跨 40 分钟');
+  });
+
   it('flags a fizzle window with both sample sizes and never as a sell signal', () => {
     const base = candidate();
     const view = evaluatePlanTicker({
@@ -291,6 +355,7 @@ describe('evaluatePlanTicker', () => {
       })],
       laneAvailability: availability(),
       pulseGeneratedAt: PULSE_AT,
+      nowMs: NOW_MS,
     });
 
     const row = byId(view, 'fizzle');

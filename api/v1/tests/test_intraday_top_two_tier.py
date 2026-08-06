@@ -1278,3 +1278,176 @@ def test_deep_lane_total_cap_trims_lowest_priority_and_discloses(monkeypatch):
         in {"plan_always_include", "mover_rank", "user_pinned", "user_focus"}
         for row in trimmed
     )
+
+
+# --- 16 分钟悬挂修复链的两层扫描侧回归 ---------------------------------------
+
+# 顶层捕获真实实现：autouse 桩会在每个用例内替换模块属性，需要测真身时用它。
+_REAL_COMPUTE_EXPIRY_AVAILABILITY = opportunities._compute_expiry_availability_moomoo
+
+
+def test_total_cap_trimmed_symbols_do_not_consume_day_promotion_quota(
+    monkeypatch,
+):
+    """G-7a：被总数硬顶挤掉的标的从未被深扫，绝不写入当日晋升账本。
+
+    修复前：晋升账本在硬顶裁剪**之前**提交，被挤掉的标的白白消耗当日/30 天
+    去重配额记录。
+    """
+
+    monkeypatch.setenv("MOOMOO_OPEND_ENABLED", "true")
+    _stub_daily_loader(monkeypatch)
+    _watchlist(monkeypatch, ["AAA", "BBB"], deep_lane_max=5)
+    monkeypatch.setattr(opportunities, "_INTRADAY_DEEP_LANE_TOTAL_MAX", 1)
+    monkeypatch.setattr(
+        opportunities,
+        "_fetch_underlying_session_quotes",
+        lambda symbols: {
+            "AAA": _quote("AAA", last_price=110.0, prev_close_price=100.0, turnover=100.0),
+            "BBB": _quote("BBB", last_price=105.0, prev_close_price=100.0, turnover=100.0),
+        },
+    )
+    _stub_events(monkeypatch, {})
+
+    response = _client().post(
+        "/api/v1/opportunities/intraday-top", json={"symbols": []}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    scan = body["universe_scan"]
+    assert [entry["ticker"] for entry in scan["deep_lane"]] == ["AAA"]
+    assert scan["trimmed_by_total_cap"] == [
+        {"ticker": "BBB", "would_be_promoted_by": "mover_rank"}
+    ]
+    with opportunities._scan_cache_lock:
+        promoted = set(
+            opportunities._intraday_deep_promotion_log.get(
+                body["market_date_et"], set()
+            )
+        )
+    assert promoted == {"AAA"}
+
+
+def test_lane_availability_wall_lane_busy_defers_without_caching(monkeypatch):
+    """G-5：wall lane 正忙＝推迟到下一轮（不缓存失败），结论保持 unknown。"""
+
+    from data_provider.moomoo_options import MoomooWallLaneBusyError
+
+    calls: list[str] = []
+
+    def compute(symbol: str, *, max_dte: int):
+        calls.append(symbol)
+        if symbol == "AAOI":
+            raise MoomooWallLaneBusyError("lanes busy")
+        return SimpleNamespace(
+            symbol=symbol,
+            market_date="2026-08-04",
+            max_dte=max_dte,
+            expiries=(("2026-08-05", 1),),
+            fetched_at=datetime.now(timezone.utc),
+        )
+
+    monkeypatch.setattr(
+        opportunities, "_compute_expiry_availability_moomoo", compute
+    )
+    body = _run_two_tier(
+        monkeypatch, ["NVDA", "AAOI"], {"NVDA": 103.0, "AAOI": 102.0}
+    )
+
+    lane = body["lane_availability"]
+    assert lane["day_type"] == "unknown"
+    by_ticker = {item["ticker"]: item for item in lane["tickers"]}
+    assert by_ticker["AAOI"]["unavailable_reason"] == "deferred_wall_lane_busy"
+    assert "AAOI" in lane["deferred_tickers"]
+    assert calls.count("NVDA") == 1
+    assert calls.count("AAOI") == 1
+
+    second = _client().post(
+        "/api/v1/opportunities/intraday-top",
+        json={"symbols": [], "refresh": True},
+    )
+    assert second.status_code == 200
+    # busy 未被缓存：AAOI 下一轮重试；NVDA 命中逐标的缓存零新增读取。
+    assert calls.count("AAOI") == 2
+    assert calls.count("NVDA") == 1
+
+
+def test_momentum_history_time_retention_survives_fast_polling():
+    """G-7b：保留按样本年龄裁剪。每 10 秒喂一次跑 30 分钟后 mom15 仍可算。
+
+    旧的 40 条计数上限在该频率下只覆盖 400 秒 < 12 分钟回看下限——mom15
+    永久 None、闸门静默退回 v1（动量饥饿）。
+    """
+
+    t0 = 2_000_000.0
+    feed = opportunities._feed_intraday_momentum_history
+    for i in range(0, 1801, 10):
+        feed(
+            [{"ticker": "AAA", "last_price": 100.0 + i * 0.001}],
+            market_date_et="2026-07-28",
+            now_epoch=t0 + i,
+        )
+
+    with opportunities._scan_cache_lock:
+        history = list(opportunities._intraday_momentum_history["AAA"])
+    assert history
+    # 最老样本不老于回看上限 + 缓冲（时间制保留），且条数有硬性兜底。
+    assert (
+        t0 + 1800 - history[0][0]
+        <= opportunities._INTRADAY_MOMENTUM_RETENTION_SECONDS
+    )
+    assert len(history) <= opportunities._INTRADAY_MOMENTUM_HISTORY_MAXLEN
+
+    # 12–18 分钟窗内最老样本＝t0+720（100.72）：mom15 可计算，不再饥饿。
+    value = opportunities._intraday_mom15("AAA", 103.0, now_epoch=t0 + 1800)
+    assert value == pytest.approx((103.0 / 100.72 - 1.0) * 100.0)
+
+
+def test_single_tier_snapshot_feeds_momentum_history(monkeypatch):
+    """G-7b：单层路径的 tier-1 批量快照同样喂养动量历史（同源，不再只耗不产）。"""
+
+    monkeypatch.setenv("MOOMOO_OPEND_ENABLED", "true")
+    _stub_daily_loader(monkeypatch)
+    _watchlist(monkeypatch, [])
+    monkeypatch.setattr(opportunities, "_configured_symbols", lambda: ["NVDA"])
+    monkeypatch.setattr(opportunities, "_intraday_now", lambda: _FIXED_NOW)
+    monkeypatch.setattr(
+        opportunities,
+        "_fetch_underlying_session_quotes",
+        lambda symbols: {"NVDA": _quote()},
+    )
+    _stub_events(monkeypatch, {"NVDA": []})
+
+    response = _client().post(
+        "/api/v1/opportunities/intraday-top", json={"symbols": []}
+    )
+    assert response.status_code == 200
+    with opportunities._scan_cache_lock:
+        history = list(opportunities._intraday_momentum_history.get("NVDA") or [])
+    assert history
+    assert history[-1][1] == pytest.approx(130.5)
+
+
+def test_expiry_availability_compute_passes_short_lane_wait(monkeypatch):
+    """G-5：车道可用性读取向适配器声明短 lane 等待（leader 内绝不排 30 秒队）。"""
+
+    from data_provider import moomoo_options as moomoo_options_module
+
+    captured: dict[str, object] = {}
+
+    def fake_fetch(symbol, *, max_dte, lane_wait_seconds=None):
+        captured.update(
+            symbol=symbol, max_dte=max_dte, lane_wait_seconds=lane_wait_seconds
+        )
+        return None
+
+    monkeypatch.setattr(
+        moomoo_options_module, "fetch_expiry_availability_moomoo", fake_fetch
+    )
+
+    assert _REAL_COMPUTE_EXPIRY_AVAILABILITY("NVDA", max_dte=7) is None
+    assert captured == {
+        "symbol": "NVDA",
+        "max_dte": 7,
+        "lane_wait_seconds": opportunities._LANE_AVAILABILITY_LANE_WAIT_SECONDS,
+    }

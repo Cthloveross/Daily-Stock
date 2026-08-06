@@ -350,7 +350,17 @@ def _detect_s2(
             "跳空高开但托举只成立一半：" + "；".join(missing) + "。",
             lines,
         )
-    return "not_matched", "跳空高开后未托住：缺口回补且现价低于 VWAP。", lines
+    # not_matched 的原因只陈述**观测到的**失败；标缺的一侧如实写「标缺」，
+    # 绝不把没看过的输入说成已观测到的事实（未知 ≠ 失败细节）。
+    observed = [
+        "缺口已回补" if hold_low is False else "最低价/参考前收标缺",
+        "现价低于 VWAP" if hold_vwap is False else "现价/VWAP 标缺",
+    ]
+    return (
+        "not_matched",
+        "跳空高开后未托住：" + "；".join(observed) + "。",
+        lines,
+    )
 
 
 def _detect_s3(
@@ -394,9 +404,22 @@ def _detect_s3(
     if reject_vwap is True:
         lines.append(f"现价 {_price(last_price)} < VWAP {_price(vwap)}")
     if not rejected:
+        # 同 S2：只陈述观测到的「未跌破」，标缺的一侧如实写「标缺」。
+        observed = [
+            (
+                f"现价 {_price(last_price)} ≥ 开盘 {_price(session_open)}"
+                if reject_open is False
+                else "开盘价标缺"
+            ),
+            (
+                f"现价 {_price(last_price)} ≥ VWAP {_price(vwap)}"
+                if reject_vwap is False
+                else "VWAP 标缺"
+            ),
+        ]
         return (
             "not_matched",
-            "高开后未见回落（现价未跌破开盘价或 VWAP）。",
+            "高开后未见回落：" + "；".join(observed) + "。",
             lines,
         )
     if spy_vwap_position == "below":

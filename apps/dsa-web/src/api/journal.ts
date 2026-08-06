@@ -290,9 +290,15 @@ export async function fetchReviewInsights(): Promise<ReviewInsightsResponse> {
 
 /**
  * 个人画像回灌（你的战绩）：默认 build 已平仓回合的描述统计。
- * sessionCache 默认 10 分钟 TTL，与服务端进程内缓存同一口径——
- * 每会话/10 分钟最多一次网络请求；not_built 不缓存（构建完成立即可见）。
+ *
+ * 会话缓存 TTL 收紧为 2 分钟（不是默认 10 分钟）：请求发出前无从得知
+ * 服务端默认 build 会解析到谁，缓存键里放不进 buildId——激活另一个 build
+ * 后，长 TTL 会让旧 build 的数字在页面上多活 10 分钟。选择短 TTL 而不是
+ * 键里塞 buildId，是两个诚实选项里更简单的那个（服务端缓存键已含解析后的
+ * build id，激活即失效）。not_built 不缓存（构建完成立即可见）。
  */
+const PERSONAL_EDGE_CACHE_TTL_MS = 2 * 60 * 1000;
+
 export async function fetchPersonalEdge(refresh = false): Promise<PersonalEdgeResponse> {
   const key = 'journal:personal-edge';
   if (!refresh) {
@@ -302,7 +308,7 @@ export async function fetchPersonalEdge(refresh = false): Promise<PersonalEdgeRe
   const { data } = await apiClient.get(`${BASE}/v2/personal-edge`);
   const camel = toCamelCase<PersonalEdgeResponse>(data);
   if (camel.dataState === 'ready') {
-    sessionCache.set(key, camel);
+    sessionCache.set(key, camel, PERSONAL_EDGE_CACHE_TTL_MS);
   }
   return camel;
 }

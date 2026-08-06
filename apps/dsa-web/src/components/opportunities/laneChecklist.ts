@@ -52,7 +52,12 @@ import { parseApiTimestamp } from '../../utils/marketTime';
 
 export type LaneId = 'intraday' | 'overnight';
 
-export type CheckStatus = 'pass' | 'fail' | 'missing' | 'requirement';
+/**
+ * `neutral` 是第五态：**纯描述读数**（例如近 30 分位移对 0.5 ATR 参考线的
+ * 位置）——它既不是「符合」也不是「不符合」，因为 0.5 这条线的分层循环性已被
+ * v8 更正推翻，达线/未达线不构成任何判定。
+ */
+export type CheckStatus = 'pass' | 'fail' | 'missing' | 'requirement' | 'neutral';
 
 export interface LaneCheck {
   /** 稳定标识，供测试与 aria-label 使用。 */
@@ -77,6 +82,8 @@ export interface LaneChecklistInput {
   intendsToCloseToday: boolean;
   /** 脉搏端点的 `generatedAt`（服务端时点）；缺席时 ET 时钟标缺。 */
   pulseGeneratedAt: string | null;
+  /** 「现在」的毫秒时戳（测试注入用）；缺省取 `Date.now()`。 */
+  nowMs?: number;
   /** 今日车道可用性（V2-E）；缺席＝标缺，不猜、不冒充「今天没有 0DTE」。 */
   laneAvailability: IntradayLaneAvailability | null;
   /**
@@ -90,6 +97,11 @@ export interface LaneChecklistResult {
   lane: LaneId;
   etHour: number | null;
   etClock: string | null;
+  /**
+   * 脉搏时点距「现在」的分钟数（超过 5 分钟才置值，否则 null）：过时的时钟
+   * 不能给出「符合」——时间只会前进，过时读数唯一还成立的是「已过截止线」。
+   */
+  pulseStaleMinutes: number | null;
   dayType: LaneDayTypeReading;
   checks: LaneCheck[];
   hardBlocks: LaneHardBlock[];
@@ -98,6 +110,8 @@ export interface LaneChecklistResult {
 
 /** V2-A / V2-C③：ET 12:00 是 0DTE 的开仓截止线。 */
 export const INTRADAY_ET_CUTOFF_HOUR = 12;
+/** 脉搏时点超过这个年龄即视为过时：ET 时钟检查不得再基于它给出「符合」。 */
+export const PULSE_STALE_AFTER_MS = 5 * 60 * 1000;
 /** V2-B：过夜车道的 DTE 区间。 */
 export const OVERNIGHT_MIN_DTE = 4;
 export const OVERNIGHT_MAX_DTE = 7;
@@ -180,7 +194,9 @@ function laneAvailabilityTooltip(lines: string[]): string {
  *
  * 五种状态（缺区块＝标缺，与「没有 0DTE」严格区分）：
  * 1. `intraday_available`：有非黑名单标的存在 0DTE → 日内车道可用；
- * 2. `blacklist_only`：确证有 0DTE，但**全部**落在黑名单上（V2-E 附带禁令）；
+ * 2. `blacklist_only`：确证有 0DTE 且**全部**落在黑名单上，且每一个非黑名单
+ *    标的都已读到链并确证无 0DTE（V2-E 附带禁令）；只要还有非黑名单标的未读
+ *    （读不到/本轮延后），未读 ≠ 无 0DTE，退回 `unknown`；
  * 3. `overnight_only`：全部标的都读到了链且都没有 0DTE → 日内车道关闭；
  * 4. `unknown`：区块缺席或链读不到 → 标缺 + 原因，**未知≠「今天没有 0DTE」**；
  * 5. `loading`：首轮扫描还在飞（冷启动/服务刚重启）→「读取中…」。
@@ -216,6 +232,7 @@ export function evaluateLaneDayType(
   }
 
   const zeroDteTickers = availability.zeroDteTickers ?? [];
+  const deferred = availability.deferredTickers ?? [];
   const blacklisted = zeroDteTickers.filter((ticker) =>
     BLACKLIST_SET.has(ticker.trim().toUpperCase()));
   const tradable = zeroDteTickers.filter((ticker) =>
@@ -241,7 +258,33 @@ export function evaluateLaneDayType(
   }
 
   if (availability.dayType === 'intraday_available') {
-    // 确证有 0DTE，但全部落在黑名单上。
+    // 确证有 0DTE，但可交易（非黑名单）侧一个都没有。「今日仅黑名单标的有
+    // 0DTE」只有在**每一个非黑名单标的都读到了链**且确证无 0DTE 时才成立——
+    // 未读（读不到/本轮延后未查）的标的可能有 0DTE，未读 ≠ 无 0DTE。
+    const unreadNonBlacklist = [
+      ...(availability.tickers ?? [])
+        .filter((row) =>
+          row.state !== 'ready'
+          && !BLACKLIST_SET.has(row.ticker.trim().toUpperCase()))
+        .map((row) => row.ticker),
+      ...deferred.filter((ticker) =>
+        !BLACKLIST_SET.has(ticker.trim().toUpperCase())),
+    ];
+    if (unreadNonBlacklist.length > 0) {
+      return {
+        state: 'unknown',
+        text: `今日：已确证 0DTE 仅见于黑名单标的（${blacklisted.join('/')}）`
+          + `· 另有 ${unreadNonBlacklist.length} 檔非黑名单标的未读——车道可用性标缺`,
+        tooltip: laneAvailabilityTooltip([
+          `未读标的（链读不到或本轮延后未查）：${unreadNonBlacklist.join('、')}——`
+          + '未读 ≠ 无 0DTE，不能据此断言「今日仅黑名单标的有 0DTE」或日内车道关闭。',
+          'V2-E 附带禁令仍然适用：不得因「今天只有它有 0DTE」而交易黑名单标的。',
+          scopeLine,
+        ]),
+        zeroDteTickers,
+        blacklistedZeroDteTickers: blacklisted,
+      };
+    }
     return {
       state: 'blacklist_only',
       text: `今日仅黑名单标的有 0DTE（${blacklisted.join('/')}）· 日内车道实际关闭（V2-E）`,
@@ -270,7 +313,6 @@ export function evaluateLaneDayType(
     };
   }
 
-  const deferred = availability.deferredTickers ?? [];
   return {
     state: 'unknown',
     text: '今日：车道可用性标缺 · 今日到期日读不到',
@@ -407,6 +449,7 @@ function clockCheckIntraday(
   etHour: number | null,
   etClock: string | null,
   loading: boolean,
+  staleMinutes: number | null,
 ): LaneCheck {
   if (etHour === null) {
     return {
@@ -418,23 +461,36 @@ function clockCheckIntraday(
         : '市场脉搏时点不可得，ET 时钟标缺——无法对照 V2-A / V2-C③ 的 12:00 截止线',
     };
   }
-  if (etHour < INTRADAY_ET_CUTOFF_HOUR) {
+  // 已过截止线是**单调**事实：时间只会前进，即便脉搏过时它仍然成立。
+  if (etHour >= INTRADAY_ET_CUTOFF_HOUR) {
     return {
       id: 'clock',
       label: '开仓时点',
-      status: 'pass',
+      status: 'fail',
       reason:
-        `当前 ${etClock ?? '—'} ET · 约束窗口 ET 09:30–${INTRADAY_ET_CUTOFF_HOUR}:00`
-        + `（V2-A：优先 09:30–11:00；${INTRADAY_ET_CUTOFF_HOUR}:00 后不开新的 0DTE）`,
+        `当前 ${etClock ?? '—'} ET 已过 ET ${INTRADAY_ET_CUTOFF_HOUR}:00 截止线`
+        + '（V2-C③：12:00 后不开 0DTE，−8.19%，剔除最好 5 笔 −15.54%）',
+    };
+  }
+  // 「仍在截止线内」不是单调事实：过时的脉搏可能早已越过 12:00——不给「符合」。
+  if (staleMinutes !== null) {
+    return {
+      id: 'clock',
+      label: '开仓时点',
+      status: 'missing',
+      reason:
+        `市场脉搏时点已过时（${etClock ?? '—'} ET 为约 ${staleMinutes} 分钟前的服务端时点）`
+        + `——不以过时时钟判定仍在 ET ${INTRADAY_ET_CUTOFF_HOUR}:00 截止线内`
+        + '（V2-A / V2-C③），请刷新后再核对',
     };
   }
   return {
     id: 'clock',
     label: '开仓时点',
-    status: 'fail',
+    status: 'pass',
     reason:
-      `当前 ${etClock ?? '—'} ET 已过 ET ${INTRADAY_ET_CUTOFF_HOUR}:00 截止线`
-      + '（V2-C③：12:00 后不开 0DTE，−8.19%，剔除最好 5 笔 −15.54%）',
+      `当前 ${etClock ?? '—'} ET · 约束窗口 ET 09:30–${INTRADAY_ET_CUTOFF_HOUR}:00`
+      + `（V2-A：优先 09:30–11:00；${INTRADAY_ET_CUTOFF_HOUR}:00 后不开新的 0DTE）`,
   };
 }
 
@@ -442,6 +498,7 @@ function clockCheckOvernight(
   etHour: number | null,
   etClock: string | null,
   loading: boolean,
+  staleMinutes: number | null,
 ): LaneCheck {
   if (etHour === null) {
     return {
@@ -451,6 +508,18 @@ function clockCheckOvernight(
       reason: loading
         ? '市场脉搏读取中…（约束：V2-B 避开 ET 11:00–12:00 与 13:00–14:00）'
         : '市场脉搏时点不可得，ET 时钟标缺——无法对照 V2-B 的偏弱时段',
+    };
+  }
+  // 偏弱时段的成员关系不单调（会进也会出）：过时脉搏两个方向都不可靠，
+  // 一律标缺，不给「符合」也不给「不符合」。
+  if (staleMinutes !== null) {
+    return {
+      id: 'clock',
+      label: '开仓时点',
+      status: 'missing',
+      reason:
+        `市场脉搏时点已过时（${etClock ?? '—'} ET 为约 ${staleMinutes} 分钟前的服务端时点）`
+        + '——无法对照 V2-B 的偏弱时段（11:00–12:00 / 13:00–14:00），请刷新后再核对',
     };
   }
   if (OVERNIGHT_WEAK_ENTRY_ET_HOURS.includes(etHour)) {
@@ -613,16 +682,26 @@ export function evaluateLaneChecklist(input: LaneChecklistInput): LaneChecklistR
   const loading = Boolean(input.loading);
   const dayType = evaluateLaneDayType(input.laneAvailability, { loading });
 
+  // 脉搏时点年龄：超过 PULSE_STALE_AFTER_MS 即过时——ET 时钟检查不得再
+  // 基于它给出「符合」（时间只会前进，过时读数唯一仍成立的是「已过截止线」）。
+  const nowMs = input.nowMs ?? Date.now();
+  const pulseParsed = parseApiTimestamp(input.pulseGeneratedAt);
+  const pulseAgeMs = pulseParsed ? nowMs - pulseParsed.getTime() : null;
+  const pulseStaleMinutes =
+    pulseAgeMs !== null && pulseAgeMs > PULSE_STALE_AFTER_MS
+      ? Math.round(pulseAgeMs / 60_000)
+      : null;
+
   // 财报回避不在这里：没有标的时它只能是「标缺」，等于噪音。它下沉到
   // 「盘中计划」的逐标的卡片（那里一定有标的）。
   const checks: LaneCheck[] = input.lane === 'intraday'
     ? [
       dteCheckIntraday(input.dte, dayType),
-      clockCheckIntraday(etHour, etClock, loading),
+      clockCheckIntraday(etHour, etClock, loading, pulseStaleMinutes),
     ]
     : [
       dteCheckOvernight(input.dte, dayType),
-      clockCheckOvernight(etHour, etClock, loading),
+      clockCheckOvernight(etHour, etClock, loading, pulseStaleMinutes),
     ];
 
   const reminders = input.lane === 'overnight'
@@ -636,6 +715,7 @@ export function evaluateLaneChecklist(input: LaneChecklistInput): LaneChecklistR
     lane: input.lane,
     etHour,
     etClock,
+    pulseStaleMinutes,
     dayType,
     checks,
     hardBlocks: hardBlocks(input, etHour, dayType),

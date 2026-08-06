@@ -9,6 +9,17 @@ import pytest
 import data_provider.moomoo_fetcher as moomoo_fetcher_module
 from data_provider.base import DataFetchError
 from data_provider.moomoo_fetcher import MoomooFetcher
+from src.services.moomoo_runtime import MOOMOO_RPC_BREAKER
+
+
+@pytest.fixture(autouse=True)
+def _reset_moomoo_breaker():
+    """共享断路器状态不得跨用例泄漏（含用桩故意制造的失败）。"""
+
+    MOOMOO_RPC_BREAKER.reset_for_tests()
+    yield
+    MOOMOO_RPC_BREAKER.reset_for_tests()
+
 
 
 class _PagedContext:
@@ -158,3 +169,81 @@ def test_intraday_pagination_enforces_page_cap(monkeypatch) -> None:
         _fetch(context)
 
     assert len(context.calls) == 2
+
+
+# --- G-7e：RPC 与健康检查 close() 持同一把生命周期锁 + 断路器快速失败 --------
+
+
+def test_close_waits_for_in_flight_realtime_rpc(monkeypatch) -> None:
+    """close() 不得在另一线程的 RPC 执行中途关闭同一个 ctx（锁内 RPC）。"""
+
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    _install_sdk(monkeypatch)
+    started = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+
+    class _BlockingCtx:
+        def get_market_snapshot(self, codes):
+            started.set()
+            assert release.wait(timeout=2)
+            return 0, pd.DataFrame(
+                [{"code": "US.AAPL", "last_price": 100.0, "volume": 10}]
+            )
+
+        def close(self):
+            closed.set()
+
+    fetcher = MoomooFetcher.__new__(MoomooFetcher)
+    fetcher.enabled = True
+    fetcher._sdk_ok = True
+    fetcher.host, fetcher.port = "127.0.0.1", 11111
+    fetcher._ctx = _BlockingCtx()
+    monkeypatch.setattr(
+        moomoo_fetcher_module, "probe_opend_tcp", lambda *args, **kwargs: True
+    )
+    monkeypatch.setattr(
+        moomoo_fetcher_module, "quote_context_is_ready", lambda ctx: True
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        rpc_future = pool.submit(fetcher.get_realtime_quote, "AAPL")
+        assert started.wait(timeout=2)
+        close_future = pool.submit(fetcher.close)
+        # RPC 持锁期间 close() 必须等待，绝不中途拆连接。
+        assert closed.wait(timeout=0.2) is False
+        release.set()
+        assert rpc_future.result(timeout=2) is not None
+        close_future.result(timeout=2)
+        assert closed.is_set()
+    assert fetcher._ctx is None
+
+
+def test_history_kline_fails_fast_while_breaker_is_open(monkeypatch) -> None:
+    """断路器打开：history kline 直接 DataFetchError（交给下游数据源 fallback）。"""
+
+    _install_sdk(monkeypatch)
+    for _ in range(3):
+        MOOMOO_RPC_BREAKER.record_failure("request timeout")
+    context = _PagedContext([])
+
+    with pytest.raises(DataFetchError, match="断路器"):
+        _fetch(context)
+    assert context.calls == []
+
+
+def test_realtime_quote_fails_fast_while_breaker_is_open(monkeypatch) -> None:
+    _install_sdk(monkeypatch)
+    for _ in range(3):
+        MOOMOO_RPC_BREAKER.record_failure("request timeout")
+
+    fetcher = MoomooFetcher.__new__(MoomooFetcher)
+    fetcher.enabled = True
+    fetcher._sdk_ok = True
+    fetcher._get_ctx = lambda: pytest.fail(
+        "open breaker must not reach the quote context"
+    )
+
+    assert fetcher.get_realtime_quote("AAPL", log_final_failure=False) is None

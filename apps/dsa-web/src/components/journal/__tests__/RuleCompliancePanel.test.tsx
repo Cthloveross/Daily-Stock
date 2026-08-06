@@ -167,16 +167,7 @@ function ready(
       overnightLaneWeakEntryEtHours: [11, 13],
       allHistory: populatedSlice(),
       sinceAdoption,
-      dailyBudget: {
-        asOfTradingDay: '2026-07-31',
-        intradayTicketCount: 19,
-        intradayTicketLimit: 6,
-        intradayReason: null,
-        overnightOpenCount: 0,
-        overnightConcurrentLimit: 3,
-        overnightReason: null,
-        overnightUnknownDteOpenCount: 0,
-      },
+      // dailyBudget 已移除：Journal 永远不含今天，该读数恒为过期。
       limitations: [LIMITATION],
     },
   };

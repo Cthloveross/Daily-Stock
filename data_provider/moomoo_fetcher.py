@@ -48,8 +48,11 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from src.services.moomoo_runtime import (
+    MOOMOO_RPC_BREAKER,
+    MoomooCircuitOpenError,
     MoomooRuntimeError,
     create_ready_quote_context,
+    is_transport_failure_detail,
     probe_opend_tcp,
     quote_context_is_ready,
 )
@@ -233,6 +236,28 @@ class MoomooFetcher(BaseFetcher):
         """Inspect connection state without issuing a blocking SDK query."""
         return quote_context_is_ready(self._ctx)
 
+    def _lifecycle_lock(self) -> threading.RLock:
+        """Return the ctx lifecycle lock, tolerating test scaffolds via __new__.
+
+        每一次 SDK RPC 都必须与健康检查的 ``close()`` 持同一把锁：否则
+        `_get_ctx` 判定旧连接已死并 close 时，另一个线程可能正拿着同一个
+        ctx 在做 RPC（实测表现为随机的 SDK 内部异常/悬挂）。RLock 允许
+        `_get_ctx` 在已持锁的 RPC 包装内重入。
+        """
+        lock = getattr(self, "_ctx_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._ctx_lock = lock
+        return lock
+
+    @staticmethod
+    def _record_rpc_outcome(ok: bool, detail: object = None) -> None:
+        """Feed the shared breaker; business rejections are not failures."""
+        if ok or not is_transport_failure_detail(detail):
+            MOOMOO_RPC_BREAKER.record_success()
+        else:
+            MOOMOO_RPC_BREAKER.record_failure(str(detail)[:200])
+
     def _get_ctx(self):
         """Lazy-create + cache the OpenQuoteContext.
 
@@ -241,7 +266,7 @@ class MoomooFetcher(BaseFetcher):
         """
         if not self.enabled or not self._sdk_ok:
             raise DataFetchError("MoomooFetcher 未启用或 SDK 未安装")
-        with self._ctx_lock:
+        with self._lifecycle_lock():
             if self._ctx is not None and (
                 not probe_opend_tcp(self.host, self.port)
                 or not self._is_ctx_alive()
@@ -259,14 +284,39 @@ class MoomooFetcher(BaseFetcher):
                         port=self.port,
                     )
                 except MoomooRuntimeError as exc:
+                    MOOMOO_RPC_BREAKER.record_failure(str(exc))
                     raise DataFetchError(
                         f"无法连接 OpenD ({self.host}:{self.port})：{exc}"
                     ) from exc
             return self._ctx
 
+    def _history_kline_page(self, request: dict):
+        """Run one ``request_history_kline`` RPC under the lifecycle lock.
+
+        Acquiring ctx and issuing the RPC under one lock section closes the
+        close()-vs-RPC race（G-7e）；断路器把「卡死的 OpenD」限制在连续三次
+        传输失败内，冷却期内直接以 DataFetchError 快速失败并交给下游数据源
+        fallback（诚实降级，不静默）。
+        """
+        try:
+            MOOMOO_RPC_BREAKER.check()
+        except MoomooCircuitOpenError as exc:
+            raise DataFetchError(f"Moomoo 断路器打开：{exc}") from exc
+        from moomoo import RET_OK
+
+        with self._lifecycle_lock():
+            ctx = self._get_ctx()
+            try:
+                ret, data, next_page_key = ctx.request_history_kline(**request)
+            except Exception as exc:
+                MOOMOO_RPC_BREAKER.record_failure(str(exc))
+                raise
+        self._record_rpc_outcome(ret == RET_OK, data if ret != RET_OK else None)
+        return ret, data, next_page_key
+
     def close(self) -> None:
         """Tear down the OpenD connection. Safe to call repeatedly."""
-        with self._ctx_lock:
+        with self._lifecycle_lock():
             if self._ctx is not None:
                 try:
                     self._ctx.close()
@@ -334,7 +384,6 @@ class MoomooFetcher(BaseFetcher):
     ) -> pd.DataFrame:
         from moomoo import KLType, AuType, KL_FIELD, RET_OK
 
-        ctx = self._get_ctx()
         mcode = self._to_moomoo_code(stock_code)
         logger.info(
             "[Moomoo] history_kline daily code=%s start=%s end=%s",
@@ -343,15 +392,19 @@ class MoomooFetcher(BaseFetcher):
             end_date,
         )
         try:
-            ret, data, _page_key = ctx.request_history_kline(
-                code=mcode,
-                start=start_date,
-                end=end_date,
-                ktype=KLType.K_DAY,
-                autype=AuType.QFQ,
-                fields=[KL_FIELD.ALL],
-                max_count=1000,
+            ret, data, _page_key = self._history_kline_page(
+                {
+                    "code": mcode,
+                    "start": start_date,
+                    "end": end_date,
+                    "ktype": KLType.K_DAY,
+                    "autype": AuType.QFQ,
+                    "fields": [KL_FIELD.ALL],
+                    "max_count": 1000,
+                }
             )
+        except DataFetchError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise DataFetchError(f"Moomoo daily request raised: {exc}") from exc
 
@@ -446,7 +499,6 @@ class MoomooFetcher(BaseFetcher):
 
         from moomoo import AuType, KLType, KL_FIELD, RET_OK
 
-        ctx = self._get_ctx()
         common_request = {
             "code": mcode,
             "start": session_date.isoformat(),
@@ -466,7 +518,9 @@ class MoomooFetcher(BaseFetcher):
             if page_req_key is not None:
                 request["page_req_key"] = page_req_key
             try:
-                ret, data, next_page_key = ctx.request_history_kline(**request)
+                ret, data, next_page_key = self._history_kline_page(request)
+            except DataFetchError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 raise DataFetchError(
                     f"Moomoo premarket page {page_number} request raised: {exc}"
@@ -605,7 +659,6 @@ class MoomooFetcher(BaseFetcher):
         from moomoo import KLType, AuType, KL_FIELD, RET_OK
 
         ktype = getattr(KLType, ktype_attr)
-        ctx = self._get_ctx()
         mcode = self._to_moomoo_code(stock_code)
         end = datetime.now().date()
         start = end - timedelta(days=max(1, days))
@@ -638,7 +691,9 @@ class MoomooFetcher(BaseFetcher):
             if page_req_key is not None:
                 request["page_req_key"] = page_req_key
             try:
-                ret, data, next_page_key = ctx.request_history_kline(**request)
+                ret, data, next_page_key = self._history_kline_page(request)
+            except DataFetchError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 raise DataFetchError(
                     f"Moomoo intraday page {page_number} request raised: {exc}"
@@ -741,9 +796,24 @@ class MoomooFetcher(BaseFetcher):
         try:
             from moomoo import RET_OK
 
-            ctx = self._get_ctx()
+            try:
+                MOOMOO_RPC_BREAKER.check()
+            except MoomooCircuitOpenError as exc:
+                if log_final_failure:
+                    logger.info("[Moomoo] snapshot skipped: %s", exc)
+                return None
             mcode = self._to_moomoo_code(stock_code)
-            ret, data = ctx.get_market_snapshot([mcode])
+            # RPC 与健康检查 close() 持同一把生命周期锁（G-7e）。
+            with self._lifecycle_lock():
+                ctx = self._get_ctx()
+                try:
+                    ret, data = ctx.get_market_snapshot([mcode])
+                except Exception as exc:
+                    MOOMOO_RPC_BREAKER.record_failure(str(exc))
+                    raise
+            self._record_rpc_outcome(
+                ret == RET_OK, data if ret != RET_OK else None
+            )
             if ret != RET_OK or data is None or data.empty:
                 if log_final_failure:
                     logger.info("[Moomoo] snapshot %s empty: %s", mcode, data)

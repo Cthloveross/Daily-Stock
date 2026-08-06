@@ -128,9 +128,19 @@ _NEW_YORK = ZoneInfo("America/New_York")
 _MAX_FETCH_WORKERS = 4
 _MAX_OPTION_WALL_WORKERS = 5
 _SCAN_CACHE_TTL_SECONDS = 30.0
-_SCAN_CACHE_MAX_ENTRIES = 32
+# 完成态缓存条目很小（纯 dict），但 key 空间不小：逐标的的 option_context /
+# option_event / near_expiry / option_wall 各占一键。32 的旧上限在 20 标的
+# 清单下会互相挤兑（缓存刚写就被淘汰 → 重复供应商请求）；128 覆盖现实
+# key 数量仍然有界。
+_SCAN_CACHE_MAX_ENTRIES = 128
 _SCAN_FLIGHT_LEASE_SECONDS = 30.0
 _SCAN_FOLLOWER_WAIT_SECONDS = 30.0
+# 单飞计算与请求线程解耦（leader 也有截止时间）：工厂在共享有界线程池上
+# 执行，请求线程只做有界等待，租约到点返回 504、孤儿计算继续在后台完成并
+# 发布到缓存。池大小覆盖「同时在算的 key 数」的现实上界（逐标的 key 由
+# 各自 30–60 秒 TTL + 单飞去重压到个位数～十几个）；极端排队时等待方也
+# 只会等到租约到期的 504，绝不无界悬挂。
+_SCAN_EXECUTOR_MAX_WORKERS = 16
 _OPTION_CONTEXT_VERSION = "nearest_expiry_atm_call_iv_v1"
 _OPTION_CONTEXT_SOURCE = "moomoo_openapi"
 _OPTION_OVERVIEW_VERSION = "moomoo_option_underlying_overview_v1"
@@ -239,6 +249,11 @@ _LANE_AVAILABILITY_MAX_SYMBOLS = 12
 _LANE_AVAILABILITY_MAX_NEW_FETCHES = 8
 _LANE_AVAILABILITY_MAX_WORKERS = 4
 _LANE_AVAILABILITY_CHECKED_SCOPE = "intraday_deep_lane_tickers"
+# 车道可用性只在日内榜单飞 leader 内被调用，而 leader 自己有 45 秒租约：
+# 到期日读取的 wall lane 获取等待必须远小于租约（旧值 30 秒 × 最多 8 个
+# 标的可以独占整个租约）。lane 正忙不是失败——该标的推迟到下一轮
+# （deferred，不缓存失败），deferred_tickers 机制已如实呈现。
+_LANE_AVAILABILITY_LANE_WAIT_SECONDS = 2.5
 # --- watchlist v1 两层扫描（INTRADAY_WATCHLIST 配置后启用；未配置零改动）---
 # 宽层（tier-1）：整个清单每个 60 秒轮询周期只发 1 次 Moomoo
 # ``get_market_snapshot`` 批量快照（官方单次上限 400 个代码）。清单上限 200
@@ -298,8 +313,14 @@ _INTRADAY_MOMENTUM_WARMING_UP_WARNING = (
 )
 _INTRADAY_MOMENTUM_LOOKBACK_MIN_SECONDS = 12 * 60
 _INTRADAY_MOMENTUM_LOOKBACK_MAX_SECONDS = 18 * 60
-# 60 秒轮询下 40 个样本 ≈ 40 分钟覆盖，远超 18 分钟回看上限（有界防涨）。
-_INTRADAY_MOMENTUM_HISTORY_MAXLEN = 40
+# 样本保留是**时间制**（回看窗上限 + 2 分钟缓冲）：旧的 40 条计数上限在
+# 工厂每分钟跑 >2 次时（refresh、多调用方）覆盖跌破 12 分钟回看下限，
+# mom15 永久饥饿、闸门静默退回 v1。maxlen 仅作硬性兜底（240 条 ≈ 每 5 秒
+# 一样本仍覆盖满 20 分钟），真正的裁剪按样本年龄进行。
+_INTRADAY_MOMENTUM_HISTORY_MAXLEN = 240
+_INTRADAY_MOMENTUM_RETENTION_SECONDS = (
+    _INTRADAY_MOMENTUM_LOOKBACK_MAX_SECONDS + 120
+)
 # 今日深扫账本（display truth）：进程内 per-ET-day 保留每个曾晋升深度层标的
 # 最后一次深扫的候选摘要（含分级波段），轮换出深度层后仍以「今日曾深扫」
 # as-of 行呈现——2026-08-03 实盘：ORCL 09:40 记录强波段后被后续 movers 挤出
@@ -374,6 +395,9 @@ class _ScanFlight:
     generation: int
     started_at: float
     deadline_at: float
+    # 迟到发布用的完成态 TTL：孤儿计算（超过租约后才算完）写缓存时沿用
+    # 启动方声明的 TTL，让下一次轮询直接命中，绝不丢弃已算出的结果。
+    ttl_seconds: float = _SCAN_CACHE_TTL_SECONDS
     event: threading.Event = field(default_factory=threading.Event)
     result: Optional[dict[str, Any]] = None
     error: Optional[BaseException] = None
@@ -544,6 +568,58 @@ def _prune_scan_cache(now: float) -> None:
         _scan_cache.pop(oldest_key, None)
 
 
+_scan_executor: Optional[ThreadPoolExecutor] = None
+_scan_executor_lock = threading.Lock()
+
+
+def _get_scan_executor() -> ThreadPoolExecutor:
+    """Lazily create the shared bounded worker pool for scan factories."""
+
+    global _scan_executor
+    with _scan_executor_lock:
+        if _scan_executor is None:
+            _scan_executor = ThreadPoolExecutor(
+                max_workers=_SCAN_EXECUTOR_MAX_WORKERS,
+                thread_name_prefix="opportunity-scan",
+            )
+        return _scan_executor
+
+
+def _finish_scan_flight(
+    key: tuple[Any, ...],
+    flight: _ScanFlight,
+    *,
+    result: Optional[dict[str, Any]] = None,
+    error: Optional[BaseException] = None,
+) -> None:
+    """Publish one finished computation — even one that outlived its lease.
+
+    迟到的成功结果**绝不丢弃**：只要该 flight 仍是这个 key 的在册计算，
+    就写入完成态缓存并清账，下一次轮询直接命中（活锁修复的核心——旧实现
+    把超租约完成的结果扔掉再抛 504，慢供应商下永远无人能读到结果）。
+    flight 已被测试重置等原因除名时不再发布，防止跨代际污染。
+    """
+
+    completion_time = _cache_now()
+    with _scan_cache_lock:
+        current = _scan_flights.get(key)
+        if error is not None:
+            if flight.error is None:
+                flight.error = error
+        else:
+            stored = copy.deepcopy(result)
+            flight.result = stored
+            if current is flight:
+                _prune_scan_cache(completion_time)
+                _scan_cache[key] = _ScanCacheEntry(
+                    expires_at=completion_time + flight.ttl_seconds,
+                    result=stored,
+                )
+        if current is flight:
+            _scan_flights.pop(key, None)
+        flight.event.set()
+
+
 def _get_or_compute_scan(
     key: tuple[Any, ...],
     factory: Callable[[], dict[str, Any]],
@@ -558,6 +634,18 @@ def _get_or_compute_scan(
     ``bypass_cache`` skips only a completed TTL entry.  A matching in-flight
     request is still shared so repeated refresh clicks cannot multiply provider
     traffic.
+
+    并发合同（2026-08 16 分钟悬挂事故后收紧）：
+
+    - **每个 key 同时至多一个工厂在执行**。工厂跑在共享有界线程池上；
+      后到的请求只会加入等待，绝不会因为租约过期而启动第二个工厂
+      （旧实现的「过期逐出 + 新 leader」会自我放大重复扫描）。
+    - **发起方与跟随方都有截止时间**：等待不超过
+      ``min(wait_timeout_seconds, 租约剩余)``，到点抛
+      :class:`OpportunityScanTimeoutError`（端点译为可重试 504），
+      而工厂继续在后台完成。
+    - **迟到结果发布**：超过租约才算完的工厂照常写完成态缓存
+      （见 :func:`_finish_scan_flight`），下一次轮询直接命中。
     """
 
     if wait_timeout_seconds <= 0 or lease_seconds <= 0:
@@ -565,6 +653,7 @@ def _get_or_compute_scan(
 
     global _scan_flight_generation
     now = _cache_now()
+    started = False
     with _scan_cache_lock:
         _prune_scan_cache(now)
         cached = _scan_cache.get(key)
@@ -572,82 +661,48 @@ def _get_or_compute_scan(
             return copy.deepcopy(cached.result)
 
         flight = _scan_flights.get(key)
-        if flight is not None and flight.deadline_at <= now:
-            flight.error = OpportunityScanTimeoutError(
-                "opportunity scan exceeded its lease"
-            )
-            _scan_flights.pop(key, None)
-            flight.event.set()
-            flight = None
-        is_leader = flight is None
         if flight is None:
             _scan_flight_generation += 1
             flight = _ScanFlight(
                 generation=_scan_flight_generation,
                 started_at=now,
                 deadline_at=now + lease_seconds,
+                ttl_seconds=(
+                    _SCAN_CACHE_TTL_SECONDS if ttl_seconds is None else ttl_seconds
+                ),
             )
             _scan_flights[key] = flight
+            started = True
 
-    if not is_leader:
-        remaining = min(
-            wait_timeout_seconds,
-            max(0.0, flight.deadline_at - _cache_now()),
+    if started:
+
+        def run_scan_factory() -> None:
+            try:
+                produced = factory()
+            except BaseException as exc:  # noqa: BLE001 - published to all waiters
+                _finish_scan_flight(key, flight, error=exc)
+            else:
+                _finish_scan_flight(key, flight, result=produced)
+
+        try:
+            _get_scan_executor().submit(run_scan_factory)
+        except BaseException as exc:
+            _finish_scan_flight(key, flight, error=exc)
+
+    remaining = min(
+        wait_timeout_seconds,
+        max(0.0, flight.deadline_at - _cache_now()),
+    )
+    completed = flight.event.wait(timeout=remaining)
+    if not completed:
+        raise OpportunityScanTimeoutError(
+            "opportunity scan is still running; retry shortly"
         )
-        completed = flight.event.wait(timeout=remaining)
-        if not completed:
-            now = _cache_now()
-            with _scan_cache_lock:
-                current = _scan_flights.get(key)
-                if current is flight and now >= flight.deadline_at:
-                    flight.error = OpportunityScanTimeoutError(
-                        "opportunity scan exceeded its lease"
-                    )
-                    _scan_flights.pop(key, None)
-                    flight.event.set()
-            raise OpportunityScanTimeoutError(
-                "opportunity scan is still running; retry shortly"
-            )
-        if flight.error is not None:
-            raise flight.error
-        if flight.result is None:
-            raise RuntimeError("opportunity scan single-flight completed without a result")
-        return copy.deepcopy(flight.result)
-
-    try:
-        result = factory()
-    except BaseException as exc:
-        with _scan_cache_lock:
-            if _scan_flights.get(key) is flight:
-                _scan_flights.pop(key, None)
-            if flight.error is None:
-                flight.error = exc
-            flight.event.set()
-        raise
-
-    stored = copy.deepcopy(result)
-    completion_time = _cache_now()
-    with _scan_cache_lock:
-        current = _scan_flights.get(key)
-        if current is not flight or completion_time > flight.deadline_at:
-            if current is flight:
-                _scan_flights.pop(key, None)
-            if flight.error is None:
-                flight.error = OpportunityScanTimeoutError(
-                    "opportunity scan completed after its lease"
-                )
-            flight.event.set()
-            raise flight.error
-        _prune_scan_cache(completion_time)
-        _scan_cache[key] = _ScanCacheEntry(
-            expires_at=completion_time
-            + (_SCAN_CACHE_TTL_SECONDS if ttl_seconds is None else ttl_seconds),
-            result=stored,
-        )
-        flight.result = stored
-        _scan_flights.pop(key, None)
-        flight.event.set()
-    return copy.deepcopy(stored)
+    if flight.error is not None:
+        raise flight.error
+    if flight.result is None:
+        raise RuntimeError("opportunity scan single-flight completed without a result")
+    return copy.deepcopy(flight.result)
 
 
 def _scan_timeout_response(exc: OpportunityScanTimeoutError) -> HTTPException:
@@ -1176,12 +1231,19 @@ def _compute_expiry_availability_moomoo(symbol: str, *, max_dte: int):
 
     与 ``_compute_near_expiry_chain_moomoo`` 共用临期合约链读取路径的第一步，
     但不发链窗口与快照批次（详见 data_provider 侧 docstring 与本模块
-    ``_LANE_AVAILABILITY_*`` 常量的额度护栏说明）。
+    ``_LANE_AVAILABILITY_*`` 常量的额度护栏说明）。lane 获取用短等待
+    （``_LANE_AVAILABILITY_LANE_WAIT_SECONDS``）：本读取只发生在日内榜
+    单飞 leader 内，lane 正忙时抛 ``MoomooWallLaneBusyError`` 交给调用方
+    推迟到下一轮，绝不在 leader 租约内排队 30 秒。
     """
 
     from data_provider.moomoo_options import fetch_expiry_availability_moomoo
 
-    return fetch_expiry_availability_moomoo(symbol, max_dte=max_dte)
+    return fetch_expiry_availability_moomoo(
+        symbol,
+        max_dte=max_dte,
+        lane_wait_seconds=_LANE_AVAILABILITY_LANE_WAIT_SECONDS,
+    )
 
 
 def _option_context_item(
@@ -2531,10 +2593,30 @@ def _load_lane_availability(
     to_fetch = misses[:_LANE_AVAILABILITY_MAX_NEW_FETCHES]
     deferred = misses[_LANE_AVAILABILITY_MAX_NEW_FETCHES:]
 
+    from data_provider.moomoo_options import MoomooWallLaneBusyError
+
     def load_one(symbol: str) -> tuple[str, dict[str, Any], float]:
         try:
             snapshot = _compute_expiry_availability_moomoo(
                 symbol, max_dte=LANE_AVAILABILITY_MAX_DTE
+            )
+        except MoomooWallLaneBusyError:
+            # lane 正忙 ≠ 供应商失败：推迟到下一轮（TTL=0 → 不缓存失败），
+            # 结论侧与额度预算 deferred 同样保持 unknown。
+            logger.debug(
+                "[opportunities] lane availability deferred (wall lane busy) "
+                "for %s",
+                symbol,
+            )
+            return (
+                symbol,
+                build_ticker_availability(
+                    symbol,
+                    None,
+                    max_dte=LANE_AVAILABILITY_MAX_DTE,
+                    unavailable_reason="deferred_wall_lane_busy",
+                ),
+                0.0,
             )
         except Exception as exc:  # noqa: BLE001 - availability failures degrade
             logger.debug(
@@ -2579,6 +2661,9 @@ def _load_lane_availability(
     with _scan_cache_lock:
         _prune_lane_availability_cache(completion_time)
         for symbol, payload, ttl in fetched:
+            if ttl <= 0:
+                # lane-busy 推迟：不缓存，下一轮直接重试。
+                continue
             _lane_availability_cache[(symbol, market_date_et)] = _ScanCacheEntry(
                 expires_at=completion_time + ttl,
                 result=copy.deepcopy(payload),
@@ -2589,6 +2674,11 @@ def _load_lane_availability(
             _lane_availability_cache.pop(key, None)
 
     by_symbol = {**cached, **{symbol: payload for symbol, payload, _ in fetched}}
+    lane_busy_deferred = [
+        symbol
+        for symbol, payload, _ in fetched
+        if payload.get("unavailable_reason") == "deferred_wall_lane_busy"
+    ]
     for symbol in deferred:
         by_symbol[symbol] = build_ticker_availability(
             symbol,
@@ -2602,7 +2692,7 @@ def _load_lane_availability(
         max_dte=LANE_AVAILABILITY_MAX_DTE,
         market_date_et=market_date_et,
         checked_scope=_LANE_AVAILABILITY_CHECKED_SCOPE,
-        skipped_tickers=[*skipped_for_cap, *deferred],
+        skipped_tickers=[*skipped_for_cap, *deferred, *lane_busy_deferred],
     )
 
 
@@ -2672,6 +2762,22 @@ def _execute_intraday_top(
         spy_quote = (
             _quote_to_intraday_input(spy_raw) if spy_raw is not None else None
         )
+        # G-7b：动量历史由**每一轮 tier-1 批量快照**喂养（单层/两层同源）。
+        # 只有两层路径喂养时，单层轮询/并行调用只消耗不生产，mom15 长期
+        # 饥饿。仍仅限常规时段——盘前/盘后常规快照价不再前进。
+        if session_state == "regular" and raw_quotes:
+            _feed_intraday_momentum_history(
+                [
+                    {
+                        "ticker": symbol,
+                        "last_price": getattr(quote, "last_price", None),
+                    }
+                    for symbol, quote in raw_quotes.items()
+                    if symbol in supported
+                ],
+                market_date_et=market_date_et,
+                now_epoch=requested_at.timestamp(),
+            )
 
     option_event_items = _load_intraday_option_event_items(
         supported,
@@ -2862,6 +2968,8 @@ def _feed_intraday_momentum_history(
 
     仅常规时段调用（调用方约束）；ET 日期切换即整体清空——隔日样本对
     「最近 15 分钟动量」毫无意义，绝不跨日比价。缺价/非法价的行不入历史。
+    单层与两层路径的每一轮 tier-1 批量快照都喂养同一份历史（G-7b），
+    保留按样本年龄裁剪（时间制），调用频率再高也不会把足龄样本挤出去。
     """
 
     global _intraday_momentum_history_date
@@ -2882,6 +2990,12 @@ def _feed_intraday_momentum_history(
                 history = deque(maxlen=_INTRADAY_MOMENTUM_HISTORY_MAXLEN)
                 _intraday_momentum_history[row["ticker"]] = history
             history.append((float(now_epoch), float(last_price)))
+            while (
+                history
+                and now_epoch - history[0][0]
+                > _INTRADAY_MOMENTUM_RETENTION_SECONDS
+            ):
+                history.popleft()
 
 
 def _intraday_mom15(
@@ -3140,22 +3254,26 @@ def _execute_intraday_top_two_tier(
         )
         for key in [k for k in _intraday_deep_promotion_log if k != market_date_et]:
             _intraday_deep_promotion_log.pop(key, None)
-        # 计划/用户钉选/盘中计划提升不受日上限约束，但计入当日去重集合
+        # G-7a：额度判定在**假想集合**上进行；当日账本只在总数硬顶裁剪后
+        # 提交「本轮真正进入深度层」的标的——被硬顶挤掉（trimmed_by_total_cap）
+        # 的标的从未被深扫，绝不消耗当日/30 天配额记录。
+        # 计划/用户钉选/盘中计划提升不受日上限约束，但计入假想去重集合
         # （额度语义一致）。
-        promoted_today.update(plan_tickers)
-        promoted_today.update(pinned_effective)
-        promoted_today.update(focus_effective)
+        tentative_today = set(promoted_today)
+        tentative_today.update(plan_tickers)
+        tentative_today.update(pinned_effective)
+        tentative_today.update(focus_effective)
         for symbol in mover_order:
             if len(promoted_movers) >= deep_lane_max:
                 break
-            if symbol in promoted_today:
+            if symbol in tentative_today:
                 promoted_movers.append(symbol)
                 continue
-            if len(promoted_today) >= _INTRADAY_DEEP_DAILY_DISTINCT_CAP:
+            if len(tentative_today) >= _INTRADAY_DEEP_DAILY_DISTINCT_CAP:
                 # 日上限触顶：该标的当日只保留宽层快照行（显式标注，不静默）。
                 day_cap_reached = True
                 continue
-            promoted_today.add(symbol)
+            tentative_today.add(symbol)
             promoted_movers.append(symbol)
 
     # -- 深度层总行数硬顶 ----------------------------------------------------
@@ -3195,6 +3313,13 @@ def _execute_intraday_top_two_tier(
                 continue
             deep_symbols.append(symbol)
     deep_set = set(deep_symbols)
+
+    # G-7a：当日晋升账本只记「本轮真正进入深度层」的标的——display truth
+    # 与供应商配额语义一致（宽层快照行不消耗 request_history_kline 配额）。
+    with _scan_cache_lock:
+        _intraday_deep_promotion_log.setdefault(market_date_et, set()).update(
+            deep_symbols
+        )
 
     # -- Tier 2：既有 v4 管线，仅深度层标的 -----------------------------------
     daily_raw = _intraday_daily_inputs(
@@ -3992,13 +4117,16 @@ def option_overview(payload: OptionOverviewRequest) -> OptionOverviewResponse:
         _moomoo_opend_enabled(),
         market_date_et,
     )
-    result = _get_or_compute_scan(
-        key,
-        lambda: _execute_option_overview(
-            payload.symbols,
-            enabled=_moomoo_opend_enabled(),
-        ),
-    )
+    try:
+        result = _get_or_compute_scan(
+            key,
+            lambda: _execute_option_overview(
+                payload.symbols,
+                enabled=_moomoo_opend_enabled(),
+            ),
+        )
+    except OpportunityScanTimeoutError as exc:
+        raise _scan_timeout_response(exc) from exc
     return OptionOverviewResponse.model_validate(result)
 
 
@@ -4012,7 +4140,10 @@ def option_context(payload: OptionContextRequest) -> OptionContextResponse:
 
     symbols = payload.symbols
     enabled = _moomoo_opend_enabled()
-    result = _execute_option_context(symbols, enabled=enabled)
+    try:
+        result = _execute_option_context(symbols, enabled=enabled)
+    except OpportunityScanTimeoutError as exc:
+        raise _scan_timeout_response(exc) from exc
     return OptionContextResponse.model_validate(result)
 
 
@@ -4027,12 +4158,15 @@ def option_walls(payload: OptionWallRequest) -> OptionWallResponse:
     chain request.
     """
 
-    result = _execute_option_walls(
-        payload.symbols,
-        enabled=_moomoo_opend_enabled(),
-        dte_min=payload.dte_min,
-        dte_max=payload.dte_max,
-    )
+    try:
+        result = _execute_option_walls(
+            payload.symbols,
+            enabled=_moomoo_opend_enabled(),
+            dte_min=payload.dte_min,
+            dte_max=payload.dte_max,
+        )
+    except OpportunityScanTimeoutError as exc:
+        raise _scan_timeout_response(exc) from exc
     return OptionWallResponse.model_validate(result)
 
 
@@ -4056,12 +4190,15 @@ def option_walls_daily_snapshot(
     再钳一次。抓取失败的标的**不写任何行**（而不是写 0）。
     """
 
-    result = _execute_option_walls(
-        payload.symbols,
-        enabled=_moomoo_opend_enabled(),
-        dte_min=payload.dte_min,
-        dte_max=payload.dte_max,
-    )
+    try:
+        result = _execute_option_walls(
+            payload.symbols,
+            enabled=_moomoo_opend_enabled(),
+            dte_min=payload.dte_min,
+            dte_max=payload.dte_max,
+        )
+    except OpportunityScanTimeoutError as exc:
+        raise _scan_timeout_response(exc) from exc
     try:
         written = record_wall_snapshots(result, tickers=payload.symbols)
     except OptionWallSnapshotError as exc:
@@ -4085,11 +4222,14 @@ def option_events(payload: OptionEventRequest) -> OptionEventResponse:
     infer open/close or dealer direction, and does not alter candidate ranking.
     """
 
-    result = _execute_option_events(
-        payload.symbols,
-        enabled=_moomoo_opend_enabled(),
-        limit_per_symbol=payload.limit_per_symbol,
-    )
+    try:
+        result = _execute_option_events(
+            payload.symbols,
+            enabled=_moomoo_opend_enabled(),
+            limit_per_symbol=payload.limit_per_symbol,
+        )
+    except OpportunityScanTimeoutError as exc:
+        raise _scan_timeout_response(exc) from exc
     return OptionEventResponse.model_validate(result)
 
 

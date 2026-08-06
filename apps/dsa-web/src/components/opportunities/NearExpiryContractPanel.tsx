@@ -9,7 +9,7 @@ import type {
   NearExpiryExpiryGroup,
 } from '../../types/opportunities';
 import { Tooltip } from '../common/Tooltip';
-import { formatSignedCompactUsd } from './intradayFormat';
+import { formatSignedCompactUsd, quoteTimeLabel } from './intradayFormat';
 
 /**
  * 点差 > 15% 标「流动性差」。这是 v1 启发式展示阈值（未经交易结果验证），
@@ -34,12 +34,6 @@ function formatPrice(value: number | null, digits = 2): string {
 function formatCount(value: number | null): string {
   if (value === null || !Number.isFinite(value)) return '标缺';
   return value.toLocaleString('en-US');
-}
-
-function quoteTimeLabel(value: string | null): string {
-  if (!value) return '标缺';
-  const match = value.match(/\d{2}:\d{2}(?::\d{2})?/);
-  return match ? `${match[0]} ET` : value;
 }
 
 /**
@@ -218,7 +212,7 @@ export function NearExpiryContractPanel({
   const [item, setItem] = useState<NearExpiryContractItem | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  // 个人画像回灌：DTE 提示行数据；失败/未构建显式标缺（10 分钟会话缓存）。
+  // 个人画像回灌：DTE 提示行数据；失败/未构建显式标缺（2 分钟会话缓存）。
   const personalEdge = usePersonalEdge();
 
   const load = useCallback(async (refresh: boolean) => {

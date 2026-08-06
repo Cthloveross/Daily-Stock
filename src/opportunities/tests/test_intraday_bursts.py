@@ -812,6 +812,27 @@ class TestFizzleFlagTruthTable:
         assert profile["fizzle_flag"]["state"] == "not_flagged"
         assert profile["fizzle_flag"]["stratum"] == "open"
 
+    def test_degenerate_current_median_marks_fizzle_unavailable(self):
+        """当日 <6 根且**无上一时段**：中位数分母由 3 根开盘 K 线自证（退化
+        基准），哑火形态必须标缺（median_basis_insufficient）而不是硬算出
+        一个命中/未命中。"""
+
+        today = [
+            _bar("2026-07-28T09:30:00-04:00", open_=100.0, high=100.4, low=100.0, close=100.4, volume=100.0),
+            _bar("2026-07-28T09:35:00-04:00", open_=100.4, high=100.8, low=100.4, close=100.8, volume=100.0),
+            _bar("2026-07-28T09:40:00-04:00", open_=100.8, high=101.2, low=100.8, close=101.2, volume=100.0),
+        ]
+        profile = compute_session_burst_profile(
+            today,
+            market_date_et="2026-07-28",
+            quote_session_scope="current_session",
+        )
+        assert profile["state"] == "ready"
+        assert profile["median_basis"] == MEDIAN_BASIS_CURRENT
+        flag = profile["fizzle_flag"]
+        assert flag["state"] == "unavailable"
+        assert flag["reason"] == "median_basis_insufficient"
+
 
 class TestRecentDisplacement:
     """v6 近 30 分钟位移：窗口数学、ATR 标尺选择与 fail-closed 三态。
@@ -871,6 +892,70 @@ class TestRecentDisplacement:
         assert displacement["abs_range_atr"] == pytest.approx(
             (window_high - window_low) / 2.0
         )
+
+    def test_contiguous_window_reports_a_30_minute_span(self):
+        bars = self._ramp_bars([100.0, 100.4, 100.2, 100.6, 100.8, 101.0])
+        displacement = compute_recent_displacement(
+            bars,
+            market_date_et="2026-07-28",
+            quote_session_scope="current_session",
+            atr14=2.0,
+        )
+        assert displacement["state"] == "ready"
+        assert displacement["window_span_minutes"] == 30
+
+    def test_small_gap_keeps_the_reading_but_reports_the_true_span(self):
+        """含断档但跨度 ≤45 分钟：读数保留，实际跨度如实带出（不冒充连续 30 分钟）。"""
+
+        times = ("09:30", "09:35", "09:40", "09:45", "09:50", "10:05")
+        bars = [
+            _bar(
+                f"2026-07-28T{hhmm}:00-04:00",
+                open_=100.0 + index * 0.2,
+                high=100.3 + index * 0.2,
+                low=99.9 + index * 0.2,
+                close=100.2 + index * 0.2,
+                volume=1_000.0,
+            )
+            for index, hhmm in enumerate(times)
+        ]
+        displacement = compute_recent_displacement(
+            bars,
+            market_date_et="2026-07-28",
+            quote_session_scope="current_session",
+            atr14=2.0,
+        )
+        assert displacement["state"] == "ready"
+        # 09:30 → 10:05 的 6 根 K 线：实际跨度 40 分钟，不是 30。
+        assert displacement["window_span_minutes"] == 40
+        assert displacement["net_move_atr"] is not None
+
+    def test_large_gap_fails_closed_with_the_span_in_the_reason(self):
+        """跨度 >45 分钟的「6 根 K 线」不再是「近 30 分钟」——整个读数标缺。"""
+
+        times = ("09:30", "09:35", "09:40", "09:45", "09:50", "10:25")
+        bars = [
+            _bar(
+                f"2026-07-28T{hhmm}:00-04:00",
+                open_=100.0,
+                high=100.4,
+                low=99.9,
+                close=100.2,
+                volume=1_000.0,
+            )
+            for hhmm in times
+        ]
+        displacement = compute_recent_displacement(
+            bars,
+            market_date_et="2026-07-28",
+            quote_session_scope="current_session",
+            atr14=2.0,
+        )
+        assert displacement["state"] == "unavailable"
+        assert displacement["window_span_minutes"] == 60
+        assert "60m" in displacement["unavailable_reason"]
+        assert "45m" in displacement["unavailable_reason"]
+        assert displacement["net_move_atr"] is None
 
     def test_window_is_only_the_last_six_bars(self):
         # 前段大涨、后 30 分钟横盘：位移必须只反映最后 6 根，不吃掉早盘涨幅。

@@ -677,3 +677,48 @@ def test_history_endpoint_accepts_native_intraday_periods(monkeypatch, period):
     assert body["source"] == "MoomooFetcher"
     assert body["derived_from_period"] is None
     assert body["aggregation_method"] is None
+
+
+def test_history_reuses_one_process_wide_fetcher_manager(monkeypatch):
+    """G-7d：轮询/每标的不再各建一个 DataFetcherManager（= 各开一条 OpenD 连接）。
+
+    共享 manager 按类身份缓存：同一个（monkeypatch 后的）类只构建一次；
+    换一个类（新一次 monkeypatch）自动重建，测试之间互不串味。
+    """
+
+    import src.services.stock_service as stock_service_module
+
+    frame = pd.DataFrame(
+        [{"date": "2026-07-21", "open": 3, "high": 4, "low": 2, "close": 3.5}]
+    )
+    constructions = []
+
+    class _CountingManager(_DailyManager):
+        def __init__(self):
+            super().__init__(frame, "YfinanceFetcher")
+            constructions.append(self)
+
+    monkeypatch.setattr(
+        data_provider_base, "DataFetcherManager", _CountingManager
+    )
+
+    service = _service()
+    first = service.get_history_data("AAPL", period="daily", days=30)
+    second = service.get_history_data("AAPL", period="daily", days=30)
+
+    assert first["source"] == second["source"] == "YfinanceFetcher"
+    assert len(constructions) == 1
+    assert (
+        stock_service_module._get_shared_fetcher_manager() is constructions[0]
+    )
+
+    # 换一个类（模拟下一个测试重新 monkeypatch）：立即重建，不复用旧实例。
+    class _ReplacementManager(_CountingManager):
+        pass
+
+    monkeypatch.setattr(
+        data_provider_base, "DataFetcherManager", _ReplacementManager
+    )
+    rebuilt = stock_service_module._get_shared_fetcher_manager()
+    assert isinstance(rebuilt, _ReplacementManager)
+    assert rebuilt is not constructions[0]

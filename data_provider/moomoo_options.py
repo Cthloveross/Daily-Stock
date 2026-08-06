@@ -57,13 +57,39 @@ from typing import Any, Iterator, List, Optional
 from zoneinfo import ZoneInfo
 
 from src.services.moomoo_runtime import (
+    MOOMOO_RPC_BREAKER,
+    MoomooCircuitOpenError,
     MoomooRuntimeError,
     create_ready_quote_context,
+    is_transport_failure_detail,
     probe_opend_tcp,
     quote_context_is_ready,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class MoomooWallLaneBusyError(RuntimeError):
+    """Every wall QuoteContext lane stayed busy within the caller's bounded wait.
+
+    只在调用方显式要求「租不到 lane 就报忙」时抛出（见
+    :func:`_lease_wall_context` 的 ``busy_error``）。它表示**别的读取正在用
+    lane**，不表示 OpenD 故障——调用方应把该标的推迟到下一轮（deferred），
+    而不是缓存一次失败。
+    """
+
+
+def _record_rpc_outcome(ok: bool, detail: Any = None) -> None:
+    """Feed the shared breaker from one completed provider reply.
+
+    业务型拒绝（ret != RET_OK 但详情不含超时/断连标记）视为「守护进程仍在
+    应答」→ 计成功；只有传输类失败计入连续失败预算。
+    """
+
+    if ok or not is_transport_failure_detail(detail):
+        MOOMOO_RPC_BREAKER.record_success()
+    else:
+        MOOMOO_RPC_BREAKER.record_failure(_brief_detail(detail))
 
 
 # Reuse the OptionQuote dataclass shape already used downstream so we can
@@ -132,6 +158,86 @@ _SNAPSHOT_BATCH_SIZE = 400
 _WALL_CONTEXT_MAX_LANES = 5
 _WALL_CONTEXT_LEASE_WAIT_SECONDS = 30.0
 _NEW_YORK = ZoneInfo("America/New_York")
+
+# 批量快照的未知代码恢复（2026-08 LIVE 复现：清单里 1 个 'Unknown stock'
+# 让整批 69 个代码全部失败）。识别到未知代码型拒绝时：错误详情点名了代码
+# 就过滤后重试，没点名就二分重试；额外调用有硬顶，预算耗尽的代码如实留在
+# 未解析集合（调用方的 snapshot_unresolved_symbols 已按「无返回行」披露）。
+_SNAPSHOT_UNKNOWN_CODE_MARKERS = ("unknown stock", "stock not exist", "找不到股票")
+_SNAPSHOT_RECOVERY_MAX_EXTRA_CALLS = 3
+
+
+def _detail_names_unknown_code(detail: Any) -> bool:
+    # 不做真值判断：pandas DataFrame 的 __bool__ 会抛错。
+    text = ("" if detail is None else str(detail)).lower()
+    return any(marker in text for marker in _SNAPSHOT_UNKNOWN_CODE_MARKERS)
+
+
+def _codes_named_in_detail(detail: Any, codes: list[str]) -> list[str]:
+    text = ("" if detail is None else str(detail)).upper()
+    return [code for code in codes if code.upper() in text]
+
+
+def _snapshot_frames_with_unknown_code_recovery(
+    ctx,
+    requested: list[str],
+    ret_ok,
+) -> tuple[Optional[list], list[str]]:
+    """One batch snapshot with bounded unknown-code recovery.
+
+    Returns ``(frames, rejected_codes)``.  ``frames is None`` means the read
+    failed for a non-unknown-code reason before any rows were observed（既有
+    fail-closed 语义不变）。``rejected_codes`` 是被供应商拒绝或恢复预算内
+    未能解析的代码——绝不把它们的失败扩大成整批失败。
+    """
+
+    frames: list = []
+    rejected: list[str] = []
+    extra_calls = 0
+    pending: list[list[str]] = [list(requested)]
+    first_call = True
+    while pending:
+        batch = pending.pop(0)
+        if not batch:
+            continue
+        if not first_call:
+            if extra_calls >= _SNAPSHOT_RECOVERY_MAX_EXTRA_CALLS:
+                rejected.extend(batch)
+                continue
+            extra_calls += 1
+        first_call = False
+        ret, frame = ctx.get_market_snapshot(batch)
+        if ret == ret_ok and frame is not None and hasattr(frame, "iterrows"):
+            _record_rpc_outcome(True)
+            frames.append(frame)
+            continue
+        detail = (ret, frame)
+        _record_rpc_outcome(False, frame)
+        if not _detail_names_unknown_code(frame):
+            logger.warning(
+                "[moomoo_options] underlying session snapshot unavailable "
+                "(batch=%s): %s",
+                len(batch),
+                _brief_detail(detail),
+            )
+            if not frames and not pending:
+                return None, rejected
+            rejected.extend(batch)
+            continue
+        named = _codes_named_in_detail(frame, batch)
+        if named:
+            rejected.extend(named)
+            remaining = [code for code in batch if code not in named]
+            if remaining:
+                pending.append(remaining)
+            continue
+        if len(batch) == 1:
+            rejected.append(batch[0])
+            continue
+        mid = len(batch) // 2
+        pending.append(batch[:mid])
+        pending.append(batch[mid:])
+    return frames, rejected
 
 
 @dataclass
@@ -428,18 +534,32 @@ def fetch_underlying_session_quotes_moomoo(
         return {}
 
     try:
+        MOOMOO_RPC_BREAKER.check()
+    except MoomooCircuitOpenError as exc:
+        logger.warning(
+            "[moomoo_options] underlying session snapshot skipped: %s", exc
+        )
+        return {}
+
+    try:
         with _ctx_lock:
             ctx = _get_ctx()
             if ctx is None:
                 return {}
-            ret, frame = ctx.get_market_snapshot(requested)
-        if ret != RET_OK or frame is None or not hasattr(frame, "iterrows"):
-            logger.warning(
-                "[moomoo_options] underlying session snapshot unavailable: %s",
-                _brief_detail((ret, frame)),
+            frames, rejected = _snapshot_frames_with_unknown_code_recovery(
+                ctx, requested, RET_OK
             )
+        if frames is None:
             return {}
+        if rejected:
+            # 未知/未解析代码只影响它们自己；有效代码照常返回，端点侧通过
+            # snapshot_unresolved_symbols 如实披露缺席的行。
+            logger.warning(
+                "[moomoo_options] underlying session snapshot rejected codes: %s",
+                ",".join(rejected),
+            )
     except Exception as exc:  # noqa: BLE001 - quote-only provider boundary
+        MOOMOO_RPC_BREAKER.record_failure(str(exc))
         logger.warning(
             "[moomoo_options] underlying session snapshot failed: %s",
             exc,
@@ -449,7 +569,8 @@ def fetch_underlying_session_quotes_moomoo(
     fetched_at = datetime.now(timezone.utc)
     requested_set = set(requested)
     result: dict[str, MoomooUnderlyingSessionQuote] = {}
-    for _, row in frame.iterrows():
+    rows_iter = [row for frame in frames for _, row in frame.iterrows()]
+    for row in rows_iter:
         item = row.to_dict() if hasattr(row, "to_dict") else dict(row)
         code = (_safe_text(item.get("code")) or "").upper()
         if code not in requested_set:
@@ -506,6 +627,7 @@ def _get_ctx():
             try:
                 _ctx_singleton = create_ready_quote_context(host=host, port=port)
             except MoomooRuntimeError as exc:
+                MOOMOO_RPC_BREAKER.record_failure(str(exc))
                 logger.warning("[moomoo_options] OpenD connect failed: %s", exc)
                 return None
         return _ctx_singleton
@@ -541,6 +663,7 @@ def _get_event_ctx():
                     port=port,
                 )
             except MoomooRuntimeError as exc:
+                MOOMOO_RPC_BREAKER.record_failure(str(exc))
                 logger.warning(
                     "[moomoo_options] OpenD event connect failed: %s",
                     exc,
@@ -549,10 +672,21 @@ def _get_event_ctx():
         return _event_ctx_singleton
 
 
-def _claim_wall_context_lane() -> Optional[_WallContextLane]:
-    """Reserve one bounded wall lane without serializing provider I/O."""
+def _claim_wall_context_lane(
+    wait_seconds: Optional[float] = None,
+) -> Optional[_WallContextLane]:
+    """Reserve one bounded wall lane without serializing provider I/O.
 
-    deadline = time.monotonic() + _WALL_CONTEXT_LEASE_WAIT_SECONDS
+    ``wait_seconds`` 缺省沿用 30 秒；日内榜等「装配自身有租约」的调用方
+    可传入更短的等待，把排队时间换成对下一轮的推迟。
+    """
+
+    lease_wait = (
+        _WALL_CONTEXT_LEASE_WAIT_SECONDS
+        if wait_seconds is None
+        else max(0.0, float(wait_seconds))
+    )
+    deadline = time.monotonic() + lease_wait
     with _wall_ctx_condition:
         while True:
             for lane in _wall_ctx_lanes:
@@ -568,7 +702,7 @@ def _claim_wall_context_lane() -> Optional[_WallContextLane]:
                 logger.warning(
                     "[moomoo_options] option-wall context lanes remained busy "
                     "for %.1fs",
-                    _WALL_CONTEXT_LEASE_WAIT_SECONDS,
+                    lease_wait,
                 )
                 return None
             _wall_ctx_condition.wait(timeout=remaining)
@@ -581,7 +715,11 @@ def _release_wall_context_lane(lane: _WallContextLane) -> None:
 
 
 @contextmanager
-def _lease_wall_context() -> Iterator[Optional[tuple[Any, Any]]]:
+def _lease_wall_context(
+    wait_seconds: Optional[float] = None,
+    *,
+    busy_error: bool = False,
+) -> Iterator[Optional[tuple[Any, Any]]]:
     """Lease a reusable QuoteContext dedicated to one full wall scan.
 
     A Top-5 request can otherwise take roughly five times the slowest symbol:
@@ -589,6 +727,12 @@ def _lease_wall_context() -> Iterator[Optional[tuple[Any, Any]]]:
     lanes let those read-only scans overlap while keeping every SDK context
     exclusive to one worker.  Five lanes stay within the endpoint's five-symbol
     contract; provider failures still return ``None`` and never synthesize data.
+
+    ``wait_seconds`` bounds the lane acquisition wait（缺省 30 秒）。
+    ``busy_error=True`` 时租不到 lane 抛 :class:`MoomooWallLaneBusyError`
+    而不是 yield ``None``——调用方可据此把该读取推迟到下一轮，而不是把
+    「lane 正忙」当成一次供应商失败缓存起来。断路器打开时同样快速失败
+    （yield ``None``），不再排队等一台已判定卡死的 OpenD。
     """
 
     if not _enabled():
@@ -600,9 +744,22 @@ def _lease_wall_context() -> Iterator[Optional[tuple[Any, Any]]]:
         logger.warning("[moomoo_options] SDK not installed; returning None")
         yield None
         return
+    # 只读探测（is_open），不占用半开探针名额——租下 lane 之后的第一笔 RPC
+    # 才是真正的探针（那里的 check() 负责放行与回报）。
+    if MOOMOO_RPC_BREAKER.is_open():
+        logger.warning(
+            "[moomoo_options] wall context lease skipped: circuit open"
+        )
+        yield None
+        return
 
-    lane = _claim_wall_context_lane()
+    lane = _claim_wall_context_lane(wait_seconds)
     if lane is None:
+        if busy_error:
+            raise MoomooWallLaneBusyError(
+                "all option-wall quote-context lanes stayed busy within "
+                f"{wait_seconds if wait_seconds is not None else _WALL_CONTEXT_LEASE_WAIT_SECONDS:.1f}s"
+            )
         yield None
         return
 
@@ -622,6 +779,7 @@ def _lease_wall_context() -> Iterator[Optional[tuple[Any, Any]]]:
                 try:
                     lane.ctx = create_ready_quote_context(host=host, port=port)
                 except MoomooRuntimeError as exc:
+                    MOOMOO_RPC_BREAKER.record_failure(str(exc))
                     logger.warning(
                         "[moomoo_options] OpenD wall context connect failed: %s",
                         exc,
@@ -1000,8 +1158,22 @@ def _get_option_snapshots(
         for start in range(0, len(clean_codes), _SNAPSHOT_BATCH_SIZE):
             batch = list(clean_codes[start : start + _SNAPSHOT_BATCH_SIZE])
             try:
+                MOOMOO_RPC_BREAKER.check()
+            except MoomooCircuitOpenError as exc:
+                # 断路器打开：整批快速失败（计失败批次，覆盖率如实收缩），
+                # 不再逐批烧满 SDK 内部超时。
+                failed_batch_count += 1
+                logger.warning(
+                    "[moomoo_options] option snapshot batch skipped "
+                    "(requested=%s): %s",
+                    len(batch),
+                    exc,
+                )
+                continue
+            try:
                 ret, frame = ctx.get_market_snapshot(batch)
             except Exception as exc:  # noqa: BLE001
+                MOOMOO_RPC_BREAKER.record_failure(str(exc))
                 failed_batch_count += 1
                 logger.warning(
                     "[moomoo_options] option snapshot batch failed "
@@ -1011,6 +1183,7 @@ def _get_option_snapshots(
                 )
                 continue
             if ret != ret_ok or frame is None or frame.empty:
+                _record_rpc_outcome(False, frame)
                 failed_batch_count += 1
                 logger.warning(
                     "[moomoo_options] option snapshot batch unavailable "
@@ -1020,6 +1193,7 @@ def _get_option_snapshots(
                     _brief_detail(frame),
                 )
                 continue
+            _record_rpc_outcome(True)
             for _, row in frame.iterrows():
                 item = row.to_dict()
                 code = str(item.get("code") or "").strip()
@@ -1219,8 +1393,18 @@ def _expiration_dates_from_ctx(ctx, underlying: str, ret_ok) -> Optional[list[st
     """Read expiration metadata from an already leased quote context."""
 
     try:
+        MOOMOO_RPC_BREAKER.check()
+    except MoomooCircuitOpenError as exc:
+        logger.warning(
+            "[moomoo_options] expiration query skipped for %s: %s",
+            underlying,
+            exc,
+        )
+        return None
+    try:
         ret, data = ctx.get_option_expiration_date(code=underlying)
     except Exception as exc:  # noqa: BLE001
+        MOOMOO_RPC_BREAKER.record_failure(str(exc))
         logger.warning(
             "[moomoo_options] option-wall expiration query failed for %s: %s",
             underlying,
@@ -1228,6 +1412,7 @@ def _expiration_dates_from_ctx(ctx, underlying: str, ret_ok) -> Optional[list[st
         )
         return None
     if ret != ret_ok or data is None:
+        _record_rpc_outcome(False, data)
         logger.warning(
             "[moomoo_options] option-wall expirations unavailable for %s "
             "(ret=%s, detail=%s)",
@@ -1236,6 +1421,7 @@ def _expiration_dates_from_ctx(ctx, underlying: str, ret_ok) -> Optional[list[st
             _brief_detail(data),
         )
         return None
+    _record_rpc_outcome(True)
     if data.empty:
         return []
     if "strike_time" not in data.columns:
@@ -1464,6 +1650,8 @@ def fetch_expiry_availability_moomoo(
     symbol: str,
     max_dte: int = 7,
     ref_date: Optional[date] = None,
+    *,
+    lane_wait_seconds: Optional[float] = None,
 ) -> Optional[MoomooExpiryAvailability]:
     """Return today's ``(expiry, dte)`` pairs within ``max_dte`` for one symbol.
 
@@ -1484,6 +1672,11 @@ def fetch_expiry_availability_moomoo(
     fail closed：开关未启用、SDK 缺失、lane 租不到、元数据查询失败一律
     返回 ``None``（由调用方标为 unknown）；窗口内没有到期日返回空
     ``expiries`` 的读数（诚实空态，不是失败）。
+
+    例外：调用方传入 ``lane_wait_seconds``（有界短等待）时，lane 在等待窗
+    内始终被占用会抛 :class:`MoomooWallLaneBusyError` 而不是返回 ``None``——
+    「别的读取正在用 lane」不是供应商失败，调用方应推迟到下一轮而不是把
+    它缓存成一次失败。
     """
 
     if not isinstance(max_dte, int) or isinstance(max_dte, bool):
@@ -1507,7 +1700,10 @@ def fetch_expiry_availability_moomoo(
         return None
 
     try:
-        with _lease_wall_context() as leased:
+        with _lease_wall_context(
+            lane_wait_seconds,
+            busy_error=lane_wait_seconds is not None,
+        ) as leased:
             if leased is None:
                 return None
             ctx, _context_lock = leased
@@ -1534,6 +1730,9 @@ def fetch_expiry_availability_moomoo(
             expiries=tuple(selected),
             fetched_at=datetime.now(timezone.utc),
         )
+    except MoomooWallLaneBusyError:
+        # lane 正忙不是失败：向上抛给调用方做「推迟到下一轮」处理。
+        raise
     except Exception as exc:  # noqa: BLE001 - metadata failures degrade to unknown
         logger.warning(
             "[moomoo_options] expiry availability(%s) failed: %s",
@@ -2102,6 +2301,16 @@ def fetch_option_events_moomoo(
         return None
 
     try:
+        MOOMOO_RPC_BREAKER.check()
+    except MoomooCircuitOpenError as exc:
+        logger.warning(
+            "[moomoo_options] unusual option events skipped for %s: %s",
+            owner_code,
+            exc,
+        )
+        return None
+
+    try:
         with _event_ctx_lock:
             ctx = _get_event_ctx()
             if ctx is None:
@@ -2124,12 +2333,14 @@ def fetch_option_events_moomoo(
 
         unpacked = _unpack_option_event_result(raw_result, ret_ok=RET_OK)
         if unpacked is None:
+            _record_rpc_outcome(False, raw_result)
             logger.warning(
                 "[moomoo_options] unusual option events unavailable for %s: %s",
                 owner_code,
                 _brief_detail(raw_result),
             )
             return None
+        _record_rpc_outcome(True)
         rows, all_count = unpacked
         events = tuple(
             event
@@ -2170,6 +2381,7 @@ def fetch_option_events_moomoo(
             events=events,
         )
     except Exception as exc:  # noqa: BLE001 - per-symbol graceful degradation
+        MOOMOO_RPC_BREAKER.record_failure(str(exc))
         logger.warning(
             "[moomoo_options] unusual option events(%s) failed: %s",
             owner_code,

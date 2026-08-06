@@ -479,21 +479,6 @@ class RuleComplianceSliceModel(BaseModel):
     verdicts: list[RuleComplianceStatModel] = Field(default_factory=list)
 
 
-class RuleComplianceDailyBudgetModel(BaseModel):
-    """V2-D 的两个额度读数，带明确 as-of 交易日（消费端须自行判定是否过期）。"""
-
-    as_of_trading_day: Optional[str] = Field(
-        default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"
-    )
-    intraday_ticket_count: Optional[int] = Field(default=None, ge=0)
-    intraday_ticket_limit: int = Field(ge=1)
-    intraday_reason: Optional[str] = None
-    overnight_open_count: Optional[int] = Field(default=None, ge=0)
-    overnight_concurrent_limit: int = Field(ge=1)
-    overnight_reason: Optional[str] = None
-    overnight_unknown_dte_open_count: int = Field(default=0, ge=0)
-
-
 class PersonalEdgeRuleComplianceModel(BaseModel):
     """车道遵守度：把本人规则 v2 变成可前向证伪的记账（描述统计，非建议）。"""
 
@@ -514,7 +499,8 @@ class PersonalEdgeRuleComplianceModel(BaseModel):
     overnight_lane_weak_entry_et_hours: list[int] = Field(default_factory=list)
     all_history: RuleComplianceSliceModel
     since_adoption: RuleComplianceSliceModel
-    daily_budget: RuleComplianceDailyBudgetModel
+    # daily_budget（V2-D 额度读数）已于 2026-08 移除：Journal 永远不含今天，
+    # 该读数的 as-of 恒落在过去、恒为过期；当日额度改由前端手动计数承载。
     limitations: list[str] = Field(default_factory=list)
 
 
@@ -693,6 +679,9 @@ class RulesEvidenceResponse(BaseModel):
     excluded_aggregate_or_unknown_basis: int = Field(default=0, ge=0)
     excluded_missing_premium: int = Field(default=0, ge=0)
     excluded_not_closed_or_missing_pnl: int = Field(default=0, ge=0)
+    # additive：样本内缺 total_fee 的回合数——这些回合仍进净口径/胜率，
+    # 但从毛口径与费率的分子分母中排除（0 回填会把毛口径冒充成净口径）。
+    fee_unknown_count: int = Field(default=0, ge=0)
     first_trading_day: Optional[str] = None
     last_trading_day: Optional[str] = None
     banner: Optional[str] = None

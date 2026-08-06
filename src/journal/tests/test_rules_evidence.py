@@ -13,11 +13,13 @@ from decimal import Decimal
 import pytest
 
 from src.journal.rules_evidence import (
+    DTE_HOLD_EX_TOP_N_MIN_EPISODE_COUNT,
     DTE_HOLD_EXCLUDE_TOP_N,
     _Episode,
     _aggregate,
     _dte_hold_lanes,
     _et_hours,
+    _fee_threshold,
     _percentile,
     _position_evidence,
     _price_bands,
@@ -29,7 +31,7 @@ from src.journal.rules_evidence import (
 def _episode(
     *,
     pnl: str,
-    fee: str,
+    fee: str | None,
     risk: str,
     entry_price: str | None = None,
     dte: int | None = 0,
@@ -51,7 +53,8 @@ def _episode(
         dte=dte,
         lane=lane,
         pnl=Decimal(pnl),
-        fee=Decimal(fee),
+        # fee=None ＝ 缺 total_fee（费用缺席只计缺席，不以 0 冒充）。
+        fee=Decimal(fee) if fee is not None else None,
         risk=Decimal(risk),
         entry_price=Decimal(entry_price) if entry_price is not None else None,
         opened_at=opened_at,
@@ -102,6 +105,54 @@ class TestAggregate:
         ]
 
         assert _aggregate(members)[3] == pytest.approx(100 / 3, abs=1e-4)
+
+    def test_missing_fee_is_excluded_from_gross_and_fee_not_zero_filled(self):
+        """缺 total_fee 的回合仍进净口径/胜率，但绝不以 0 费用进毛口径/费率。"""
+        members = [
+            _episode(pnl="-10", fee="30", risk="1000"),
+            # 缺费用的回合：0 回填会把毛口径拉向净口径、同时稀释费率。
+            _episode(pnl="100", fee=None, risk="1000"),
+        ]
+
+        gross, net, fee, win, reason = _aggregate(members)
+
+        # 净口径与胜率覆盖全部两笔。
+        assert net == pytest.approx(4.5)
+        assert win == pytest.approx(50.0)
+        # 毛口径与费率只在费用已知的那一笔上计算：(−10+30)/1000 与 30/1000。
+        assert gross == pytest.approx(2.0)
+        assert fee == pytest.approx(3.0)
+        assert reason is None
+
+    def test_all_fees_missing_leaves_gross_and_fee_absent(self):
+        gross, net, fee, _win, _reason = _aggregate(
+            [_episode(pnl="50", fee=None, risk="1000")]
+        )
+
+        assert net == pytest.approx(5.0)
+        assert gross is None
+        assert fee is None
+
+
+class TestFeeThreshold:
+    def test_n_counts_only_fee_known_members(self):
+        threshold = _fee_threshold(
+            [
+                _episode(pnl="10", fee="30", risk="1000"),
+                _episode(pnl="10", fee=None, risk="1000"),
+            ]
+        )
+
+        assert threshold.n == 1
+        assert threshold.fee_pct_of_premium == pytest.approx(3.0)
+
+    def test_all_fees_missing_reports_a_reason_instead_of_zero(self):
+        threshold = _fee_threshold([_episode(pnl="10", fee=None, risk="1000")])
+
+        assert threshold.n == 0
+        assert threshold.fee_pct_of_premium is None
+        assert threshold.reason is not None
+        assert "total_fee" in threshold.reason
 
 
 class TestPriceBands:
@@ -200,21 +251,21 @@ class TestDteHoldLanes:
         assert rows["4-7DTE 过夜"].n == 0
 
     def test_ex_top_n_strips_the_biggest_winners(self):
-        """剔尾读数用来看「是不是靠少数几笔撑住的」。"""
+        """剔尾读数用来看「是不是靠少数几笔撑住的」（样本须过 n≥15 门槛）。"""
         members = [
             _episode(pnl="1000", fee="0", risk="100", dte=5, close_trading_day="2026-05-05")
             for _ in range(DTE_HOLD_EXCLUDE_TOP_N)
         ] + [
             _episode(pnl="-50", fee="0", risk="100", dte=5, close_trading_day="2026-05-05")
-            for _ in range(5)
+            for _ in range(10)
         ]
 
         row = {r.label: r for r in _dte_hold_lanes(members)}["4-7DTE 过夜"]
 
-        assert row.n == 10
-        assert row.gross_pct == pytest.approx(475.0)
+        assert row.n == 15
+        assert row.gross_pct == pytest.approx(300.0)
         # 去掉 5 笔大赢家后只剩亏损。
-        assert row.ex_top_n_n == 5
+        assert row.ex_top_n_n == 10
         assert row.ex_top_n_gross_pct == pytest.approx(-50.0)
 
     def test_ex_top_n_fails_closed_when_sample_is_too_small(self):
@@ -227,6 +278,21 @@ class TestDteHoldLanes:
 
         assert row.ex_top_n_gross_pct is None
         assert str(DTE_HOLD_EXCLUDE_TOP_N) in row.ex_top_n_reason
+        assert str(DTE_HOLD_EX_TOP_N_MIN_EPISODE_COUNT) in row.ex_top_n_reason
+
+    def test_ex_top_n_enforces_the_n_ge_15_gate_it_claims(self):
+        """n=10（> 剔尾数但 < 15）也必须 fail closed：与车道遵守度同一门槛。"""
+        members = [
+            _episode(pnl="10", fee="0", risk="100", dte=5, close_trading_day="2026-05-05")
+            for _ in range(10)
+        ]
+
+        row = {r.label: r for r in _dte_hold_lanes(members)}["4-7DTE 过夜"]
+
+        assert DTE_HOLD_EX_TOP_N_MIN_EPISODE_COUNT == 15
+        assert row.n == 10
+        assert row.ex_top_n_gross_pct is None
+        assert "15" in row.ex_top_n_reason
 
 
 class TestHoursAndWeekdays:

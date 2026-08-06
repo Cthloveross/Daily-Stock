@@ -561,6 +561,16 @@ function displacementTooltip(item: IntradayTopCandidate): string {
       + ` · 幅度 ${formatSignedAtr(displacement.absRangeAtr)}`
       + `（${displacement.barCount} 根 5m K 线）`,
     );
+    // 断档诚实化：窗口不连续时如实标注实际跨度，不冒充「近 30 分钟」。
+    if (
+      typeof displacement.windowSpanMinutes === 'number'
+      && displacement.windowSpanMinutes > minutes
+    ) {
+      parts.push(
+        `断档提示：最近 6 根 5m K 线不连续（停牌/缺 K 线），实际跨 `
+        + `${displacement.windowSpanMinutes} 分钟——「近 ${minutes} 分钟」按此口径读。`,
+      );
+    }
   } else if (displacement?.state === 'insufficient_bars') {
     parts.push(`当前时段仅 ${displacement.barCount} 根 5m K 线，不足 6 根（30 分钟）。`);
   } else {
@@ -614,13 +624,21 @@ function displacementCell(item: IntradayTopCandidate) {
       : null;
   const money = (value: number) =>
     `${value < 0 ? '−' : '+'}$${Math.abs(value).toFixed(2)}`;
-  const caption = reached
-    ? `高 ${formatSignedAtr(displacement.highExcursionAtr)} · 低 ${formatSignedAtr(
-      displacement.lowExcursionAtr,
-    )}`
-    : moneyNeeded !== null
-      ? `需 $${moneyNeeded.toFixed(2)}${pctNeeded !== null ? `（${pctNeeded.toFixed(1)}%）` : ''}`
-      : `不足 ${line} ATR`;
+  // 断档窗口：次行优先提示实际跨度（比高低偏移更重要的口径事实）。
+  const gapSpan =
+    typeof displacement.windowSpanMinutes === 'number'
+    && displacement.windowSpanMinutes > displacement.windowMinutes
+      ? displacement.windowSpanMinutes
+      : null;
+  const caption = gapSpan !== null
+    ? `含断档 · 跨 ${gapSpan} 分钟`
+    : reached
+      ? `高 ${formatSignedAtr(displacement.highExcursionAtr)} · 低 ${formatSignedAtr(
+        displacement.lowExcursionAtr,
+      )}`
+      : moneyNeeded !== null
+        ? `需 $${moneyNeeded.toFixed(2)}${pctNeeded !== null ? `（${pctNeeded.toFixed(1)}%）` : ''}`
+        : `不足 ${line} ATR`;
   return (
     <Tooltip focusable content={<span className="whitespace-pre-line">{tooltip}</span>}>
       <span aria-label={tooltip} className="inline-block">
@@ -852,7 +870,7 @@ export function IntradayScanTable({
   error: string | null;
 }) {
   const navigate = useNavigate();
-  // 个人画像回灌：每会话/10 分钟最多取一次；失败或未构建 → 显式标缺。
+  // 个人画像回灌：每会话/2 分钟最多取一次；失败或未构建 → 显式标缺。
   const personalEdge = usePersonalEdge();
   // 盘中计划（按 ET 交易日作用域的本地清单）：行内一键提升到页面顶部的
   // 「盘中计划」区块。它走的是 additive 的 focus_symbols，**不进 symbols**，
@@ -866,7 +884,11 @@ export function IntradayScanTable({
   const [methodologyExpanded, setMethodologyExpanded] = useState(false);
 
   // 盘前口径：闸门/宽层排序按盘前字段；回退时携带显式警示，绝不静默。
-  /** 今日概览：达 0.5 ATR 的檔数与量比中位（描述统计，缺读数的不计入分母）。 */
+  /**
+   * 今日概览：达 0.5 ATR 的檔数与量比中位（描述统计）。分母＝**有位移读数**
+   * 的檔数，不是整个深度层——缺读数的檔以 `missing` 计数如实标出，绝不把
+   * 「未读」并进「未达」。中位数为标准中位（偶数个取中间两值平均）。
+   */
   const liveSummary = useMemo(() => {
     const rows = data?.candidates ?? [];
     if (rows.length === 0) return null;
@@ -881,10 +903,19 @@ export function IntradayScanTable({
       .map((row) => row.sessionBursts?.current?.volNorm)
       .filter((v): v is number => typeof v === 'number')
       .sort((a, b) => a - b);
-    const medianVolNorm = vols.length > 0
-      ? vols[Math.floor((vols.length - 1) / 2)]
-      : null;
-    return { total: displacements.length, reached, medianVolNorm };
+    let medianVolNorm: number | null = null;
+    if (vols.length > 0) {
+      const mid = Math.floor(vols.length / 2);
+      medianVolNorm = vols.length % 2 === 1
+        ? vols[mid]
+        : (vols[mid - 1] + vols[mid]) / 2;
+    }
+    return {
+      total: displacements.length,
+      missing: rows.length - displacements.length,
+      reached,
+      medianVolNorm,
+    };
   }, [data]);
 
   const premarketBasis = data?.universeScan?.gateBasis === PREMARKET_GATE_BASIS;
@@ -961,7 +992,8 @@ export function IntradayScanTable({
             {data?.quoteSessionScope === 'latest_prior_session'
               ? '休市 · 按最近交易时段最强波段排序'
               : '波段爆发优先排名'}
-            （{data?.signalVersion ?? 'intraday_session_evidence_v8'}）· 不冻结 · 不入统计
+            {/* 载荷没带版本就如实写「版本未声明」，绝不冒充某个具体版本。 */}
+            （{data?.signalVersion ?? '版本未声明'}）· 不冻结 · 不入统计
           </span>
           {data?.universeScan && (
             <span className="text-caption text-text-3">
@@ -977,7 +1009,9 @@ export function IntradayScanTable({
             className="mt-1.5 text-body-sm text-text-2"
           >
             <span className={liveSummary.reached > 0 ? 'font-medium text-text-1' : ''}>
-              {`深度层 ${liveSummary.total} 檔中 ${liveSummary.reached} 檔近30分位移达 0.5 ATR`}
+              {liveSummary.missing > 0
+                ? `有位移读数的 ${liveSummary.total} 檔中 ${liveSummary.reached} 檔近30分位移达 0.5 ATR（另 ${liveSummary.missing} 檔标缺）`
+                : `深度层 ${liveSummary.total} 檔中 ${liveSummary.reached} 檔近30分位移达 0.5 ATR`}
             </span>
             {liveSummary.medianVolNorm !== null && (
               <span className="text-text-3">

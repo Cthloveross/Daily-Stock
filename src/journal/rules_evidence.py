@@ -54,6 +54,7 @@ from src.journal.ledger.repository import (
 )
 from src.journal.ledger.review_insights import _build_source_kind
 from src.journal.personal_edge import (
+    DISCIPLINE_BODY_MIN_EPISODE_COUNT,
     RULE_COMPLIANCE_CLEAN_BASIS_REASON,
     RULE_COMPLIANCE_CLEAN_BASIS_START,
     RULE_SET_V2_ADOPTED_AT,
@@ -127,6 +128,10 @@ DTE_HOLD_LANES: tuple[tuple[str, int, int, str], ...] = (
 
 #: 剔除最好 N 笔（按净盈亏金额降序）后的稳健读数，用于识别「靠少数几笔撑住」。
 DTE_HOLD_EXCLUDE_TOP_N = 5
+#: 剔尾读数的样本门槛：与车道遵守度/规模纪律共用同一 n≥15 门槛
+#: （personal_edge._exclude_top_n_readings 的口径），低于门槛返回 null + 原因，
+#: 绝不以截断样本冒充稳健读数。
+DTE_HOLD_EX_TOP_N_MIN_EPISODE_COUNT = DISCIPLINE_BODY_MIN_EPISODE_COUNT
 
 #: 星期表刻意排除缺 DTE 的回合：缺 DTE 无法判定它属于哪条车道，
 #: 混入会让「周二/周四没有 0DTE 可用」这个因果读错。
@@ -295,6 +300,9 @@ class RulesEvidenceResult:
     excluded_aggregate_or_unknown_basis: int
     excluded_missing_premium: int
     excluded_not_closed_or_missing_pnl: int
+    #: 样本内缺 total_fee 的回合数：这些回合仍进净口径/胜率，但从毛口径与
+    #: 费率的分子分母中排除（0 回填会把毛口径冒充成净口径）。
+    fee_unknown_count: int
     first_trading_day: Optional[str]
     last_trading_day: Optional[str]
     banner: str
@@ -328,7 +336,9 @@ class _Episode:
     dte: Optional[int]
     lane: str
     pnl: Decimal
-    fee: Decimal
+    #: ``None`` ＝ 缺 total_fee。费用缺席只计缺席：0 回填会同时低估费率、
+    #: 把毛口径（= 净 + 费）冒充成净口径。
+    fee: Optional[Decimal]
     risk: Decimal
     entry_price: Optional[Decimal]
     opened_at: datetime
@@ -350,7 +360,13 @@ def _pct(numerator: Decimal, denominator: Decimal) -> Optional[float]:
 def _aggregate(members: list[_Episode]) -> tuple[
     Optional[float], Optional[float], Optional[float], Optional[float], Optional[str]
 ]:
-    """(gross%, net%, fee%, win%, reason) —— 金额加权，分母为 0 时 fail closed。"""
+    """(gross%, net%, fee%, win%, reason) —— 金额加权，分母为 0 时 fail closed。
+
+    净口径与胜率不依赖费用，按全部成员计算；毛口径（= 净 + 费）与费率依赖
+    ``total_fee``，只在**费用已知**的子集上计算——缺 total_fee 的回合从这两个
+    比率的分子分母中一并排除，绝不按 0 计（0 回填会同时低估费率、把毛口径
+    冒充成净口径）。排除计数由结果级 ``fee_unknown_count`` 如实报告。
+    """
 
     if not members:
         return None, None, None, None, "无样本"
@@ -358,12 +374,21 @@ def _aggregate(members: list[_Episode]) -> tuple[
     if risk == 0:
         return None, None, None, None, "该分组风险金额合计为 0"
     pnl = sum((item.pnl for item in members), Decimal("0"))
-    fee = sum((item.fee for item in members), Decimal("0"))
     wins = sum(1 for item in members if item.pnl > 0)
+    fee_known = [item for item in members if item.fee is not None]
+    fee_risk = sum((item.risk for item in fee_known), Decimal("0"))
+    if fee_known and fee_risk > 0:
+        fee_total = sum((item.fee for item in fee_known), Decimal("0"))
+        pnl_known = sum((item.pnl for item in fee_known), Decimal("0"))
+        gross_pct = _pct(pnl_known + fee_total, fee_risk)
+        fee_pct = _pct(fee_total, fee_risk)
+    else:
+        gross_pct = None
+        fee_pct = None
     return (
-        _pct(pnl + fee, risk),
+        gross_pct,
         _pct(pnl, risk),
-        _pct(fee, risk),
+        fee_pct,
         round(wins / len(members) * 100.0, 4),
         None,
     )
@@ -436,16 +461,19 @@ def _dte_hold_lanes(members: list[_Episode]) -> tuple[DteHoldRow, ...]:
         ]
         gross, net, fee, win, reason = _aggregate(bucket)
 
-        # 剔除最好 N 笔（按净盈亏金额）后的稳健读数。
+        # 剔除最好 N 笔（按净盈亏金额）后的稳健读数。样本门槛与车道遵守度
+        # 共用同一 n≥15（DTE_HOLD_EX_TOP_N_MIN_EPISODE_COUNT）：低于门槛时
+        # 剔尾读数不成立，返回 null + 原因，绝不以截断样本冒充。
         trimmed = sorted(bucket, key=lambda item: item.pnl, reverse=True)[
             DTE_HOLD_EXCLUDE_TOP_N:
         ]
         ex_gross, _net, _fee, _win, ex_reason = _aggregate(trimmed)
-        if len(bucket) <= DTE_HOLD_EXCLUDE_TOP_N:
+        if len(bucket) < DTE_HOLD_EX_TOP_N_MIN_EPISODE_COUNT:
             ex_gross = None
             ex_reason = (
-                f"样本 ≤ {DTE_HOLD_EXCLUDE_TOP_N} 笔，剔除最好 "
-                f"{DTE_HOLD_EXCLUDE_TOP_N} 笔后无剩余样本"
+                f"样本 {len(bucket)} 笔 < "
+                f"{DTE_HOLD_EX_TOP_N_MIN_EPISODE_COUNT} 笔，剔除最好 "
+                f"{DTE_HOLD_EXCLUDE_TOP_N} 笔后读数不成立"
             )
         rows.append(
             DteHoldRow(
@@ -517,9 +545,14 @@ def _weekdays(members: list[_Episode]) -> tuple[WeekdayRow, ...]:
 def _fee_threshold(members: list[_Episode]) -> FeeThreshold:
     gross, _net, fee_pct, _win, reason = _aggregate(members)
     del gross
+    # 费率的样本量按「费用已知」的子集报告：缺 total_fee 的回合不进这个比率，
+    # n 里也不冒充它们进了。
+    fee_known = [item for item in members if item.fee is not None]
+    if members and not fee_known and reason is None:
+        reason = "全部样本缺 total_fee，费率标缺"
     return FeeThreshold(
         fee_pct_of_premium=fee_pct,
-        n=len(members),
+        n=len(fee_known),
         reason=reason,
         default_ticket_usd=FEE_CALCULATOR_DEFAULT_TICKET_USD,
         default_tickets_per_day=FEE_CALCULATOR_DEFAULT_TICKETS_PER_DAY,
@@ -776,8 +809,9 @@ def get_rules_evidence(
                     closed_trading_day=close_trading_day,
                 ),
                 pnl=Decimal(row.realized_pnl_net),
+                # 费用缺席只计缺席：不以 0 冒充过路费（见 _Episode.fee）。
                 fee=(
-                    Decimal(row.total_fee) if row.total_fee is not None else Decimal("0")
+                    Decimal(row.total_fee) if row.total_fee is not None else None
                 ),
                 risk=risk,
                 entry_price=(
@@ -799,6 +833,14 @@ def get_rules_evidence(
         max_concurrent=max_concurrent,
     )
 
+    fee_unknown_count = sum(1 for item in members if item.fee is None)
+    limitations = RULES_EVIDENCE_LIMITATIONS
+    if fee_unknown_count:
+        limitations = limitations + (
+            f"{fee_unknown_count} 个回合缺 total_fee：仍进净口径与胜率，"
+            "但已从毛口径与费率的分子分母中排除——费用缺席不以 0 冒充。",
+        )
+
     return RulesEvidenceResult(
         account_key=resolved_account_key,
         build_id=build_id,
@@ -813,6 +855,7 @@ def get_rules_evidence(
         excluded_aggregate_or_unknown_basis=excluded_basis,
         excluded_missing_premium=excluded_missing_premium,
         excluded_not_closed_or_missing_pnl=excluded_not_closed_or_missing_pnl,
+        fee_unknown_count=fee_unknown_count,
         first_trading_day=trading_days[0] if trading_days else None,
         last_trading_day=trading_days[-1] if trading_days else None,
         banner=RULES_EVIDENCE_BANNER,
@@ -828,5 +871,5 @@ def get_rules_evidence(
         position=_position_evidence(members, params=params),
         correlation=_correlation(members, max_concurrent=max_concurrent),
         overnight_gap_note=OVERNIGHT_GAP_NOTE,
-        limitations=RULES_EVIDENCE_LIMITATIONS,
+        limitations=limitations,
     )

@@ -263,3 +263,78 @@ def test_fee_calculator_anchors_travel_from_the_backend():
     assert fee["default_tickets_per_day"] == 4
     assert fee["trading_days_per_month"] == 21
     assert "不落库" in fee["note"]
+
+
+def test_missing_total_fee_is_reported_not_zero_filled():
+    """缺 total_fee 的回合从毛口径/费率中排除并计数，绝不以 0 费用冒充。"""
+    from src.journal.tests.test_personal_edge import _seed_build
+
+    _seed_build(
+        [
+            {
+                "underlying": "NVDA",
+                "opened_at": datetime(2026, 5, 4, 14, 0, tzinfo=timezone.utc),
+                "hold_seconds": 3_600,
+                "realized_pnl_net": Decimal("-100"),
+                "total_fee": Decimal("30"),
+                "dte_at_entry": 0,
+                "opening_cash_flow": Decimal("-1000"),
+                "average_entry_price": Decimal("0.50"),
+            },
+            {
+                "underlying": "NVDA",
+                "opened_at": datetime(2026, 5, 4, 15, 0, tzinfo=timezone.utc),
+                "hold_seconds": 3_600,
+                "realized_pnl_net": Decimal("100"),
+                "total_fee": None,
+                "dte_at_entry": 0,
+                "opening_cash_flow": Decimal("-1000"),
+                "average_entry_price": Decimal("0.60"),
+            },
+        ]
+    )
+
+    body = _client().get(URL).json()
+
+    assert body["sample_episode_count"] == 2
+    assert body["fee_unknown_count"] == 1
+    # 费率的样本量按「费用已知」子集报告。
+    assert body["fee_threshold"]["n"] == 1
+    assert body["fee_threshold"]["fee_pct_of_premium"] == pytest.approx(3.0)
+    # 排除口径写进 limitations，读者不需要猜。
+    assert any("total_fee" in line for line in body["limitations"])
+    # 分档 n 计全部成员（净口径覆盖全部），毛口径只在费用已知子集上算：
+    # (−100+30)/1000 = −7%，而不是 0 回填后的 (0+30)/2000。
+    bands = {row["label"]: row for row in body["price_bands"]}
+    assert bands["<$1"]["n"] == 2
+    assert bands["<$1"]["net_pct"] == pytest.approx(0.0)
+    assert bands["<$1"]["gross_pct"] == pytest.approx(-7.0)
+
+
+def test_activating_a_newer_build_busts_the_rules_evidence_cache():
+    """默认 build 解析进缓存键：换默认 build 后绝不再端出旧 build 的数字。"""
+    from src.journal.tests.test_personal_edge import _seed_build
+
+    first_build = _seed()
+    client = _client()
+    assert client.get(URL).json()["build_id"] == first_build
+
+    second_build = _seed_build(
+        [
+            {
+                "underlying": "AMD",
+                "opened_at": datetime(2026, 5, 4, 14, 0, tzinfo=timezone.utc),
+                "hold_seconds": 3_600,
+                "realized_pnl_net": Decimal("50"),
+                "total_fee": Decimal("5"),
+                "dte_at_entry": 0,
+                "opening_cash_flow": Decimal("-1000"),
+                "average_entry_price": Decimal("2.50"),
+            }
+        ]
+    )
+
+    # 不清缓存、TTL 之内再取：必须立即读到新的默认 build。
+    body = client.get(URL).json()
+    assert body["build_id"] == second_build
+    assert body["sample_episode_count"] == 1

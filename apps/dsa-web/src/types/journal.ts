@@ -1156,18 +1156,6 @@ export interface RuleComplianceSlice {
   verdicts: RuleComplianceStat[];
 }
 
-/** V2-D 的两个额度读数；`asOfTradingDay` 不是今天时读数已过期，消费端须显式标缺。 */
-export interface RuleComplianceDailyBudget {
-  asOfTradingDay: string | null;
-  intradayTicketCount: number | null;
-  intradayTicketLimit: number;
-  intradayReason: string | null;
-  overnightOpenCount: number | null;
-  overnightConcurrentLimit: number;
-  overnightReason: string | null;
-  overnightUnknownDteOpenCount: number;
-}
-
 export interface PersonalEdgeRuleCompliance {
   ruleSetId: string;
   adoptedAt: string;
@@ -1186,7 +1174,8 @@ export interface PersonalEdgeRuleCompliance {
   overnightLaneWeakEntryEtHours: number[];
   allHistory: RuleComplianceSlice;
   sinceAdoption: RuleComplianceSlice;
-  dailyBudget: RuleComplianceDailyBudget;
+  // dailyBudget（V2-D 额度读数）已于 2026-08 移除：Journal 永远不含「今天」，
+  // 该读数恒为过期；当日额度由 useIntradayManualBudgetStore 手动计数承载。
   limitations: string[];
 }
 
@@ -1328,6 +1317,11 @@ export interface RulesEvidenceResponse {
   excludedAggregateOrUnknownBasis: number;
   excludedMissingPremium: number;
   excludedNotClosedOrMissingPnl: number;
+  /**
+   * additive：样本内缺 total_fee 的回合数——仍进净口径/胜率，但从毛口径与
+   * 费率的分子分母中排除（0 回填会把毛口径冒充成净口径）。旧载荷可省略。
+   */
+  feeUnknownCount?: number;
   firstTradingDay: string | null;
   lastTradingDay: string | null;
   banner: string | null;

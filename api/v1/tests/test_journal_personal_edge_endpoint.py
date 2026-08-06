@@ -299,8 +299,9 @@ def test_rule_compliance_block_is_additive_and_keeps_existing_fields():
     assert compliance["overnight_lane_min_dte"] == 4
     assert compliance["overnight_lane_max_dte"] == 7
     assert compliance["overnight_lane_weak_entry_et_hours"] == [11, 13]
-    assert compliance["daily_budget"]["intraday_ticket_limit"] == 6
-    assert compliance["daily_budget"]["overnight_concurrent_limit"] == 3
+    # daily_budget（V2-D 额度读数）已移除：Journal 永远不含「今天」，该读数
+    # 恒为过期；当日额度由前端手动计数承载，响应里不得再出现该键。
+    assert "daily_budget" not in compliance
     # 判定与规则编号随每一条车道行下发（不发以车道 id 为键的字典：Web 层的深层
     # camelCase 会改写字典键，规则 id 必须只以「值」的形式过网）。
     lanes = {lane["key"]: lane for lane in compliance["all_history"]["lanes"]}
@@ -347,9 +348,8 @@ def test_rule_compliance_lane_and_verdict_payload():
     assert verdicts["violation"]["gross_pct_excluding_top_n"] is None
     assert "15" in verdicts["violation"]["excluding_top_n_reason"]
 
-    budget = compliance["daily_budget"]
-    assert budget["as_of_trading_day"] == "2026-05-11"
-    assert budget["overnight_open_count"] == 1
+    # daily_budget 已移除（恒过期的读数等于没有）。
+    assert "daily_budget" not in compliance
 
 
 def test_rule_compliance_since_adoption_is_empty_and_says_so():
@@ -395,6 +395,35 @@ def test_rule_compliance_rejects_a_malformed_since():
     client = _client()
     assert client.get(URL, params={"since": "20260805"}).status_code == 422
     assert client.get(URL, params={"since": "not-a-date"}).status_code == 422
+
+
+def test_activating_a_newer_build_busts_the_personal_edge_cache():
+    """默认 build 解析进缓存键：换默认 build 后绝不再端出旧 build 的数字。"""
+    from src.journal.tests.test_personal_edge import _seed_build
+
+    first_build = _seed()
+    client = _client()
+    first_body = client.get(URL).json()
+    assert first_body["build_id"] == first_build
+    assert first_body["closed_episode_count"] == 5
+
+    second_build = _seed_build(
+        [
+            {
+                "underlying": "BBB",
+                "opened_at": datetime(2026, 5, 4, 14, 0, tzinfo=timezone.utc),
+                "hold_seconds": 3_600,
+                "realized_pnl_net": Decimal("10"),
+                "total_fee": Decimal("1"),
+                "dte_at_entry": 0,
+            }
+        ]
+    )
+
+    # 不清缓存、TTL 之内再取：必须立即读到新的默认 build。
+    body = client.get(URL).json()
+    assert body["build_id"] == second_build
+    assert body["closed_episode_count"] == 1
 
 
 def test_not_built_leaves_rule_compliance_absent_rather_than_zeroed():

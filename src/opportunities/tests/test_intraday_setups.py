@@ -191,6 +191,25 @@ class TestS2GapUpHold:
         s2 = _setup(profile, "S2")
         assert s2["state"] == "not_matched"
         assert "未托住" in s2["reason"]
+        assert "缺口已回补" in s2["reason"]
+        assert "现价低于 VWAP" in s2["reason"]
+
+    def test_not_matched_reason_marks_missing_vwap_instead_of_asserting_it(self):
+        """缺口已回补 + VWAP 标缺：原因只陈述观测到的失败，标缺侧如实写标缺。"""
+        profile = _profile(
+            None,
+            **{
+                **_S2_QUOTE,
+                "session_low": 99.5,  # 观测到：缺口已回补。
+                "vwap": None,  # 未观测：VWAP 侧标缺。
+            },
+        )
+        s2 = _setup(profile, "S2")
+        assert s2["state"] == "not_matched"
+        assert "缺口已回补" in s2["reason"]
+        assert "现价/VWAP 标缺" in s2["reason"]
+        # 绝不把没观测过的「现价低于 VWAP」写成事实。
+        assert "现价低于 VWAP" not in s2["reason"]
 
     def test_missing_gap_inputs_are_unavailable(self):
         profile = _profile(None, last_price=103.0)
@@ -244,6 +263,26 @@ class TestS3GapUpRejection:
         s3 = _setup(profile, "S3")
         assert s3["state"] == "not_matched"
         assert "未见回落" in s3["reason"]
+        # 两侧都被观测到未跌破：原因逐侧陈述观测值。
+        assert "≥ 开盘" in s3["reason"]
+        assert "≥ VWAP" in s3["reason"]
+
+    def test_not_matched_reason_marks_missing_vwap_instead_of_asserting_it(self):
+        """现价未跌破开盘 + VWAP 标缺：原因只陈述观测侧，标缺侧如实写标缺。"""
+        profile = _profile(
+            None,
+            gap_percent=2.0,
+            gap_atr_multiple=1.0,
+            session_open=102.0,
+            last_price=103.0,  # 观测到：未跌破开盘。
+            vwap=None,  # 未观测：VWAP 侧标缺。
+        )
+        s3 = _setup(profile, "S3")
+        assert s3["state"] == "not_matched"
+        assert "现价 103.00 ≥ 开盘 102.00" in s3["reason"]
+        assert "VWAP 标缺" in s3["reason"]
+        # 绝不把没观测过的「未跌破 VWAP」写成事实。
+        assert "≥ VWAP" not in s3["reason"]
 
     def test_missing_last_price_is_unavailable(self):
         profile = _profile(
