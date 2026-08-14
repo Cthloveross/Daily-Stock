@@ -3454,10 +3454,19 @@ def _execute_intraday_top_two_tier(
             "basis": gate_basis,
         }
 
+    wide_row_by_ticker = {row["ticker"]: row for row in wide_rows}
     for candidate in run["candidates"]:
         candidate["scan_tier"] = "deep"
         candidate["deep_lane_reason"] = _deep_lane_reason(
             str(candidate.get("ticker") or "")
+        )
+        # 盘中机会提示器需要深度层标的的盘前读数：盘前异动最强的标的恰好
+        # 会被闸门晋升，宽层快照行随之离开 snapshot_only。把同一批快照的
+        # pre_change_percent 原样带到候选上（进程内 additive 字段；API 响应
+        # 模型未声明它，序列化时被丢弃，客户端载荷逐字节不变）。
+        wide_row = wide_row_by_ticker.get(str(candidate.get("ticker") or ""))
+        candidate["pre_change_percent"] = (
+            wide_row.get("pre_change_percent") if wide_row else None
         )
 
     # -- 今日深扫账本（display truth）----------------------------------------
@@ -4497,7 +4506,9 @@ def _stamp_intraday_top_latency(
         result["served_from"] = "fresh"
 
 
-def warm_default_intraday_top_scan() -> dict[str, Any]:
+def warm_default_intraday_top_scan(
+    payload_observer: Optional[Callable[[dict[str, Any]], None]] = None,
+) -> dict[str, Any]:
     """Warm the page's default intraday-top poll through the same single flight.
 
     服务端预热循环（`IntradayWarmCacheScheduler`）每 tick 调用一次：以
@@ -4506,13 +4517,17 @@ def warm_default_intraday_top_scan() -> dict[str, Any]:
     ——与用户点「刷新」同语义：只绕过已完成 TTL 条目，仍然加入同 key 的
     在途请求（join-not-duplicate，绝不并发第二个工厂）。返回小结摘要，
     载荷本身只通过共享缓存被后续请求读取。
+
+    ``payload_observer``（盘中机会提示器专用）：预热成功后把本次载荷的
+    **独立深拷贝**交给观察者做纯内存的事实检测——零新增取数，绝不改写
+    缓存。观察者按合同永不抛出，这里仍兜一层：预热节奏永远优先。
     """
 
     key, factory = _intraday_top_key_and_factory(
         [], [], _INTRADAY_TOP_DEFAULT_LIMIT
     )
     meta: dict[str, Any] = {}
-    _get_or_compute_scan(
+    result = _get_or_compute_scan(
         key,
         factory,
         bypass_cache=True,
@@ -4522,6 +4537,13 @@ def warm_default_intraday_top_scan() -> dict[str, Any]:
         initiator="warm_scheduler",
         meta_out=meta,
     )
+    if payload_observer is not None:
+        try:
+            payload_observer(result)
+        except Exception:  # noqa: BLE001 - alert detection must never break warming
+            logger.debug(
+                "[opportunities] intraday alert observer failed", exc_info=True
+            )
     return {
         "led_flight": bool(meta.get("led_flight")),
         "generated_in_seconds": meta.get("generated_in_seconds"),

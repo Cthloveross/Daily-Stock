@@ -636,6 +636,8 @@ class SystemConfigService:
             "OPPORTUNITY_OUTCOME_SCHEDULER_ENABLED",
             "INTRADAY_REFRESH_SCHEDULER_ENABLED",
             "INTRADAY_REFRESH_INTERVAL_SECONDS",
+            "INTRADAY_ALERTS_ENABLED",
+            "INTRADAY_ALERTS_MAX_PER_DAY",
         }
         if startup_only_schedule_keys:
             warnings.append(

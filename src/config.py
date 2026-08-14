@@ -762,6 +762,13 @@ class Config:
     intraday_refresh_scheduler_enabled: bool = False
     # 预热间隔（秒）：默认 45；低于 30（基础单飞租约）会被钳制到 30。
     intraday_refresh_interval_seconds: int = 45
+    # 盘中机会提示器（Telegram）：把预热扫描载荷里已有的事实（盘前异动/
+    # 放量/强波段/位移/日型）推送到手机；挂在预热循环上，零新增取数，
+    # 需要 INTRADAY_REFRESH_SCHEDULER_ENABLED=true 才有载荷可观察。
+    # 默认关闭＝行为零变化。
+    intraday_alerts_enabled: bool = False
+    # 每日提示上限（条，最小 1）：触顶后补发一条「今日提示已达上限」并当日停发。
+    intraday_alerts_max_per_day: int = 20
     schedule_time: str = "18:00"              # 每日推送时间（HH:MM 格式）
     schedule_run_immediately: bool = True     # 启动时是否立即执行一次
     run_immediately: bool = True              # 启动时是否立即执行一次（非定时模式）
@@ -879,6 +886,7 @@ class Config:
             "PREMARKET_RESEARCH_SCHEDULER_ENABLED",
             "OPPORTUNITY_OUTCOME_SCHEDULER_ENABLED",
             "INTRADAY_REFRESH_SCHEDULER_ENABLED",
+            "INTRADAY_ALERTS_ENABLED",
             "SCHEDULE_TIME",
             "SCHEDULE_RUN_IMMEDIATELY",
         }
@@ -1497,6 +1505,17 @@ class Config:
                 45,
                 field_name='INTRADAY_REFRESH_INTERVAL_SECONDS',
                 minimum=30,
+            ),
+            intraday_alerts_enabled=cls._resolve_env_value(
+                'INTRADAY_ALERTS_ENABLED',
+                default='false',
+                prefer_env_file=True,
+            ).lower() == 'true',
+            intraday_alerts_max_per_day=parse_env_int(
+                os.getenv('INTRADAY_ALERTS_MAX_PER_DAY'),
+                20,
+                field_name='INTRADAY_ALERTS_MAX_PER_DAY',
+                minimum=1,
             ),
             schedule_time=(schedule_time_value or '18:00').strip() or '18:00',
             schedule_run_immediately=schedule_run_immediately,

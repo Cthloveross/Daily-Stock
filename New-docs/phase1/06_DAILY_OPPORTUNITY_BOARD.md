@@ -1025,3 +1025,68 @@ env 开关（或置 false）重启。
 前端实时扫描表脚注渲染一行小字（如「本轮扫描耗时 12.4s · 预热缓存命中」，
 `data-testid="scan-latency-footer"`）——之后任何「页面变慢」都能从截图直接
 定位是生成慢还是缓存没接住。
+
+## 14. 盘中机会提示器：Telegram 事实推送（2026-08-14）
+
+### 14.1 诉求与架构
+
+用户诉求：「盘前盘中的时候知道什么票有机会，比如高开的、放量的」——人不必
+盯盘，手机收提示。实现为**预热载荷的观察者**（`src/services/
+intraday_opportunity_alerter.py`）：§13 的预热循环每 tick 经 single-flight
+算出两层扫描载荷后，把该独立深拷贝交给提示器做纯内存检测（
+`warm_default_intraday_top_scan(payload_observer=...)`），**零新增供应商
+请求、零新增时钟逻辑**。因此提示器**依赖预热循环**：
+`INTRADAY_REFRESH_SCHEDULER_ENABLED=false` 时没有载荷可观察，提示器零检测。
+检测窗口即预热窗口（工作日 09:00–16:15 ET）。发送复用既有
+`TelegramSender`（`src/notification_sender/telegram_sender.py`），不新建
+发送通道。
+
+### 14.2 五条检测规则（v1 启发式，全部只读载荷已有字段）
+
+阈值沿用扫描面板已校准的常量，**全部是 v1 启发式，不是验证过的交易边际**；
+数字与口径原样透传，不重算（唯一乘法是位移美元换算，见规则 4）：
+
+1. **高开/盘前异动**（仅 `session_state="premarket"`，预热窗口内即
+   09:00–09:30 ET）：`|pre_change_percent| ≥ 2.0` →
+   「{T} 盘前 {+x.x}%」。盘前异动最强的标的恰好会被闸门晋升出宽层，
+   两层扫描因此把同一批快照的 `pre_change_percent` 原样带到深度候选上
+   （进程内 additive 字段，API 响应模型未声明、序列化时丢弃，客户端载荷
+   逐字节不变）。
+2. **放量**（仅 `session_state="regular"`）：候选当前 15 分钟窗口
+   `vol_norm ≥ 2.0` 且爆发分 `score ≥ LEG_MEDIUM_MIN_SCORE(2.5)` →
+   「{T} 放量 {vol_norm:.1f}× · 15分推力 {thrust:+.1f}% · 爆发分 {score:.1f}」。
+3. **强波段入账**（仅 `quote_session_scope="current_session"`）：候选
+   `legs` 中**新出现**的 `grade="strong"` 波段（进程内按
+   (ticker, start_et) 记忆）→「{T} 强波段 {start_et} 分 {score:.0f} {方向}」。
+4. **位移达标**（仅 current_session）：`recent_displacement.net_move_atr`
+   首次达到 ±0.5 ATR 参考线（优先读载荷自带 `survival_line_atr`；每标的
+   每方向每日一次）→「{T} 近30分位移 {±$X.XX}（{±0.xx} ATR）」。美元换算
+   沿用前端扫描表同一口径：仅 `atr_basis="atr14_daily"` 时 `net × atr14`，
+   其余标尺不可横向比较，只报 ATR 值。
+5. **日型提醒**（每日一次）：`lane_availability.day_type` 一旦不再
+   `unknown` →「今日有 0DTE：日内车道可用」或「今日无 0DTE：过夜日 ·
+   日内关闭」。未知≠没有，unknown 期间不提醒。
+
+黑名单标的（PLTR/AMD/QQQ/SMCI，后端单一出处
+`src/opportunities/blacklist.py`，与前端 `laneChecklist.ts` 的
+`BLACKLIST_TICKERS` 同源同值需保持同步）**不压制**，只附加
+「⚠️ 你的历史亏钱标的」标注——系统标注，用户过滤。
+
+### 14.3 防骚扰与诚实合同
+
+- （标的 × 规则）× ET 日去重，进程内、ET 日期翻转清零；**中途重启后最坏
+  情况会重复提示**（接受的代价，不落库）。
+- 单 tick 多条提示合并为**一条** Telegram 消息（头行「【盘中提示 ·
+  HH:MM ET】」取载荷 `as_of` 的 ET 时刻）。
+- 全局日上限 `INTRADAY_ALERTS_MAX_PER_DAY`（默认 20，最小 1）：触顶后在
+  同一条消息内补「今日提示已达上限 N 条」，当日不再发送。
+- 每条消息末尾固定一行「事实描述，非买卖信号」；全文永不出现概率、建议、
+  目标价或买卖措辞。
+- 发送在独立 daemon 线程消化有界队列（满则丢弃本 tick 消息并按状态变化记
+  一行日志）；Telegram 失败/恢复同样只在状态变化时各记一行
+  （quiet-unless-incident），任何异常都不上抛、不阻塞预热节奏。
+
+配置：`INTRADAY_ALERTS_ENABLED`（默认 false ＝行为零变化）+
+`INTRADAY_ALERTS_MAX_PER_DAY`，由 Web/API lifespan 在预热调度器分支内托管，
+需要 `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`，修改后需重启进程。
+回滚＝去掉 `INTRADAY_ALERTS_ENABLED`（或置 false）重启。

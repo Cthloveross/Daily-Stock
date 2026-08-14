@@ -526,6 +526,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] 盘中默认扫描的服务端预热循环（`INTRADAY_REFRESH_SCHEDULER_ENABLED`，默认关闭）：工作日 04:00–20:00 ET 内每 `INTRADAY_REFRESH_INTERVAL_SECONDS`（默认 45，地板 30）秒预热页面默认轮询命中的同一扫描 key，走与用户请求相同的 single-flight 路径（join-not-duplicate，绝不并发第二个工厂）；断路器打开时安静折叠保持节奏，预热结果与请求驱动结果同缓存同 TTL 不可区分。
 - [改进] `/opportunities/intraday-top` 响应新增 additive 延迟诊断字段 `generated_in_seconds`（工厂墙钟耗时；缓存命中报告原始生成耗时）与 `served_from`（fresh/cache/warm_cache）；实时扫描表脚注渲染「本轮扫描耗时 Xs · 缓存命中」一行小字。
 - [测试] 预热调度器 tick 时窗闸门（假时钟）、失败折叠与状态迁移日志、间隔地板钳制、lifespan 开/关接线、预热加入用户 leader 的单飞（慢工厂确定性）、延迟字段 additive 合同与前端脚注渲染。
+- [新功能] 盘中机会提示器（`INTRADAY_ALERTS_ENABLED`，默认关闭，依赖 `INTRADAY_REFRESH_SCHEDULER_ENABLED`）：挂在预热循环的扫描载荷上（零新增取数），把五类事实推送到 Telegram——盘前 |pre_change_percent|≥2% 异动、放量爆发（量比 ≥2 且爆发分 ≥2.5）、新强波段入账、近 30 分位移达 ±0.5 ATR（美元换算沿用前端扫描表同一口径，仅日线 ATR14 标尺）、当日 0DTE 日型；黑名单标的（PLTR/AMD/QQQ/SMCI，后端单一出处 src/opportunities/blacklist.py）不压制只附「⚠️ 你的历史亏钱标的」标注；每条消息末尾固定「事实描述，非买卖信号」，全文无概率、建议或买卖措辞。
+- [新功能] 提示防骚扰：（标的×规则）ET 日去重（进程内，中途重启后最坏重复提示）、单 tick 多条合并为一条消息、全局日上限 `INTRADAY_ALERTS_MAX_PER_DAY`（默认 20，最小 1）触顶补「今日提示已达上限 N 条」后当日停发；发送在独立线程消化有界队列，Telegram 失败/恢复仅状态变化时各记一行日志，绝不阻塞或拖垮预热节奏。
+- [测试] 提示器五规则触发/不触发与文案、盘前时段闸门、黑名单标注、日内去重与 ET 翻转清零、全局上限与终止通知、批量合并单消息（单页脚）、发送失败安静降级与异常吞噬、有界队列不阻塞、warm 入口 observer 接线、lifespan 三态接线（开/缺预热/默认关）、配置解析与最小值钳制（夹具载荷 + mock 发送器，全部确定性）。
 
 ## [3.11.0] - 2026-03-27
 

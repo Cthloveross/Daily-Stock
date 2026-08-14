@@ -1581,7 +1581,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "title": "Intraday Warm Cache Scheduler",
         "description": (
             "Keep the default intraday-top scan cache warm on weekdays "
-            "04:00-20:00 ET so the page's default poll never hits the "
+            "09:00-16:15 ET warm window so the page default poll never hits the "
             "10-45s cold path. Goes through the same single-flight scan "
             "path as user requests; read-only, never places orders. "
             "Requires a process restart."
@@ -1613,6 +1613,45 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "options": [],
         "validation": {"min": 30},
         "display_order": 13,
+    },
+    "INTRADAY_ALERTS_ENABLED": {
+        "title": "Intraday Opportunity Alerts (Telegram)",
+        "description": (
+            "Push factual intraday alerts (premarket movers, volume "
+            "bursts, strong legs, 30-min displacement, 0DTE day type) "
+            "to Telegram, detected on the warm-scan payload with zero "
+            "extra provider fetches. Facts only, never trade advice. "
+            "Requires INTRADAY_REFRESH_SCHEDULER_ENABLED plus Telegram "
+            "credentials, and a process restart."
+        ),
+        "category": "system",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "false",
+        "options": [],
+        "validation": {},
+        "display_order": 14,
+    },
+    "INTRADAY_ALERTS_MAX_PER_DAY": {
+        "title": "Intraday Alerts Daily Cap",
+        "description": (
+            "Maximum alerts per ET day (default 20, minimum 1). When the "
+            "cap is reached one final notice is sent and alerting stops "
+            "for the rest of the day."
+        ),
+        "category": "system",
+        "data_type": "number",
+        "ui_control": "number",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "20",
+        "options": [],
+        "validation": {"min": 1},
+        "display_order": 15,
     },
     "SCHEDULE_RUN_IMMEDIATELY": {
         "title": "Schedule Run Immediately",

@@ -45,6 +45,7 @@ async def app_lifespan(app: FastAPI):
     premarket_scheduler = None
     outcome_scheduler = None
     intraday_warm_scheduler = None
+    intraday_alerter = None
     try:
         from src.config import get_config
 
@@ -106,9 +107,47 @@ async def app_lifespan(app: FastAPI):
                 execute_intraday_warm_tick,
             )
 
+            warm_runner = warm_default_intraday_top_scan
+            if bool(getattr(config, "intraday_alerts_enabled", False)):
+                # 盘中机会提示器：只挂在预热载荷上（零新增取数），预热
+                # 关闭时本分支不可达——提示器随之零检测（文档已注明）。
+                from src.notification_sender.telegram_sender import (
+                    TelegramSender,
+                )
+                from src.services.intraday_opportunity_alerter import (
+                    IntradayOpportunityAlerter,
+                )
+
+                # 凭据缺失时不构造提示器：否则 TelegramSender 会对每条消息
+                # 各刷一行 WARNING（最多日上限条/天）——对抗复核修正为一次
+                # 启动警告 + 干净禁用。
+                if not (
+                    getattr(config, "telegram_bot_token", None)
+                    and getattr(config, "telegram_chat_id", None)
+                ):
+                    logger.warning(
+                        "INTRADAY_ALERTS_ENABLED=true 但 Telegram 凭据缺失"
+                        "（TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID）；提示器已禁用"
+                    )
+                else:
+                    intraday_alerter = IntradayOpportunityAlerter(
+                        TelegramSender(config).send_to_telegram,
+                        max_alerts_per_day=getattr(
+                            config, "intraday_alerts_max_per_day", 20
+                        ),
+                    )
+                    intraday_alerter.start()
+                    app.state.intraday_opportunity_alerter = intraday_alerter
+                    observer = intraday_alerter.observe
+
+                    def warm_runner():  # noqa: D401 - closure over the warm scan
+                        return warm_default_intraday_top_scan(
+                            payload_observer=observer
+                        )
+
             intraday_warm_scheduler = IntradayWarmCacheScheduler(
                 lambda: execute_intraday_warm_tick(
-                    warm_runner=warm_default_intraday_top_scan,
+                    warm_runner=warm_runner,
                 ),
                 interval_seconds=getattr(
                     config, "intraday_refresh_interval_seconds", 45
@@ -121,6 +160,7 @@ async def app_lifespan(app: FastAPI):
         for scheduler_name, scheduler in (
             ("moomoo_premarket_prefetch", premarket_evidence_scheduler),
             ("intraday_warm_cache", intraday_warm_scheduler),
+            ("intraday_opportunity_alerter", intraday_alerter),
             ("opportunity_outcome", outcome_scheduler),
             ("premarket_research", premarket_scheduler),
         ):
@@ -136,6 +176,8 @@ async def app_lifespan(app: FastAPI):
                 )
         if hasattr(app.state, "intraday_warm_cache_scheduler"):
             delattr(app.state, "intraday_warm_cache_scheduler")
+        if hasattr(app.state, "intraday_opportunity_alerter"):
+            delattr(app.state, "intraday_opportunity_alerter")
         if hasattr(app.state, "opportunity_outcome_scheduler"):
             delattr(app.state, "opportunity_outcome_scheduler")
         if hasattr(app.state, "premarket_research_scheduler"):
