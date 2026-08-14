@@ -16,6 +16,7 @@ import PositionEpisodesPanel from '../components/journal/PositionEpisodesPanel';
 import ReviewInsightsPanel from '../components/journal/ReviewInsightsPanel';
 import DisciplineMonthlyPanel from '../components/journal/DisciplineMonthlyPanel';
 import RuleCompliancePanel from '../components/journal/RuleCompliancePanel';
+import JournalOptionEventReview from '../components/journal/JournalOptionEventReview';
 import PlaybookPanel from '../components/journal/PlaybookPanel';
 import CurrentPositionsSnapshotCard from '../components/journal/CurrentPositionsSnapshotCard';
 import { positionReviewPath } from '../components/journal/review/journalReviewRouting';
@@ -299,6 +300,9 @@ const JournalPage: React.FC = () => {
           <DisciplineMonthlyPanel />
           {/* 规模与频率的同层兄弟：两车道规则的遵守度记账（合规单 vs 违规单）。 */}
           <RuleCompliancePanel />
+          {/* 期权异动 feed（2026-08-14 自 /intraday 迁入）：复盘证据——回看
+              当天/最近时段发生了什么；只读一次、不轮询，分类不证明方向。 */}
+          <JournalOptionEventReview />
           <PlaybookPanel refreshToken={playbookRefreshToken} />
         </div>
       )}

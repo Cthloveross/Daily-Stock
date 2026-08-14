@@ -1186,6 +1186,13 @@ export interface IntradayTopCandidate {
   /** watchlist 两层模式（additive）：单层模式下缺席/为 null。 */
   scanTier?: 'deep' | null;
   deepLaneReason?: IntradayDeepLaneReason | null;
+  /**
+   * 盘前涨跌（additive，G-12 口径）：盘前时段 sessionChangePercent 仍指向
+   * 上一常规时段，真实盘前变动只在本字段；仅盘前时段有值，非盘前服务端
+   * 一律 null（快照残留的早间读数是陈旧值）。旧载荷可省略；缺席/为 null
+   * 显式标缺，绝不 0 回填。
+   */
+  preChangePercent?: number | null;
 }
 
 /** 跨标的异动 feed 单行；供应商分类原样透传，不改写为方向结论。 */

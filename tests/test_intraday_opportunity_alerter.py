@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Deterministic tests for the intraday opportunity alerter.
 
-覆盖：五条 v1 规则的触发/不触发与消息文案、盘前时段闸门、黑名单标注、
+覆盖：六条 v1 规则的触发/不触发与消息文案、盘前时段闸门、黑名单标注、
 （标的×规则）日内去重与 ET 日期翻转清零、全局日上限与终止通知、单 tick
 批量合并为一条消息、Telegram 失败的安静降级（状态变化才记日志）、有界
 队列不阻塞、warm 入口的 observer 接线，以及 lifespan 开/关接线与配置解析。
@@ -77,8 +77,9 @@ def _candidate(
     displacement=None,
     atr14=None,
     pre_change=None,
+    option_activity=None,
 ):
-    return {
+    row = {
         "ticker": ticker,
         "session_bursts": bursts if bursts is not None else _bursts(state="unavailable"),
         "recent_displacement": (
@@ -89,6 +90,9 @@ def _candidate(
         "atr14": atr14,
         "pre_change_percent": pre_change,
     }
+    if option_activity is not None:
+        row["option_activity"] = option_activity
+    return row
 
 
 def _payload(
@@ -162,6 +166,67 @@ def test_premarket_move_reads_promoted_deep_candidates_first():
     )
     alerts = detect_intraday_alerts(payload, seen=set())
     assert [a.text for a in alerts] == ["NVDA 盘前 -3.1%", "TSLA 盘前 +2.4%"]
+
+
+# ---------------------------------------------------------------------------
+# 规则 6：盘前期权大单（option_activity.max_single_turnover ≥ $1M）
+# ---------------------------------------------------------------------------
+
+def _option_activity(max_single_turnover):
+    return {
+        "state": "ready",
+        "count": 3,
+        "dominant_sentiment": "bullish",
+        "max_single_turnover": max_single_turnover,
+    }
+
+
+def test_premarket_large_print_fires_only_in_premarket():
+    fires = _payload(
+        session_state="premarket",
+        candidates=[
+            _candidate("NVDA", option_activity=_option_activity(1_200_000.0))
+        ],
+    )
+    alerts = detect_intraday_alerts(fires, seen=set())
+    assert [a.text for a in alerts] == [
+        "NVDA 期权大单 $1.2M（上一时段异动页最大单笔）"
+    ]
+
+    # 低于 $1M 不触发；标缺（None）绝不当 0 或当命中处理。
+    for turnover in (999_999.0, None):
+        quiet = _payload(
+            session_state="premarket",
+            candidates=[
+                _candidate("NVDA", option_activity=_option_activity(turnover))
+            ],
+        )
+        assert detect_intraday_alerts(quiet, seen=set()) == []
+
+    # 常规时段不触发：这条规则是盘前简报，不是盘中事实流。
+    regular = _payload(
+        candidates=[
+            _candidate("NVDA", option_activity=_option_activity(2_000_000.0))
+        ],
+    )
+    texts = [a.text for a in detect_intraday_alerts(regular, seen=set())]
+    assert not any("期权大单" in text for text in texts)
+
+
+def test_premarket_large_print_dedupes_per_ticker_per_day():
+    payload = _payload(
+        session_state="premarket",
+        candidates=[
+            _candidate("NVDA", option_activity=_option_activity(1_500_000.0))
+        ],
+    )
+    seen: set[tuple[str, ...]] = set()
+    first = detect_intraday_alerts(payload, seen=seen)
+    assert [a.text for a in first] == [
+        "NVDA 期权大单 $1.5M（上一时段异动页最大单笔）"
+    ]
+    # 同一事实当日不再重复；去重键随载荷重放保持稳定。
+    assert detect_intraday_alerts(payload, seen=seen) == []
 
 
 # ---------------------------------------------------------------------------
@@ -669,30 +734,34 @@ def test_config_parses_intraday_alert_settings(
     _mock_parse_litellm_yaml, _mock_setup_env
 ):
     try:
-        with patch.dict(
-            os.environ,
-            {
-                "STOCK_LIST": "600519",
-                "INTRADAY_ALERTS_ENABLED": "true",
-                "INTRADAY_ALERTS_MAX_PER_DAY": "5",
-            },
-            clear=True,
-        ):
-            config = Config._load_from_env()
-        assert config.intraday_alerts_enabled is True
-        assert config.intraday_alerts_max_per_day == 5
+        # 隔离真实 .env：INTRADAY_ALERTS_ENABLED 属 env-file 优先键，
+        # 本机 .env 的真实值会穿透 patch.dict —— 与 test_config_env_compat
+        # 同法直接桩掉文件读取。
+        with patch.object(Config, "_get_env_file_value", return_value=None):
+            with patch.dict(
+                os.environ,
+                {
+                    "STOCK_LIST": "600519",
+                    "INTRADAY_ALERTS_ENABLED": "true",
+                    "INTRADAY_ALERTS_MAX_PER_DAY": "5",
+                },
+                clear=True,
+            ):
+                config = Config._load_from_env()
+            assert config.intraday_alerts_enabled is True
+            assert config.intraday_alerts_max_per_day == 5
 
-        with patch.dict(
-            os.environ,
-            {
-                "STOCK_LIST": "600519",
-                "INTRADAY_ALERTS_MAX_PER_DAY": "0",
-            },
-            clear=True,
-        ):
-            config = Config._load_from_env()
-        assert config.intraday_alerts_enabled is False  # 默认关闭
-        assert config.intraday_alerts_max_per_day == 1  # 最小 1 钳制
+            with patch.dict(
+                os.environ,
+                {
+                    "STOCK_LIST": "600519",
+                    "INTRADAY_ALERTS_MAX_PER_DAY": "0",
+                },
+                clear=True,
+            ):
+                config = Config._load_from_env()
+            assert config.intraday_alerts_enabled is False  # 默认关闭
+            assert config.intraday_alerts_max_per_day == 1  # 最小 1 钳制
     finally:
         Config.reset_instance()
 

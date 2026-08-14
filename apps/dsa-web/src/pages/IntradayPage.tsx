@@ -19,7 +19,7 @@ import { IntradayDisciplineStrip } from '../components/opportunities/IntradayDis
 import { LaneChecklistPanel } from '../components/opportunities/LaneChecklistPanel';
 import { IntradayPlanPanel } from '../components/opportunities/IntradayPlanPanel';
 import { IntradayScanTable } from '../components/opportunities/IntradayScanTable';
-import { IntradayOptionEventFeed } from '../components/opportunities/IntradayOptionEventFeed';
+import { PremarketOptionAnomalyPanel } from '../components/opportunities/PremarketOptionAnomalyPanel';
 import { IntradayTrackingPanel } from '../components/opportunities/IntradayTrackingPanel';
 import { Button } from '../components/ui';
 
@@ -34,8 +34,11 @@ export const INTRADAY_PAGE_POLL_INTERVAL_MS = 60_000;
  * （今日哪条车道成立）→ **盘中计划**（用户手动提升上来的标的，逐条机械核对
  * + 合约候选 + 张数/手续费 + 失效位提示）→ **实时扫描（滚动）**（现在谁在动，
  * 提升来源；盘中滚动证据排名 + 今日曾深扫账本）→ 今日计划跟踪（盘前冻结
- * 计划走到哪了）→ 期权事件流。全部内容是盘中滚动研究：不是信号、不冻结、
- * 不进入统计；期权异动是 Moomoo 分类，不证明方向。周内研究仍在 /regime。
+ * 计划走到哪了）→ **盘前期权异常**（侧栏：深度层标的上一时段的 call/put
+ * 偏斜与大单事实，盘前 + 开盘 30 分钟醒目、其后收起）。全部内容是盘中滚动
+ * 研究：不是信号、不冻结、不进入统计；期权分类是 Moomoo 标签，不证明方向。
+ * 周内研究仍在 /regime。2026-08-14 起盘中期权异动 feed 移入 Journal 仓位
+ * 复盘面（用户定位：异动是复盘证据，不是盘中决策输入）。
  *
  * 盘中计划的标的以 additive 的 `focusSymbols` 传给服务端（**不进 `symbols`**）：
  * 服务端只在「空 symbols + 已配置 INTRADAY_WATCHLIST」时走两层扫描，混进
@@ -162,7 +165,8 @@ const IntradayPage: React.FC = () => {
             </span>
           </div>
           <p className="mt-1 max-w-4xl text-body-sm text-text-3">
-            当日交易的单屏视图：市场脉搏、冻结盘前计划对照、日内滚动扫描与期权异动。
+            当日交易的单屏视图：市场脉搏、冻结盘前计划对照、日内滚动扫描与盘前期权异常。
+            期权异动 feed 已移至 Journal 仓位复盘（复盘证据，不是盘中输入）。
             周内（盘前冻结 · 数日至数周）研究在
             {' '}
             <Link to="/regime" className="text-text-2 underline-offset-2 hover:text-text-1 hover:underline">
@@ -211,7 +215,9 @@ const IntradayPage: React.FC = () => {
       <LaneChecklistPanel pulse={pulse} top={top} loading={loading} />
 
       {/* 主次顺序：盘中计划（真正干活的地方）在最上，实时扫描（滚动，谁现在
-          在动）在其下作为提升来源，今日计划跟踪其后，期权事件流侧栏。 */}
+          在动）在其下作为提升来源，今日计划跟踪其后；侧栏为盘前期权异常
+          （昨日 call/put 偏斜与大单事实——盘前 + 开盘 30 分钟醒目，其后收起；
+          盘中期权异动 feed 已移入 Journal 仓位复盘）。 */}
       <div className="grid gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(340px,1fr)]">
         <div className="min-w-0 space-y-4">
           <IntradayPlanPanel pulse={pulse} top={top} loading={loading} />
@@ -237,10 +243,7 @@ const IntradayPage: React.FC = () => {
             )}
           </section>
         </div>
-        <IntradayOptionEventFeed
-          events={top?.recentOptionEvents ?? []}
-          quoteSessionLabel={top?.quoteSessionLabel ?? null}
-        />
+        <PremarketOptionAnomalyPanel top={top} />
       </div>
     </div>
   );

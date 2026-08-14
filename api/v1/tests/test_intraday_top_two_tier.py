@@ -466,6 +466,14 @@ def test_premarket_gate_ranks_by_pre_fields_and_never_promotes_missing_rows(
             "premarket_pre_price_change_then_pre_turnover_v1"
         )
 
+    # additive 契约：盘前时段深度候选把同批快照的盘前涨跌带进响应
+    # （G-12：session_change_percent 此刻仍指向上一常规时段）。
+    pre_by_ticker = {
+        item["ticker"]: item["pre_change_percent"] for item in body["candidates"]
+    }
+    assert pre_by_ticker["BBB"] == pytest.approx(-4.0)
+    assert pre_by_ticker["CCC"] == pytest.approx(2.0)
+
     # 宽层剩余行按盘前口径降序：DDD |2%| > AAA |0.5%|；EEE 缺盘前字段恒最后。
     snapshot_only = scan["snapshot_only"]
     assert [row["ticker"] for row in snapshot_only] == ["DDD", "AAA", "EEE"]
@@ -536,7 +544,8 @@ def test_regular_session_gate_ignores_pre_fields_and_keeps_legacy_basis(
             # AAA 带巨大盘前读数：常规时段必须被闸门无视。
             "AAA": _quote("AAA", last_price=101.0, prev_close_price=100.0, turnover=9_000_000.0, pre_change_rate=99.0, pre_turnover=9_000_000_000.0),
             "BBB": _quote("BBB", last_price=105.0, prev_close_price=100.0, turnover=1_000_000.0),
-            "CCC": _quote("CCC", last_price=94.0, prev_close_price=100.0, turnover=2_000_000.0),
+            # CCC 残留当日早间盘前读数：候选序列化时必须被置 None（陈旧）。
+            "CCC": _quote("CCC", last_price=94.0, prev_close_price=100.0, turnover=2_000_000.0, pre_change_rate=88.0, pre_turnover=1_000.0),
             "SPY": _quote("SPY", last_price=500.0, prev_close_price=490.0, volume=1_000, turnover=499_000.0),
         }
 
@@ -564,6 +573,10 @@ def test_regular_session_gate_ignores_pre_fields_and_keeps_legacy_basis(
         assert item["deep_lane_reason"]["basis"] == (
             "abs_change_percent_then_turnover_v1"
         )
+    # additive 契约：非盘前时段候选的 pre_change_percent 一律 None——快照
+    # 残留的早间盘前列是陈旧读数（CCC 带 88.0 也不例外），绝不冒充现时。
+    for item in body["candidates"]:
+        assert item["pre_change_percent"] is None
     # 宽层剩余行仍按常规 |涨跌| 排序（AAA 唯一剩余行，携带盘前字段只是透传）。
     assert [row["ticker"] for row in scan["snapshot_only"]] == ["AAA"]
     assert scan["snapshot_only"][0]["pre_change_percent"] == pytest.approx(99.0)

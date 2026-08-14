@@ -4,7 +4,7 @@
 用户诉求：「盘前盘中的时候知道什么票有机会，比如高开的、放量的」。本模块
 **不新增任何取数路径**——它挂在 :class:`IntradayWarmCacheScheduler` 的预热
 循环上，逐 tick 读取 :func:`warm_default_intraday_top_scan` 经 single-flight
-算出的同一份两层扫描载荷（独立深拷贝），从**已有字段**里按五条 v1 规则提取
+算出的同一份两层扫描载荷（独立深拷贝），从**已有字段**里按六条 v1 规则提取
 事实并推送。预热调度器关闭时（``INTRADAY_REFRESH_SCHEDULER_ENABLED=false``）
 没有载荷可观察，提示器自然零检测。
 
@@ -65,6 +65,13 @@ VOLUME_ALERT_MIN_SCORE = LEG_MEDIUM_MIN_SCORE
 # 规则 4（位移达标）：|net_move_atr| 首次达到 ±0.5 ATR 参考线（v8 更正后它
 # 只描述过去 30 分钟，不承载前向信息）；优先读载荷自带的 survival_line_atr。
 DISPLACEMENT_ALERT_LINE_ATR = DISPLACEMENT_SURVIVAL_LINE_ATR
+# 规则 6（盘前期权大单）：候选 option_activity.max_single_turnover ≥ $1M。
+# 阈值是 v1 启发式圆整数（与 /intraday 盘前期权异常面板同值），不是验证过
+# 的边际。盘前读到的异动页是上一时段的成交（盘前绝大多数期权无成交），
+# 文案如实标注口径。警告：载荷只带比例/大单里的**大单**一半——call/put
+# 偏斜比例在期权墙端点（option-walls）上，不在预热扫描载荷里，本模块
+# 不为它新增取数路径，偏斜提示因此不存在。
+PREMARKET_LARGE_PRINT_MIN_TURNOVER = 1_000_000.0
 
 ALERT_FOOTER = "事实描述，非买卖信号"
 DEFAULT_MAX_ALERTS_PER_DAY = 20
@@ -121,7 +128,7 @@ def detect_intraday_alerts(
     *,
     seen: set[tuple[str, ...]],
 ) -> list[IntradayAlert]:
-    """五条 v1 规则的确定性检测；``seen`` 为当日去重键集合（就地登记）。
+    """六条 v1 规则的确定性检测；``seen`` 为当日去重键集合（就地登记）。
 
     只读载荷已有字段：数字与口径原样透传，不重算（唯一的乘法是位移美元
     换算 ``net_move_atr × atr14``，与前端扫描表同一显示口径，且仅在
@@ -183,6 +190,35 @@ def detect_intraday_alerts(
                     rule="premarket_move",
                     ticker=ticker,
                     text=_tagged(ticker, f"{ticker} 盘前 {pre_change:+.1f}%"),
+                ),
+            )
+
+        # -- 规则 6：盘前期权大单（仅盘前；每标的每日一次）------------------
+        # 只读候选已带的 option_activity.max_single_turnover（深度层逐标的
+        # 异动页聚合）；盘前该页承载的是上一时段成交，文案如实声明口径。
+        # 供应商分类不随大单转述（dominant_sentiment 是整页多数，不是该笔
+        # 的分类，转述会张冠李戴）。
+        for candidate in candidates:
+            ticker = str(candidate.get("ticker") or "").strip().upper()
+            activity = candidate.get("option_activity")
+            if not ticker or not isinstance(activity, Mapping):
+                continue
+            max_turnover = _finite(activity.get("max_single_turnover"))
+            if (
+                max_turnover is None
+                or max_turnover < PREMARKET_LARGE_PRINT_MIN_TURNOVER
+            ):
+                continue
+            _emit(
+                ("premarket_large_print", ticker),
+                IntradayAlert(
+                    rule="premarket_large_print",
+                    ticker=ticker,
+                    text=_tagged(
+                        ticker,
+                        f"{ticker} 期权大单 ${max_turnover / 1e6:.1f}M"
+                        "（上一时段异动页最大单笔）",
+                    ),
                 ),
             )
 
@@ -531,6 +567,7 @@ __all__ = [
     "IntradayAlert",
     "IntradayOpportunityAlerter",
     "PREMARKET_ABS_CHANGE_MIN",
+    "PREMARKET_LARGE_PRINT_MIN_TURNOVER",
     "VOLUME_ALERT_MIN_SCORE",
     "VOLUME_ALERT_VOL_NORM_MIN",
     "detect_intraday_alerts",

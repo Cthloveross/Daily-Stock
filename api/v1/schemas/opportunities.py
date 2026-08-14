@@ -1602,6 +1602,13 @@ class IntradayTopCandidate(BaseModel):
     # watchlist 两层模式（additive）：单层模式恒为 null。
     scan_tier: Optional[Literal["deep"]] = None
     deep_lane_reason: Optional[IntradayDeepLaneReason] = None
+    # 盘前涨跌（additive，G-12 口径）：盘前时段 session_change_percent 仍指向
+    # 上一常规时段（快照前收分母），今晨真实盘前变动只在本字段。仅盘前时段
+    # 有值——快照的 pre_* 列在开盘后仍残留当日早间读数（不再是「现在的盘前
+    # 变动」），因此非盘前时段服务端一律置 None，防止陈旧读数冒充现时。
+    # 快照缺列同样是 None（标缺），绝不 0 回填；单层（显式 symbols）模式恒
+    # 为 None（该字段由两层扫描的宽层快照带入）。
+    pre_change_percent: Optional[float] = None
 
 
 class IntradayTopRecentOptionEvent(BaseModel):

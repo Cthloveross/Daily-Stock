@@ -421,12 +421,17 @@ describe('IntradayScanTable 默认 10 列网格（v3 上下文并入）', () => 
     render(<IntradayScanTable data={response} loading={false} error={null} />);
 
     const table = screen.getByRole('table', { name: '实时扫描表' });
-    // 默认网格恰好 10 列交易关键读数（v6 起含「近30分位移」，「波段vs大盘」下沉）。
-    const headers = ['排名', '标的', '涨跌%', '当前爆发', '今日波段', '速度', '近30分位移', '形态', '你的战绩', '详情'];
+    // 默认网格恰好 10 列交易关键读数（v6 起含「近30分位移」，「波段vs大盘」
+    // 下沉；2026-08-14 按用户要求「你的战绩」收尾——上下文标注放最后）。
+    const headers = ['排名', '标的', '涨跌%', '当前爆发', '今日波段', '速度', '近30分位移', '形态', '详情', '你的战绩'];
     for (const header of headers) {
       expect(within(table).getByText(header)).toBeInTheDocument();
     }
-    expect(within(table).getAllByRole('columnheader').length).toBe(10);
+    const columnHeaders = within(table).getAllByRole('columnheader');
+    expect(columnHeaders.length).toBe(10);
+    // 「你的战绩」必须是最后一列（用户要求：战绩不挤在行情读数前面）。
+    expect(columnHeaders[columnHeaders.length - 1].textContent).toContain('你的战绩');
+    expect(columnHeaders[columnHeaders.length - 2].textContent).toContain('详情');
     // 次要指标移出默认网格（展开行「研究读数」一键可达，不是删除）。
     for (const moved of ['缺口', '量能节奏', 'VWAP', '波幅扩张(ATR)', '财报', '期权异动', '研究状态', '波段vs大盘']) {
       expect(within(table).queryByText(moved)).not.toBeInTheDocument();
@@ -968,6 +973,76 @@ describe('IntradayScanTable watchlist 两层模式（universeScan）', () => {
     expect(within(section).getByText('按 |涨跌幅| 排序 · 闸门之外无爆发/形态/速度读数——缺席即缺席，不以 0 冒充')).toBeInTheDocument();
     expect(within(section).getByText('+2.31%')).toBeInTheDocument();
     expect(within(section).queryByText(/盘前/)).not.toBeInTheDocument();
+  });
+});
+
+describe('IntradayScanTable 盘前涨跌%列（G-12：主行盘前、副行昨日）', () => {
+  beforeEach(() => {
+    navigateMock.mockReset();
+    vi.mocked(fetchNearExpiryContracts).mockReset();
+    vi.mocked(fetchNearExpiryContracts).mockImplementation(
+      async (symbol: string) => nearExpiryEmpty(symbol),
+    );
+  });
+
+  function premarketResponse(): IntradayTopResponse {
+    return {
+      ...topResponse(),
+      sessionState: 'premarket',
+      sessionPhase: 'premarket',
+      sessionPhaseLabel: '盘前 · 只读简报',
+      candidates: [
+        candidate({ preChangePercent: 2.4 }),
+        candidate({ ticker: 'MU', lastPrice: 100.5, preChangePercent: null }),
+      ],
+    };
+  }
+
+  it('renders 盘前 prominently and demotes 昨日 (prior session) to the sub-line', () => {
+    render(<IntradayScanTable data={premarketResponse()} loading={false} error={null} />);
+    const table = screen.getByRole('table', { name: '实时扫描表' });
+    // 主行＝真实盘前变动，醒目着色。
+    const pre = within(table).getByText('盘前 +2.40%');
+    expect(pre).toHaveClass('text-up-strong');
+    // 副行如实标「昨日」：G-12——sessionChangePercent 此刻仍指向上一常规
+    // 时段，绝不冒充今晨读数（两行候选都带昨日副行）。
+    expect(within(table).getAllByText(/昨日 \+5\.24%/).length).toBe(2);
+    // 盘前字段标缺的行显式「盘前标缺」，绝不把昨日涨跌顶进主行。
+    const muRow = within(table).getByLabelText('打开 MU 即时扫描详情');
+    expect(within(muRow).getByText('盘前标缺')).toBeInTheDocument();
+    expect(within(muRow).queryByText('+5.24%')).not.toBeInTheDocument();
+  });
+
+  it('sorts the 涨跌% column by the premarket change with 标缺 rows last', () => {
+    // MU（盘前标缺）在服务端排名第一：点列头后必须按盘前口径把它排最后。
+    const response = {
+      ...premarketResponse(),
+      candidates: [
+        candidate({ ticker: 'MU', lastPrice: 100.5, preChangePercent: null }),
+        candidate({ preChangePercent: 2.4 }),
+      ],
+    };
+    render(<IntradayScanTable data={response} loading={false} error={null} />);
+    const table = screen.getByRole('table', { name: '实时扫描表' });
+    const tickerOrder = () =>
+      within(table)
+        .getAllByRole('row')
+        .slice(1)
+        .map((row) => within(row).getAllByRole('cell')[1].textContent ?? '');
+    expect(tickerOrder()[0]).toContain('MU');
+    fireEvent.click(within(table).getByRole('button', { name: '按涨跌%排序' }));
+    // desc：排序键＝盘前涨跌（与显示同口径）；标缺行恒最后——若仍按
+    // sessionChangePercent（两行同为 +5.24%）此断言不可能区分先后。
+    expect(tickerOrder()[0]).toContain('NVDA');
+    expect(tickerOrder()[1]).toContain('MU');
+  });
+
+  it('keeps the regular-session rendering unchanged without 盘前/昨日 markers', () => {
+    render(<IntradayScanTable data={topResponse()} loading={false} error={null} />);
+    const table = screen.getByRole('table', { name: '实时扫描表' });
+    expect(within(table).getAllByText('+5.24%').length).toBe(2);
+    expect(within(table).queryByText(/盘前/)).not.toBeInTheDocument();
+    expect(within(table).queryByText(/昨日/)).not.toBeInTheDocument();
   });
 });
 

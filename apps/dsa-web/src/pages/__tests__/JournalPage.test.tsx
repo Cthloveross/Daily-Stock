@@ -78,6 +78,11 @@ vi.mock('../../components/journal/StyleBreakdown', () => ({ default: () => null 
 vi.mock('../../components/journal/PnLByDte', () => ({ default: () => null }));
 vi.mock('../../components/journal/FrameworkPanel', () => ({ default: () => null }));
 vi.mock('../../components/journal/AskJournalChat', () => ({ default: () => null }));
+// 期权异动 feed（自 /intraday 迁入的复盘证据）：页面级测试只验挂载位置，
+// 组件自身行为由 JournalOptionEventReview.test.tsx 覆盖。
+vi.mock('../../components/journal/JournalOptionEventReview', () => ({
+  default: () => <div data-testid="journal-option-event-review" />,
+}));
 
 function LocationProbe() {
   const location = useLocation();
@@ -104,6 +109,8 @@ describe('JournalPage active journal routing and legacy isolation', () => {
     expect(screen.queryByTestId('current-positions-snapshot-card')).not.toBeInTheDocument();
     expect(screen.queryByLabelText('可信事实集构建预览')).not.toBeInTheDocument();
     expect(screen.getByText('没有符合当前筛选条件的仓位回合。')).toBeInTheDocument();
+    // 期权异动 feed 落在复盘面（2026-08-14 自 /intraday 迁入：复盘证据）。
+    expect(screen.getByTestId('journal-option-event-review')).toBeInTheDocument();
     expect(storeMocks.loadStats).not.toHaveBeenCalled();
     expect(storeMocks.loadTrades).not.toHaveBeenCalled();
     expect(storeMocks.loadRealityTest).not.toHaveBeenCalled();
@@ -124,6 +131,8 @@ describe('JournalPage active journal routing and legacy isolation', () => {
     expect(screen.getByLabelText('可信事实集构建预览')).toBeInTheDocument();
     // No legacy warning banner: this is an active tab, not an archive.
     expect(screen.queryByText(/Legacy \/ 存档视图/)).not.toBeInTheDocument();
+    // 期权异动 feed 只在仓位复盘页签：数据页签不加载它。
+    expect(screen.queryByTestId('journal-option-event-review')).not.toBeInTheDocument();
   });
 
   it('presents win rate and 0DTE share as context-dependent metrics', () => {

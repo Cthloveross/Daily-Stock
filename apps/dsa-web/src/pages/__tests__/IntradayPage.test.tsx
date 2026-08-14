@@ -546,14 +546,16 @@ describe('IntradayPage', () => {
     ).toBeInTheDocument();
 
     // 实时扫描表（两级布局默认 10 列交易关键读数，v6 起含「近30分位移」，
-    // 「波段vs大盘」下沉到展开区「研究读数」）。
+    // 「波段vs大盘」下沉到展开区「研究读数」；「你的战绩」按用户要求收尾）。
     expect(screen.getByText('实时扫描 · 现在谁在动')).toBeInTheDocument();
     const table = await screen.findByRole('table', { name: '实时扫描表' });
-    const headers = ['排名', '标的', '涨跌%', '当前爆发', '今日波段', '速度', '近30分位移', '形态', '你的战绩', '详情'];
+    const headers = ['排名', '标的', '涨跌%', '当前爆发', '今日波段', '速度', '近30分位移', '形态', '详情', '你的战绩'];
     for (const header of headers) {
       expect(within(table).getByText(header)).toBeInTheDocument();
     }
-    expect(within(table).getAllByRole('columnheader').length).toBe(10);
+    const columnHeaders = within(table).getAllByRole('columnheader');
+    expect(columnHeaders.length).toBe(10);
+    expect(columnHeaders[columnHeaders.length - 1].textContent).toContain('你的战绩');
     expect(within(table).queryByText('波段vs大盘')).not.toBeInTheDocument();
     // v6 位移：NVDA 越过 0.5 ATR 经验线；主行为可对照盘面的美元
     // （0.72 ATR × ATR14 1.5 = $1.08），ATR 刻度退到副行。
@@ -583,7 +585,7 @@ describe('IntradayPage', () => {
     expect(screen.getByText(/intraday_session_evidence_v8/)).toBeInTheDocument();
 
     // 主次顺序：脉搏 → 纪律条 → 车道清单 → 盘中计划 → 实时扫描（滚动）
-    // → 今日计划跟踪 → 期权事件流。
+    // → 今日计划跟踪 → 盘前期权异常（侧栏）。
     const order = [
       '市场脉搏',
       '规模与频率',
@@ -591,7 +593,7 @@ describe('IntradayPage', () => {
       '盘中计划',
       '实时扫描',
       '今日计划',
-      '期权异动',
+      '盘前期权异常',
     ].map((label) => screen.getByLabelText(label));
     for (let index = 0; index < order.length - 1; index += 1) {
       expect(
@@ -600,11 +602,21 @@ describe('IntradayPage', () => {
       ).toBeTruthy();
     }
 
-    // 期权异动 feed + 诚实边界文案。
-    const feed = screen.getByLabelText('期权异动');
-    expect(within(feed).getByText('偏多（Moomoo 分类）')).toBeInTheDocument();
+    // 期权异动 feed 已移入 Journal 仓位复盘（复盘证据，不是盘中输入）：
+    // 本页不再渲染它；侧栏换成盘前期权异常面板（常规时段 prime 默认收起，
+    // 收起态不发任何请求）。
+    expect(screen.queryByLabelText('期权异动')).not.toBeInTheDocument();
+    const anomalyPanel = screen.getByLabelText('盘前期权异常');
     expect(
-      within(feed).getByText(/不推断开平仓，不证明真实主动买卖方向，不是信号/),
+      within(anomalyPanel).getByText('盘前期权异常 · 昨日事实'),
+    ).toBeInTheDocument();
+    expect(
+      within(anomalyPanel).getByRole('button', {
+        name: '展开或收起盘前期权异常面板',
+      }),
+    ).toHaveAttribute('aria-expanded', 'false');
+    expect(
+      within(anomalyPanel).getByText(/当前为次要参考（昨日事实）/),
     ).toBeInTheDocument();
   });
 

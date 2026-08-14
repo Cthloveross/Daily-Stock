@@ -169,14 +169,23 @@ function quoteAsOfLabel(item: IntradayTopCandidate): string {
   }).format(parsed)} ET`;
 }
 
-function sortValue(item: IntradayTopCandidate, key: IntradaySortKey): number | null {
+function sortValue(
+  item: IntradayTopCandidate,
+  key: IntradaySortKey,
+  premarketPhase: boolean,
+): number | null {
   switch (key) {
     case 'burst':
       return item.sessionBursts.state === 'ready'
         ? item.sessionBursts.current?.score ?? null
         : null;
     case 'change':
-      return item.sessionChangePercent;
+      // 盘前时段列头显示的是盘前涨跌（G-12：sessionChangePercent 此刻仍是
+      // 上一常规时段读数），排序必须跟着显示口径走；盘前标缺行按 null 语义
+      // 恒排最后，绝不用昨日涨跌冒充盘前排序键。
+      return premarketPhase
+        ? item.preChangePercent ?? null
+        : item.sessionChangePercent;
     default:
       return null;
   }
@@ -844,9 +853,15 @@ function ResearchReadoutsGrid({ item }: { item: IntradayTopCandidate }) {
  *
  * 两级布局（2026-08-03 声效整理，2026-08-04 加「你的战绩」与「近30分位移」）：
  * 默认网格保留 10 列交易关键读数（排名/标的/涨跌%/当前爆发/今日波段/速度/
- * 近30分位移/形态/你的战绩/详情），次要指标移入行内展开区「研究读数」网格
+ * 近30分位移/形态/详情/你的战绩），次要指标移入行内展开区「研究读数」网格
  * （临期合约面板上方）——重排可见性 ≠ 删除，所有读数一键可达，标缺语义不变。
  * v6 为给「近30分位移」腾出默认位，「波段vs大盘」下沉到研究读数区。
+ * 2026-08-14 按用户要求把「你的战绩」移到最后一列（它是上下文标注，不是
+ * 盘中交易关键读数），语义与列头 tooltip 不变。
+ *
+ * 盘前时段（sessionPhase=premarket）「涨跌%」列改示真实盘前变动（G-12：
+ * sessionChangePercent 此刻仍指向上一常规时段，副行如实标「昨日」），
+ * 盘前字段标缺显式「盘前标缺」；常规时段渲染不变。
  *
  * 「近30分位移」＝该标的最近 30 分钟（6×5m）的 ATR 归一化净位移。证据：用户
  * 自己 766 笔回合（2026-06-08→07-31）的取证分析显示进场几何无预测力，而进场后
@@ -919,6 +934,10 @@ export function IntradayScanTable({
   }, [data]);
 
   const premarketBasis = data?.universeScan?.gateBasis === PREMARKET_GATE_BASIS;
+  // 盘前时段（按盘段而非闸门口径判定）：深度行「涨跌%」主行改示真实盘前
+  // 变动（G-12：sessionChangePercent 此刻仍指向上一常规时段，副行如实标
+  // 「昨日」）；盘前字段标缺显式「盘前标缺」，绝不以昨日涨跌冒充。
+  const premarketPhase = data?.sessionPhase === 'premarket';
   const premarketFieldsUnavailable = (data?.universeScan?.gateWarnings ?? []).includes(
     PREMARKET_FIELDS_UNAVAILABLE_WARNING,
   );
@@ -943,15 +962,15 @@ export function IntradayScanTable({
     const candidates = data?.candidates ?? [];
     if (!sort) return candidates;
     const sorted = [...candidates].sort((left, right) => {
-      const a = sortValue(left, sort.key);
-      const b = sortValue(right, sort.key);
+      const a = sortValue(left, sort.key, premarketPhase);
+      const b = sortValue(right, sort.key, premarketPhase);
       if (a === null && b === null) return 0;
       if (a === null) return 1; // 标缺永远排最后，不参与方向。
       if (b === null) return -1;
       return sort.direction === 'desc' ? b - a : a - b;
     });
     return sorted;
-  }, [data, sort]);
+  }, [data, sort, premarketPhase]);
 
   const toggleSort = (key: IntradaySortKey) => {
     setSort((current) => {
@@ -1086,12 +1105,14 @@ export function IntradayScanTable({
                   </Tooltip>
                 </th>
                 <th className="px-3 py-2 font-medium">形态</th>
+                <th className="px-3 py-2 font-medium">详情</th>
+                {/* 「你的战绩」按用户要求收尾：它是上下文标注，不是盘中
+                    交易关键读数——放最后一列，读表动线先看行情后看战绩。 */}
                 <th className="px-3 py-2 font-medium">
                   <Tooltip focusable content={PERSONAL_HEADER_TOOLTIP}>
                     <span aria-label={PERSONAL_HEADER_TOOLTIP}>你的战绩</span>
                   </Tooltip>
                 </th>
-                <th className="px-3 py-2 font-medium">详情</th>
               </tr>
             </thead>
             <tbody>
@@ -1129,21 +1150,51 @@ export function IntradayScanTable({
                     })()}
                   </td>
                   <td className="px-3 py-2.5 text-right">
-                    <div className={`font-mono text-mono-sm ${
-                      item.sessionChangePercent === null
-                        ? 'text-text-3'
-                        : item.sessionChangePercent > 0
-                          ? 'text-up-strong'
-                          : item.sessionChangePercent < 0
-                            ? 'text-down-strong'
-                            : 'text-text-3'
-                    }`}
-                    >
-                      {formatSignedPercent(item.sessionChangePercent)}
-                    </div>
-                    <div className="mt-0.5 text-caption text-text-3">
-                      {formatPrice(item.lastPrice)} · {quoteAsOfLabel(item)}
-                    </div>
+                    {premarketPhase ? (
+                      // 盘前口径（G-12）：主行＝真实盘前变动，标缺显式
+                      // 「盘前标缺」；sessionChangePercent 此刻仍是上一常规
+                      // 时段读数——降级到副行并如实标「昨日」。
+                      <>
+                        {item.preChangePercent !== null
+                        && item.preChangePercent !== undefined ? (
+                          <div className={`font-mono text-mono-sm ${
+                            item.preChangePercent > 0
+                              ? 'text-up-strong'
+                              : item.preChangePercent < 0
+                                ? 'text-down-strong'
+                                : 'text-text-3'
+                          }`}
+                          >
+                            盘前 {formatSignedPercent(item.preChangePercent)}
+                          </div>
+                        ) : (
+                          <div className="font-mono text-mono-sm text-text-3">盘前标缺</div>
+                        )}
+                        <div className="mt-0.5 text-caption text-text-3">
+                          昨日 {formatSignedPercent(item.sessionChangePercent)}
+                          {' · '}
+                          {formatPrice(item.lastPrice)} · {quoteAsOfLabel(item)}
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div className={`font-mono text-mono-sm ${
+                          item.sessionChangePercent === null
+                            ? 'text-text-3'
+                            : item.sessionChangePercent > 0
+                              ? 'text-up-strong'
+                              : item.sessionChangePercent < 0
+                                ? 'text-down-strong'
+                                : 'text-text-3'
+                        }`}
+                        >
+                          {formatSignedPercent(item.sessionChangePercent)}
+                        </div>
+                        <div className="mt-0.5 text-caption text-text-3">
+                          {formatPrice(item.lastPrice)} · {quoteAsOfLabel(item)}
+                        </div>
+                      </>
+                    )}
                   </td>
                   <td className="px-3 py-2.5 text-right">
                     {item.sessionBursts.state === 'ready' && item.sessionBursts.current ? (
@@ -1239,7 +1290,6 @@ export function IntradayScanTable({
                   </td>
                   <td className="px-3 py-2.5">{displacementCell(item)}</td>
                   <td className="px-3 py-2.5">{setupMatchCell(item)}</td>
-                  <td className="px-3 py-2.5">{personalStatCell(personalEdge, item.ticker)}</td>
                   <td className="px-3 py-2.5">
                     <div className="flex items-center gap-1.5">
                       <button
@@ -1286,6 +1336,9 @@ export function IntradayScanTable({
                       )}
                     </div>
                   </td>
+                  {/* 「你的战绩」按用户要求放最后：上下文标注收尾，不挤占
+                      行情读数的视线（列头 tooltip 口径不变）。 */}
+                  <td className="px-3 py-2.5">{personalStatCell(personalEdge, item.ticker)}</td>
                 </tr>
                 {expandedTicker === item.ticker && (
                   <tr className="border-b border-subtle last:border-b-0">

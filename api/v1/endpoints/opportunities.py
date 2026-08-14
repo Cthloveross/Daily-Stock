@@ -3460,13 +3460,17 @@ def _execute_intraday_top_two_tier(
         candidate["deep_lane_reason"] = _deep_lane_reason(
             str(candidate.get("ticker") or "")
         )
-        # 盘中机会提示器需要深度层标的的盘前读数：盘前异动最强的标的恰好
-        # 会被闸门晋升，宽层快照行随之离开 snapshot_only。把同一批快照的
-        # pre_change_percent 原样带到候选上（进程内 additive 字段；API 响应
-        # 模型未声明它，序列化时被丢弃，客户端载荷逐字节不变）。
+        # 盘中机会提示器与前端扫描表都需要深度层标的的盘前读数：盘前异动
+        # 最强的标的恰好会被闸门晋升，宽层快照行随之离开 snapshot_only。把
+        # 同一批快照的 pre_change_percent 原样带到候选上（additive 字段，已
+        # 在 IntradayTopCandidate 声明、随响应序列化）。仅盘前时段携带：
+        # 快照的 pre_* 列在开盘后仍残留当日早间读数，非盘前一律置 None，
+        # 防止陈旧读数冒充现时（G-12 同源口径）。
         wide_row = wide_row_by_ticker.get(str(candidate.get("ticker") or ""))
         candidate["pre_change_percent"] = (
-            wide_row.get("pre_change_percent") if wide_row else None
+            wide_row.get("pre_change_percent")
+            if wide_row is not None and session_phase_now == "premarket"
+            else None
         )
 
     # -- 今日深扫账本（display truth）----------------------------------------
