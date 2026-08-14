@@ -24,6 +24,20 @@ vi.mock('../../api/opportunities', async (importOriginal) => {
     fetchIntradayTop: vi.fn(),
     fetchIntradayTracking: vi.fn().mockResolvedValue({ items: [], sessionState: 'closed', limitations: [] }),
     fetchPremarketCycleStatus: vi.fn(),
+    // 扫描表「期权墙」列 + 盘前期权异常面板共用的墙读取：页面级测试固定
+    // 空返回（逐檔标缺），只验页面链路、绝不触网。
+    fetchOpportunityOptionWalls: vi.fn(async () => ({
+      schemaVersion: 'option-wall/1.3',
+      marketDateEt: '2026-07-28',
+      generatedAt: '2026-07-28T14:30:05+00:00',
+      items: [],
+    })),
+    fetchOpportunityOptionEvents: vi.fn(async () => ({
+      schemaVersion: 'option-events/1.0',
+      marketDateEt: '2026-07-28',
+      generatedAt: '2026-07-28T14:30:05+00:00',
+      items: [],
+    })),
     // 盘中计划卡片里的合约候选区：页面级测试固定成「未配置」，只验计划链路。
     fetchNearExpiryContracts: vi.fn(async () => ({
       schemaVersion: 'near-expiry-contracts/1.0',
@@ -545,16 +559,17 @@ describe('IntradayPage', () => {
       await screen.findByText(/今日尚无已发布的冻结盘前计划/),
     ).toBeInTheDocument();
 
-    // 实时扫描表（两级布局默认 10 列交易关键读数，v6 起含「近30分位移」，
-    // 「波段vs大盘」下沉到展开区「研究读数」；「你的战绩」按用户要求收尾）。
+    // 实时扫描表（两级布局默认 11 列交易关键读数，v6 起含「近30分位移」，
+    // 「波段vs大盘」下沉到展开区「研究读数」；「你的战绩」按用户要求收尾；
+    // 2026-08-15 形态后加「期权墙」）。
     expect(screen.getByText('实时扫描 · 现在谁在动')).toBeInTheDocument();
     const table = await screen.findByRole('table', { name: '实时扫描表' });
-    const headers = ['排名', '标的', '涨跌%', '当前爆发', '今日波段', '速度', '近30分位移', '形态', '详情', '你的战绩'];
+    const headers = ['排名', '标的', '涨跌%', '当前爆发', '今日波段', '速度', '近30分位移', '形态', '期权墙', '详情', '你的战绩'];
     for (const header of headers) {
       expect(within(table).getByText(header)).toBeInTheDocument();
     }
     const columnHeaders = within(table).getAllByRole('columnheader');
-    expect(columnHeaders.length).toBe(10);
+    expect(columnHeaders.length).toBe(11);
     expect(columnHeaders[columnHeaders.length - 1].textContent).toContain('你的战绩');
     expect(within(table).queryByText('波段vs大盘')).not.toBeInTheDocument();
     // v6 位移：NVDA 越过 0.5 ATR 经验线；主行为可对照盘面的美元

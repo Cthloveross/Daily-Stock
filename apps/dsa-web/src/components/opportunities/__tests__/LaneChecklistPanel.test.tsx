@@ -94,17 +94,24 @@ describe('LaneChecklistPanel', () => {
     useIntradayManualBudgetStore.getState().reset();
   });
 
-  it('carries exactly one framing line and no read-only boilerplate', async () => {
+  it('keeps the framing sentence out of visible chrome and verbatim inside the header ⓘ', async () => {
     render(<LaneChecklistPanel pulse={pulse()} top={top()} />);
     expect(await screen.findByText(/开仓前车道检查 · 对照你自己的规则/)).toBeInTheDocument();
-    expect(screen.getByText(/按你自己的规则机械核对，不是买卖建议/)).toBeInTheDocument();
+    // 界面披露策略（2026-08-15，用户：「不要急着撇清关系」）：定位句不再
+    // 以可见正文出现——逐字收进标题行 ⓘ 的 tooltip/aria-label。
+    expect(
+      screen.queryByText(/按你自己的规则机械核对，不是买卖建议/),
+    ).not.toBeInTheDocument();
+    const hint = screen.getByLabelText(/按你自己的规则机械核对，不是买卖建议/);
+    expect(hint.getAttribute('aria-label')).toContain(
+      '样本窗口仅 2026-04→07 一个市场状态',
+    );
+    expect(hint.getAttribute('aria-label')).toContain(
+      '数字口径：build #3 干净口径，n=1,407，2026-04-21→07-31。',
+    );
     // 用户明确要求删掉的样板话，一个字都不许留在正文。
     expect(screen.queryByText(/本系统只读/)).not.toBeInTheDocument();
     expect(screen.queryByText(/不会下单/)).not.toBeInTheDocument();
-    // 长口径 caveat 不占正文，但内容仍在（挂 tooltip 的 aria-label）。
-    expect(
-      screen.getByLabelText(/样本窗口仅 2026-04→07 一个市场状态/),
-    ).toBeInTheDocument();
     // 也不得出现任何「你应该 / 建议你」式的指令性措辞。
     expect(screen.queryByText(/你应该|建议你|推荐你/)).not.toBeInTheDocument();
   });

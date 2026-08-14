@@ -4,6 +4,7 @@ import {
   LARGE_PRINT_MIN_TURNOVER_USD,
   OPTION_SKEW_RATIO_HIGH,
   OPTION_SKEW_RATIO_LOW,
+  PREMARKET_PANEL_HONESTY_NOTE,
   PremarketOptionAnomalyPanel,
 } from '../PremarketOptionAnomalyPanel';
 import {
@@ -273,42 +274,60 @@ describe('PremarketOptionAnomalyPanel（盘前期权异常 · 昨日事实）', 
       within(panel).getByRole('button', { name: '展开或收起盘前期权异常面板' }),
     ).toHaveAttribute('aria-expanded', 'true');
 
-    // NVDA：量比偏斜 + ≥$1M 大单章；大单明细逐字段带供应商分类。
+    // NVDA：量比偏斜 + ≥$1M 大单章（方向写进章面，用户要求「明显一点」）。
     expect(await within(panel).findByText('偏斜 · 量比 5.20')).toBeInTheDocument();
-    expect(within(panel).getByText('大单 $1.2M')).toBeInTheDocument();
+    expect(within(panel).getByText('大单 Call $1.2M')).toBeInTheDocument();
+    // 最大单一行给全明细（一行一个事实，不再另起「大单明细」重复金额）。
+    const nvdaRow = within(panel).getByLabelText('NVDA 盘前期权事实');
     expect(
-      within(panel).getByText(
-        '大单明细：Call 250 · 2026-08-21 · 7DTE · 2400 张 · $1.2M · 偏多（Moomoo 分类）',
+      within(nvdaRow).getByText(
+        'Call 250 · 2026-08-21 · 7DTE · 2400 张 · $1.2M · 偏多（Moomoo 分类）',
       ),
     ).toBeInTheDocument();
 
     // TSLA：OI 比 0.33 命中下沿阈值 → 偏斜；<$1M 的最大单不盖「大单」章，
-    // 但金额仍如实陈列。
+    // 但明细仍如实陈列（含方向与金额）。
     expect(within(panel).getByText('偏斜 · OI比 0.33')).toBeInTheDocument();
-    expect(within(panel).queryByText('大单 $1.0M')).not.toBeInTheDocument();
-    expect(within(panel).getByText('最大单 $1000K')).toBeInTheDocument();
-
-    // 事实读数行（未偏斜的比例照常陈列，不因未命中阈值而隐藏）。
-    expect(within(panel).getByText('量比 C/P 5.20')).toBeInTheDocument();
-    expect(within(panel).getByText('OI比 C/P 1.10')).toBeInTheDocument();
-    expect(within(panel).getByText('量比 C/P 1.00')).toBeInTheDocument();
-
-    // 诚实口径三连：上一时段基准、启发式阈值声明、供应商分类边界。
+    expect(within(panel).queryByText(/^大单 Put/)).not.toBeInTheDocument();
+    const tslaRow = within(panel).getByLabelText('TSLA 盘前期权事实');
     expect(
-      within(panel).getByText(/OI＝上一清算时段结算；成交量与大单＝供应商快照\/异动页的会话累计/),
-    ).toBeInTheDocument();
-    expect(
-      within(panel).getByText(
-        new RegExp(
-          `偏斜＝量比或 OI比 ≥${OPTION_SKEW_RATIO_HIGH} 或 ≤${OPTION_SKEW_RATIO_LOW}；大单＝单笔 ≥\\$1M——v1 启发式，未经验证`,
-        ),
+      within(tslaRow).getByText(
+        'Put 300 · 2026-08-21 · 7DTE · 2400 张 · $1000K · 偏空（Moomoo 分类）',
       ),
     ).toBeInTheDocument();
+
+    // 事实读数行（未偏斜的比例照常陈列，不因未命中阈值而隐藏）；
+    // 标签列与数值列对齐分离（一行一个事实）。
+    const nvdaVolume = nvdaRow.querySelector('[data-fact-id="volume_ratio"]') as HTMLElement;
+    expect(nvdaVolume.textContent).toContain('量比 C/P');
+    expect(nvdaVolume.textContent).toContain('5.20');
+    const nvdaOi = nvdaRow.querySelector('[data-fact-id="oi_ratio"]') as HTMLElement;
+    expect(nvdaOi.textContent).toContain('1.10');
+    const tslaVolume = tslaRow.querySelector('[data-fact-id="volume_ratio"]') as HTMLElement;
+    expect(tslaVolume.textContent).toContain('1.00');
+
+    // 诚实口径三连原文迁入标题行 ⓘ tooltip（隐藏 ≠ 删除）：aria-label
+    // 逐字携带，正文不再渲染整段样板话。
+    const hint = within(panel).getByLabelText(
+      new RegExp('盘前期权异常口径：事实描述，非信号。'),
+    );
+    expect(hint.getAttribute('aria-label')).toContain(
+      'OI＝上一清算时段结算；成交量与大单＝供应商快照/异动页的会话累计',
+    );
+    expect(hint.getAttribute('aria-label')).toContain(
+      `偏斜＝量比或 OI比 ≥${OPTION_SKEW_RATIO_HIGH} 或 ≤${OPTION_SKEW_RATIO_LOW}；大单＝单笔 ≥$1M——v1 启发式，未经验证`,
+    );
+    expect(hint.getAttribute('aria-label')).toContain(
+      '分类来自供应商，不构成方向证明；比例异常≠会涨会跌——该假说在你的数据上尚未检验（期权墙逐日快照正在积累样本）',
+    );
+    expect(hint.getAttribute('aria-label')).toBe(
+      `盘前期权异常口径：${PREMARKET_PANEL_HONESTY_NOTE}`,
+    );
+    // 可见正文不再有常驻披露句（含标题行小字里原来的「事实描述，非信号」）。
+    expect(within(panel).queryByText(/事实描述，非信号/)).not.toBeInTheDocument();
     expect(
-      within(panel).getByText(
-        /分类来自供应商，不构成方向证明；比例异常≠会涨会跌——该假说在你的数据上尚未检验（期权墙逐日快照正在积累样本）/,
-      ),
-    ).toBeInTheDocument();
+      within(panel).queryByText(/OI＝上一清算时段结算；成交量与大单/),
+    ).not.toBeInTheDocument();
 
     // 请求有界：2 檔 → 墙 1 次（≤5 檔/批）、异动 1 次（≤3 檔/批，每檔 10 条）。
     expect(fetchOpportunityOptionWalls).toHaveBeenCalledTimes(1);
@@ -343,17 +362,21 @@ describe('PremarketOptionAnomalyPanel（盘前期权异常 · 昨日事实）', 
     );
 
     const panel = screen.getByLabelText('盘前期权异常');
-    expect(await within(panel).findAllByText('量比标缺')).toHaveLength(2);
-    expect(within(panel).getAllByText('OI比标缺')).toHaveLength(2);
+    // 两檔 × 量比/OI比 = 4 个显式标缺（含原因），绝不用 0 冒充。
+    expect(
+      await within(panel).findAllByText('标缺（该檔墙读取失败或无返回）'),
+    ).toHaveLength(4);
     // NVDA 的异动仍可用（大单照常）；TSLA 异动无返回行 → 显式标缺。
-    expect(within(panel).getByText('大单 $1.2M')).toBeInTheDocument();
-    expect(within(panel).getByText('大单标缺')).toBeInTheDocument();
+    expect(within(panel).getByText('大单 Call $1.2M')).toBeInTheDocument();
+    expect(
+      within(panel).getByText('标缺（该檔异动读取失败或无返回）'),
+    ).toBeInTheDocument();
     // 行仍全部在列：fail-closed 标缺，不隐藏任何深度层标的。
     expect(within(panel).getByText('NVDA')).toBeInTheDocument();
     expect(within(panel).getByText('TSLA')).toBeInTheDocument();
   });
 
-  it('renders a null ratio as 标缺 with the server reason instead of 0 or infinity', async () => {
+  it('renders a null ratio as 标缺 with a compact label and the verbatim reason in the ⓘ tooltip', async () => {
     vi.mocked(fetchOpportunityOptionWalls).mockResolvedValue(wallResponse([
       {
         ...wallItem('NVDA', 2.0, 1.0),
@@ -374,13 +397,71 @@ describe('PremarketOptionAnomalyPanel（盘前期权异常 · 昨日事实）', 
     render(<PremarketOptionAnomalyPanel top={topStub('premarket', ['NVDA'])} />);
 
     const panel = screen.getByLabelText('盘前期权异常');
+    // 可见行只留紧凑短语（未知原因 → 保守的「无法计算」），长原因逐字进 ⓘ。
+    const compact = await within(panel).findByText('无法计算 ⓘ');
+    expect(compact.getAttribute('aria-label')).toContain(
+      '服务端原因（逐字）：put_volume_total_zero',
+    );
+    const nvdaRow = within(panel).getByLabelText('NVDA 盘前期权事实');
     expect(
-      await within(panel).findByText('量比 C/P 标缺（put_volume_total_zero）'),
-    ).toBeInTheDocument();
+      (nvdaRow.querySelector('[data-fact-id="volume_ratio"]') as HTMLElement).textContent,
+    ).toContain('标缺');
     // 无定义比例绝不参与偏斜判定。
     expect(within(panel).queryByText(/偏斜 · 量比/)).not.toBeInTheDocument();
     // 异动页可读但最近一页没有带金额成交：如实陈述，不等同「无大单」章。
     expect(within(panel).getByText('最近一页无带金额成交')).toBeInTheDocument();
+  });
+
+  it('maps the no-valid-contract reason to 近月窗口无合约 and explains the LEAP cause in the tooltip', async () => {
+    // CRWV 场景：大单落在远月 LEAP，0–45 DTE 比例窗口内无有效合约。
+    vi.mocked(fetchOpportunityOptionWalls).mockResolvedValue(wallResponse([
+      {
+        ...wallItem('CRWV', null, null),
+        ratios: {
+          callPutOiRatio: ratio(
+            null,
+            'settled_open_interest_prior_session',
+            '该窗口内无有效合约，无法计算比例',
+          ),
+          callPutVolumeRatio: ratio(
+            null,
+            'current_session_cumulative_volume',
+            '该窗口内无有效合约，无法计算比例',
+          ),
+          caveat: '这两个比例在本账户数据上尚未被检验过。',
+        },
+      },
+    ]));
+    vi.mocked(fetchOpportunityOptionEvents).mockResolvedValue(eventResponse([
+      eventItem('CRWV', [
+        optionEvent({
+          eventId: 'crwv_leap',
+          turnover: 7_900_000,
+          optionType: 'CALL',
+          strikePrice: 7.5,
+          expiry: '2028-01-21',
+          dte: 733,
+          volume: 40,
+        }),
+      ]),
+    ]));
+    render(<PremarketOptionAnomalyPanel top={topStub('premarket', ['CRWV'])} />);
+
+    const panel = screen.getByLabelText('盘前期权异常');
+    // 大单章带方向：「大单 Call $7.9M」。
+    expect(await within(panel).findByText('大单 Call $7.9M')).toBeInTheDocument();
+    // 两条比例行各一枚紧凑短语，不再重复整句长原因。
+    const compactLabels = within(panel).getAllByText('近月窗口无合约 ⓘ');
+    expect(compactLabels).toHaveLength(2);
+    // ⓘ tooltip 逐字带服务端原因 + 「为什么」（远月 LEAP 在窗口外）。
+    expect(compactLabels[0].getAttribute('aria-label')).toContain(
+      '服务端原因（逐字）：该窗口内无有效合约，无法计算比例',
+    );
+    expect(compactLabels[0].getAttribute('aria-label')).toContain('LEAP');
+    // 整句长原因不再以可见文本重复出现。
+    expect(
+      within(panel).queryByText(/（该窗口内无有效合约，无法计算比例）/),
+    ).not.toBeInTheDocument();
   });
 
   it('stays collapsed outside premarket/opening_probe and only fetches after manual expand', async () => {

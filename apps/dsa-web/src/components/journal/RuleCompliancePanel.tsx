@@ -8,6 +8,7 @@ import type {
   RuleComplianceSlice,
   RuleComplianceStat,
 } from '../../types/journal';
+import { InfoHint } from '../common/InfoHint';
 import { Tooltip } from '../common/Tooltip';
 
 /**
@@ -245,7 +246,18 @@ export const RuleCompliancePanel: React.FC = () => {
           <div className="text-label uppercase tracking-label text-text-3">
             Rule compliance
           </div>
-          <h2 className="mt-0.5 text-h2 text-text-1">规则遵守度</h2>
+          <h2 className="mt-0.5 flex items-baseline gap-2 text-h2 text-text-1">
+            规则遵守度
+            {/* 界面披露策略（2026-08-15）：端点 limitations 原文一字不删，
+                从底部常驻列表收进这枚 ⓘ；正文只保留车道判定与样本口径
+                （它们是表内数字的基准标注，不是免责声明）。 */}
+            {compliance && compliance.limitations.length > 0 && (
+              <InfoHint
+                text={compliance.limitations.join('\n')}
+                label="规则遵守度诚实边界"
+              />
+            )}
+          </h2>
         </div>
         <div className="flex items-center gap-2">
           {edge?.dataState === 'ready' && (
@@ -324,12 +336,6 @@ export const RuleCompliancePanel: React.FC = () => {
               caption={`自 ${compliance.cleanBasisStart} 起 · 规则由这段样本推出，因此它必然好看`}
               excludeTopN={excludeTopN}
             />
-
-            <ul className="border-t border-subtle pt-2 text-caption text-text-3">
-              {compliance.limitations.map((line) => (
-                <li key={line}>· {line}</li>
-              ))}
-            </ul>
           </>
         )}
       </div>

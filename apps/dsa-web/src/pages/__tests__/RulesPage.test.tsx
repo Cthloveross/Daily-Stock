@@ -232,12 +232,17 @@ describe('RulesPage', () => {
     mocks.fetchPlaybook.mockResolvedValue(PLAYBOOK);
   });
 
-  it('renders the standing banner and links to the compliance panel', async () => {
+  it('keeps the banner text tooltip-only and links to the compliance panel', async () => {
     renderPage();
 
+    // 界面披露策略（2026-08-15）：横幅原文（后端下发，逐字）收进 ⓘ tooltip，
+    // 可见 chrome 只留跳转入口——隐藏 ≠ 删除。
     const note = await screen.findByLabelText('交易纪律页说明');
-    expect(note).toHaveTextContent('这一页是你自己的历史统计，不是建议');
-    expect(note).toHaveTextContent('前向验证见 /journal 规则遵守度');
+    expect(note).not.toHaveTextContent('这一页是你自己的历史统计，不是建议');
+    const hint = within(note).getByLabelText(/这一页是你自己的历史统计，不是建议/);
+    expect(hint.getAttribute('aria-label')).toContain(
+      '前向验证见 /journal 规则遵守度',
+    );
     expect(within(note).getByRole('link')).toHaveAttribute(
       'href',
       '/journal?tab=positions',

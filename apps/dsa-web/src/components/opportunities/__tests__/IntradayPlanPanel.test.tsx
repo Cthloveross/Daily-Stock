@@ -145,9 +145,16 @@ describe('IntradayPlanPanel', () => {
     vi.mocked(fetchNearExpiryContracts).mockResolvedValue(contractsResponse([]));
   });
 
-  it('carries exactly one framing line and no advice wording', () => {
+  it('keeps the framing sentence tooltip-only and no advice wording in visible chrome', () => {
     renderPanel();
-    expect(screen.getByText(/按你自己的规则机械核对，不是买卖建议/)).toBeInTheDocument();
+    // 界面披露策略（2026-08-15）：定位句不再占可见正文，逐字收进标题行 ⓘ。
+    expect(
+      screen.queryByText(/按你自己的规则机械核对，不是买卖建议/),
+    ).toBeNull();
+    const hint = screen.getByLabelText(/按你自己的规则机械核对，不是买卖建议/);
+    expect(hint.getAttribute('aria-label')).toContain(
+      '样本窗口仅 2026-04→07 一个市场状态',
+    );
     expect(screen.queryByText(/本系统只读|不会下单|建议买入|可以进场|目标价|胜率/)).toBeNull();
   });
 

@@ -12,6 +12,7 @@ import {
   selectPlanTickers,
   useIntradayPlanStore,
 } from '../../stores/intradayPlanStore';
+import { InfoHint } from '../common/InfoHint';
 import { Tooltip } from '../common/Tooltip';
 import { LANE_SAMPLE_CAVEAT } from './LaneChecklistPanel';
 import { SPREAD_ILLIQUID_THRESHOLD_PERCENT } from './NearExpiryContractPanel';
@@ -58,8 +59,17 @@ const STATUS_CLASS: Record<CheckStatus, string> = {
   neutral: 'text-text-2',
 };
 
-/** 面板唯一的定位行（用户明确要求：不要满屏「只读/不下单」样板话）。 */
+/**
+ * 面板定位句（用户明确要求：不要满屏「只读/不下单」样板话；2026-08-15
+ * 界面披露策略后进一步收进标题行 ⓘ tooltip，不再占可见正文——原文一字不删）。
+ */
 export const PLAN_FRAMING_LINE = '按你自己的规则机械核对，不是买卖建议';
+
+/** 标题行 ⓘ 的完整诚实边界：定位句 + 样本口径 caveat（逐字）。 */
+export const PLAN_HONESTY_NOTE = [
+  `${PLAN_FRAMING_LINE}。`,
+  LANE_SAMPLE_CAVEAT,
+].join('\n');
 
 export const INVALIDATION_PROMPT =
   '进场前先写下失效位；说不清就不开（结构止损）';
@@ -368,11 +378,8 @@ export function IntradayPlanPanel({
       <header className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 border-b border-subtle px-4 py-3">
         <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
           <h2 className="text-h3 font-semibold text-text-1">盘中计划</h2>
-          <Tooltip focusable contentClassName="whitespace-pre-line" content={LANE_SAMPLE_CAVEAT}>
-            <span className="text-caption text-text-3 underline decoration-dotted underline-offset-2">
-              {PLAN_FRAMING_LINE}（样本与口径边界 ⓘ）
-            </span>
-          </Tooltip>
+          {/* 界面披露策略：定位句 + 样本口径边界原文收进这枚 ⓘ，不占正文。 */}
+          <InfoHint text={PLAN_HONESTY_NOTE} label="盘中计划口径" />
         </div>
         <div className="flex items-center gap-3">
           <label className="flex items-center gap-1.5 text-caption text-text-3">

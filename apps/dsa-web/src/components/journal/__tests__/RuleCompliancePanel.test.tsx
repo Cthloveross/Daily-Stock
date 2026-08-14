@@ -294,7 +294,13 @@ describe('RuleCompliancePanel', () => {
     expect(basis).toHaveTextContent('1,407');
     expect(basis).toHaveTextContent('241');
     expect(basis).toHaveTextContent('2026-04-21');
-    expect(screen.getByText(new RegExp(LIMITATION.slice(0, 12)))).toBeInTheDocument();
+    // 界面披露策略（2026-08-15）：limitations 原文不再常驻底部列表，逐字
+    // 收进标题旁 ⓘ 的 tooltip/aria-label——隐藏 ≠ 删除。
+    expect(
+      screen.queryByText(new RegExp(LIMITATION.slice(0, 12))),
+    ).not.toBeInTheDocument();
+    const hint = screen.getByLabelText(new RegExp(LIMITATION.slice(0, 12)));
+    expect(hint.getAttribute('aria-label')).toContain(LIMITATION);
     // 「规则由这段样本推出，因此它必然好看」必须写明。
     expect(screen.getByText(/规则由这段样本推出，因此它必然好看/)).toBeInTheDocument();
   });

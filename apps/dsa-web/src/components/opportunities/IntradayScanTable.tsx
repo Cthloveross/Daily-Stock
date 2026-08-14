@@ -5,9 +5,16 @@ import type {
   IntradaySetupMatch,
   IntradayTopCandidate,
   IntradayTopResponse,
+  OpportunityOptionWallItem,
+  OpportunityOptionWallLevel,
 } from '../../types/opportunities';
 import type { PersonalEdgeUnderlyingStat } from '../../types/journal';
 import { usePersonalEdge, type PersonalEdgeView } from '../../hooks/usePersonalEdge';
+import {
+  DEEP_LANE_OPTION_WALL_MAX_TICKERS,
+  useDeepLaneOptionWalls,
+  type DeepLaneOptionWallsView,
+} from '../../hooks/useDeepLaneOptionWalls';
 import {
   INTRADAY_PLAN_MAX_TICKERS,
   selectPlanTickers,
@@ -351,11 +358,20 @@ const ALIGNMENT_HEADER_TOOLTIP =
   + '上涨股在 SPY 处于 VWAP 下方时同样标「逆势」。任一侧标缺时显示标缺。';
 
 /**
+ * 从 footer 可见行迁走的披露句（2026-08-15 界面披露策略）：原文一字不删，
+ * 随「完整口径」切换一键可见——可见行只留数据口径，不留「不是信号/非预测」
+ * 类样板话。
+ */
+const RELOCATED_SIGNAL_DISCLAIMER =
+  '披露：近30分位移不含前向信息、非预测、非信号；速度/位移/波段vs大盘/财报/形态/'
+  + '期权墙/你的战绩均为上下文标注——不隐藏行、不参与排序、不是信号。';
+
+/**
  * 完整口径原文（逐字保留）：默认收进「完整口径」切换——隐藏 ≠ 删除，
  * 文本本身必须可一键展开查看。
  */
 const FULL_METHODOLOGY_TEXT =
-  '当前爆发＝最近 15 分钟（3 根 5m K 线）|收−开| ÷ 当日 5m 波幅中位 × 窗口量比（阈值按 2026-07-31 标注样本校准，盘中排序优先，不是信号）；速度＝相邻两个 15 分钟窗口爆发分之差（5m 近似，非 1m/2m 秒级；减速=你的离场信号，R1）；今日波段＝爆发分分级记录的独立窗口（强 ≥8 按 2026-07-31 暴动样本校准、中 ≥2.5 按 2026-08-03 NVDA 上午持续推升校准；起点相隔 ≥30 分钟，≤4 个，休市显示最近一个交易时段）；缺口＝开盘价对参考前收（休市时段改用快照前收并标注）；量能节奏＝当日累计 vs 20 日全日中位（未按时点折算）；大盘＝候选爆发方向 vs SPY 会话 VWAP 位置（累计额/量近似）；波幅扩张＝当日高低价差 ÷ ATR14；财报＝Finnhub 前向 5 天窗口，≤3 天标「期权贵」（你的回避规则）；期权异动＝最近一页 Moomoo 分类计数，不推断开平仓。你的战绩＝Journal 当前默认 build 已平仓回合按标的聚合（净盈亏/胜率/笔数，<5 笔样本不足，净亏损且 ≥20 笔警示；持仓时长与结果存在内生性，描述非因果、不构成建议）。时段/财报/大盘/速度/你的战绩均为上下文标注——系统标注，用户过滤：不隐藏行、不阻断操作、不参与排序。形态＝styleMatch v1（S1 低点抬高 / S2 跳空托举 / S3 高开遇阻，与你的 Playbook setup 的形状对比；「· 似」=部分相似，缺 K 线或快照输入时标缺）：形态相似度为 v1 几何检测（5m近似），不含你的进场确认帧（2m/1m 回踩8/13EMA），不是信号。近30分位移＝最近 30 分钟（6 根 5m K 线）相对「30 分钟前价格」（窗口首根开盘）的净位移 ÷ ATR 标尺，同时给出区间最高/最低偏移；ATR 标尺优先日线 ATR14（与取证分析同源），缺失时先回退「上一批交易时段真实波幅均值」（日线量级、当日内恒定），连一个上一时段都没有时才落回旧盘中代理（最近 20 根 5m 波幅均值 ×3）；每行标注实际基准与可比性——旧代理与真实日线 ATR14 之比在盘中 0.28→0.42→0.20 漂移，因此标了「不可比」的行不要与走 ATR14 的行横向比较，全都不可得时显式标缺。0.5 ATR 这条线来自你自己 766 笔期权回合（2026-06-08→07-31，Journal build #3）的取证分析：进场几何（追高 vs 回调）对结果没有预测力，而按持仓时长分组后 30 分钟位移把结果分得很开——速死亏损单（持仓<30分钟）前向 MFE 中位 0.18 ATR / MAE −0.49 ATR，仅 18.3% 达到 ≥0.5 ATR；走出来的赢家（30分钟-3小时）MFE 0.69 / MAE −0.13，71.2% 达到 ≥0.5 ATR；该样本 84% 的合约 ≤1DTE，对「不动」零容忍。【v8 更正——这一段必须连着上一段读】上面那个 18.3% vs 71.2% 的分层**按构造就是循环的**：分组变量是持仓时长，而持仓时长本身由结果决定，等于拿结果去解释结果。2026-08 的 2m 回放研究（3,492 次 EMA8/13 回踩持稳进场，21 标的 × 123 个交易时段）用同一套机器量化了这份循环性：按同样的循环方式记分（用整段 30 分钟窗口内速度是否还活着，去判这同一段 30 分钟的结果），速度未死均值 +0.071 / P(>0) 54.4%、速度已死 −0.476 / 16.8%，鸿沟 37.6 个百分点；改成只从第 15 分钟检查点**向前**计分（即进场当时真能知道的信息），只剩 +0.005 / 49.9% vs −0.013 / 49.8%——**0.1 个百分点**；而且样本内那点微弱的检查点效应**样本外直接反号**（样本内「第 5 分钟已走 ≥0.3 ATR」→ 其后 +0.122；样本外同一条件 → −0.128）。结论：肉眼可见的那道鸿沟几乎全部是循环性，**这一列不含任何前向信息**，0.5 只是参考刻度，不要读成「越过它就能活下来」。位移读数本身仍然保留，因为它是对「它现在到底有没有在动」的诚实描述。诚实边界：这是对已经发生的事的描述统计，不是预测、不是买卖信号；样本窗口恰是你最差的两个月，K 线为非官方 5m 聚合。缺失字段显式标缺，不以 0 冒充。「哑火形态」（当前爆发格内的小徽标，命中才出现）＝当前 15 分钟窗口效率 ≥0.9（几乎无回撤）+ 量比 <2.0（量能平平）+ 盘中段：2026-08 起速回放研究（9,173 次爆发起点、21 标的 × 123 个交易时段）里这类窗口 30 分钟内达到 ≥0.5 ATR 有利位移的比例只有 26.8%（样本内 n=291）/ 25.4%（样本外 n=177），基准 47.8%/50.5%。同一份研究的首要结论是否定的：起速那一刻**方向不可预测**（P(方向)=50.6%，19 个候选因子方向 AUC 0.48–0.52，MFE/|MAE| 中位 1.026），所以本表**没有**延续概率或真假速度评分；哑火形态是形态描述与历史频率，不是卖出信号。';
+  '当前爆发＝最近 15 分钟（3 根 5m K 线）|收−开| ÷ 当日 5m 波幅中位 × 窗口量比（阈值按 2026-07-31 标注样本校准，盘中排序优先，不是信号）；速度＝相邻两个 15 分钟窗口爆发分之差（5m 近似，非 1m/2m 秒级；减速=你的离场信号，R1）；今日波段＝爆发分分级记录的独立窗口（强 ≥8 按 2026-07-31 暴动样本校准、中 ≥2.5 按 2026-08-03 NVDA 上午持续推升校准；起点相隔 ≥30 分钟，≤4 个，休市显示最近一个交易时段）；缺口＝开盘价对参考前收（休市时段改用快照前收并标注）；量能节奏＝当日累计 vs 20 日全日中位（未按时点折算）；大盘＝候选爆发方向 vs SPY 会话 VWAP 位置（累计额/量近似）；波幅扩张＝当日高低价差 ÷ ATR14；财报＝Finnhub 前向 5 天窗口，≤3 天标「期权贵」（你的回避规则）；期权异动＝最近一页 Moomoo 分类计数，不推断开平仓。你的战绩＝Journal 当前默认 build 已平仓回合按标的聚合（净盈亏/胜率/笔数，<5 笔样本不足，净亏损且 ≥20 笔警示；持仓时长与结果存在内生性，描述非因果、不构成建议）。时段/财报/大盘/速度/你的战绩均为上下文标注——系统标注，用户过滤：不隐藏行、不阻断操作、不参与排序。形态＝styleMatch v1（S1 低点抬高 / S2 跳空托举 / S3 高开遇阻，与你的 Playbook setup 的形状对比；「· 似」=部分相似，缺 K 线或快照输入时标缺）：形态相似度为 v1 几何检测（5m近似），不含你的进场确认帧（2m/1m 回踩8/13EMA），不是信号。近30分位移＝最近 30 分钟（6 根 5m K 线）相对「30 分钟前价格」（窗口首根开盘）的净位移 ÷ ATR 标尺，同时给出区间最高/最低偏移；ATR 标尺优先日线 ATR14（与取证分析同源），缺失时先回退「上一批交易时段真实波幅均值」（日线量级、当日内恒定），连一个上一时段都没有时才落回旧盘中代理（最近 20 根 5m 波幅均值 ×3）；每行标注实际基准与可比性——旧代理与真实日线 ATR14 之比在盘中 0.28→0.42→0.20 漂移，因此标了「不可比」的行不要与走 ATR14 的行横向比较，全都不可得时显式标缺。0.5 ATR 这条线来自你自己 766 笔期权回合（2026-06-08→07-31，Journal build #3）的取证分析：进场几何（追高 vs 回调）对结果没有预测力，而按持仓时长分组后 30 分钟位移把结果分得很开——速死亏损单（持仓<30分钟）前向 MFE 中位 0.18 ATR / MAE −0.49 ATR，仅 18.3% 达到 ≥0.5 ATR；走出来的赢家（30分钟-3小时）MFE 0.69 / MAE −0.13，71.2% 达到 ≥0.5 ATR；该样本 84% 的合约 ≤1DTE，对「不动」零容忍。【v8 更正——这一段必须连着上一段读】上面那个 18.3% vs 71.2% 的分层**按构造就是循环的**：分组变量是持仓时长，而持仓时长本身由结果决定，等于拿结果去解释结果。2026-08 的 2m 回放研究（3,492 次 EMA8/13 回踩持稳进场，21 标的 × 123 个交易时段）用同一套机器量化了这份循环性：按同样的循环方式记分（用整段 30 分钟窗口内速度是否还活着，去判这同一段 30 分钟的结果），速度未死均值 +0.071 / P(>0) 54.4%、速度已死 −0.476 / 16.8%，鸿沟 37.6 个百分点；改成只从第 15 分钟检查点**向前**计分（即进场当时真能知道的信息），只剩 +0.005 / 49.9% vs −0.013 / 49.8%——**0.1 个百分点**；而且样本内那点微弱的检查点效应**样本外直接反号**（样本内「第 5 分钟已走 ≥0.3 ATR」→ 其后 +0.122；样本外同一条件 → −0.128）。结论：肉眼可见的那道鸿沟几乎全部是循环性，**这一列不含任何前向信息**，0.5 只是参考刻度，不要读成「越过它就能活下来」。位移读数本身仍然保留，因为它是对「它现在到底有没有在动」的诚实描述。诚实边界：这是对已经发生的事的描述统计，不是预测、不是买卖信号；样本窗口恰是你最差的两个月，K 线为非官方 5m 聚合。缺失字段显式标缺，不以 0 冒充。「哑火形态」（当前爆发格内的小徽标，命中才出现）＝当前 15 分钟窗口效率 ≥0.9（几乎无回撤）+ 量比 <2.0（量能平平）+ 盘中段：2026-08 起速回放研究（9,173 次爆发起点、21 标的 × 123 个交易时段）里这类窗口 30 分钟内达到 ≥0.5 ATR 有利位移的比例只有 26.8%（样本内 n=291）/ 25.4%（样本外 n=177），基准 47.8%/50.5%。同一份研究的首要结论是否定的：起速那一刻**方向不可预测**（P(方向)=50.6%，19 个候选因子方向 AUC 0.48–0.52，MFE/|MAE| 中位 1.026），所以本表**没有**延续概率或真假速度评分；哑火形态是形态描述与历史频率，不是卖出信号。期权墙＝深度层每檔（≤8 檔，与盘前期权异常面板共用同一次读取与缓存）上一清算时段 OI 的未平仓分布事实：C＝看涨侧最大 OI 行权价、P＝看跌侧最大 OI 行权价、γ＝1% 波动下 gross gamma 名义变化最大的行权价、中心＝Σ(行权价×OI)÷Σ(OI) 的描述性重心（刻意不叫 max pain、不作预测）；单元格 tooltip 逐位给 OI 张数/占该侧%/距现价%/主力到期与 as-of；深度层外、读取失败或窗口内无读数一律显式标缺。墙位＝未平仓分布事实（上一清算时段 OI）；『价格会向墙位靠拢』在你的数据上尚未验证——逐日快照 2026-08-04 起积累，样本足够后回测。';
 
 function formatBurstThrust(value: number | null): string {
   if (value === null) return '—';
@@ -744,6 +760,149 @@ function setupMatchCell(item: IntradayTopCandidate) {
 }
 
 /**
+ * 期权墙列（2026-08-15）：深度层每檔的**未平仓分布事实**——只陈列专业盘手
+ * 会看的四个位（最大看涨 OI 墙 / 最大看跌 OI 墙 / gross gamma 集中行权价 /
+ * OI 加权中心），每个位带距现价%。**刻意不渲染**「最可能收在 X」之类的
+ * 概率或预测：「价格会向墙位靠拢」（pinning / max pain）在用户自己的数据上
+ * 尚未验证（G-24；逐日快照 2026-08-04 才开始积累），该边界逐字进 tooltip。
+ * 数据与盘前期权异常面板共用 useDeepLaneOptionWalls 的同一次读取与缓存。
+ */
+const OPTION_WALL_UNVERIFIED_NOTE =
+  '墙位＝未平仓分布事实（上一清算时段 OI）；『价格会向墙位靠拢』在你的数据上尚未验证'
+  + '——逐日快照 2026-08-04 起积累，样本足够后回测';
+
+const OPTION_WALL_HEADER_TOOLTIP =
+  '期权墙＝深度层每檔的未平仓分布事实（0–45DTE 窗口，与盘前期权异常面板共用同一次读取）：'
+  + 'C＝看涨侧最大 OI 行权价、P＝看跌侧最大 OI 行权价、γ＝1% 波动下 gross gamma 集中的行权价、'
+  + '中心＝Σ(行权价×OI)÷Σ(OI) 的描述性重心（刻意不叫 max pain）。'
+  + '悬停单元格看各位的 OI/占比/距现价/主力到期与 as-of；缺失显式标缺。\n'
+  + `${OPTION_WALL_UNVERIFIED_NOTE}。`;
+
+/** 行权价短格式：210 / 7.5 / 202.43；null 显式 —。 */
+function formatStrikeShort(
+  value: number | null | undefined,
+  maxDigits = 2,
+): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—';
+  return value.toLocaleString('en-US', { maximumFractionDigits: maxDigits });
+}
+
+/** OI 墙位 tooltip 行：OI 张数 · 占该侧% · 距现价% · 主力到期。 */
+function wallLevelTooltipLine(
+  label: string,
+  sideLabel: string,
+  level: OpportunityOptionWallLevel | undefined,
+): string | null {
+  if (!level) return null;
+  const oi = level.metricValue.toLocaleString('en-US', { maximumFractionDigits: 0 });
+  const topExpiry = level.expiryBreakdown?.topExpiries?.[0];
+  const expiry = topExpiry
+    ? `主力到期 ${topExpiry.expiry}（占该位 ${topExpiry.shareOfLevelPercent.toFixed(0)}%）`
+    : '主力到期未报告';
+  return `${label} ${formatStrikeShort(level.strike)}：OI ${oi} 张 · `
+    + `占${sideLabel} ${level.shareOfBucketPercent.toFixed(1)}% · `
+    + `距现价 ${formatSignedPercent(level.distanceFromSpotPercent)} · ${expiry}`;
+}
+
+/** 期权墙 tooltip：四个位逐行给证据，末尾固定携带未验证边界与 as-of。 */
+function optionWallTooltip(wall: OpportunityOptionWallItem): string {
+  const call = wall.walls.callOi[0];
+  const put = wall.walls.putOi[0];
+  const gamma = wall.walls.grossGammaConcentration[0];
+  const center = wall.oiWeightedCenter ?? null;
+  const lines: string[] = [];
+  const callLine = wallLevelTooltipLine('看涨墙 C', '看涨侧 OI', call);
+  if (callLine) lines.push(callLine);
+  const putLine = wallLevelTooltipLine('看跌墙 P', '看跌侧 OI', put);
+  if (putLine) lines.push(putLine);
+  if (gamma) {
+    lines.push(
+      `γ 集中 ${formatStrikeShort(gamma.strike)}：距现价 `
+      + `${formatSignedPercent(gamma.distanceFromSpotPercent)}`
+      + '（1% 波动下 gross gamma 名义变化最大的行权价）',
+    );
+  }
+  if (center) {
+    if (center.strike !== null) {
+      const distance = wall.spot !== null && wall.spot > 0
+        ? `距现价 ${formatSignedPercent(((center.strike - wall.spot) / wall.spot) * 100)}`
+        : '距现价标缺（现价不可得）';
+      lines.push(
+        `OI 加权中心 ${formatStrikeShort(center.strike, 1)}：${distance}`
+        + ' · Σ(行权价×OI)÷Σ(OI)，描述性重心',
+      );
+    } else {
+      lines.push(`OI 加权中心标缺（${center.reason ?? '原因未报告'}）`);
+    }
+  }
+  lines.push(
+    `as-of：${wall.quoteAsOf ?? wall.fetchedAt}（OI＝上一清算时段口径 · `
+    + `窗口 ${wall.scope.dteMin}–${wall.scope.dteMax}DTE）`,
+  );
+  lines.push(`${OPTION_WALL_UNVERIFIED_NOTE}。`);
+  return lines.join('\n');
+}
+
+/** 期权墙标缺单元格：紧凑主行「标缺」+ 一行原因，全文挂 tooltip。 */
+function optionWallMissingCell(caption: string, tooltip: string) {
+  return (
+    <Tooltip focusable content={<span className="whitespace-pre-line">{tooltip}</span>}>
+      <span aria-label={tooltip} className="inline-block">
+        <span className="block font-mono text-mono-sm text-text-3">标缺</span>
+        <span className="mt-0.5 block text-caption text-text-3">{caption}</span>
+      </span>
+    </Tooltip>
+  );
+}
+
+/**
+ * 期权墙单元格：主行「C 210 · P 195」，次行「γ205 · 中心202.4」。
+ * 深度层外/读取失败/供应商无返回一律显式标缺，绝不用 0 或空墙冒充。
+ */
+function optionWallCell(item: IntradayTopCandidate, view: DeepLaneOptionWallsView) {
+  if (!view.tickers.includes(item.ticker)) {
+    return optionWallMissingCell(
+      '未取墙',
+      `墙读取只覆盖深度层前 ${DEEP_LANE_OPTION_WALL_MAX_TICKERS} 檔，本行不在名单内。\n`
+      + `${OPTION_WALL_UNVERIFIED_NOTE}。`,
+    );
+  }
+  if (view.loading) {
+    return <div className="font-mono text-mono-sm text-text-3">…</div>;
+  }
+  const wall = view.wallByTicker.get(item.ticker) ?? null;
+  if (!wall || (wall.state !== 'ready' && wall.state !== 'partial')) {
+    const reason = wall
+      ? wall.message || `供应商状态 ${wall.state}`
+      : '墙读取失败或供应商无返回行';
+    return optionWallMissingCell('墙读取失败', `${reason}\n${OPTION_WALL_UNVERIFIED_NOTE}。`);
+  }
+  const call = wall.walls.callOi[0] ?? null;
+  const put = wall.walls.putOi[0] ?? null;
+  const gamma = wall.walls.grossGammaConcentration[0] ?? null;
+  const centerStrike = wall.oiWeightedCenter?.strike ?? null;
+  if (!call && !put && !gamma && centerStrike === null) {
+    return optionWallMissingCell(
+      '窗口内无墙位读数',
+      `0–45DTE 窗口内没有可聚合的墙位读数。\n${OPTION_WALL_UNVERIFIED_NOTE}。`,
+    );
+  }
+  const tooltip = optionWallTooltip(wall);
+  return (
+    <Tooltip focusable content={<span className="whitespace-pre-line">{tooltip}</span>}>
+      <span aria-label={tooltip} className="inline-block">
+        <span className="block whitespace-nowrap font-mono text-mono-sm text-text-1">
+          {`C ${formatStrikeShort(call?.strike)} · P ${formatStrikeShort(put?.strike)}`}
+        </span>
+        <span className="mt-0.5 block whitespace-nowrap text-caption text-text-3">
+          {`γ${formatStrikeShort(gamma?.strike)} · 中心${formatStrikeShort(centerStrike, 1)}`}
+        </span>
+      </span>
+    </Tooltip>
+  );
+}
+
+/**
  * 展开行「研究读数」网格：从默认网格移出的次要指标（波段vs大盘/量能节奏/缺口/
  * 波幅/VWAP/期权异动/财报全文/研究状态），一键可达——重排可见性，不删除任何
  * 读数；缺失字段照旧显式标缺，不以 0 冒充。
@@ -851,13 +1010,20 @@ function ResearchReadoutsGrid({ item }: { item: IntradayTopCandidate }) {
  * 两层模式下深度层为实时排名主表，表下依次为「今日曾深扫 · 波段保留」账本
  * （轮换出深度层的标的以最后一次深扫摘要 as-of 保留）与「仅快照」次级列表。
  *
- * 两级布局（2026-08-03 声效整理，2026-08-04 加「你的战绩」与「近30分位移」）：
- * 默认网格保留 10 列交易关键读数（排名/标的/涨跌%/当前爆发/今日波段/速度/
- * 近30分位移/形态/详情/你的战绩），次要指标移入行内展开区「研究读数」网格
- * （临期合约面板上方）——重排可见性 ≠ 删除，所有读数一键可达，标缺语义不变。
+ * 两级布局（2026-08-03 声效整理，2026-08-04 加「你的战绩」与「近30分位移」，
+ * 2026-08-15 加「期权墙」）：默认网格保留 11 列交易关键读数（排名/标的/涨跌%/
+ * 当前爆发/今日波段/速度/近30分位移/形态/期权墙/详情/你的战绩），次要指标移入
+ * 行内展开区「研究读数」网格（临期合约面板上方）——重排可见性 ≠ 删除，所有
+ * 读数一键可达，标缺语义不变。
  * v6 为给「近30分位移」腾出默认位，「波段vs大盘」下沉到研究读数区。
  * 2026-08-14 按用户要求把「你的战绩」移到最后一列（它是上下文标注，不是
  * 盘中交易关键读数），语义与列头 tooltip 不变。
+ *
+ * 「期权墙」＝深度层每檔上一清算时段 OI 的未平仓分布事实（C/P 墙、γ 集中、
+ * OI 加权中心，各带距现价%）。**不渲染任何「最可能收在 X」**：pinning/max
+ * pain 假说在用户数据上尚未验证（逐日快照 2026-08-04 起积累），边界逐字
+ * 挂在列头与单元格 tooltip。数据经 useDeepLaneOptionWalls 与盘前期权异常
+ * 面板共用同一次读取与缓存。
  *
  * 盘前时段（sessionPhase=premarket）「涨跌%」列改示真实盘前变动（G-12：
  * sessionChangePercent 此刻仍指向上一常规时段，副行如实标「昨日」），
@@ -887,6 +1053,8 @@ export function IntradayScanTable({
   const navigate = useNavigate();
   // 个人画像回灌：每会话/2 分钟最多取一次；失败或未构建 → 显式标缺。
   const personalEdge = usePersonalEdge();
+  // 期权墙（深度层 ≤8 檔）：与盘前期权异常面板共用同一次读取与缓存。
+  const optionWalls = useDeepLaneOptionWalls(data);
   // 盘中计划（按 ET 交易日作用域的本地清单）：行内一键提升到页面顶部的
   // 「盘中计划」区块。它走的是 additive 的 focus_symbols，**不进 symbols**，
   // 因此不会关掉服务端两层扫描。
@@ -1086,7 +1254,7 @@ export function IntradayScanTable({
         </div>
       ) : (
         <div className="overflow-auto">
-          <table className="w-full min-w-[1180px] border-collapse" aria-label="实时扫描表">
+          <table className="w-full min-w-[1280px] border-collapse" aria-label="实时扫描表">
             <thead>
               <tr className="border-b border-subtle text-left text-caption text-text-3">
                 <th className="px-3 py-2 text-right font-medium">
@@ -1105,6 +1273,16 @@ export function IntradayScanTable({
                   </Tooltip>
                 </th>
                 <th className="px-3 py-2 font-medium">形态</th>
+                {/* 期权墙（2026-08-15）：上一清算时段 OI 分布事实——四个位 +
+                    距现价%，不含任何「最可能收在」预测（假说未验证，见 tooltip）。 */}
+                <th className="px-3 py-2 font-medium">
+                  <Tooltip
+                    focusable
+                    content={<span className="whitespace-pre-line">{OPTION_WALL_HEADER_TOOLTIP}</span>}
+                  >
+                    <span aria-label={OPTION_WALL_HEADER_TOOLTIP}>期权墙</span>
+                  </Tooltip>
+                </th>
                 <th className="px-3 py-2 font-medium">详情</th>
                 {/* 「你的战绩」按用户要求收尾：它是上下文标注，不是盘中
                     交易关键读数——放最后一列，读表动线先看行情后看战绩。 */}
@@ -1290,6 +1468,7 @@ export function IntradayScanTable({
                   </td>
                   <td className="px-3 py-2.5">{displacementCell(item)}</td>
                   <td className="px-3 py-2.5">{setupMatchCell(item)}</td>
+                  <td className="px-3 py-2.5">{optionWallCell(item, optionWalls)}</td>
                   <td className="px-3 py-2.5">
                     <div className="flex items-center gap-1.5">
                       <button
@@ -1342,7 +1521,7 @@ export function IntradayScanTable({
                 </tr>
                 {expandedTicker === item.ticker && (
                   <tr className="border-b border-subtle last:border-b-0">
-                    <td colSpan={10} className="bg-bg-0 px-3 py-3">
+                    <td colSpan={11} className="bg-bg-0 px-3 py-3">
                       <ResearchReadoutsGrid item={item} />
                       <NearExpiryContractPanel symbol={item.ticker} />
                     </td>
@@ -1588,13 +1767,15 @@ export function IntradayScanTable({
           </div>
         )}
         <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+          {/* 界面披露策略（2026-08-15）：可见行只留数据口径；「不是信号/非预测」
+              类披露句原文并入「完整口径」切换（隐藏 ≠ 删除，见 RELOCATED_
+              SIGNAL_DISCLAIMER）。 */}
           <span>
             排序与口径说明：盘中排序＝爆发分优先（休市按最近交易时段）；今日波段分级
             强＝爆发分 ≥8 暴动 / 中＝≥2.5 持续推升；近30分位移＝最近 6 根 5m K 线净位移 ÷ ATR，
             0.5 ATR 只是参考刻度（原分层按持仓时长定义、循环性已被量化推翻：向前计分后差距仅
-            0.1pp）——该列只描述过去 30 分钟，不含前向信息、非预测、非信号；
-            速度/位移/波段vs大盘/财报/形态/你的战绩均为上下文标注——
-            不隐藏行、不参与排序、不是信号；缺失字段显式标缺，不以 0 冒充。
+            0.1pp）——该列只描述过去 30 分钟；期权墙＝上一清算时段 OI 分布（C/P/γ/中心，
+            详见列头与单元格 tooltip）；缺失字段显式标缺，不以 0 冒充。
           </span>
           <button
             type="button"
@@ -1607,7 +1788,12 @@ export function IntradayScanTable({
             {methodologyExpanded ? ' ▴' : ' ▾'}
           </button>
         </div>
-        {methodologyExpanded && <div className="mt-2">{FULL_METHODOLOGY_TEXT}</div>}
+        {methodologyExpanded && (
+          <div className="mt-2 space-y-2">
+            <div>{RELOCATED_SIGNAL_DISCLAIMER}</div>
+            <div>{FULL_METHODOLOGY_TEXT}</div>
+          </div>
+        )}
       </div>
     </section>
   );

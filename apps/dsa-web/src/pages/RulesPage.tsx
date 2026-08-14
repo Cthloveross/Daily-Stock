@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { fetchPlaybook, fetchRulesEvidence } from '../api/journal';
 import { parseApiError, type ParsedApiError } from '../api/error';
+import { InfoHint } from '../components/common/InfoHint';
 import type {
   PlaybookListResponse,
   RulesEvidenceCell,
@@ -22,6 +23,10 @@ import type {
  * 费率乘以用户当场输入的两个数——输入只存在于组件 state，不落库、不上报，
  * 系统既不知道也不猜用户的账户规模。
  */
+
+/** 后端横幅缺席时的回退文案（与后端默认同句，逐字挂 ⓘ tooltip）。 */
+const RULES_BANNER_FALLBACK =
+  '这一页是你自己的历史统计，不是建议；规则由这段样本推出，前向验证见 /journal 规则遵守度';
 
 const NUMBER_FORMAT = new Intl.NumberFormat('en-US', {
   maximumFractionDigits: 0,
@@ -239,15 +244,17 @@ export const RulesPage: React.FC = () => {
           </button>
         </div>
 
-        {/* 顶部横幅：文案由后端下发，逐字渲染。 */}
+        {/* 界面披露策略（2026-08-15）：横幅文案（后端下发，逐字）不再以整条
+            警示横幅占可见 chrome——原文收进 ⓘ tooltip，可见只留跳转入口。 */}
         <div
-          className="rounded-ds-sm border border-[color:var(--warn-muted)] bg-bg-2 px-3 py-2 text-body-sm text-text-2"
+          className="flex flex-wrap items-baseline gap-x-2 gap-y-1 text-body-sm text-text-2"
           role="note"
           aria-label="交易纪律页说明"
         >
-          {evidence?.banner ??
-            '这一页是你自己的历史统计，不是建议；规则由这段样本推出，前向验证见 /journal 规则遵守度'}
-          {' · '}
+          <InfoHint
+            text={evidence?.banner ?? RULES_BANNER_FALLBACK}
+            label="交易纪律页说明"
+          />
           <Link className="underline hover:text-text-1" to="/journal?tab=positions">
             打开规则遵守度面板 →
           </Link>

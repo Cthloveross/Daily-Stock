@@ -1,7 +1,10 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { IntradayScanTable } from '../IntradayScanTable';
-import { fetchNearExpiryContracts } from '../../../api/opportunities';
+import {
+  fetchNearExpiryContracts,
+  fetchOpportunityOptionWalls,
+} from '../../../api/opportunities';
 import { fetchPersonalEdge } from '../../../api/journal';
 import type { PersonalEdgeResponse } from '../../../types/journal';
 import type {
@@ -13,6 +16,9 @@ import type {
   IntradayTopCandidate,
   IntradayTopResponse,
   NearExpiryContractResponse,
+  OpportunityOptionWallItem,
+  OpportunityOptionWallLevel,
+  OpportunityOptionWallResponse,
 } from '../../../types/opportunities';
 
 const SETUP_LABELS: Record<IntradaySetupKey, string> = {
@@ -106,6 +112,14 @@ vi.mock('../../../api/opportunities', async (importOriginal) => {
   return {
     ...actual,
     fetchNearExpiryContracts: vi.fn(),
+    // 期权墙列（useDeepLaneOptionWalls）：默认空返回＝逐檔标缺，绝不触网。
+    // vitest 的 mockReset 会恢复到这里传入的默认实现。
+    fetchOpportunityOptionWalls: vi.fn(async () => ({
+      schemaVersion: 'option-wall/1.3',
+      marketDateEt: '2026-08-04',
+      generatedAt: '2026-08-04T14:30:06+00:00',
+      items: [],
+    })),
   };
 });
 
@@ -421,17 +435,21 @@ describe('IntradayScanTable 默认 10 列网格（v3 上下文并入）', () => 
     render(<IntradayScanTable data={response} loading={false} error={null} />);
 
     const table = screen.getByRole('table', { name: '实时扫描表' });
-    // 默认网格恰好 10 列交易关键读数（v6 起含「近30分位移」，「波段vs大盘」
-    // 下沉；2026-08-14 按用户要求「你的战绩」收尾——上下文标注放最后）。
-    const headers = ['排名', '标的', '涨跌%', '当前爆发', '今日波段', '速度', '近30分位移', '形态', '详情', '你的战绩'];
+    // 默认网格恰好 11 列交易关键读数（v6 起含「近30分位移」，「波段vs大盘」
+    // 下沉；2026-08-14 按用户要求「你的战绩」收尾——上下文标注放最后；
+    // 2026-08-15 形态后加「期权墙」）。
+    const headers = ['排名', '标的', '涨跌%', '当前爆发', '今日波段', '速度', '近30分位移', '形态', '期权墙', '详情', '你的战绩'];
     for (const header of headers) {
       expect(within(table).getByText(header)).toBeInTheDocument();
     }
     const columnHeaders = within(table).getAllByRole('columnheader');
-    expect(columnHeaders.length).toBe(10);
+    expect(columnHeaders.length).toBe(11);
     // 「你的战绩」必须是最后一列（用户要求：战绩不挤在行情读数前面）。
     expect(columnHeaders[columnHeaders.length - 1].textContent).toContain('你的战绩');
     expect(columnHeaders[columnHeaders.length - 2].textContent).toContain('详情');
+    // 「期权墙」紧跟「形态」（在详情/你的战绩之前）。
+    expect(columnHeaders[columnHeaders.length - 3].textContent).toContain('期权墙');
+    expect(columnHeaders[columnHeaders.length - 4].textContent).toContain('形态');
     // 次要指标移出默认网格（展开行「研究读数」一键可达，不是删除）。
     for (const moved of ['缺口', '量能节奏', 'VWAP', '波幅扩张(ATR)', '财报', '期权异动', '研究状态', '波段vs大盘']) {
       expect(within(table).queryByText(moved)).not.toBeInTheDocument();
@@ -1660,12 +1678,31 @@ describe('IntradayScanTable footer 口径两级展示', () => {
       screen.queryByText(/0.5 ATR 是你自己 766 笔样本的经验「活下来」线/),
     ).not.toBeInTheDocument();
     expect(screen.queryByText(/当前爆发＝最近 15 分钟（3 根 5m K 线）/)).not.toBeInTheDocument();
+    // 期权墙口径进入可见行（数据口径，不是披露句）。
+    expect(screen.getByText(/期权墙＝上一清算时段 OI 分布（C\/P\/γ\/中心/)).toBeInTheDocument();
+    // 界面披露策略（2026-08-15）：常驻可见行不再有「不是信号/非预测」类
+    // 披露句——它们逐字收进「完整口径」切换（见下）。
+    const visibleFooterLine = screen.getByText(/排序与口径说明：盘中排序＝爆发分优先/);
+    expect(visibleFooterLine.textContent).not.toContain('不是信号');
+    expect(visibleFooterLine.textContent).not.toContain('非预测');
+    expect(screen.queryByText(/披露：近30分位移不含前向信息/)).not.toBeInTheDocument();
 
     // 一键展开完整口径：原文逐字可见（隐藏 ≠ 删除）。
     const toggle = screen.getByRole('button', { name: '展开完整口径说明' });
     expect(toggle).toHaveAttribute('aria-expanded', 'false');
     fireEvent.click(toggle);
     expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    // 从可见行迁走的披露句在展开区逐字可见。
+    expect(
+      screen.getByText(
+        '披露：近30分位移不含前向信息、非预测、非信号；速度/位移/波段vs大盘/财报/形态/期权墙/你的战绩均为上下文标注——不隐藏行、不参与排序、不是信号。',
+      ),
+    ).toBeInTheDocument();
+    // 期权墙完整口径与未验证边界逐字在公式墙内。
+    expect(screen.getByText(/期权墙＝深度层每檔（≤8 檔/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/『价格会向墙位靠拢』在你的数据上尚未验证——逐日快照 2026-08-04 起积累/),
+    ).toBeInTheDocument();
     expect(screen.getByText(/当前爆发＝最近 15 分钟（3 根 5m K 线）/)).toBeInTheDocument();
     expect(screen.getByText(/减速=你的离场信号，R1/)).toBeInTheDocument();
     expect(screen.getByText(/系统标注，用户过滤：不隐藏行、不阻断操作、不参与排序/)).toBeInTheDocument();
@@ -1910,8 +1947,8 @@ describe('IntradayScanTable 哑火形态标记（v7，命中才渲染）', () =>
 
   it('renders a warning-muted chip inside the existing 当前爆发 cell, adding no column', () => {
     const table = renderWith(fizzleFlag());
-    // 不新增列：默认网格仍是 10 列。
-    expect(within(table).getAllByRole('columnheader').length).toBe(10);
+    // 不新增列：默认网格仍是 11 列（2026-08-15 起含「期权墙」）。
+    expect(within(table).getAllByRole('columnheader').length).toBe(11);
     const chip = within(table).getByText('哑火形态');
     expect(chip).toBeInTheDocument();
     expect(chip.className).toContain('text-warning');
@@ -2012,5 +2049,195 @@ describe('IntradayScanTable 延迟诊断脚注（generatedInSeconds + servedFrom
   it('renders no latency footer when the payload omits the additive fields', () => {
     render(<IntradayScanTable data={topResponse()} loading={false} error={null} />);
     expect(screen.queryByTestId('scan-latency-footer')).not.toBeInTheDocument();
+  });
+});
+
+describe('IntradayScanTable 「期权墙」列（上一清算时段 OI 分布事实）', () => {
+  beforeEach(() => {
+    navigateMock.mockReset();
+    vi.mocked(fetchNearExpiryContracts).mockReset();
+    vi.mocked(fetchNearExpiryContracts).mockImplementation(
+      async (symbol: string) => nearExpiryEmpty(symbol),
+    );
+    // mockReset 恢复工厂默认（空 items）；各用例按需覆盖。
+    vi.mocked(fetchOpportunityOptionWalls).mockReset();
+  });
+
+  afterEach(() => {
+    vi.mocked(fetchOpportunityOptionWalls).mockReset();
+  });
+
+  function oiLevel(
+    strike: number,
+    distance: number,
+    metricValue: number,
+    share: number,
+    expiry: string,
+  ): OpportunityOptionWallLevel {
+    return {
+      rank: 1,
+      strike,
+      distanceFromSpotPercent: distance,
+      metricValue,
+      shareOfBucketPercent: share,
+      unit: 'contracts',
+      method: 'sum_open_interest',
+      expiryBreakdown: {
+        topExpiries: [
+          {
+            expiry,
+            dte: 4,
+            metricValue,
+            shareOfLevelPercent: 62,
+            contractCount: 1,
+            quote: { ivPercent: null, bid: null, ask: null, mark: null, quoteAsOf: null },
+            quoteEvidence: 'unavailable',
+          },
+        ],
+        other: null,
+      },
+    };
+  }
+
+  function nvdaWall(): OpportunityOptionWallItem {
+    return {
+      ticker: 'NVDA',
+      state: 'ready',
+      source: 'moomoo_openapi',
+      fetchedAt: '2026-08-04T14:30:06+00:00',
+      quoteAsOf: '2026-08-01 16:00:00',
+      formulaVersion: 'option-wall/1.3',
+      spot: 200,
+      atmCallIv: {
+        state: 'ready',
+        expiry: '2026-08-08',
+        strike: 200,
+        atmCallIvPercent: 40,
+        selectionMethod: 'nearest_expiry_atm_call_from_same_wall_snapshot',
+      },
+      scope: { dteMin: 0, dteMax: 45, expiries: ['2026-08-08'], standardContractsOnly: true },
+      coverage: {
+        requestedContracts: 10,
+        snapshotReceivedContracts: 10,
+        validContracts: 10,
+        coveragePercent: 100,
+        failedBatches: 0,
+        excludedNonstandardContracts: 0,
+        excludedUnknownStandardTypeContracts: 0,
+        gammaContracts: 10,
+      },
+      walls: {
+        callOi: [oiLevel(210, 5, 12345, 18.2, '2026-08-08')],
+        putOi: [oiLevel(195, -2.5, 9876, 15, '2026-08-08')],
+        callVolume: [],
+        putVolume: [],
+        callGammaConcentration: [],
+        putGammaConcentration: [],
+        grossGammaConcentration: [
+          {
+            rank: 1,
+            strike: 205,
+            distanceFromSpotPercent: 2.5,
+            metricValue: 100_000,
+            shareOfBucketPercent: 30,
+            unit: 'usd_delta_change_per_1pct_move',
+            method: 'gross_gamma_concentration_1pct',
+          },
+        ],
+      },
+      totals: null,
+      ratios: null,
+      oiWeightedCenter: {
+        strike: 202.4,
+        totalOpenInterest: 50_000,
+        label: '未平仓分布的加权中心（描述，未验证是否有引力）',
+        method: 'open_interest_weighted_mean_strike',
+        metricBasis: 'settled_open_interest_prior_session',
+        validatedAsPriceMagnet: false,
+        reason: null,
+      },
+      message: '',
+      assumptions: [],
+      limitations: [],
+    };
+  }
+
+  function wallsResponse(items: OpportunityOptionWallItem[]): OpportunityOptionWallResponse {
+    return {
+      schemaVersion: 'option-wall/1.3',
+      marketDateEt: '2026-08-04',
+      generatedAt: '2026-08-04T14:30:06+00:00',
+      items,
+    };
+  }
+
+  it('renders C/P walls with γ and center, batching one shared wall read per deep lane', async () => {
+    vi.mocked(fetchOpportunityOptionWalls).mockResolvedValue(wallsResponse([nvdaWall()]));
+    const response = { ...topResponse(), candidates: [candidate()], universe: ['NVDA'] };
+    render(<IntradayScanTable data={response} loading={false} error={null} />);
+
+    const table = screen.getByRole('table', { name: '实时扫描表' });
+    // 紧凑两行：主行 C/P 墙，次行 γ 集中 + OI 加权中心。
+    expect(await within(table).findByText('C 210 · P 195')).toBeInTheDocument();
+    expect(within(table).getByText('γ205 · 中心202.4')).toBeInTheDocument();
+
+    // tooltip（aria-label 同文）逐位给 OI/占比/距现价/主力到期 + as-of。
+    const label = within(table)
+      .getByText('C 210 · P 195')
+      .closest('span[aria-label]')
+      ?.getAttribute('aria-label') ?? '';
+    expect(label).toContain('看涨墙 C 210：OI 12,345 张 · 占看涨侧 OI 18.2% · 距现价 +5.00%');
+    expect(label).toContain('主力到期 2026-08-08（占该位 62%）');
+    expect(label).toContain('看跌墙 P 195：OI 9,876 张 · 占看跌侧 OI 15.0% · 距现价 −2.50%');
+    expect(label).toContain('γ 集中 205：距现价 +2.50%');
+    expect(label).toContain('OI 加权中心 202.4：距现价 +1.20%');
+    expect(label).toContain('描述性重心');
+    expect(label).toContain('as-of：2026-08-01 16:00:00（OI＝上一清算时段口径 · 窗口 0–45DTE）');
+    // 硬约束：未验证边界逐字携带——绝不渲染「最可能收在 X」。
+    expect(label).toContain(
+      '墙位＝未平仓分布事实（上一清算时段 OI）；『价格会向墙位靠拢』在你的数据上尚未验证——逐日快照 2026-08-04 起积累，样本足够后回测',
+    );
+    expect(within(table).queryByText(/最可能收在/)).not.toBeInTheDocument();
+
+    // 共享读取：深度层名单一次批量调用（≤5 檔/批），与盘前面板同一条路径。
+    expect(fetchOpportunityOptionWalls).toHaveBeenCalledTimes(1);
+    expect(fetchOpportunityOptionWalls).toHaveBeenCalledWith(['NVDA']);
+  });
+
+  it('marks 标缺 per row when the wall read fails, never inventing levels', async () => {
+    vi.mocked(fetchOpportunityOptionWalls).mockRejectedValue(new Error('wall down'));
+    render(<IntradayScanTable data={topResponse()} loading={false} error={null} />);
+
+    const table = screen.getByRole('table', { name: '实时扫描表' });
+    // NVDA + MU 两行各一枚显式标缺（副行给原因）。
+    const captions = await within(table).findAllByText('墙读取失败');
+    expect(captions).toHaveLength(2);
+    const label = captions[0]
+      .closest('span[aria-label]')
+      ?.getAttribute('aria-label') ?? '';
+    expect(label).toContain('墙读取失败或供应商无返回行');
+    expect(label).toContain('『价格会向墙位靠拢』在你的数据上尚未验证');
+  });
+
+  it('marks 标缺 when the provider returns no row for a ticker (default empty items)', async () => {
+    // 工厂默认：items=[] → 每檔都是「供应商无返回行」标缺。
+    render(<IntradayScanTable data={topResponse()} loading={false} error={null} />);
+    const table = screen.getByRole('table', { name: '实时扫描表' });
+    expect(await within(table).findAllByText('墙读取失败')).toHaveLength(2);
+  });
+
+  it('keeps the header tooltip factual with the unverified-pinning note verbatim', () => {
+    render(<IntradayScanTable data={topResponse()} loading={false} error={null} />);
+    const table = screen.getByRole('table', { name: '实时扫描表' });
+    const header = within(table).getByText('期权墙');
+    const label = header.getAttribute('aria-label') ?? '';
+    expect(label).toContain('C＝看涨侧最大 OI 行权价');
+    expect(label).toContain('P＝看跌侧最大 OI 行权价');
+    expect(label).toContain('γ＝1% 波动下 gross gamma 集中的行权价');
+    expect(label).toContain('中心＝Σ(行权价×OI)÷Σ(OI)');
+    expect(label).toContain('刻意不叫 max pain');
+    expect(label).toContain(
+      '墙位＝未平仓分布事实（上一清算时段 OI）；『价格会向墙位靠拢』在你的数据上尚未验证',
+    );
   });
 });

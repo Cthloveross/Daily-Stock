@@ -8,6 +8,7 @@ import {
   selectManualOvernightPositions,
   useIntradayManualBudgetStore,
 } from '../../stores/intradayPlanStore';
+import { InfoHint } from '../common/InfoHint';
 import { Tooltip } from '../common/Tooltip';
 import {
   DAY_TYPE_EVIDENCE_LINE,
@@ -73,6 +74,16 @@ export const LANE_SAMPLE_CAVEAT = [
   '过夜车道 n=65 偏小，隔夜跳空风险在该窗口内未被充分体现。',
   '规则由同一份样本内推出（in-sample）；前向验证见 /journal 的规则遵守度。',
   '数字口径：build #3 干净口径，n=1,407，2026-04-21→07-31。',
+].join('\n');
+
+/**
+ * 界面披露策略（2026-08-15，用户反馈「不要急着撇清关系」）：定位句
+ * 「按你自己的规则机械核对，不是买卖建议」不再占可见正文，与样本 caveat
+ * 一起逐字收进标题行的 ⓘ tooltip——隐藏 ≠ 删除。
+ */
+export const LANE_CHECKLIST_HONESTY_NOTE = [
+  '按你自己的规则机械核对，不是买卖建议。',
+  LANE_SAMPLE_CAVEAT,
 ].join('\n');
 
 /**
@@ -218,6 +229,8 @@ export function LaneChecklistPanel({
         <span className="text-caption font-medium text-text-2">
           开仓前车道检查 · 对照你自己的规则
         </span>
+        {/* 界面披露策略：定位句 + 样本口径边界原文收进这枚 ⓘ。 */}
+        <InfoHint text={LANE_CHECKLIST_HONESTY_NOTE} label="车道检查口径" />
 
         <div className="flex items-center gap-1" role="group" aria-label="车道">
           {(['intraday', 'overnight'] as LaneId[]).map((option) => {
@@ -372,15 +385,12 @@ export function LaneChecklistPanel({
         <li className="text-caption text-text-3">手动维护 · 按 ET 交易日自动归零</li>
       </ul>
 
+      {/* 提醒行是用户自己的规则要求（数据），保留可见；定位句与样本边界
+          已收进标题行 ⓘ（LANE_CHECKLIST_HONESTY_NOTE），不再占正文。 */}
       <div className="mt-2 border-t border-subtle pt-1.5 text-caption text-text-3">
         {result.reminders.map((line) => (
           <p key={line}>· {line}</p>
         ))}
-        <Tooltip content={LANE_SAMPLE_CAVEAT} focusable contentClassName="whitespace-pre-line">
-          <p className="mt-1 underline decoration-dotted underline-offset-2" aria-label={LANE_SAMPLE_CAVEAT}>
-            按你自己的规则机械核对，不是买卖建议（样本与口径边界 ⓘ）
-          </p>
-        </Tooltip>
       </div>
     </section>
   );
