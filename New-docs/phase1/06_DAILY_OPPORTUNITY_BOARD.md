@@ -974,3 +974,54 @@ MU 不在清单里也被并入同一批快照并深扫，且没有挤掉异动�
 - **7e** `MoomooFetcher` 的每笔 RPC 与健康检查 `close()` 持同一把生命周期锁，close 不再能在 RPC 执行中途拆连接。
 
 以上并发行为均有确定性测试（慢工厂 + 短租约、假时钟断路器、混合有效/未知代码批次），见 `api/v1/tests/test_opportunities_endpoint.py`、`api/v1/tests/test_intraday_top_two_tier.py`、`tests/test_moomoo_runtime.py`、`tests/test_moomoo_options_snapshots.py`、`tests/test_moomoo_intraday_pagination.py`。
+
+## 13. 盘中预热循环 + 扫描延迟诊断（2026-08-14）
+
+### 13.1 问题
+
+盘中工作台是纯请求驱动：单飞 leader 已被 45 秒租约约束（§12.1），但**冷路径**
+（缓存空窗后的完整两层装配）实测 12.5 秒（冷）vs 0.01 秒（暖）。页面关过一阵、
+TTL 过期、服务重启、显式刷新——任何缓存空窗都会让用户的下一次轮询吃满冷路径，
+实盘时体感就是「页面卡了」。
+
+### 13.2 服务端预热循环（`src/services/intraday_warm_cache_scheduler.py`）
+
+`IntradayWarmCacheScheduler`：与 premarket/outcome host 同一模式的 daemon 线程
+（start 幂等、stop 无界 join、quiet-unless-incident）。语义：
+
+- **时窗闸门**：完全复用 `market_session_state`（`america_new_york_clock_v1`，
+  不新增时钟逻辑）——工作日 04:00–20:00 ET（盘前→盘后）内预热，之外 idle
+  零请求（周末/夜间每 tick 只是一次纯时钟判定）。
+- **预热目标**：`warm_default_intraday_top_scan()` 以「无显式 symbols、无
+  focus、默认 limit=5」解析出与页面默认轮询**完全相同**的 key/工厂
+  （`_intraday_top_key_and_factory`，端点与预热共用，无平行实现），并以
+  `bypass_cache=True` 走 `_get_or_compute_scan`——与用户点「刷新」同语义：
+  绕过已完成 TTL 条目、仍加入同 key 在途请求。**join-not-duplicate**：用户
+  在 leader 时预热只加入等待，绝不并发第二个工厂（有慢工厂确定性测试钉住）。
+- **节奏**：`INTRADAY_REFRESH_INTERVAL_SECONDS`（默认 45，低于 30——基础
+  单飞租约——钳制到 30）。装配超时（>45s 租约）折叠为 failed tick，孤儿计算
+  照常迟到发布（§12.1 合同不变）。
+- **断路器兼容**：`MOOMOO_RPC_BREAKER` 打开时工厂快速失败，预热 tick 折叠为
+  `failed:<error_type>` 并保持节奏；host 只在状态迁移时各写一行 INFO
+  （idle→warming、warming→failed、恢复），绝不逐 tick 刷屏、绝不刷 error。
+- **不可区分性**：预热结果与请求驱动结果同缓存、同 TTL、同诚实字段——载荷
+  本身零特殊化；唯一痕迹是完成态缓存条目的元数据（发起方 + 生成耗时）。
+
+配置：`INTRADAY_REFRESH_SCHEDULER_ENABLED`（默认 false ＝行为零变化）+
+`INTRADAY_REFRESH_INTERVAL_SECONDS`，由 Web/API lifespan 托管（与另三个
+scheduler 同一 start/stop/异常隔离模式），修改后需重启进程。回滚＝去掉
+env 开关（或置 false）重启。
+
+### 13.3 扫描延迟诊断（additive）
+
+`/opportunities/intraday-top` 响应新增两个 additive 字段（旧载荷缺席即缺席）：
+
+- `generated_in_seconds`：该结果的**工厂墙钟耗时**（秒）。命中完成态缓存的
+  响应报告**原始**生成耗时，不是本次请求耗时。
+- `served_from ∈ {fresh, cache, warm_cache}`：fresh＝本次等到了一次工厂运行
+  （leader 或加入在途计算）；cache＝命中请求驱动的完成态缓存；warm_cache＝
+  命中预热循环写入的完成态缓存。
+
+前端实时扫描表脚注渲染一行小字（如「本轮扫描耗时 12.4s · 预热缓存命中」，
+`data-testid="scan-latency-footer"`）——之后任何「页面变慢」都能从截图直接
+定位是生成慢还是缓存没接住。

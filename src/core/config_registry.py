@@ -1577,6 +1577,43 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "validation": {},
         "display_order": 11,
     },
+    "INTRADAY_REFRESH_SCHEDULER_ENABLED": {
+        "title": "Intraday Warm Cache Scheduler",
+        "description": (
+            "Keep the default intraday-top scan cache warm on weekdays "
+            "04:00-20:00 ET so the page's default poll never hits the "
+            "10-45s cold path. Goes through the same single-flight scan "
+            "path as user requests; read-only, never places orders. "
+            "Requires a process restart."
+        ),
+        "category": "system",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "false",
+        "options": [],
+        "validation": {},
+        "display_order": 12,
+    },
+    "INTRADAY_REFRESH_INTERVAL_SECONDS": {
+        "title": "Intraday Warm Cache Interval (seconds)",
+        "description": (
+            "Warm-loop cadence in seconds (default 45). Values below 30 "
+            "(the base single-flight lease) are clamped to 30."
+        ),
+        "category": "system",
+        "data_type": "number",
+        "ui_control": "number",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "45",
+        "options": [],
+        "validation": {"min": 30},
+        "display_order": 13,
+    },
     "SCHEDULE_RUN_IMMEDIATELY": {
         "title": "Schedule Run Immediately",
         "description": "Whether to run one analysis immediately on startup in schedule mode.",

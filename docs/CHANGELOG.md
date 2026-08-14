@@ -523,6 +523,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] styleMatch S2/S3 的 not_matched 原因只陈述观测到的失败，标缺输入如实写「标缺」，不再断言未观测的事实；当日 <6 根 5m K 线且无上一时段可回退时，哑火形态按标缺（median_basis_insufficient）处理，不再基于退化中位数硬算。
 - [修复] 开仓前车道检查的 ET 时钟增加 5 分钟过时界：过时脉搏不再给出「符合」（「已过 12:00 截止线」这类单调事实保留为不符合），角落时钟标注「约 N 分钟前的服务端时点，已过时」；/rules 页刷新失败仍显示旧表时新增「显示的是上次成功读取（时间）」标注。
 - [文档] docs/CHANGELOG.md [Unreleased] 段的分类标题（### 发布亮点/新功能/改进/修复/测试）整理为扁平 `- [类型]` 行，符合 AGENTS.md 硬规则。
+- [新功能] 盘中默认扫描的服务端预热循环（`INTRADAY_REFRESH_SCHEDULER_ENABLED`，默认关闭）：工作日 04:00–20:00 ET 内每 `INTRADAY_REFRESH_INTERVAL_SECONDS`（默认 45，地板 30）秒预热页面默认轮询命中的同一扫描 key，走与用户请求相同的 single-flight 路径（join-not-duplicate，绝不并发第二个工厂）；断路器打开时安静折叠保持节奏，预热结果与请求驱动结果同缓存同 TTL 不可区分。
+- [改进] `/opportunities/intraday-top` 响应新增 additive 延迟诊断字段 `generated_in_seconds`（工厂墙钟耗时；缓存命中报告原始生成耗时）与 `served_from`（fresh/cache/warm_cache）；实时扫描表脚注渲染「本轮扫描耗时 Xs · 缓存命中」一行小字。
+- [测试] 预热调度器 tick 时窗闸门（假时钟）、失败折叠与状态迁移日志、间隔地板钳制、lifespan 开/关接线、预热加入用户 leader 的单飞（慢工厂确定性）、延迟字段 additive 合同与前端脚注渲染。
 
 ## [3.11.0] - 2026-03-27
 

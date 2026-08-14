@@ -187,6 +187,9 @@ _INTRADAY_TRACKING_SCHEMA = "intraday-tracking/1.0"
 # 日内 Top 榜是盘中滚动研究：60 秒 TTL 与前端 60 秒轮询对齐，一个轮询周期内
 # 的重复请求（多标签页/多组件）只触发一次完整装配。
 _INTRADAY_TOP_CACHE_TTL_SECONDS = 60.0
+# 服务端预热循环使用的默认 limit：与 IntradayTopRequest.limit 默认值及页面
+# 默认轮询（limit=5）一致，保证预热命中的正是默认轮询的缓存 key。
+_INTRADAY_TOP_DEFAULT_LIMIT = 5
 # 20 个标的 × 逐标的期权异动一页读取可能超过默认 30 秒 lease；给装配一个
 # 明确的更长租约而不是放大默认值。
 _INTRADAY_TOP_LEASE_SECONDS = 45.0
@@ -388,6 +391,10 @@ _OPTION_EVENT_FIELDS = (
 class _ScanCacheEntry:
     expires_at: float
     result: dict[str, Any]
+    # 延迟诊断（additive）：完成态条目记住原始工厂墙钟耗时与发起方，命中
+    # 缓存的响应报告**原始**生成耗时，预热条目可被如实标为 warm_cache。
+    generated_in_seconds: Optional[float] = None
+    generated_by: str = "request"
 
 
 @dataclass
@@ -398,6 +405,10 @@ class _ScanFlight:
     # 迟到发布用的完成态 TTL：孤儿计算（超过租约后才算完）写缓存时沿用
     # 启动方声明的 TTL，让下一次轮询直接命中，绝不丢弃已算出的结果。
     ttl_seconds: float = _SCAN_CACHE_TTL_SECONDS
+    # 发起方标记：预热调度器发起的 flight 记为 warm_scheduler，随完成态
+    # 缓存条目一起发布——载荷本身绝不特殊化。
+    initiated_by: str = "request"
+    generated_in_seconds: Optional[float] = None
     event: threading.Event = field(default_factory=threading.Event)
     result: Optional[dict[str, Any]] = None
     error: Optional[BaseException] = None
@@ -614,6 +625,8 @@ def _finish_scan_flight(
                 _scan_cache[key] = _ScanCacheEntry(
                     expires_at=completion_time + flight.ttl_seconds,
                     result=stored,
+                    generated_in_seconds=flight.generated_in_seconds,
+                    generated_by=flight.initiated_by,
                 )
         if current is flight:
             _scan_flights.pop(key, None)
@@ -628,12 +641,20 @@ def _get_or_compute_scan(
     wait_timeout_seconds: float = _SCAN_FOLLOWER_WAIT_SECONDS,
     lease_seconds: float = _SCAN_FLIGHT_LEASE_SECONDS,
     ttl_seconds: Optional[float] = None,
+    initiator: str = "request",
+    meta_out: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Return a cached scan or share one in-flight computation per key.
 
     ``bypass_cache`` skips only a completed TTL entry.  A matching in-flight
     request is still shared so repeated refresh clicks cannot multiply provider
     traffic.
+
+    ``initiator`` 标记本次调用方（"request" / "warm_scheduler"），只随完成态
+    缓存条目的元数据传播；``meta_out``（additive，可选）由调用方传入空 dict，
+    函数在成功返回前写入 ``source``（"cache"/"flight"）、``led_flight``、
+    ``generated_in_seconds``（原始工厂墙钟耗时）与 ``generated_by``。载荷
+    本身绝不因发起方不同而变化。
 
     并发合同（2026-08 16 分钟悬挂事故后收紧）：
 
@@ -658,6 +679,13 @@ def _get_or_compute_scan(
         _prune_scan_cache(now)
         cached = _scan_cache.get(key)
         if not bypass_cache and cached is not None and cached.expires_at > now:
+            if meta_out is not None:
+                meta_out.update(
+                    source="cache",
+                    led_flight=False,
+                    generated_in_seconds=cached.generated_in_seconds,
+                    generated_by=cached.generated_by,
+                )
             return copy.deepcopy(cached.result)
 
         flight = _scan_flights.get(key)
@@ -670,6 +698,7 @@ def _get_or_compute_scan(
                 ttl_seconds=(
                     _SCAN_CACHE_TTL_SECONDS if ttl_seconds is None else ttl_seconds
                 ),
+                initiated_by=initiator,
             )
             _scan_flights[key] = flight
             started = True
@@ -677,11 +706,15 @@ def _get_or_compute_scan(
     if started:
 
         def run_scan_factory() -> None:
+            factory_started_at = _cache_now()
             try:
                 produced = factory()
             except BaseException as exc:  # noqa: BLE001 - published to all waiters
                 _finish_scan_flight(key, flight, error=exc)
             else:
+                flight.generated_in_seconds = max(
+                    0.0, _cache_now() - factory_started_at
+                )
                 _finish_scan_flight(key, flight, result=produced)
 
         try:
@@ -702,6 +735,13 @@ def _get_or_compute_scan(
         raise flight.error
     if flight.result is None:
         raise RuntimeError("opportunity scan single-flight completed without a result")
+    if meta_out is not None:
+        meta_out.update(
+            source="flight",
+            led_flight=started,
+            generated_in_seconds=flight.generated_in_seconds,
+            generated_by=flight.initiated_by,
+        )
     return copy.deepcopy(flight.result)
 
 
@@ -4323,22 +4363,57 @@ def intraday_top(payload: IntradayTopRequest) -> IntradayTopResponse:
     深度位标注 ``promoted_by="user_focus"``；单层路径完全不受影响。
     """
 
+    key, factory = _intraday_top_key_and_factory(
+        list(payload.symbols),
+        list(payload.focus_symbols),
+        payload.limit,
+    )
+    meta: dict[str, Any] = {}
+    try:
+        result = _get_or_compute_scan(
+            key,
+            factory,
+            bypass_cache=payload.refresh,
+            ttl_seconds=_INTRADAY_TOP_CACHE_TTL_SECONDS,
+            lease_seconds=_INTRADAY_TOP_LEASE_SECONDS,
+            wait_timeout_seconds=_INTRADAY_TOP_LEASE_SECONDS,
+            meta_out=meta,
+        )
+    except OpportunityScanTimeoutError as exc:
+        raise _scan_timeout_response(exc) from exc
+    _stamp_intraday_top_latency(result, meta)
+    return IntradayTopResponse.model_validate(result)
+
+
+def _intraday_top_key_and_factory(
+    symbols_requested: list[str],
+    focus_symbols_requested: list[str],
+    limit: int,
+) -> tuple[tuple[Any, ...], Callable[[], dict[str, Any]]]:
+    """Resolve the intraday-top universe into one scan key + factory.
+
+    端点与服务端预热循环共用本函数：预热以空 symbols / 空 focus / 默认
+    limit 调用，保证预热的正是页面默认轮询命中的同一个 key（同一工厂、
+    同一 TTL、同一诚实字段），绝不产生并行实现。
+
+    两层模式仅在「未显式传 symbols 且 INTRADAY_WATCHLIST 已配置」时启用；
+    显式 symbols（≤20）与未配置清单的路径与既有行为逐字节一致。
+    """
+
     enabled = _moomoo_opend_enabled()
     requested_at = _intraday_now()
     market_date_et = requested_at.astimezone(_NEW_YORK).date().isoformat()
 
-    # 两层模式仅在「客户端未显式传 symbols 且 INTRADAY_WATCHLIST 已配置」时
-    # 启用；显式 symbols（≤20）与未配置清单的路径与既有行为逐字节一致。
     watchlist_configured = (
-        _configured_intraday_watchlist() if not payload.symbols else []
+        _configured_intraday_watchlist() if not symbols_requested else []
     )
-    if not payload.symbols and watchlist_configured:
+    if not symbols_requested and watchlist_configured:
         watchlist = watchlist_configured[:_INTRADAY_WATCHLIST_MAX_SYMBOLS]
         deep_lane_max = _configured_deep_lane_max()
         pinned_configured = _configured_intraday_pinned_tickers()
         # 盘中计划提升进入缓存 key：不同 focus 名单是不同的深度层名单，
         # 共用一个 key 会让后提升的标的读到不含它的旧结果。
-        focus_requested = list(payload.focus_symbols)[:_INTRADAY_FOCUS_MAX_SYMBOLS]
+        focus_requested = focus_symbols_requested[:_INTRADAY_FOCUS_MAX_SYMBOLS]
         key = (
             "intraday_top",
             INTRADAY_TOP_SIGNAL_VERSION,
@@ -4350,13 +4425,13 @@ def intraday_top(payload: IntradayTopRequest) -> IntradayTopResponse:
                 tuple(focus_requested),
                 deep_lane_max,
             ),
-            int(payload.limit),
+            int(limit),
             market_date_et,
         )
         factory: Callable[[], dict[str, Any]] = (
             lambda: _execute_intraday_top_two_tier(
                 watchlist,
-                payload.limit,
+                limit,
                 enabled=enabled,
                 deep_lane_max=deep_lane_max,
                 watchlist_configured_total=len(watchlist_configured),
@@ -4364,40 +4439,94 @@ def intraday_top(payload: IntradayTopRequest) -> IntradayTopResponse:
                 focus_tickers=focus_requested,
             )
         )
+        return key, factory
+
+    symbols = symbols_requested or _configured_symbols()
+    symbols = normalize_symbols(symbols)[:20]
+    if not symbols:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "empty_universe",
+                "message": "symbols 为空且服务端 STOCK_LIST 未配置。",
+            },
+        )
+    key = (
+        "intraday_top",
+        INTRADAY_TOP_SIGNAL_VERSION,
+        enabled,
+        tuple(symbols),
+        int(limit),
+        market_date_et,
+    )
+    factory = lambda: _execute_intraday_top(  # noqa: E731 - mirrors two-tier arm
+        symbols, limit, enabled=enabled
+    )
+    return key, factory
+
+
+def _stamp_intraday_top_latency(
+    result: dict[str, Any],
+    meta: dict[str, Any],
+) -> None:
+    """Attach the additive latency diagnostics to one response copy.
+
+    ``result`` 是 :func:`_get_or_compute_scan` 返回的独立深拷贝——就地打点
+    绝不污染共享缓存。语义：
+
+    - ``served_from="fresh"``：本次响应等到了一个工厂运行完成（leader 或
+      加入在途计算的 follower）。
+    - ``served_from="cache"`` / ``"warm_cache"``：命中完成态 TTL 缓存，
+      按条目发起方区分；``generated_in_seconds`` 报告**原始**生成耗时。
+    - meta 为空（例如上游被测试替换）时两个字段保持缺席——additive 合同。
+    """
+
+    if not meta:
+        return
+    generated = meta.get("generated_in_seconds")
+    result["generated_in_seconds"] = (
+        None if generated is None else round(float(generated), 3)
+    )
+    if meta.get("source") == "cache":
+        result["served_from"] = (
+            "warm_cache"
+            if meta.get("generated_by") == "warm_scheduler"
+            else "cache"
+        )
     else:
-        symbols = payload.symbols or _configured_symbols()
-        symbols = normalize_symbols(symbols)[:20]
-        if not symbols:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "error": "empty_universe",
-                    "message": "symbols 为空且服务端 STOCK_LIST 未配置。",
-                },
-            )
-        key = (
-            "intraday_top",
-            INTRADAY_TOP_SIGNAL_VERSION,
-            enabled,
-            tuple(symbols),
-            int(payload.limit),
-            market_date_et,
-        )
-        factory = lambda: _execute_intraday_top(  # noqa: E731 - mirrors two-tier arm
-            symbols, payload.limit, enabled=enabled
-        )
-    try:
-        result = _get_or_compute_scan(
-            key,
-            factory,
-            bypass_cache=payload.refresh,
-            ttl_seconds=_INTRADAY_TOP_CACHE_TTL_SECONDS,
-            lease_seconds=_INTRADAY_TOP_LEASE_SECONDS,
-            wait_timeout_seconds=_INTRADAY_TOP_LEASE_SECONDS,
-        )
-    except OpportunityScanTimeoutError as exc:
-        raise _scan_timeout_response(exc) from exc
-    return IntradayTopResponse.model_validate(result)
+        result["served_from"] = "fresh"
+
+
+def warm_default_intraday_top_scan() -> dict[str, Any]:
+    """Warm the page's default intraday-top poll through the same single flight.
+
+    服务端预热循环（`IntradayWarmCacheScheduler`）每 tick 调用一次：以
+    「无显式 symbols、无 focus、默认 limit」解析出与页面默认轮询完全相同
+    的 key/工厂，并以 ``bypass_cache=True`` 走 :func:`_get_or_compute_scan`
+    ——与用户点「刷新」同语义：只绕过已完成 TTL 条目，仍然加入同 key 的
+    在途请求（join-not-duplicate，绝不并发第二个工厂）。返回小结摘要，
+    载荷本身只通过共享缓存被后续请求读取。
+    """
+
+    key, factory = _intraday_top_key_and_factory(
+        [], [], _INTRADAY_TOP_DEFAULT_LIMIT
+    )
+    meta: dict[str, Any] = {}
+    _get_or_compute_scan(
+        key,
+        factory,
+        bypass_cache=True,
+        ttl_seconds=_INTRADAY_TOP_CACHE_TTL_SECONDS,
+        lease_seconds=_INTRADAY_TOP_LEASE_SECONDS,
+        wait_timeout_seconds=_INTRADAY_TOP_LEASE_SECONDS,
+        initiator="warm_scheduler",
+        meta_out=meta,
+    )
+    return {
+        "led_flight": bool(meta.get("led_flight")),
+        "generated_in_seconds": meta.get("generated_in_seconds"),
+        "generated_by": meta.get("generated_by"),
+    }
 
 
 @router.get("/intraday-pulse", response_model=IntradayPulseResponse)

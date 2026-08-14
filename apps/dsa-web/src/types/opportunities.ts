@@ -1237,6 +1237,16 @@ export interface IntradayTopResponse {
   candidates: IntradayTopCandidate[];
   recentOptionEvents: IntradayTopRecentOptionEvent[];
   limitations: string[];
+  /**
+   * 延迟诊断（additive）：工厂墙钟耗时（秒）。命中缓存的响应报告**原始**
+   * 生成耗时；旧服务端载荷缺席。
+   */
+  generatedInSeconds?: number | null;
+  /**
+   * fresh=本次等到了一次扫描生成；cache=命中请求驱动缓存；
+   * warm_cache=命中服务端预热缓存。载荷其余字段与来源无关。
+   */
+  servedFrom?: 'fresh' | 'cache' | 'warm_cache' | null;
 }
 
 /** 市场脉搏单行（SPY/QQQ/VIX）：缺失显式标缺，不以 0 冒充。 */

@@ -916,3 +916,126 @@ def test_intraday_pulse_session_phase_noise_window(monkeypatch):
     assert body["session_phase"] == "noise"
     assert "默认观望" in body["session_phase_label"]
     assert any("系统标注，用户过滤" in text for text in body["limitations"])
+
+
+# ---------------------------------------------------------------------------
+# 服务端预热循环 + 延迟诊断（generated_in_seconds / served_from，additive）
+# ---------------------------------------------------------------------------
+
+
+def _stub_default_universe(monkeypatch):
+    """固定「清单未配置 → STOCK_LIST=[NVDA]」的默认轮询路径（单层）。"""
+
+    monkeypatch.delenv("MOOMOO_OPEND_ENABLED", raising=False)
+    _stub_daily_loader(monkeypatch)
+    monkeypatch.setattr(opportunities, "_configured_intraday_watchlist", lambda: [])
+    monkeypatch.setattr(opportunities, "_configured_symbols", lambda: ["NVDA"])
+
+
+def test_latency_fields_fresh_then_cache_reports_original_generation_time(
+    monkeypatch,
+):
+    """G-latency：fresh 响应带工厂墙钟耗时；缓存命中报告原始耗时不变。"""
+
+    _stub_default_universe(monkeypatch)
+    client = _client()
+
+    first = client.post("/api/v1/opportunities/intraday-top", json={})
+    second = client.post("/api/v1/opportunities/intraday-top", json={})
+
+    assert first.status_code == second.status_code == 200
+    first_body = first.json()
+    second_body = second.json()
+    assert first_body["served_from"] == "fresh"
+    assert isinstance(first_body["generated_in_seconds"], float)
+    assert first_body["generated_in_seconds"] >= 0.0
+    # 缓存命中：served_from 翻转为 cache，但耗时仍是原始生成耗时。
+    assert second_body["served_from"] == "cache"
+    assert second_body["generated_in_seconds"] == first_body["generated_in_seconds"]
+    # 除 additive 延迟字段外载荷逐字节一致（同一缓存条目）。
+    for field in ("generated_at", "run_id", "candidates", "universe"):
+        assert second_body[field] == first_body[field]
+
+
+def test_warm_scan_populates_the_default_poll_key_as_warm_cache(monkeypatch):
+    """预热结果与请求驱动结果同缓存同 TTL：默认轮询直接命中 warm_cache。"""
+
+    _stub_default_universe(monkeypatch)
+
+    summary = opportunities.warm_default_intraday_top_scan()
+    assert summary["led_flight"] is True
+    assert summary["generated_by"] == "warm_scheduler"
+    assert isinstance(summary["generated_in_seconds"], float)
+
+    response = _client().post("/api/v1/opportunities/intraday-top", json={})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["served_from"] == "warm_cache"
+    assert body["generated_in_seconds"] == pytest.approx(
+        round(summary["generated_in_seconds"], 3), abs=1e-9
+    )
+    # 载荷本身不特殊化：仍是完整合同（schema/候选/诚实字段照旧）。
+    assert body["schema_version"] == "intraday-top/1.0"
+    assert body["universe"] == ["NVDA"]
+    assert body["moomoo_enabled"] is False
+
+
+def test_warm_tick_joins_user_led_flight_instead_of_duplicating(monkeypatch):
+    """G-warm-join：用户在 leader 时预热只加入等待，绝不并发第二个工厂。"""
+
+    monkeypatch.setattr(opportunities, "_intraday_now", lambda: _FIXED_NOW)
+    monkeypatch.setattr(opportunities, "_moomoo_opend_enabled", lambda: False)
+    monkeypatch.setattr(
+        opportunities, "_configured_intraday_watchlist", lambda: ["NVDA"]
+    )
+    monkeypatch.setattr(
+        opportunities, "_configured_intraday_pinned_tickers", lambda: []
+    )
+    monkeypatch.setattr(opportunities, "_configured_deep_lane_max", lambda: 8)
+
+    started = threading.Event()
+    release = threading.Event()
+    counter_lock = threading.Lock()
+    factory_calls = 0
+
+    def slow_two_tier(*_args, **_kwargs):
+        nonlocal factory_calls
+        with counter_lock:
+            factory_calls += 1
+        started.set()
+        assert release.wait(timeout=5)
+        return {"payload": "user-led"}
+
+    monkeypatch.setattr(
+        opportunities, "_execute_intraday_top_two_tier", slow_two_tier
+    )
+
+    key, factory = opportunities._intraday_top_key_and_factory([], [], 5)
+    user_meta: dict = {}
+
+    def user_leg():
+        return opportunities._get_or_compute_scan(
+            key,
+            factory,
+            ttl_seconds=opportunities._INTRADAY_TOP_CACHE_TTL_SECONDS,
+            lease_seconds=opportunities._INTRADAY_TOP_LEASE_SECONDS,
+            wait_timeout_seconds=opportunities._INTRADAY_TOP_LEASE_SECONDS,
+            meta_out=user_meta,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        user = executor.submit(user_leg)
+        assert started.wait(timeout=2)
+        warm = executor.submit(opportunities.warm_default_intraday_top_scan)
+        # 给预热线程时间加入在途 flight（与既有单飞测试同一模式）。
+        time.sleep(0.05)
+        release.set()
+        user_result = user.result(timeout=5)
+        warm_summary = warm.result(timeout=5)
+
+    assert factory_calls == 1
+    assert user_result == {"payload": "user-led"}
+    assert user_meta["led_flight"] is True
+    # 预热加入了用户 leader 的 flight：既没抢 leader 也没另起工厂。
+    assert warm_summary["led_flight"] is False
+    assert warm_summary["generated_by"] == "request"

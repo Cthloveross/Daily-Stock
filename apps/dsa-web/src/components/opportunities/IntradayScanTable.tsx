@@ -1517,6 +1517,23 @@ export function IntradayScanTable({
       )}
 
       <div className="border-t border-subtle bg-bg-0 px-4 py-2 text-caption text-text-3">
+        {/* 延迟诊断（additive）：让「页面变慢」可以从截图直接定位。命中缓存
+            时耗时是该结果的原始生成耗时，不是本次请求耗时。旧载荷缺席即不渲染。 */}
+        {data?.generatedInSeconds !== null && data?.generatedInSeconds !== undefined && (
+          <div
+            data-testid="scan-latency-footer"
+            className="mb-1 font-mono text-mono-xs text-text-3"
+          >
+            {`本轮扫描耗时 ${data.generatedInSeconds.toFixed(1)}s`}
+            {data.servedFrom === 'cache'
+              ? ' · 缓存命中'
+              : data.servedFrom === 'warm_cache'
+                ? ' · 预热缓存命中'
+                : data.servedFrom === 'fresh'
+                  ? ' · 实时生成'
+                  : ''}
+          </div>
+        )}
         <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
           <span>
             排序与口径说明：盘中排序＝爆发分优先（休市按最近交易时段）；今日波段分级

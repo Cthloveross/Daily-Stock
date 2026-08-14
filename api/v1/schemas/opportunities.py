@@ -1661,6 +1661,13 @@ class IntradayTopResponse(BaseModel):
         default_factory=list
     )
     limitations: list[str] = Field(default_factory=list)
+    # 延迟诊断（additive）：工厂墙钟耗时（秒）。命中完成态缓存的响应报告
+    # **原始**生成耗时，不是本次请求耗时；上游未提供时保持缺席。
+    generated_in_seconds: Optional[float] = Field(default=None, ge=0)
+    # fresh=等到了一次工厂运行；cache=命中请求驱动的完成态缓存；
+    # warm_cache=命中服务端预热循环写入的完成态缓存。载荷其余字段与发起方
+    # 无关——预热结果与请求驱动结果不可区分。
+    served_from: Optional[Literal["fresh", "cache", "warm_cache"]] = None
 
 
 class IntradayPulseItem(BaseModel):

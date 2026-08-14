@@ -44,6 +44,7 @@ async def app_lifespan(app: FastAPI):
     premarket_evidence_scheduler = None
     premarket_scheduler = None
     outcome_scheduler = None
+    intraday_warm_scheduler = None
     try:
         from src.config import get_config
 
@@ -92,10 +93,34 @@ async def app_lifespan(app: FastAPI):
             outcome_scheduler = CanonicalOpportunityOutcomeScheduler()
             outcome_scheduler.start()
             app.state.opportunity_outcome_scheduler = outcome_scheduler
+        if bool(
+            getattr(config, "intraday_refresh_scheduler_enabled", False)
+        ):
+            # Warm the page's default intraday-top poll through the exact
+            # single-flight path the endpoint uses; join-not-duplicate.
+            from api.v1.endpoints.opportunities import (
+                warm_default_intraday_top_scan,
+            )
+            from src.services.intraday_warm_cache_scheduler import (
+                IntradayWarmCacheScheduler,
+                execute_intraday_warm_tick,
+            )
+
+            intraday_warm_scheduler = IntradayWarmCacheScheduler(
+                lambda: execute_intraday_warm_tick(
+                    warm_runner=warm_default_intraday_top_scan,
+                ),
+                interval_seconds=getattr(
+                    config, "intraday_refresh_interval_seconds", 45
+                ),
+            )
+            intraday_warm_scheduler.start()
+            app.state.intraday_warm_cache_scheduler = intraday_warm_scheduler
         yield
     finally:
         for scheduler_name, scheduler in (
             ("moomoo_premarket_prefetch", premarket_evidence_scheduler),
+            ("intraday_warm_cache", intraday_warm_scheduler),
             ("opportunity_outcome", outcome_scheduler),
             ("premarket_research", premarket_scheduler),
         ):
@@ -109,6 +134,8 @@ async def app_lifespan(app: FastAPI):
                     scheduler_name,
                     type(exc).__name__,
                 )
+        if hasattr(app.state, "intraday_warm_cache_scheduler"):
+            delattr(app.state, "intraday_warm_cache_scheduler")
         if hasattr(app.state, "opportunity_outcome_scheduler"):
             delattr(app.state, "opportunity_outcome_scheduler")
         if hasattr(app.state, "premarket_research_scheduler"):

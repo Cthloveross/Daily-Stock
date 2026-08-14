@@ -634,6 +634,8 @@ class SystemConfigService:
             "MOOMOO_PREMARKET_PREFETCH_ENABLED",
             "PREMARKET_RESEARCH_SCHEDULER_ENABLED",
             "OPPORTUNITY_OUTCOME_SCHEDULER_ENABLED",
+            "INTRADAY_REFRESH_SCHEDULER_ENABLED",
+            "INTRADAY_REFRESH_INTERVAL_SECONDS",
         }
         if startup_only_schedule_keys:
             warnings.append(
@@ -641,7 +643,7 @@ class SystemConfigService:
                     f"{', '.join(sorted(startup_only_schedule_keys))} 已写入 .env。"
                     "这些属于启动期调度配置：当前已运行的 WebUI/API 进程不会因为本次保存立即触发分析，"
                     "也不会自动重建 scheduler；请重启当前进程后生效。常规定时分析仍需以 "
-                    "schedule 模式重新启动后生效，三个美股研究 scheduler 则由 Web/API lifespan 托管。"
+                    "schedule 模式重新启动后生效，美股研究/预热 scheduler 则由 Web/API lifespan 托管。"
                 )
             )
 

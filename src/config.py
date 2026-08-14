@@ -757,6 +757,11 @@ class Config:
     premarket_research_scheduler_enabled: bool = False
     # XNYS 收盘后自动成熟 5D/20D 结果；只写 append-only 研究结果，不影响排名。
     opportunity_outcome_scheduler_enabled: bool = False
+    # 盘中默认扫描的服务端预热循环：工作日 04:00–20:00 ET 内按固定节奏刷新
+    # 页面默认轮询命中的两层扫描缓存；默认关闭，不配置＝行为零变化。
+    intraday_refresh_scheduler_enabled: bool = False
+    # 预热间隔（秒）：默认 45；低于 30（基础单飞租约）会被钳制到 30。
+    intraday_refresh_interval_seconds: int = 45
     schedule_time: str = "18:00"              # 每日推送时间（HH:MM 格式）
     schedule_run_immediately: bool = True     # 启动时是否立即执行一次
     run_immediately: bool = True              # 启动时是否立即执行一次（非定时模式）
@@ -873,6 +878,7 @@ class Config:
             "MOOMOO_PREMARKET_PREFETCH_ENABLED",
             "PREMARKET_RESEARCH_SCHEDULER_ENABLED",
             "OPPORTUNITY_OUTCOME_SCHEDULER_ENABLED",
+            "INTRADAY_REFRESH_SCHEDULER_ENABLED",
             "SCHEDULE_TIME",
             "SCHEDULE_RUN_IMMEDIATELY",
         }
@@ -1481,6 +1487,17 @@ class Config:
                 default='false',
                 prefer_env_file=True,
             ).lower() == 'true',
+            intraday_refresh_scheduler_enabled=cls._resolve_env_value(
+                'INTRADAY_REFRESH_SCHEDULER_ENABLED',
+                default='false',
+                prefer_env_file=True,
+            ).lower() == 'true',
+            intraday_refresh_interval_seconds=parse_env_int(
+                os.getenv('INTRADAY_REFRESH_INTERVAL_SECONDS'),
+                45,
+                field_name='INTRADAY_REFRESH_INTERVAL_SECONDS',
+                minimum=30,
+            ),
             schedule_time=(schedule_time_value or '18:00').strip() or '18:00',
             schedule_run_immediately=schedule_run_immediately,
             run_immediately=legacy_run_immediately,

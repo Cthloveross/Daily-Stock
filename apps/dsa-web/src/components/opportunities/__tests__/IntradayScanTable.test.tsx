@@ -1887,3 +1887,55 @@ describe('IntradayScanTable 哑火形态标记（v7，命中才渲染）', () =>
     expect(within(table).queryByText('哑火形态')).not.toBeInTheDocument();
   });
 });
+
+describe('IntradayScanTable 延迟诊断脚注（generatedInSeconds + servedFrom）', () => {
+  beforeEach(() => {
+    navigateMock.mockReset();
+    vi.mocked(fetchNearExpiryContracts).mockReset();
+    vi.mocked(fetchNearExpiryContracts).mockImplementation(
+      async (symbol: string) => nearExpiryEmpty(symbol),
+    );
+  });
+
+  it('renders the latency footer with 实时生成 for a fresh scan', () => {
+    const response: IntradayTopResponse = {
+      ...topResponse(),
+      generatedInSeconds: 12.44,
+      servedFrom: 'fresh',
+    };
+    render(<IntradayScanTable data={response} loading={false} error={null} />);
+    const footer = screen.getByTestId('scan-latency-footer');
+    expect(footer.textContent).toContain('本轮扫描耗时 12.4s');
+    expect(footer.textContent).toContain('实时生成');
+  });
+
+  it('labels cache hits and warm-cache hits distinctly with the original time', () => {
+    const cached: IntradayTopResponse = {
+      ...topResponse(),
+      generatedInSeconds: 8.3,
+      servedFrom: 'cache',
+    };
+    const { unmount } = render(
+      <IntradayScanTable data={cached} loading={false} error={null} />,
+    );
+    expect(screen.getByTestId('scan-latency-footer').textContent).toContain(
+      '本轮扫描耗时 8.3s · 缓存命中',
+    );
+    unmount();
+
+    const warm: IntradayTopResponse = {
+      ...topResponse(),
+      generatedInSeconds: 8.3,
+      servedFrom: 'warm_cache',
+    };
+    render(<IntradayScanTable data={warm} loading={false} error={null} />);
+    expect(screen.getByTestId('scan-latency-footer').textContent).toContain(
+      '本轮扫描耗时 8.3s · 预热缓存命中',
+    );
+  });
+
+  it('renders no latency footer when the payload omits the additive fields', () => {
+    render(<IntradayScanTable data={topResponse()} loading={false} error={null} />);
+    expect(screen.queryByTestId('scan-latency-footer')).not.toBeInTheDocument();
+  });
+});
