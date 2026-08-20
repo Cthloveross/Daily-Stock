@@ -129,6 +129,8 @@ class IntradayWarmCacheScheduler:
         *,
         interval_seconds: float = INTRADAY_WARM_INTERVAL_DEFAULT_SECONDS,
         thread_name: str = "dsa-intraday-warm-cache",
+        channel_watch: Optional[Callable[[], bool]] = None,
+        channel_notifier: Optional[Callable[[str], None]] = None,
     ) -> None:
         try:
             interval = float(interval_seconds)
@@ -147,6 +149,13 @@ class IntradayWarmCacheScheduler:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._last_fingerprint: Optional[str] = None
+        # 通道看门狗（可选）：watch() 返回 True＝行情通道断开（如 Moomoo
+        # 熔断器 open）。仅在预热窗口内的非 idle tick 评估；状态翻转时各
+        # 通知一次（断开→提醒，恢复→提醒），notifier 异常吞噬绝不进循环。
+        # 动机：2026-08-14 OpenD 崩溃后静默降级 6 天无人知晓（G-31）。
+        self._channel_watch = channel_watch
+        self._channel_notifier = channel_notifier
+        self._channel_down: Optional[bool] = None
 
     @property
     def interval_seconds(self) -> float:
@@ -197,6 +206,31 @@ class IntradayWarmCacheScheduler:
         self._thread = None
         logger.info("[intraday-warm] stopped")
 
+    def _watch_channel(self) -> None:
+        """预热窗口内检查行情通道；状态翻转时各通知一次，异常绝不外抛。"""
+
+        if self._channel_watch is None or self._channel_notifier is None:
+            return
+        try:
+            down = bool(self._channel_watch())
+        except Exception:  # noqa: BLE001 - watch 失败视为未知，不通知不崩溃
+            return
+        if down == self._channel_down:
+            return
+        previously = self._channel_down
+        self._channel_down = down
+        try:
+            if down:
+                self._channel_notifier(
+                    "⚠️ 行情通道断开（Moomoo OpenD 无响应，熔断器已打开）："
+                    "页面将大片标缺，盘中提示同步受影响。"
+                    "重启 OpenD 后系统会自动恢复。"
+                )
+            elif previously:
+                self._channel_notifier("✅ 行情通道已恢复（Moomoo 熔断器闭合）")
+        except Exception:  # noqa: BLE001 - 通知失败只能吞，循环优先
+            logger.warning("[intraday-warm] channel notifier failed", exc_info=True)
+
     def _log_transition(self, result: IntradayWarmTickResult) -> None:
         if result.action == "failed":
             fingerprint = f"failed:{result.error_code}"
@@ -233,6 +267,8 @@ class IntradayWarmCacheScheduler:
             try:
                 result = self._tick()
                 self._log_transition(result)
+                if result.action != "idle":
+                    self._watch_channel()
             except Exception as exc:  # noqa: BLE001 - keep daemon alive
                 fingerprint = f"tick_error:{type(exc).__name__}"
                 if fingerprint != self._last_fingerprint:

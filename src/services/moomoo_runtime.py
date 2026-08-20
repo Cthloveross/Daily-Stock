@@ -337,6 +337,19 @@ class MoomooCircuitBreaker:
         self._probe_started_at: Optional[float] = None
         self._last_failure_reason: Optional[str] = None
 
+    @property
+    def is_tripped(self) -> bool:
+        """自打开以来是否仍未被成功探针闭合——通道看门狗专用观测。
+
+        与 :meth:`is_open` 不同：``is_open()`` 在冷却到期、可放行探针时
+        返回 False（「此刻会不会快速失败」），而通道若仍然死着，探针失败
+        会立刻重开——按它做看门狗会每个冷却周期刷一对「恢复/断开」。
+        本属性回答「通道自断开后恢复了吗」：只有 record_success（探针
+        成功）才翻回 False。不改变任何状态，不消耗探针名额。
+        """
+        with self._lock:
+            return self._opened_at is not None
+
     def _open_message(self) -> str:
         reason = self._last_failure_reason or "unknown transport failure"
         return (

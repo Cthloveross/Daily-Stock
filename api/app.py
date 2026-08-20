@@ -145,10 +145,23 @@ async def app_lifespan(app: FastAPI):
                             payload_observer=observer
                         )
 
+            # 通道看门狗：Moomoo 熔断器打开/闭合时给手机各推一次系统通知
+            # （2026-08-14 OpenD 崩溃后静默降级 6 天无人知晓——G-31 修复）。
+            # 仅在提示器存在（Telegram 可用）时接线。
+            channel_watch = None
+            channel_notifier = None
+            if intraday_alerter is not None:
+                from src.services.moomoo_runtime import MOOMOO_RPC_BREAKER
+
+                channel_watch = lambda: MOOMOO_RPC_BREAKER.is_tripped  # noqa: E731
+                channel_notifier = intraday_alerter.notify_system
+
             intraday_warm_scheduler = IntradayWarmCacheScheduler(
                 lambda: execute_intraday_warm_tick(
                     warm_runner=warm_runner,
                 ),
+                channel_watch=channel_watch,
+                channel_notifier=channel_notifier,
                 interval_seconds=getattr(
                     config, "intraday_refresh_interval_seconds", 45
                 ),

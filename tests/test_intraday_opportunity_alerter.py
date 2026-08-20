@@ -610,7 +610,7 @@ def test_warm_scan_hands_payload_copy_to_observer(monkeypatch):
 # ---------------------------------------------------------------------------
 
 class _FakeWarmScheduler:
-    def __init__(self, tick, *, interval_seconds):
+    def __init__(self, tick, *, interval_seconds, channel_watch=None, channel_notifier=None):
         pass
 
     def start(self):
@@ -637,6 +637,9 @@ def test_lifespan_wires_alerter_only_with_warm_scheduler(
 
         def observe(self, payload):
             pass
+
+        def notify_system(self, text):
+            calls.append(("system", text))
 
     class FakeTelegramSender:
         def __init__(self, config):
@@ -863,3 +866,24 @@ def test_lifespan_disables_alerter_when_telegram_creds_missing(
 
     assert constructed == []
     assert any("Telegram 凭据缺失" in r.getMessage() for r in caplog.records)
+
+
+def test_notify_system_bypasses_daily_cap_and_prefixes():
+    """系统通知（通道断开/恢复）不占每日提示上限，带【系统】前缀。"""
+
+    sent: list[str] = []
+    alerter = IntradayOpportunityAlerter(
+        lambda text: sent.append(text) or True,
+        max_alerts_per_day=1,
+        async_send=False,
+    )
+    alerter.notify_system("行情通道断开测试")
+    assert sent and sent[0].startswith("【系统】")
+    # 未消耗市场提示上限：正常提示仍可发出。
+    alerter.observe({
+        "market_date_et": "2026-08-20",
+        "session_state": "premarket",
+        "quote_session_scope": "current_session",
+        "candidates": [{"ticker": "AAA", "pre_change_percent": 3.0}],
+    })
+    assert any("AAA" in m for m in sent)

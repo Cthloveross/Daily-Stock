@@ -642,3 +642,24 @@ def test_transport_detail_classification_ignores_business_rejections() -> None:
     assert moomoo_runtime.is_transport_failure_detail("Unknown stock") is False
     assert moomoo_runtime.is_transport_failure_detail("rate limited") is False
     assert moomoo_runtime.is_transport_failure_detail(None) is False
+
+
+def test_breaker_is_tripped_reflects_outage_lifecycle():
+    """G-31 看门狗观测 is_tripped：closed→False，连续失败达阈值→True，
+    冷却到期仍 True（与 is_open() 的区别所在），仅探针成功闭合→False。"""
+
+    clock = {"t": 0.0}
+    breaker = moomoo_runtime.MoomooCircuitBreaker(
+        failure_threshold=2, cooldown_seconds=10.0, clock=lambda: clock["t"]
+    )
+    assert breaker.is_tripped is False
+    breaker.record_failure("connection lost")
+    assert breaker.is_tripped is False
+    breaker.record_failure("connection lost")
+    assert breaker.is_tripped is True
+    # 观测多次不改变状态、不占探针。
+    assert breaker.is_tripped is True
+    clock["t"] = 11.0
+    breaker.check()  # 冷却结束：本调用成为探针（放行）
+    breaker.record_success()
+    assert breaker.is_tripped is False

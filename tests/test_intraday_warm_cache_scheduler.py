@@ -225,7 +225,7 @@ def test_fastapi_lifespan_starts_and_stops_warm_scheduler(
     calls = []
 
     class FakeWarmScheduler:
-        def __init__(self, tick, *, interval_seconds):
+        def __init__(self, tick, *, interval_seconds, channel_watch=None, channel_notifier=None):
             calls.append(("init", callable(tick), interval_seconds))
 
         def start(self):
@@ -275,3 +275,55 @@ def test_fastapi_lifespan_keeps_warm_scheduler_disabled_by_default(
     with TestClient(app) as client:
         assert client.get("/api/health").status_code == 200
         assert not hasattr(app.state, "intraday_warm_cache_scheduler")
+
+
+def test_channel_watchdog_notifies_on_down_and_recovery_once_each():
+    """通道看门狗（G-31）：断开→通知一次，持续断开不重复，恢复→通知一次；
+    watch/notifier 异常吞噬绝不进循环。idle tick 不评估。"""
+
+    notices: list[str] = []
+    down_flag = {"down": False}
+    warmed = IntradayWarmTickResult(
+        action="warmed", state="regular", led_flight=True,
+        generated_in_seconds=1.0, error_code=None,
+    )
+    idle = IntradayWarmTickResult(
+        action="idle", state="closed", led_flight=False,
+        generated_in_seconds=None, error_code=None,
+    )
+    scheduler = IntradayWarmCacheScheduler(
+        lambda: warmed,
+        channel_watch=lambda: down_flag["down"],
+        channel_notifier=notices.append,
+    )
+    # 直接驱动内部方法（循环行为由 daemon 测试覆盖）。
+    scheduler._watch_channel()          # 基线：正常，无通知
+    assert notices == []
+    down_flag["down"] = True
+    scheduler._watch_channel()          # 断开 → 通知
+    scheduler._watch_channel()          # 仍断开 → 不重复
+    assert len(notices) == 1 and "行情通道断开" in notices[0]
+    down_flag["down"] = False
+    scheduler._watch_channel()          # 恢复 → 通知
+    assert len(notices) == 2 and "已恢复" in notices[1]
+    # notifier 异常：吞噬不崩溃
+    def bad_notify(_text: str) -> None:
+        raise RuntimeError("boom")
+    bad = IntradayWarmCacheScheduler(
+        lambda: warmed,
+        channel_watch=lambda: True,
+        channel_notifier=bad_notify,
+    )
+    bad._watch_channel()                # 不抛
+    # watch 异常：视为未知，不通知不崩溃
+    def bad_watch() -> bool:
+        raise RuntimeError("watch boom")
+    silent = IntradayWarmCacheScheduler(
+        lambda: warmed,
+        channel_watch=bad_watch,
+        channel_notifier=notices.append,
+    )
+    silent._watch_channel()
+    assert len(notices) == 2
+    # 未接线（默认 None）：零行为
+    IntradayWarmCacheScheduler(lambda: idle)._watch_channel()

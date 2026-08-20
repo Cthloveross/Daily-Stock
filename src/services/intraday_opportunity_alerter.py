@@ -447,6 +447,19 @@ class IntradayOpportunityAlerter:
         logger.info("[intraday-alerts] stopped")
 
     # -- observation -------------------------------------------------------
+    def notify_system(self, text: str) -> None:
+        """系统级通知（如行情通道断开/恢复）：直接入队，不占每日提示上限。
+
+        通道健康属于「系统在不在工作」，与市场事实提示是两类信息——被日
+        上限压掉一条「通道断了」的通知是不可接受的。仍走同一有界队列与
+        worker 线程，绝不阻塞调用方。
+        """
+
+        try:
+            self._dispatch(f"【系统】{text}")
+        except Exception:  # noqa: BLE001 - 通知永不外抛
+            logger.warning("[intraday-alerts] system notice failed", exc_info=True)
+
     def observe(self, payload: Mapping[str, Any]) -> None:
         """Warm-path callback：任何异常折叠为状态变化日志，绝不上抛。"""
 
