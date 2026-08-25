@@ -312,6 +312,44 @@ export interface OpportunityOptionWallLevel {
   expiryBreakdown?: OpportunityOptionWallLevelExpiryBreakdown | null;
 }
 
+/**
+ * 一个聚合 call/put 比例——**事实描述，不是方向信号**。
+ *
+ * `value` 为 null 时必定带 `reason`（分母为 0 或该窗口无有效合约）：
+ * 比例无定义就是无定义，绝不以 0、1 或无穷大冒充。
+ */
+export interface OpportunityOptionWallRatio {
+  value: number | null;
+  numeratorTotal: number;
+  denominatorTotal: number;
+  numeratorSide: 'call' | 'put';
+  denominatorSide: 'call' | 'put';
+  metricBasis: 'settled_open_interest_prior_session' | 'current_session_cumulative_volume';
+  reason: string | null;
+}
+
+export interface OpportunityOptionWallRatios {
+  callPutOiRatio: OpportunityOptionWallRatio;
+  callPutVolumeRatio: OpportunityOptionWallRatio;
+  /** 逐字渲染：这两个比例在本账户数据上尚未被检验过。 */
+  caveat: string;
+}
+
+/**
+ * Σ(strike × OI) / Σ(OI) —— 描述性重心，**不是** max pain 预测。
+ * `validatedAsPriceMagnet` 恒为 false：本仓库没有历史 OI 序列，
+ * 从未检验过价格是否会向这个位置靠拢。
+ */
+export interface OpportunityOptionWallOiWeightedCenter {
+  strike: number | null;
+  totalOpenInterest: number;
+  label: string;
+  method: 'open_interest_weighted_mean_strike';
+  metricBasis: 'settled_open_interest_prior_session';
+  validatedAsPriceMagnet: false;
+  reason: string | null;
+}
+
 export interface OpportunityOptionWallItem {
   ticker: string;
   state: OpportunityOptionWallState;
@@ -352,6 +390,15 @@ export interface OpportunityOptionWallItem {
     putGammaConcentration: OpportunityOptionWallLevel[];
     grossGammaConcentration: OpportunityOptionWallLevel[];
   };
+  // Additive (option-wall/1.3); optional so pre-1.3 payloads remain valid.
+  totals?: {
+    callOi: number;
+    putOi: number;
+    callVolume: number;
+    putVolume: number;
+  } | null;
+  ratios?: OpportunityOptionWallRatios | null;
+  oiWeightedCenter?: OpportunityOptionWallOiWeightedCenter | null;
   message: string;
   assumptions: string[];
   limitations: string[];
@@ -362,6 +409,95 @@ export interface OpportunityOptionWallResponse {
   marketDateEt: string;
   generatedAt: string;
   items: OpportunityOptionWallItem[];
+}
+
+export type NearExpiryContractState =
+  | 'ready'
+  | 'partial'
+  | 'empty'
+  | 'not_configured'
+  | 'unavailable';
+
+/** 单张临期合约的只读读数：逐字段可空、缺失显式标缺；不含打分或推荐。 */
+export interface NearExpiryContractRow {
+  code: string;
+  right: 'C' | 'P';
+  strike: number;
+  expiry: string;
+  dte: number;
+  bid: number | null;
+  ask: number | null;
+  mid: number | null;
+  spreadPercent: number | null;
+  spreadUnavailableReason: string | null;
+  lastPrice: number | null;
+  sessionVolume: number | null;
+  openInterest: number | null;
+  ivPercent: number | null;
+  delta: number | null;
+  quoteAsOf: string | null;
+  quoteState: 'observed' | 'unavailable';
+  unavailableReason: string | null;
+  isAtm: boolean;
+}
+
+export interface NearExpiryExpiryGroup {
+  expiry: string;
+  dte: number;
+  state: 'ready' | 'partial' | 'unavailable';
+  contractCount: number;
+  observedQuoteCount: number;
+  contracts: NearExpiryContractRow[];
+}
+
+/** 临期合约面板（0–max_dte DTE）：合约选择参考，不构成推荐。 */
+export interface NearExpiryContractItem {
+  ticker: string;
+  state: NearExpiryContractState;
+  source: string;
+  fetchedAt: string;
+  formulaVersion: string;
+  maxDte: number;
+  spot: number | null;
+  spotAsOf: string | null;
+  openInterestAsOf: string | null;
+  openInterestBasis: 'prior_clearing_session';
+  strikeWindow: {
+    percentBand: number;
+    minStrikesPerSide: number;
+    basis: string;
+  };
+  coverage: {
+    requestedContracts: number;
+    snapshotReceivedContracts: number;
+    observedContracts: number;
+    missingContracts: number;
+    failedBatches: number;
+    excludedNonstandardContracts: number;
+    excludedUnknownStandardTypeContracts: number;
+  };
+  expiries: NearExpiryExpiryGroup[];
+  /**
+   * 今日车道可用性（V2-E，additive）：链已读到即由已在手的到期日分组推导。
+   * `null`/缺省＝链读不到（未知），**不是**「今天没有 0DTE」。
+   */
+  hasZeroDte?: boolean | null;
+  availableDteList?: number[];
+  availabilityUnavailableReason?: string | null;
+  /**
+   * v3 财报临近（additive 字段，与扫描表候选同形状、同一份日历缓存）。
+   * 旧缓存载荷可能缺省 → 按「标缺 · 未知≠安全」处理，绝不冒充安全。
+   */
+  earningsProximity?: IntradayEarningsProximity;
+  message: string;
+  limitations: string[];
+}
+
+export interface NearExpiryContractResponse {
+  schemaVersion: string;
+  generatedAt: string;
+  marketDateEt: string;
+  item: NearExpiryContractItem;
 }
 
 export type OpportunityOptionEventState =
@@ -549,5 +685,605 @@ export interface OpportunityLearningSummaryResponse {
   maintenancePolicyVersion: string | null;
   latestMaintenance: OpportunityOutcomeMaintenanceStatus | null;
   horizons: OpportunityLearningHorizon[];
+  limitations: string[];
+}
+
+export type IntradaySessionState = 'premarket' | 'regular' | 'afterhours' | 'closed';
+
+/** v3 时段上下文：常规时段按用户自身历史纪律再切分（提示文案为硬编码 v1）。 */
+export type IntradaySessionPhase =
+  | 'premarket'
+  | 'opening_probe'
+  | 'prime'
+  | 'midday'
+  | 'noise'
+  | 'afternoon'
+  | 'power_hour'
+  | 'afterhours'
+  | 'closed';
+
+export type IntradayTrackingItemState =
+  | 'ready'
+  | 'partial'
+  | 'not_configured'
+  | 'unavailable';
+
+/** 盘中跟踪单标的行：只对照冻结盘前计划，缺失字段显式标缺，不含买卖信号。 */
+export interface IntradayTrackingItem {
+  ticker: string;
+  state: IntradayTrackingItemState;
+  source: string;
+  fetchedAt: string;
+  quoteAsOf: string | null;
+  lastPrice: number | null;
+  sessionOpen: number | null;
+  sessionHigh: number | null;
+  sessionLow: number | null;
+  prevClose: number | null;
+  sessionVolume: number | null;
+  sessionTurnover: number | null;
+  vwap: number | null;
+  vwapBasis: 'session_turnover_over_volume';
+  vwapUnavailableReason: string | null;
+  atr14: number | null;
+  atr14Method: 'wilder_smoothing_14_daily_completed_bars';
+  atr14BarCount: number;
+  atr14LastBarDate: string | null;
+  atr14Source: string | null;
+  atr14UnavailableReason: string | null;
+  volumePaceRatio: number | null;
+  volumePaceBasis: 'session_cumulative_vs_prior_20_session_full_day_median';
+  prior20dMedianVolume: number | null;
+  volumePaceUnavailableReason: string | null;
+  message: string;
+  limitations: string[];
+}
+
+export interface IntradayTrackingResponse {
+  schemaVersion: string;
+  generatedAt: string;
+  marketDateEt: string;
+  sessionState: IntradaySessionState;
+  sessionStateBasis: 'america_new_york_clock_v1';
+  trackingBasis: 'frozen_premarket_plan_readonly';
+  items: IntradayTrackingItem[];
+  limitations: string[];
+}
+
+/** 日内滚动研究状态：盘中活跃 / 观察 / 数据不足（缺核心快照时 fail-closed）。 */
+export type IntradayTopResearchState = 'active' | 'watch' | 'insufficient';
+
+export type IntradayTopDominantSentiment =
+  | 'bullish'
+  | 'bearish'
+  | 'neutral'
+  | 'mixed'
+  | 'unknown';
+
+/** 一页有界 Moomoo 异动的诚实聚合：只有计数与供应商分类，不推断开平仓。 */
+export interface IntradayTopOptionActivity {
+  state: 'ready' | 'empty' | 'not_configured' | 'unavailable';
+  count: number;
+  allCount: number | null;
+  bullishCount: number;
+  bearishCount: number;
+  neutralCount: number;
+  unclassifiedCount: number;
+  dominantSentiment: IntradayTopDominantSentiment;
+  maxSingleTurnover: number | null;
+  eventAsOf: string | null;
+  fetchedAt: string | null;
+  source: string;
+  limitations: string[];
+}
+
+/** 上一完整交易日结构背景；仅作 research_context，不参与盘中排序。 */
+export interface IntradayTopPriorDayContext {
+  priorClose: number | null;
+  priorCloseDate: string | null;
+  priorHigh20d: number | null;
+  priorLow20d: number | null;
+  rangePosition:
+    | 'above_prior_20d_high'
+    | 'below_prior_20d_low'
+    | 'inside_prior_20d_range'
+    | null;
+  emaAlignment: 'bullish' | 'bearish' | 'mixed' | null;
+}
+
+/** 一个 15 分钟滚动窗口的爆发读数：推力、量比与两者乘积的爆发分。 */
+export interface IntradayBurstWindow {
+  startEt: string;
+  endEt: string;
+  thrustPercent: number | null;
+  thrustNorm: number | null;
+  volNorm: number | null;
+  score: number | null;
+  direction: 'up' | 'down' | 'flat';
+  /**
+   * v5 波段分级（additive）：strong＝强波段（爆发分 ≥8 暴动）、
+   * medium＝中波段（≥2.5 持续推升）；旧载荷可省略，缺席时不发明分级。
+   */
+  grade?: 'strong' | 'medium';
+}
+
+/** v3 速度分级：相邻两个滚动 15 分钟窗口爆发分之差（5m K 线近似）。 */
+export interface IntradayBurstSpeed {
+  state: 'accelerating' | 'decelerating' | 'flat' | 'unknown';
+  currentScore: number | null;
+  previousScore: number | null;
+  delta: number | null;
+  basis: 'consecutive_rolling_15m_window_burst_score_delta_5m_bars';
+  unavailableReason: string | null;
+}
+
+/** v3 财报临近标记：前向 5 天窗口内最近财报日；within_blackout=null 表示未知。 */
+export interface IntradayEarningsProximity {
+  state: 'ready' | 'unavailable';
+  daysToEarnings: number | null;
+  earningsDate: string | null;
+  withinBlackout: boolean | null;
+  blackoutDays: number;
+  windowDays: number;
+  basis: 'finnhub_earnings_calendar_forward_window';
+  source: string;
+  fetchedAt: string | null;
+  unavailableReason: string | null;
+}
+
+/** v3 大盘对齐：候选当前爆发方向 vs SPY 会话 VWAP 位置，仅作标注。 */
+export interface IntradayMarketAlignment {
+  state: 'aligned' | 'against' | 'unknown';
+  burstDirection: 'up' | 'down' | 'flat' | null;
+  spyVwapPosition: 'above' | 'below' | 'flat' | null;
+  basis: 'candidate_current_burst_direction_vs_spy_session_vwap_position';
+  unavailableReason: string | null;
+}
+
+/** v3 SPY 大盘上下文：会话 VWAP 位置（累计额/量近似）+ 明确 provenance。 */
+export interface IntradayMarketContext {
+  ticker: string;
+  state: 'ready' | 'not_configured' | 'unavailable';
+  lastPrice: number | null;
+  vwap: number | null;
+  vwapPosition: 'above' | 'below' | 'flat' | 'unknown';
+  vwapBasis: 'session_turnover_over_volume';
+  quoteAsOf: string | null;
+  fetchedAt: string | null;
+  source: string;
+  unavailableReason: string | null;
+}
+
+/** v4 styleMatch：S1/S2/S3 的 setup key。 */
+export type IntradaySetupKey = 'S1' | 'S2' | 'S3';
+
+/** S1/S2/S3 形态对应的 Playbook 条目：只读展示，规则不反哺评分或排序。 */
+export interface IntradaySetupPlaybookRef {
+  setupKey: IntradaySetupKey;
+  candidateKey: string | null;
+  status: 'candidate' | 'promoted';
+  title: string;
+}
+
+/** 单个 setup 的 v1 几何相似度：matched/partial/not_matched/unavailable。 */
+export interface IntradaySetupMatch {
+  setupKey: IntradaySetupKey;
+  label: string;
+  title: string;
+  state: 'matched' | 'partial' | 'not_matched' | 'unavailable';
+  reason: string;
+  evidenceLines: string[];
+  basis: string;
+  playbook: IntradaySetupPlaybookRef | null;
+}
+
+/**
+ * v4 styleMatch v1：当前时段几何形状 vs 用户三个 Playbook setup。
+ * 纯标注：不参与排序、不隐藏行、不是信号；5m 聚合到 15m 近似，非 2m/1m 确认帧。
+ */
+export interface IntradaySetupMatchProfile {
+  state: 'ready' | 'unavailable';
+  styleMatchVersion: 'style_match_v1';
+  quoteSessionScope: 'current_session' | 'latest_prior_session';
+  sessionDateEt: string | null;
+  barCount5M: number;
+  barCount15M: number;
+  matchedSetups: IntradaySetupKey[];
+  partialSetups: IntradaySetupKey[];
+  setups: IntradaySetupMatch[];
+  basis: string;
+  unavailableReason: string | null;
+  limitations: string[];
+}
+
+/** 哑火形态的冻结研究参考数字（后端下发，前端不硬编码）。 */
+export interface IntradayFizzleReference {
+  sample: string;
+  inSampleRate: number;
+  outOfSampleRate: number;
+  baseRateIn: number;
+  baseRateOut: number;
+  nIn: number;
+  nOut: number;
+}
+
+/**
+ * v7 哑火形态：对**当前 15 分钟窗口**的形态描述 + 历史频率（additive 标注）。
+ *
+ * 命中＝intraday 分层 + 窗口效率 ≥0.9（几乎无回撤）+ 量比 <2.0（量能平平）。
+ * 2026-08 起速回放研究（9,173 次爆发起点）：该形态 30 分钟内达到 ≥0.5 ATR
+ * 有利位移仅 26.8%（样本内 n=291）/ 25.4%（样本外 n=177），基准 47.8%/50.5%。
+ *
+ * **不是卖出信号、不是方向判断**——同一份样本里起速那一刻的方向 AUC 全在
+ * 0.48–0.52。`not_flagged` 与 `unavailable` 一律**不渲染**：缺席不是结论。
+ */
+export interface IntradayFizzleFlag {
+  state: 'flagged' | 'not_flagged' | 'unavailable';
+  efficiency: number | null;
+  volNorm: number | null;
+  stratum: 'open' | 'intraday' | null;
+  reason: string;
+  basis: string;
+  reference: IntradayFizzleReference;
+}
+
+/** 波段爆发（v2 主信号）：当前窗口 + 当日（或最近一个交易时段）波段列表。 */
+export interface IntradaySessionBursts {
+  state: 'ready' | 'insufficient_bars' | 'unavailable';
+  sessionDateEt: string | null;
+  barCount: number;
+  medianBarRange: number | null;
+  medianBarVolume: number | null;
+  medianBasis: 'current_session_bars_so_far' | 'prior_session_fallback' | null;
+  windowMinutes: number;
+  current: IntradayBurstWindow | null;
+  legs: IntradayBurstWindow[];
+  speed: IntradayBurstSpeed;
+  /** v7 哑火形态（additive）：描述 current 窗口；旧载荷可省略。 */
+  fizzleFlag?: IntradayFizzleFlag | null;
+  unavailableReason: string | null;
+  source: string | null;
+  fetchedAt: string | null;
+  basis: string;
+  limitations: string[];
+}
+
+/**
+ * v6 近 30 分钟位移：它「已经」在不在动，按 ATR 归一化（additive 标注）。
+ *
+ * 证据来自用户自己的 766 笔期权回合（2026-06-08→07-31，build #3 取证分析）：
+ * 进场几何没有预测力，进场后 30 分钟的位移把结果分得很开——速死亏损单
+ * （<30 分钟）MFE 中位 0.18 ATR / MAE −0.49 ATR，仅 18.3% 达到 ≥0.5 ATR；
+ * 走出来的赢家（30 分钟–3 小时）MFE 0.69 / MAE −0.13，71.2% 达到 ≥0.5 ATR。
+ * `survivalLineAtr` 因此是用户自己的经验线：描述统计，非预测、非信号。
+ */
+export interface IntradayRecentDisplacement {
+  state: 'ready' | 'insufficient_bars' | 'unavailable';
+  windowMinutes: number;
+  netMoveAtr: number | null;
+  highExcursionAtr: number | null;
+  lowExcursionAtr: number | null;
+  absRangeAtr: number | null;
+  atrBasis:
+    | 'atr14_daily'
+    | 'prior_sessions_true_range_mean'
+    | 'intraday_20bar_proxy_x3'
+    | null;
+  /**
+   * v7 ATR 标尺可比性（additive）：这一行的读数能不能与「日线 ATR14 口径」
+   * 横向比较。旧盘中代理与真实日线 ATR14 之比在盘中 0.28→0.42→0.20 漂移，
+   * 因此显式标 not_comparable。旧载荷可省略。
+   */
+  atrScaleComparability?:
+    | 'daily_atr14'
+    | 'daily_scale_prior_sessions_approximate'
+    | 'intraday_scale_not_comparable'
+    | null;
+  atrPriorSessionCount?: number | null;
+  survivalLineAtr: number;
+  barCount: number;
+  /**
+   * 断档诚实化（additive）：窗口实际跨度（末根开始 + 5 分钟 − 首根开始）。
+   * == windowMinutes 即无断档；> windowMinutes 表示 6 根 K 线含断档
+   * （停牌/缺 K 线），消费端须标注「含断档，跨 X 分钟」；超过 45 分钟时
+   * 服务端已把整个读数标缺。旧载荷可省略。
+   */
+  windowSpanMinutes?: number | null;
+  unavailableReason: string | null;
+}
+
+/**
+ * 闸门口径：v2 常规＝15 分钟动量子额度优先、当日涨跌子额度兜底（2026-08-03
+ * 普涨跳空日校准）；v1＝|当日涨跌|→成交额（冷启动回退）；盘前＝|盘前涨跌|→
+ * 盘前成交额（不变）。
+ */
+export type IntradayGateBasis =
+  | 'abs_change_percent_then_turnover_v1'
+  | 'momentum15m_then_day_change_v2'
+  | 'premarket_pre_price_change_then_pre_turnover_v1';
+
+/**
+ * 两层模式下该候选进入深度层的原因：计划钉选/用户钉选/盘中计划提升/
+ * 异动排名（非信号）。
+ */
+export type IntradayDeepLanePromotedBy =
+  | 'plan_always_include'
+  | 'user_pinned'
+  | 'user_focus'
+  | 'mover_rank';
+
+export interface IntradayDeepLaneReason {
+  promotedBy: IntradayDeepLanePromotedBy;
+  moverRank: number | null;
+  basis: IntradayGateBasis;
+}
+
+/** 宽层（仅快照）单行：只有快照可得字段，绝不虚构深度层读数。 */
+export interface IntradaySnapshotOnlyRow {
+  ticker: string;
+  state: 'ready' | 'partial' | 'unavailable';
+  lastPrice: number | null;
+  changePercent: number | null;
+  changeBasis: 'moomoo_snapshot_prev_close';
+  sessionHigh: number | null;
+  sessionLow: number | null;
+  volume: number | null;
+  turnover: number | null;
+  quoteAsOf: string | null;
+  unavailableReason: string | null;
+  /** 盘前读数（additive）：盘前时段常规字段仍指向上一常规时段；缺列＝null，旧载荷可省略。 */
+  preChangePercent?: number | null;
+  preTurnover?: number | null;
+}
+
+/** 深度层名单单行（含未上榜候选，名单本身绝不无声截断）。 */
+export interface IntradayDeepLaneEntry {
+  ticker: string;
+  promotedBy: IntradayDeepLanePromotedBy;
+  moverRank: number | null;
+}
+
+/**
+ * 今日曾深扫账本单行：被 movers 轮换出深度层的标的以最后一次深扫摘要
+ * as-of 呈现（分级波段/形态/涨跌），不实时刷新；重启后只从当前时刻累计。
+ */
+export interface IntradayDayLedgerEntry {
+  ticker: string;
+  lastSeenAt: string;
+  sessionBurstsLegs: IntradayBurstWindow[];
+  setupMatchedSetups: IntradaySetupKey[];
+  lastChangePercent: number | null;
+  state: 'rotated_out';
+}
+
+/** watchlist 两层模式的诚实 universe 概览；单层（现状）模式恒为 null。 */
+export interface IntradayUniverseScan {
+  mode: 'watchlist_two_tier';
+  gateBasis: IntradayGateBasis;
+  /** 闸门降级警示（盘前字段不可用 / 动量历史预热中）；旧载荷可省略。 */
+  gateWarnings?: string[];
+  watchlistTotal: number;
+  watchlistTruncated: boolean;
+  scannedTotal: number;
+  deepLaneCount: number;
+  deepLaneMax: number;
+  deepLane: IntradayDeepLaneEntry[];
+  planAlwaysInclude: string[];
+  /** 用户钉选（INTRADAY_PINNED_TICKERS，additive）；旧载荷可省略。 */
+  userPinned?: string[];
+  /** 盘中计划提升（请求内 focusSymbols，additive）；旧载荷可省略。 */
+  userFocus?: string[];
+  gatedOutCount: number;
+  snapshotUnresolvedSymbols: string[];
+  dayPromotionCap: number;
+  dayPromotionCapReached: boolean;
+  /** 今日曾深扫账本（additive）；旧载荷可省略。 */
+  dayLedger?: IntradayDayLedgerEntry[];
+  dayLedgerBasis?: 'in_process_since_service_start_resets_on_restart';
+  snapshotOnly: IntradaySnapshotOnlyRow[];
+  /** 深度层总行数硬顶与被挤掉的标的（additive）；旧载荷可省略。 */
+  deepLaneTotalMax?: number;
+  trimmedByTotalCap?: IntradayTrimmedLaneEntry[];
+  limitations: string[];
+}
+
+/** 因总行数上限未进深度层的标的：必须在界面上可见，否则等同静默丢弃。 */
+export interface IntradayTrimmedLaneEntry {
+  ticker: string;
+  wouldBePromotedBy:
+    | 'plan_always_include'
+    | 'user_pinned'
+    | 'user_focus'
+    | 'mover_rank';
+}
+
+/**
+ * 今日车道可用性（V2-E）的三态。
+ *
+ * - `intraday_available`：≥1 个深度层标的今日确证有 0DTE → 日内车道成立；
+ * - `overnight_only`：全部标的都读到了链且都没有 0DTE → 日内车道关闭；
+ * - `unknown`：一个都没查，或没查到 0DTE 但存在读不到的标的。
+ *   **未知不等于「今天没有 0DTE」**，也不等于安全。
+ */
+export type IntradayLaneDayType =
+  | 'intraday_available'
+  | 'overnight_only'
+  | 'unknown';
+
+/** 单个标的今日 0..maxDte 的到期日可用性；unavailable 时 hasZeroDte 恒为 null。 */
+export interface IntradayTickerLaneAvailability {
+  ticker: string;
+  state: 'ready' | 'unavailable';
+  hasZeroDte: boolean | null;
+  availableDteList: number[];
+  expiries: { expiry: string; dte: number }[];
+  unavailableReason: string | null;
+}
+
+/** 今日车道可用性区块：判定来自当日真实期权到期日元数据，不含星期规则。 */
+export interface IntradayLaneAvailability {
+  formulaVersion: string;
+  marketDateEt: string;
+  maxDte: number;
+  dayType: IntradayLaneDayType;
+  dayTypeReason: string;
+  basis: 'per_ticker_option_expiry_metadata_within_0_7_dte_v1';
+  checkedScope: 'intraday_deep_lane_tickers';
+  checkedCount: number;
+  readableCount: number;
+  unavailableCount: number;
+  zeroDteTickers: string[];
+  deferredTickers: string[];
+  tickers: IntradayTickerLaneAvailability[];
+  limitations: string[];
+}
+
+/** 日内 Top 候选行：每个指标要么有值+口径，要么显式标缺原因。 */
+export interface IntradayTopCandidate {
+  ticker: string;
+  researchState: IntradayTopResearchState;
+  stateReason: string;
+  supportingEvidenceCount: number;
+  source: string;
+  fetchedAt: string | null;
+  quoteAsOf: string | null;
+  lastPrice: number | null;
+  sessionOpen: number | null;
+  sessionHigh: number | null;
+  sessionLow: number | null;
+  sessionChangePercent: number | null;
+  sessionChangeBasis: 'moomoo_snapshot_prev_close';
+  gapPercent: number | null;
+  gapAtrMultiple: number | null;
+  gapBasis:
+    | 'session_open_vs_prior_completed_close_daily_loader'
+    | 'session_open_vs_moomoo_snapshot_prev_close';
+  gapUnavailableReason: string | null;
+  volumePaceRatio: number | null;
+  volumePaceBasis: 'session_cumulative_vs_prior_20_session_full_day_median';
+  volumePaceUnavailableReason: string | null;
+  vwap: number | null;
+  vwapPosition: 'above' | 'below' | 'flat' | 'unknown';
+  vwapBasis: 'session_turnover_over_volume';
+  vwapUnavailableReason: string | null;
+  atr14: number | null;
+  atr14LastBarDate: string | null;
+  atrRangeExpansion: number | null;
+  rangeExpansionUnavailableReason: string | null;
+  sessionBursts: IntradaySessionBursts;
+  /** v7 哑火形态（additive）：当前窗口的形态描述 + 历史频率；旧载荷可省略。 */
+  fizzleFlag?: IntradayFizzleFlag | null;
+  earningsProximity: IntradayEarningsProximity;
+  marketAlignment: IntradayMarketAlignment;
+  setupMatch: IntradaySetupMatchProfile;
+  /** v6 近 30 分钟位移（additive）：旧载荷可省略，缺席时不发明读数。 */
+  recentDisplacement?: IntradayRecentDisplacement;
+  optionActivity: IntradayTopOptionActivity;
+  priorDayContext: IntradayTopPriorDayContext;
+  evidence: OpportunityEvidence[];
+  message: string;
+  limitations: string[];
+  /** watchlist 两层模式（additive）：单层模式下缺席/为 null。 */
+  scanTier?: 'deep' | null;
+  deepLaneReason?: IntradayDeepLaneReason | null;
+  /**
+   * 盘前涨跌（additive，G-12 口径）：盘前时段 sessionChangePercent 仍指向
+   * 上一常规时段，真实盘前变动只在本字段；仅盘前时段有值，非盘前服务端
+   * 一律 null（快照残留的早间读数是陈旧值）。旧载荷可省略；缺席/为 null
+   * 显式标缺，绝不 0 回填。
+   */
+  preChangePercent?: number | null;
+}
+
+/** 跨标的异动 feed 单行；供应商分类原样透传，不改写为方向结论。 */
+export interface IntradayTopRecentOptionEvent {
+  ticker: string;
+  eventId: string;
+  optionCode: string;
+  fillTime: string | null;
+  tickerType: string | null;
+  price: number | null;
+  volume: number | null;
+  turnover: number | null;
+  optionType: string | null;
+  strikePrice: number | null;
+  expiry: string | null;
+  dte: number | null;
+  sentiment: string | null;
+  orderTypes: string[];
+  strategyType: string | null;
+}
+
+/** 盘中滚动 Top N：不冻结、不入统计，与盘前冻结榜互不替代。 */
+export interface IntradayTopResponse {
+  schemaVersion: string;
+  runId: string;
+  generatedAt: string;
+  asOf: string;
+  marketDateEt: string;
+  sessionState: IntradaySessionState;
+  sessionStateBasis: 'america_new_york_clock_v1';
+  sessionPhase: IntradaySessionPhase;
+  sessionPhaseLabel: string;
+  sessionPhaseHintBasis: 'user_trading_history_hardcoded_v1';
+  quoteSessionScope: 'current_session' | 'latest_prior_session';
+  quoteSessionLabel: string;
+  marketContext: IntradayMarketContext;
+  signalVersion: 'intraday_session_evidence_v8';
+  rankingMethod: 'burst_score_first_then_evidence_count' | 'rule_based_evidence_count';
+  statisticsTrack: 'none_intraday_v1_unscored';
+  moomooEnabled: boolean;
+  universe: string[];
+  /** watchlist 两层模式（additive）：单层（现状）模式恒为 null/缺席。 */
+  universeScan?: IntradayUniverseScan | null;
+  /** 今日车道可用性（V2-E，additive）：单层（现状）模式恒为 null/缺席。 */
+  laneAvailability?: IntradayLaneAvailability | null;
+  unsupportedSymbols: string[];
+  requestedLimit: number;
+  candidateCount: number;
+  candidates: IntradayTopCandidate[];
+  recentOptionEvents: IntradayTopRecentOptionEvent[];
+  limitations: string[];
+  /**
+   * 延迟诊断（additive）：工厂墙钟耗时（秒）。命中缓存的响应报告**原始**
+   * 生成耗时；旧服务端载荷缺席。
+   */
+  generatedInSeconds?: number | null;
+  /**
+   * fresh=本次等到了一次扫描生成；cache=命中请求驱动缓存；
+   * warm_cache=命中服务端预热缓存。载荷其余字段与来源无关。
+   */
+  servedFrom?: 'fresh' | 'cache' | 'warm_cache' | null;
+}
+
+/** 市场脉搏单行（SPY/QQQ/VIX）：缺失显式标缺，不以 0 冒充。 */
+export interface IntradayPulseItem {
+  ticker: string;
+  state: 'ready' | 'partial' | 'not_configured' | 'unavailable';
+  lastPrice: number | null;
+  prevClose: number | null;
+  changePercent: number | null;
+  changeBasis: 'moomoo_snapshot_prev_close';
+  vwap: number | null;
+  vwapPosition: 'above' | 'below' | 'flat' | 'unknown';
+  vwapBasis: 'session_turnover_over_volume';
+  vwapUnavailableReason: string | null;
+  quoteAsOf: string | null;
+  fetchedAt: string;
+  source: string;
+  message: string;
+  limitations: string[];
+}
+
+export interface IntradayPulseResponse {
+  schemaVersion: string;
+  generatedAt: string;
+  marketDateEt: string;
+  sessionState: IntradaySessionState;
+  sessionStateBasis: 'america_new_york_clock_v1';
+  sessionPhase: IntradaySessionPhase;
+  sessionPhaseLabel: string;
+  sessionPhaseHintBasis: 'user_trading_history_hardcoded_v1';
+  items: IntradayPulseItem[];
   limitations: string[];
 }

@@ -315,3 +315,386 @@ class PlaybookEpisodeLinksResponse(BaseModel):
     build_id: int = Field(ge=1)
     episode_id: int = Field(ge=1)
     links: list[PlaybookEpisodeLinkItem] = Field(default_factory=list)
+
+
+# --- personal edge (个人画像回灌): zero-write descriptive stats --------------
+
+
+class PersonalEdgeUnderlyingModel(BaseModel):
+    """Per-underlying stats; only n >= threshold entries are returned."""
+
+    underlying: str
+    n: int = Field(ge=1)
+    net: float
+    win_rate: float = Field(ge=0, le=1)
+    fees: float
+
+
+class PersonalEdgeHoldBucketModel(BaseModel):
+    """One hold-duration bucket; empty buckets keep n=0 and null ratios."""
+
+    bucket: str
+    n: int = Field(ge=0)
+    net: float
+    win_rate: Optional[float] = Field(default=None, ge=0, le=1)
+    avg_win: Optional[float] = None
+    avg_loss: Optional[float] = None
+
+
+class PersonalEdgeDteBucketModel(BaseModel):
+    bucket: str
+    n: int = Field(ge=0)
+    net: float
+    win_rate: Optional[float] = Field(default=None, ge=0, le=1)
+
+
+class PersonalEdgeMonthlyBucketModel(BaseModel):
+    month: str = Field(pattern=r"^\d{4}-\d{2}$")
+    n: int = Field(ge=0)
+    net: float
+    fees: float
+    win_rate: Optional[float] = Field(default=None, ge=0, le=1)
+
+
+class PersonalEdgeDisciplineStatsModel(BaseModel):
+    """规模与频率纪律读数：每美元回报 + 仓位 + 频率 + 本体/尾部 + 口径来源.
+
+    比率一律 fail-closed：分母为 0、无可用开仓现金流、缺 total_fee 或样本不足时
+    为 null 并附 ``*_reason``。
+
+    口径来源以 ``fill_detailed_share``（``evidence_summary_json.fill_allocations
+    > 0``）为准——它才是「是否由明细成交构建」这一因果判据；``exact_fill_share``
+    （``has_exact_fill_times`` 均值）仅作历史连续性保留，两者会不一致。
+    ``basis_break=true`` 的区间其风险金额分母被低估，**不可**与全明细区间连成一
+    条趋势线，消费端必须断开显示。
+    """
+
+    n: int = Field(ge=0)
+    trading_day_count: int = Field(ge=0)
+    trades_per_day: Optional[float] = Field(default=None, ge=0)
+    trades_per_day_reason: Optional[str] = None
+    premium_known_count: int = Field(default=0, ge=0)
+    premium_missing_count: int = Field(default=0, ge=0)
+    median_premium_at_risk: Optional[float] = None
+    total_premium_at_risk: Optional[float] = None
+    premium_reason: Optional[str] = None
+    net_pnl: float = 0.0
+    pnl_per_dollar_risked: Optional[float] = None
+    pnl_per_dollar_risked_reason: Optional[str] = None
+    median_episode_pnl: Optional[float] = None
+    body_pnl: Optional[float] = None
+    body_episode_count: Optional[int] = Field(default=None, ge=0)
+    body_pnl_reason: Optional[str] = None
+    dte_known_count: int = Field(default=0, ge=0)
+    zero_dte_share: Optional[float] = Field(default=None, ge=0, le=1)
+    zero_dte_reason: Optional[str] = None
+    exact_fill_share: Optional[float] = Field(default=None, ge=0, le=1)
+    has_reconstructed_fills: bool = False
+    # additive（2026-08-04）：口径来源判据 + 断裂标记。
+    fill_detailed_count: int = Field(default=0, ge=0)
+    aggregate_only_count: int = Field(default=0, ge=0)
+    fill_provenance_unknown_count: int = Field(default=0, ge=0)
+    fill_detailed_share: Optional[float] = Field(default=None, ge=0, le=1)
+    basis_break: bool = False
+    basis_break_reason: Optional[str] = None
+    # additive（2026-08-04）：恒定过路费与毛口径（gross = net + fee）。
+    fees_total: Optional[float] = None
+    fees_missing_count: int = Field(default=0, ge=0)
+    fee_pct_of_premium_at_risk: Optional[float] = None
+    fee_pct_of_premium_at_risk_reason: Optional[str] = None
+    gross_pct_of_premium_at_risk: Optional[float] = None
+    gross_pct_of_premium_at_risk_reason: Optional[str] = None
+    # additive（2026-08-04）：剔除最好 N 笔后的每美元回报（body_pnl 的每美元版本）。
+    pnl_per_dollar_excluding_top_n: Optional[float] = None
+    gross_pct_excluding_top_n: Optional[float] = None
+    excluding_top_n_count: Optional[int] = Field(default=None, ge=0)
+    excluding_top_n_reason: Optional[str] = None
+
+
+class PersonalEdgeDisciplineMonthModel(PersonalEdgeDisciplineStatsModel):
+    month: str = Field(pattern=r"^\d{4}-\d{2}$")
+
+
+class PersonalEdgeDisciplineWindowModel(PersonalEdgeDisciplineStatsModel):
+    """Trailing-N-trading-day window over the days present in the build."""
+
+    requested_trading_days: int = Field(ge=1)
+    start_date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    end_date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+
+
+class PersonalEdgeDisciplineModel(BaseModel):
+    """规模与频率监控：月度序列 + 当前窗口，同一 build 同一口径."""
+
+    monthly: list[PersonalEdgeDisciplineMonthModel] = Field(default_factory=list)
+    current_window: PersonalEdgeDisciplineWindowModel
+    body_trim_count: int = Field(ge=1)
+    body_min_episode_count: int = Field(ge=1)
+    # additive（2026-08-04）：剔除最好 N 笔的 N，以及「哪个口径字段说了算」的原文。
+    exclude_top_n: int = Field(default=5, ge=1)
+    fill_detailed_governs: Optional[str] = None
+
+
+class RuleComplianceStatModel(BaseModel):
+    """一个车道桶（或合规/违规汇总）的口径读数。
+
+    ``gross`` = Σ(``realized_pnl_net`` + ``total_fee``)，``risk`` =
+    Σ``ABS(opening_cash_flow)``——与规则文本引用的定义逐字一致。任何分母不足的
+    比率为 ``null`` 并附 ``ratio_reason`` / ``excluding_top_n_reason``。
+    """
+
+    key: str
+    n: int = Field(ge=0)
+    risk: Optional[float] = None
+    net: Optional[float] = None
+    gross: Optional[float] = None
+    gross_pct: Optional[float] = None
+    toll_pct: Optional[float] = None
+    win_rate: Optional[float] = Field(default=None, ge=0, le=1)
+    gross_pct_excluding_top_n: Optional[float] = None
+    excluding_top_n_count: Optional[int] = Field(default=None, ge=0)
+    excluding_top_n_reason: Optional[str] = None
+    ratio_reason: Optional[str] = None
+
+
+class RuleComplianceLaneStatModel(RuleComplianceStatModel):
+    """车道桶：额外携带判定与规则编号（UI 引用编号，不改写规则内容）。"""
+
+    verdict: Literal["compliant", "violation", "uncovered", "unknown"]
+    rule_id: str
+
+
+class RuleComplianceSliceModel(BaseModel):
+    """一个时间切片：全历史（规则怎么推出来的）或采纳后（前向验证）。
+
+    ``state`` 为 ``no_episodes_since_adoption`` 时前向样本为空——这是事实，
+    消费端必须显式说明，不得渲染成一张全 0 的表。
+    """
+
+    state: Literal["ready", "no_episodes", "no_episodes_since_adoption"]
+    state_reason: Optional[str] = None
+    start_date: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    n: int = Field(ge=0)
+    lanes: list[RuleComplianceLaneStatModel] = Field(default_factory=list)
+    verdicts: list[RuleComplianceStatModel] = Field(default_factory=list)
+
+
+class PersonalEdgeRuleComplianceModel(BaseModel):
+    """车道遵守度：把本人规则 v2 变成可前向证伪的记账（描述统计，非建议）。"""
+
+    rule_set_id: str
+    adopted_at: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    clean_basis_start: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    clean_basis_reason: str
+    population_n: int = Field(ge=0)
+    excluded_before_clean_basis_count: int = Field(ge=0)
+    excluded_aggregate_or_unknown_basis_count: int = Field(ge=0)
+    excluded_missing_premium_count: int = Field(ge=0)
+    exclude_top_n: int = Field(ge=1)
+    exclude_top_n_min_episode_count: int = Field(ge=1)
+    intraday_lane_dte: int = Field(ge=0)
+    intraday_lane_et_cutoff_hour: int = Field(ge=0, le=23)
+    overnight_lane_min_dte: int = Field(ge=0)
+    overnight_lane_max_dte: int = Field(ge=0)
+    overnight_lane_weak_entry_et_hours: list[int] = Field(default_factory=list)
+    all_history: RuleComplianceSliceModel
+    since_adoption: RuleComplianceSliceModel
+    # daily_budget（V2-D 额度读数）已于 2026-08 移除：Journal 永远不含今天，
+    # 该读数的 as-of 恒落在过去、恒为过期；当日额度改由前端手动计数承载。
+    limitations: list[str] = Field(default_factory=list)
+
+
+class PersonalEdgeResponse(BaseModel):
+    """Descriptive personal stats over the current default episode build.
+
+    ``data_state`` is ``not_built`` when the account has no episode build;
+    every numeric block is recomputed from the build at (cached) request
+    time and stamped with ``build_id`` + date range + ``computed_at`` so the
+    as-of moment is always explicit.  Ratios and buckets are descriptive
+    statistics only — the endogeneity caveat ships in ``limitations``.
+    """
+
+    schema_version: Literal["journal-personal-edge/1.0"] = (
+        "journal-personal-edge/1.0"
+    )
+    data_state: Literal["ready", "not_built"]
+    account_key: str
+    build_id: Optional[int] = Field(default=None, ge=1)
+    build_key: Optional[str] = None
+    source_kind: Optional[str] = None
+    computed_at: Optional[datetime] = None
+    first_opened_at: Optional[datetime] = None
+    last_closed_at: Optional[datetime] = None
+    closed_episode_count: int = Field(default=0, ge=0)
+    excluded_open_count: int = Field(default=0, ge=0)
+    excluded_missing_pnl_count: int = Field(default=0, ge=0)
+    underlying_min_episode_count: int = Field(default=5, ge=1)
+    underlyings: list[PersonalEdgeUnderlyingModel] = Field(
+        default_factory=list
+    )
+    small_sample_underlying_count: int = Field(default=0, ge=0)
+    hold_time_buckets: list[PersonalEdgeHoldBucketModel] = Field(
+        default_factory=list
+    )
+    hold_unknown_count: int = Field(default=0, ge=0)
+    dte_buckets: list[PersonalEdgeDteBucketModel] = Field(
+        default_factory=list
+    )
+    dte_unknown: Optional[PersonalEdgeDteBucketModel] = None
+    monthly: list[PersonalEdgeMonthlyBucketModel] = Field(
+        default_factory=list
+    )
+    # additive（2026-08-04）：规模与频率纪律；not_built 时为 null。
+    discipline: Optional[PersonalEdgeDisciplineModel] = None
+    # additive（2026-08-04）：车道遵守度前向统计；not_built 时为 null。
+    rule_compliance: Optional[PersonalEdgeRuleComplianceModel] = None
+    month_basis: Optional[str] = None
+    limitations: list[str] = Field(default_factory=list)
+
+
+# --- 交易纪律证据页（/rules）------------------------------------------------
+#
+# 这些模型只是 ``src.journal.rules_evidence`` 结果的传输壳：**所有数字都在后端
+# 算完**，前端只渲染。分档边界、剔尾 N、严重度分位数定义、费用计算器的默认
+# 锚点全部随响应下发，前端不得硬编码任何一个。
+
+
+class RulesEvidenceCellModel(BaseModel):
+    """一行读数：样本量 + 三个口径 + 显式缺席原因（缺席绝不以 0 冒充）。"""
+
+    label: str
+    n: int = Field(ge=0)
+    gross_pct: Optional[float] = None
+    net_pct: Optional[float] = None
+    fee_pct: Optional[float] = None
+    win_rate_pct: Optional[float] = Field(default=None, ge=0, le=100)
+    reason: Optional[str] = None
+
+
+class RulesEvidencePriceBandModel(RulesEvidenceCellModel):
+    lower: Optional[float] = Field(default=None, ge=0)
+    upper: Optional[float] = Field(default=None, gt=0)
+
+
+class RulesEvidenceDteHoldModel(RulesEvidenceCellModel):
+    dte_min: int = Field(ge=0)
+    dte_max: int = Field(ge=0)
+    hold_style: Literal["intraday", "overnight"]
+    excluded_top_n: int = Field(ge=1)
+    ex_top_n_gross_pct: Optional[float] = None
+    ex_top_n_n: int = Field(default=0, ge=0)
+    ex_top_n_reason: Optional[str] = None
+
+
+class RulesEvidenceHourModel(RulesEvidenceCellModel):
+    et_hour: int = Field(ge=0, le=23)
+
+
+class RulesEvidenceWeekdayModel(RulesEvidenceCellModel):
+    weekday: int = Field(ge=0, le=6)
+    zero_dte_n: int = Field(default=0, ge=0)
+    dte_1_3_n: int = Field(default=0, ge=0)
+
+
+class RulesEvidenceFeeThresholdModel(BaseModel):
+    """恒定过路费 + 前端计算器的输入锚点（输入只在浏览器里，不落库）。"""
+
+    fee_pct_of_premium: Optional[float] = None
+    n: int = Field(ge=0)
+    reason: Optional[str] = None
+    default_ticket_usd: int = Field(gt=0)
+    default_tickets_per_day: int = Field(gt=0)
+    trading_days_per_month: int = Field(gt=0)
+    note: str
+
+
+class RulesEvidenceSeverityTierModel(BaseModel):
+    label: str
+    definition: str
+    loss_pct: Optional[float] = None
+    tickets_to_breaker: Optional[float] = Field(default=None, gt=0)
+    reason: Optional[str] = None
+
+
+class RulesEvidenceChosenParamsModel(BaseModel):
+    """用户自己选定的参数——回显，不是推荐值。"""
+
+    ticket_usd: int = Field(gt=0)
+    daily_breaker_usd: int = Field(gt=0)
+    max_concurrent: int = Field(gt=0)
+
+
+class RulesEvidencePositionModel(BaseModel):
+    framing: str
+    params: RulesEvidenceChosenParamsModel
+    severity_tiers: list[RulesEvidenceSeverityTierModel] = Field(
+        default_factory=list
+    )
+    observed_breach_day_count: int = Field(ge=0)
+    observed_trading_day_count: int = Field(ge=0)
+    observed_breach_one_per_days: Optional[float] = Field(default=None, gt=0)
+    observed_median_tickets_per_day: Optional[float] = Field(default=None, ge=0)
+    observed_cadence_caveat: str
+    historical_max_drawdown_pct: Optional[float] = None
+    historical_drawdown_sizing_pct: float = Field(gt=0)
+    drawdown_caveat: str
+    reason: Optional[str] = None
+
+
+class RulesEvidenceClusterTickerModel(BaseModel):
+    ticker: str
+    n: int = Field(ge=0)
+
+
+class RulesEvidenceCorrelationModel(BaseModel):
+    tickers: list[RulesEvidenceClusterTickerModel] = Field(default_factory=list)
+    compliant_episode_count: int = Field(ge=0)
+    max_concurrent: int = Field(gt=0)
+    note: str
+
+
+class RulesEvidenceResponse(BaseModel):
+    """「交易纪律」页的全部证据表，与车道遵守度共用同一干净口径。
+
+    ``data_state='not_built'`` 表示该账户还没有任何 episode build。
+    ``build_id``/``build_key`` 始终回显：本仓库当前没有 activation 记录，
+    默认解析会落在最新的 CSV build 上，而不一定是最新的 canonical build，
+    页面必须把「这页在读哪个 build」显示出来，不做静默替换。
+    """
+
+    schema_version: Literal["journal-rules-evidence/1.0"] = (
+        "journal-rules-evidence/1.0"
+    )
+    data_state: Literal["ready", "not_built"]
+    account_key: str
+    build_id: Optional[int] = Field(default=None, ge=1)
+    build_key: Optional[str] = None
+    source_kind: Optional[str] = None
+    computed_at: Optional[datetime] = None
+    clean_basis_start: Optional[str] = None
+    clean_basis_reason: Optional[str] = None
+    rule_set_adopted_at: Optional[str] = None
+    sample_episode_count: int = Field(default=0, ge=0)
+    excluded_before_clean_basis: int = Field(default=0, ge=0)
+    excluded_aggregate_or_unknown_basis: int = Field(default=0, ge=0)
+    excluded_missing_premium: int = Field(default=0, ge=0)
+    excluded_not_closed_or_missing_pnl: int = Field(default=0, ge=0)
+    # additive：样本内缺 total_fee 的回合数——这些回合仍进净口径/胜率，
+    # 但从毛口径与费率的分子分母中排除（0 回填会把毛口径冒充成净口径）。
+    fee_unknown_count: int = Field(default=0, ge=0)
+    first_trading_day: Optional[str] = None
+    last_trading_day: Optional[str] = None
+    banner: Optional[str] = None
+    price_band_headline: Optional[str] = None
+    price_band_boundary_policy: Optional[str] = None
+    price_bands: list[RulesEvidencePriceBandModel] = Field(default_factory=list)
+    hold_style_basis: Optional[str] = None
+    dte_hold_lanes: list[RulesEvidenceDteHoldModel] = Field(default_factory=list)
+    et_hours: list[RulesEvidenceHourModel] = Field(default_factory=list)
+    weekday_headline: Optional[str] = None
+    weekdays: list[RulesEvidenceWeekdayModel] = Field(default_factory=list)
+    fee_threshold: Optional[RulesEvidenceFeeThresholdModel] = None
+    position: Optional[RulesEvidencePositionModel] = None
+    correlation: Optional[RulesEvidenceCorrelationModel] = None
+    overnight_gap_note: Optional[str] = None
+    limitations: list[str] = Field(default_factory=list)

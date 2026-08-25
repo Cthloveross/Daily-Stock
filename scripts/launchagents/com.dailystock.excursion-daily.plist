@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dailystock.excursion-daily</string>
+
+    <!-- Daily 5m-bar persister + excursion incremental backfill
+         (scripts/backfill_excursions.py in daily mode).  Read-only toward markets,
+         append-only toward the ledger; it never trades and never rewrites
+         existing rows.
+
+         NOT loaded by the repository or by any script here by default: whether
+         to schedule it is a user decision (same F-1-style gate as the other
+         agents).  To use it, substitute __PROJECT_DIR__ / __PYTHON__ (see
+         scripts/install_launchagents.sh for the sed pattern), copy the result
+         to ~/Library/LaunchAgents/, then run:
+             launchctl load ~/Library/LaunchAgents/com.dailystock.excursion-daily.plist -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__PROJECT_DIR__/scripts/run_with_rotating_logs.py</string>
+        <string>--stdout-log</string>
+        <string>__PROJECT_DIR__/logs/launchagent.excursion-daily.out.log</string>
+        <string>--stderr-log</string>
+        <string>__PROJECT_DIR__/logs/launchagent.excursion-daily.err.log</string>
+        <string>--max-bytes</string>
+        <string>10485760</string>
+        <string>--backup-count</string>
+        <string>3</string>
+        <string>--</string>
+        <string>__PYTHON__</string>
+        <string>-m</string>
+        <string>scripts.backfill_excursions</string>
+        <string>--daily</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+
+    <!-- Once per day at a fixed LOCAL wall-clock time.  launchd has no
+         timezone parameter: adjust Hour/Minute so the run lands after the US
+         market close (ET 16:30) in YOUR machine's local time.  The default
+         below (16:45 local) is correct only for a machine on Eastern Time. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>16</integer>
+        <key>Minute</key>
+        <integer>45</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+
+    <key>StandardErrorPath</key>
+    <string>/dev/null</string>
+</dict>
+</plist>

@@ -497,6 +497,10 @@ export const JournalImport: React.FC<{ onImported?: () => void }> = ({ onImporte
 
   return (
     <div className="space-y-4">
+      <div>
+        <div className="text-label uppercase tracking-label text-text-3">Data · Daily</div>
+        <h2 className="mt-0.5 text-h2 text-text-1">每日刷新</h2>
+      </div>
       <section className="card-base overflow-hidden" aria-label="OpenD 只读刷新">
         <div className="border-b border-subtle bg-bg-2/60 px-5 py-4">
           <div className="flex flex-wrap items-start justify-between gap-3">
@@ -828,6 +832,10 @@ export const JournalImport: React.FC<{ onImported?: () => void }> = ({ onImporte
         </div>
       </section>
 
+      <div className="pt-2">
+        <div className="text-label uppercase tracking-label text-text-3">Data · Backfill</div>
+        <h2 className="mt-0.5 text-h2 text-text-1">历史导入</h2>
+      </div>
       <details className="card-base overflow-hidden">
         <summary className="cursor-pointer px-5 py-4 text-body-sm font-semibold text-text-2">
           高级 / 首次导入：CSV 账单或只读 JSON

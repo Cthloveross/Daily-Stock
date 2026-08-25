@@ -524,41 +524,121 @@ def test_daily_scan_cache_key_isolated_by_et_market_date():
     )
 
 
-def test_expired_flight_generation_cannot_overwrite_replacement_cache():
-    key = ("expired-generation",)
+def _wait_for_scan_cache_entry(key, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with opportunities._scan_cache_lock:
+            if key in opportunities._scan_cache:
+                return
+        time.sleep(0.01)
+    pytest.fail("background scan completion was never published to the cache")
+
+
+def test_leader_times_out_at_lease_and_late_result_is_published():
+    """G-1 + G-2：leader 在租约到点得到 504；迟到的成功结果发布进缓存。
+
+    修复前：leader 无截止时间（可悬挂 16 分钟），且超租约完成的结果被丢弃
+    再抛 504——慢供应商下形成「永远算、永远丢」的活锁。
+    """
+
+    key = ("late-publish",)
     started = threading.Event()
     release = threading.Event()
+    factory_calls = 0
 
     def slow_factory():
+        nonlocal factory_calls
+        factory_calls += 1
         started.set()
-        assert release.wait(timeout=2)
-        return {"generation": "stale"}
+        assert release.wait(timeout=5)
+        return {"generation": "late"}
 
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        stale_future = executor.submit(
-            opportunities._get_or_compute_scan,
+    with pytest.raises(opportunities.OpportunityScanTimeoutError):
+        opportunities._get_or_compute_scan(
             key,
             slow_factory,
             lease_seconds=0.05,
             wait_timeout_seconds=0.05,
         )
-        assert started.wait(timeout=1)
-        time.sleep(0.07)
-        replacement = opportunities._get_or_compute_scan(
-            key,
-            lambda: {"generation": "fresh"},
-            lease_seconds=1,
-            wait_timeout_seconds=1,
-        )
-        release.set()
-        with pytest.raises(opportunities.OpportunityScanTimeoutError):
-            stale_future.result(timeout=1)
+    assert started.wait(timeout=1)
 
-    cached = opportunities._get_or_compute_scan(
+    release.set()
+    _wait_for_scan_cache_entry(key)
+
+    served = opportunities._get_or_compute_scan(
         key,
-        lambda: pytest.fail("fresh generation should remain cached"),
+        lambda: pytest.fail("late result must be served from the cache"),
     )
-    assert replacement == cached == {"generation": "fresh"}
+    assert served == {"generation": "late"}
+    assert factory_calls == 1
+    with opportunities._scan_cache_lock:
+        assert key not in opportunities._scan_flights
+
+
+def test_no_second_factory_starts_while_one_is_running():
+    """G-3：在途计算存续期间（哪怕租约已过期）绝不接纳第二个 leader。
+
+    修复前：过期 flight 被逐出并接纳新 leader，旧工厂仍在跑——重复扫描
+    自我放大。现约束：后到请求要么有界等待要么 504，绝不再启动同 key 的
+    第二个工厂；在途计算完成后为所有人发布。
+    """
+
+    key = ("no-duplicate-leader",)
+    started = threading.Event()
+    release = threading.Event()
+    factory_calls = 0
+
+    def slow_factory():
+        nonlocal factory_calls
+        factory_calls += 1
+        started.set()
+        assert release.wait(timeout=5)
+        return {"owner": "first"}
+
+    try:
+        with pytest.raises(opportunities.OpportunityScanTimeoutError):
+            opportunities._get_or_compute_scan(
+                key,
+                slow_factory,
+                lease_seconds=0.05,
+                wait_timeout_seconds=0.05,
+            )
+        assert started.wait(timeout=1)
+        # 租约已过期、工厂仍在执行：第二个调用绝不启动新工厂。
+        with pytest.raises(opportunities.OpportunityScanTimeoutError):
+            opportunities._get_or_compute_scan(
+                key,
+                lambda: pytest.fail("a second factory must never start"),
+                lease_seconds=1,
+                wait_timeout_seconds=1,
+            )
+        assert factory_calls == 1
+    finally:
+        release.set()
+
+    _wait_for_scan_cache_entry(key)
+    assert opportunities._get_or_compute_scan(
+        key,
+        lambda: pytest.fail("published result must be served from cache"),
+    ) == {"owner": "first"}
+
+
+def test_factory_error_clears_flight_and_next_caller_recomputes():
+    """失败不占坑：工厂异常清账后，下一位调用方可以立即重新计算。"""
+
+    key = ("error-clears-flight",)
+
+    with pytest.raises(RuntimeError, match="provider exploded"):
+        opportunities._get_or_compute_scan(
+            key,
+            lambda: (_ for _ in ()).throw(RuntimeError("provider exploded")),
+        )
+    with opportunities._scan_cache_lock:
+        assert key not in opportunities._scan_flights
+
+    assert opportunities._get_or_compute_scan(key, lambda: {"ok": True}) == {
+        "ok": True
+    }
 
 
 def test_daily_timeout_is_explicit_retryable_504(monkeypatch):
@@ -964,7 +1044,89 @@ def test_option_walls_return_ranked_observable_and_gamma_levels(monkeypatch):
             "nearest_expiry_atm_call_from_same_wall_snapshot"
         ),
     }
-    assert response.json()["schema_version"] == "option-wall/1.2"
+    assert response.json()["schema_version"] == "option-wall/1.3"
+
+    # option-wall/1.3: aggregate call/put ratios travel as additive facts with
+    # their metric basis; the fixture holds 1_000 call OI vs 1_500 put OI and
+    # 250 call volume vs 300 put volume.
+    assert item["totals"] == {
+        "call_oi": 1_000.0,
+        "put_oi": 1_500.0,
+        "call_volume": 250.0,
+        "put_volume": 300.0,
+    }
+    oi_ratio = item["ratios"]["call_put_oi_ratio"]
+    assert oi_ratio["value"] == pytest.approx(1_000 / 1_500)
+    assert oi_ratio["metric_basis"] == "settled_open_interest_prior_session"
+    assert oi_ratio["reason"] is None
+    volume_ratio = item["ratios"]["call_put_volume_ratio"]
+    assert volume_ratio["value"] == pytest.approx(250 / 300)
+    assert volume_ratio["metric_basis"] == "current_session_cumulative_volume"
+    # The untested-hypothesis caveat must ship verbatim with the ratios.
+    assert "尚未被检验" in item["ratios"]["caveat"]
+    assert item["ratios"]["caveat"] in item["limitations"]
+
+    # Σ(strike × OI) / Σ(OI) = (105×1000 + 95×1500) / 2500 = 99.0 — described
+    # as a weighted centre, never asserted to attract price.
+    center = item["oi_weighted_center"]
+    assert center["strike"] == pytest.approx(99.0)
+    assert center["validated_as_price_magnet"] is False
+    assert center["label"] == "未平仓分布的加权中心（描述，未验证是否有引力）"
+
+
+def test_option_walls_report_zero_denominator_ratio_as_null_with_reason(monkeypatch):
+    """A put-free window makes the ratio undefined — never 0, 1, or infinity."""
+
+    snapshot = _wall_snapshot()
+    calls_only = SimpleNamespace(
+        **{
+            **snapshot.__dict__,
+            "contracts": tuple(
+                contract
+                for contract in snapshot.contracts
+                if contract.right == "C"
+            ),
+        }
+    )
+    monkeypatch.setattr(opportunities, "_moomoo_opend_enabled", lambda: True)
+    monkeypatch.setattr(
+        opportunities,
+        "_compute_option_wall_moomoo",
+        lambda symbol, *, dte_min, dte_max: calls_only,
+    )
+
+    response = _client().post(
+        "/api/v1/opportunities/option-walls",
+        json={"symbols": ["nvda"], "dte_min": 0, "dte_max": 45},
+    )
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    for key in ("call_put_oi_ratio", "call_put_volume_ratio"):
+        ratio = item["ratios"][key]
+        assert ratio["value"] is None
+        assert ratio["denominator_total"] == 0.0
+        assert ratio["numerator_total"] > 0
+        assert "分母为 0" in ratio["reason"]
+
+
+def test_option_walls_disabled_reports_ratios_as_undefined(monkeypatch):
+    """A disabled read records nothing rather than zeros or a fake 1.0."""
+
+    monkeypatch.setattr(opportunities, "_moomoo_opend_enabled", lambda: False)
+
+    response = _client().post(
+        "/api/v1/opportunities/option-walls",
+        json={"symbols": ["nvda"], "dte_min": 0, "dte_max": 45},
+    )
+
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["state"] == "not_configured"
+    assert item["ratios"]["call_put_oi_ratio"]["value"] is None
+    assert item["ratios"]["call_put_oi_ratio"]["reason"]
+    assert item["oi_weighted_center"]["strike"] is None
+    assert item["oi_weighted_center"]["validated_as_price_magnet"] is False
 
 
 def test_option_wall_level_schema_accepts_legacy_levels_without_breakdown():

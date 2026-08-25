@@ -2,9 +2,23 @@
 """Explicit, append-only user reviews for immutable PositionEpisodes."""
 from __future__ import annotations
 
+import time
+from dataclasses import asdict
+from threading import Lock
+from typing import Optional
+
 from fastapi import APIRouter, HTTPException, Query
 
 from api.v1.schemas.journal_reviews import (
+    PersonalEdgeDisciplineModel,
+    PersonalEdgeDisciplineMonthModel,
+    PersonalEdgeDisciplineWindowModel,
+    PersonalEdgeDteBucketModel,
+    PersonalEdgeHoldBucketModel,
+    PersonalEdgeMonthlyBucketModel,
+    PersonalEdgeResponse,
+    PersonalEdgeRuleComplianceModel,
+    PersonalEdgeUnderlyingModel,
     PlaybookCandidateCreateRequest,
     PlaybookCandidateCreateResponse,
     PlaybookCandidateItem,
@@ -28,8 +42,23 @@ from api.v1.schemas.journal_reviews import (
     ReviewInsightThresholds,
     ReviewInsightUnreviewed,
     ReviewInsightsResponse,
+    RuleComplianceLaneStatModel,
+    RuleComplianceSliceModel,
+    RuleComplianceStatModel,
+    RulesEvidenceChosenParamsModel,
+    RulesEvidenceCorrelationModel,
+    RulesEvidenceDteHoldModel,
+    RulesEvidenceFeeThresholdModel,
+    RulesEvidenceHourModel,
+    RulesEvidencePositionModel,
+    RulesEvidencePriceBandModel,
+    RulesEvidenceResponse,
+    RulesEvidenceWeekdayModel,
 )
-from src.journal.ledger.episode_repository import EpisodeRepositoryError
+from src.journal.ledger.episode_repository import (
+    EpisodeRepositoryError,
+    _latest_build,
+)
 from src.journal.ledger.playbook_repository import (
     PlaybookConflictError,
     PlaybookEpisodeLink,
@@ -44,7 +73,20 @@ from src.journal.ledger.playbook_repository import (
     promote_candidate_to_rule,
     retire_playbook_rule,
 )
-from src.journal.ledger.repository import DEFAULT_LEDGER_ACCOUNT_KEY
+from src.journal.ledger.repository import (
+    DEFAULT_LEDGER_ACCOUNT_KEY,
+    init_ledger_schema,
+)
+from src.journal.personal_edge import (
+    PersonalEdgeResult,
+    RULE_SET_V2_ADOPTED_AT,
+    RuleComplianceSlice,
+    get_personal_edge_stats,
+)
+from src.journal.rules_evidence import (
+    RulesEvidenceResult,
+    get_rules_evidence,
+)
 from src.journal.ledger.review_insights import (
     DEFAULT_MIN_DISTINCT_TRADING_DAY_COUNT,
     DEFAULT_MIN_EPISODE_COUNT,
@@ -60,6 +102,7 @@ from src.journal.ledger.review_repository import (
     get_latest_review_annotation,
     list_review_annotation_history,
 )
+from src.storage import get_db
 
 
 router = APIRouter()
@@ -181,6 +224,399 @@ def get_review_insights(
         ),
         buckets=[_insight_bucket(bucket) for bucket in result.buckets],
     )
+
+
+# --- personal edge (个人画像回灌): zero-write descriptive stats --------------
+
+
+# In-process TTL cache: episodes are append-only per build, so a short cache
+# is safe; the response keeps computed_at so the as-of moment stays honest.
+_PERSONAL_EDGE_CACHE_TTL_SECONDS = 600.0
+# Key is (account_key, rule-compliance `since`, resolved default build id):
+# the forward slice is request-controlled, and the resolved build id makes a
+# build activation bust the cache naturally — without it, activating a new
+# build kept serving the old build's numbers for up to 10 minutes.
+_personal_edge_cache: dict[
+    tuple[str, str, Optional[int]],
+    tuple[float, PersonalEdgeResponse],
+] = {}
+_personal_edge_cache_lock = Lock()
+
+
+def _resolved_default_build_id(account_key: str) -> Optional[int]:
+    """Cheaply resolve the current default episode build id.
+
+    与其余 journal 读数同一解析（已激活 build，缺激活记录回落最新 CSV
+    build）。只发一次轻量 SELECT——把结果并入缓存键后，build 激活会让旧
+    缓存键自然失效，无需任何跨模块失效钩子。
+    """
+    init_ledger_schema()
+    db = get_db()
+    with db.session_scope() as session:
+        build = _latest_build(session, account_key)
+        return int(build.id) if build is not None else None
+
+
+def _reset_personal_edge_cache() -> None:
+    """Test hook: drop every cached personal-edge response."""
+    with _personal_edge_cache_lock:
+        _personal_edge_cache.clear()
+
+
+# --- 交易纪律证据页（/rules）: same clean basis, same zero-write contract ----
+_RULES_EVIDENCE_CACHE_TTL_SECONDS = 600.0
+# Key is (account_key, resolved build_id, ticket_usd, daily_breaker_usd,
+# max_concurrent): every request-controlled input changes the arithmetic, so
+# none of them may share a cache entry with another value.  An omitted
+# ``build_id`` is resolved to the effective default **before** the cache
+# lookup, so activating another build busts the cache instead of serving the
+# old build for up to 10 minutes.
+_rules_evidence_cache: dict[
+    tuple[str, Optional[int], int, int, int],
+    tuple[float, RulesEvidenceResponse],
+] = {}
+_rules_evidence_cache_lock = Lock()
+
+
+def _reset_rules_evidence_cache() -> None:
+    """Test hook: drop every cached rules-evidence response."""
+    with _rules_evidence_cache_lock:
+        _rules_evidence_cache.clear()
+
+
+def _compliance_slice(slice_: RuleComplianceSlice) -> RuleComplianceSliceModel:
+    """Project one compliance slice; ``asdict`` keeps the dataclass the truth."""
+    return RuleComplianceSliceModel(
+        state=slice_.state,
+        state_reason=slice_.state_reason,
+        start_date=slice_.start_date,
+        n=slice_.n,
+        lanes=[RuleComplianceLaneStatModel(**asdict(lane)) for lane in slice_.lanes],
+        verdicts=[
+            RuleComplianceStatModel(**asdict(verdict))
+            for verdict in slice_.verdicts
+        ],
+    )
+
+
+def _personal_edge_response(
+    account_key: str,
+    result: PersonalEdgeResult,
+) -> PersonalEdgeResponse:
+    return PersonalEdgeResponse(
+        data_state="ready",
+        account_key=result.account_key or account_key,
+        build_id=result.build_id,
+        build_key=result.build_key,
+        source_kind=result.source_kind,
+        computed_at=result.computed_at,
+        first_opened_at=result.first_opened_at,
+        last_closed_at=result.last_closed_at,
+        closed_episode_count=result.closed_episode_count,
+        excluded_open_count=result.excluded_open_count,
+        excluded_missing_pnl_count=result.excluded_missing_pnl_count,
+        underlying_min_episode_count=result.underlying_min_episode_count,
+        underlyings=[
+            PersonalEdgeUnderlyingModel(
+                underlying=item.underlying,
+                n=item.n,
+                net=item.net,
+                win_rate=item.win_rate,
+                fees=item.fees,
+            )
+            for item in result.underlyings
+        ],
+        small_sample_underlying_count=result.small_sample_underlying_count,
+        hold_time_buckets=[
+            PersonalEdgeHoldBucketModel(
+                bucket=item.bucket,
+                n=item.n,
+                net=item.net,
+                win_rate=item.win_rate,
+                avg_win=item.avg_win,
+                avg_loss=item.avg_loss,
+            )
+            for item in result.hold_time_buckets
+        ],
+        hold_unknown_count=result.hold_unknown_count,
+        dte_buckets=[
+            PersonalEdgeDteBucketModel(
+                bucket=item.bucket,
+                n=item.n,
+                net=item.net,
+                win_rate=item.win_rate,
+            )
+            for item in result.dte_buckets
+        ],
+        dte_unknown=PersonalEdgeDteBucketModel(
+            bucket=result.dte_unknown.bucket,
+            n=result.dte_unknown.n,
+            net=result.dte_unknown.net,
+            win_rate=result.dte_unknown.win_rate,
+        ),
+        monthly=[
+            PersonalEdgeMonthlyBucketModel(
+                month=item.month,
+                n=item.n,
+                net=item.net,
+                fees=item.fees,
+                win_rate=item.win_rate,
+            )
+            for item in result.monthly
+        ],
+        discipline=PersonalEdgeDisciplineModel(
+            monthly=[
+                PersonalEdgeDisciplineMonthModel(
+                    month=item.month,
+                    **asdict(item.stats),
+                )
+                for item in result.discipline.monthly
+            ],
+            current_window=PersonalEdgeDisciplineWindowModel(
+                requested_trading_days=(
+                    result.discipline.current_window.requested_trading_days
+                ),
+                start_date=result.discipline.current_window.start_date,
+                end_date=result.discipline.current_window.end_date,
+                **asdict(result.discipline.current_window.stats),
+            ),
+            body_trim_count=result.discipline.body_trim_count,
+            body_min_episode_count=result.discipline.body_min_episode_count,
+            exclude_top_n=result.discipline.exclude_top_n,
+            fill_detailed_governs=result.discipline.fill_detailed_governs,
+        ),
+        rule_compliance=PersonalEdgeRuleComplianceModel(
+            rule_set_id=result.rule_compliance.rule_set_id,
+            adopted_at=result.rule_compliance.adopted_at,
+            clean_basis_start=result.rule_compliance.clean_basis_start,
+            clean_basis_reason=result.rule_compliance.clean_basis_reason,
+            population_n=result.rule_compliance.population_n,
+            excluded_before_clean_basis_count=(
+                result.rule_compliance.excluded_before_clean_basis_count
+            ),
+            excluded_aggregate_or_unknown_basis_count=(
+                result.rule_compliance.excluded_aggregate_or_unknown_basis_count
+            ),
+            excluded_missing_premium_count=(
+                result.rule_compliance.excluded_missing_premium_count
+            ),
+            exclude_top_n=result.rule_compliance.exclude_top_n,
+            exclude_top_n_min_episode_count=(
+                result.rule_compliance.exclude_top_n_min_episode_count
+            ),
+            intraday_lane_dte=result.rule_compliance.intraday_lane_dte,
+            intraday_lane_et_cutoff_hour=(
+                result.rule_compliance.intraday_lane_et_cutoff_hour
+            ),
+            overnight_lane_min_dte=result.rule_compliance.overnight_lane_min_dte,
+            overnight_lane_max_dte=result.rule_compliance.overnight_lane_max_dte,
+            overnight_lane_weak_entry_et_hours=list(
+                result.rule_compliance.overnight_lane_weak_entry_et_hours
+            ),
+            all_history=_compliance_slice(result.rule_compliance.all_history),
+            since_adoption=_compliance_slice(
+                result.rule_compliance.since_adoption
+            ),
+            limitations=list(result.rule_compliance.limitations),
+        ),
+        month_basis=result.month_basis,
+        limitations=list(result.limitations),
+    )
+
+
+@router.get("/v2/personal-edge", response_model=PersonalEdgeResponse)
+def get_personal_edge(
+    account_key: str = Query(
+        DEFAULT_LEDGER_ACCOUNT_KEY,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    ),
+    since: str = Query(
+        RULE_SET_V2_ADOPTED_AT,
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+        description=(
+            "车道遵守度前向切片的起点（ET 自然日）；默认＝规则 v2 采纳日。"
+            "只影响 rule_compliance.since_adoption，不影响任何既有字段。"
+        ),
+    ),
+) -> PersonalEdgeResponse:
+    """个人画像回灌：当前默认 build 已平仓回合的零写描述统计。
+
+    Per-underlying / hold-time / DTE / monthly buckets plus the additive
+    ``discipline`` block (规模与频率：每美元回报 + 仓位 + 频率 + 本体/尾部 +
+    成交明细来源，按月与近 20 个交易日窗口) and the additive ``rule_compliance``
+    block (车道遵守度：把本人规则 v2 的车道判定与合规/违规每美元读数按干净口径
+    摊开，全历史 + 采纳后两个切片) recomputed from the same effective default
+    build the other journal reads use, cached in-process for ~10 minutes per
+    ``(account_key, since)``.  Descriptive only — never a signal, never a
+    filter, and no order is ever placed; the endogeneity, reconstructed-fill,
+    single-regime and fail-closed caveats ship verbatim in ``limitations``.
+    """
+    # 便宜地先解析默认 build：激活另一个 build 会改变这个 id，从而天然
+    # 换到新的缓存键——绝不让旧 build 的数字在激活后再被端上来。
+    try:
+        resolved_build_id = _resolved_default_build_id(account_key)
+    except EpisodeRepositoryError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    now = time.monotonic()
+    cache_key = (account_key, since, resolved_build_id)
+    with _personal_edge_cache_lock:
+        cached = _personal_edge_cache.get(cache_key)
+        if cached is not None and now - cached[0] < _PERSONAL_EDGE_CACHE_TTL_SECONDS:
+            return cached[1]
+    try:
+        result = get_personal_edge_stats(account_key, rule_compliance_since=since)
+    except EpisodeRepositoryError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if result is None:
+        # 未构建不进缓存：导入后第一次构建完成即可立刻看到数据。
+        return PersonalEdgeResponse(
+            data_state="not_built",
+            account_key=account_key,
+        )
+    response = _personal_edge_response(account_key, result)
+    with _personal_edge_cache_lock:
+        _personal_edge_cache[cache_key] = (now, response)
+    return response
+
+
+def _rules_evidence_response(
+    account_key: str,
+    result: RulesEvidenceResult,
+) -> RulesEvidenceResponse:
+    """Transport shell only — every number is already computed in the reader."""
+
+    return RulesEvidenceResponse(
+        data_state="ready",
+        account_key=result.account_key or account_key,
+        build_id=result.build_id,
+        build_key=result.build_key,
+        source_kind=result.source_kind,
+        computed_at=result.computed_at,
+        clean_basis_start=result.clean_basis_start,
+        clean_basis_reason=result.clean_basis_reason,
+        rule_set_adopted_at=result.rule_set_adopted_at,
+        sample_episode_count=result.sample_episode_count,
+        excluded_before_clean_basis=result.excluded_before_clean_basis,
+        excluded_aggregate_or_unknown_basis=(
+            result.excluded_aggregate_or_unknown_basis
+        ),
+        excluded_missing_premium=result.excluded_missing_premium,
+        excluded_not_closed_or_missing_pnl=(
+            result.excluded_not_closed_or_missing_pnl
+        ),
+        fee_unknown_count=result.fee_unknown_count,
+        first_trading_day=result.first_trading_day,
+        last_trading_day=result.last_trading_day,
+        banner=result.banner,
+        price_band_headline=result.price_band_headline,
+        price_band_boundary_policy=result.price_band_boundary_policy,
+        price_bands=[
+            RulesEvidencePriceBandModel(**asdict(row)) for row in result.price_bands
+        ],
+        hold_style_basis=result.hold_style_basis,
+        dte_hold_lanes=[
+            RulesEvidenceDteHoldModel(**asdict(row)) for row in result.dte_hold_lanes
+        ],
+        et_hours=[RulesEvidenceHourModel(**asdict(row)) for row in result.et_hours],
+        weekday_headline=result.weekday_headline,
+        weekdays=[
+            RulesEvidenceWeekdayModel(**asdict(row)) for row in result.weekdays
+        ],
+        fee_threshold=RulesEvidenceFeeThresholdModel(
+            **asdict(result.fee_threshold)
+        ),
+        position=RulesEvidencePositionModel(**asdict(result.position)),
+        correlation=RulesEvidenceCorrelationModel(**asdict(result.correlation)),
+        overnight_gap_note=result.overnight_gap_note,
+        limitations=list(result.limitations),
+    )
+
+
+@router.get("/v2/rules-evidence", response_model=RulesEvidenceResponse)
+def get_rules_evidence_endpoint(
+    account_key: str = Query(
+        DEFAULT_LEDGER_ACCOUNT_KEY,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    ),
+    build_id: Optional[int] = Query(
+        None,
+        ge=1,
+        description=(
+            "显式指定要读的 episode build；缺省走与其余 journal 读数相同的默认解析"
+            "（已激活 build，无激活记录时回落到最新 CSV build）。响应始终回显 "
+            "build_id/build_key，页面据此显示「这页在读哪个 build」。"
+        ),
+    ),
+    ticket_usd: int = Query(
+        3000,
+        ge=1,
+        le=1_000_000,
+        description="你选择的单笔金额（用于熔断触发算术）；不落库、不改变样本。",
+    ),
+    daily_breaker_usd: int = Query(
+        6000,
+        ge=1,
+        le=10_000_000,
+        description="你选择的每日熔断额度；不落库、不改变样本。",
+    ),
+    max_concurrent: int = Query(
+        2,
+        ge=1,
+        le=100,
+        description="你选择的最大并发持仓数；仅用于相关性提醒的文案。",
+    ),
+) -> RulesEvidenceResponse:
+    """「交易纪律」页的证据读数：与车道遵守度同一干净口径的零写聚合。
+
+    合约价格甜蜜区 / DTE × 持有方式 / 时段 / 星期 × 0DTE 可用性 / 手续费门槛 /
+    仓位与回撤算术 / 相关性簇，全部在后端算完并按 ``(account_key, build_id,
+    参数)`` 缓存 ~10 分钟。纯描述统计——不是建议、不是信号、不参与任何排序或
+    下单；单一 regime、样本内拟合与 fail-closed 的告警随 ``limitations`` 原样下发。
+    """
+    # 缺省 build_id 先解析成当前默认 build 再查缓存：激活另一个 build 会
+    # 改变解析结果，缓存键随之更换——激活即失效，无需失效钩子。
+    resolved_build_id = build_id
+    if resolved_build_id is None:
+        try:
+            resolved_build_id = _resolved_default_build_id(account_key)
+        except EpisodeRepositoryError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    now = time.monotonic()
+    cache_key = (
+        account_key,
+        resolved_build_id,
+        ticket_usd,
+        daily_breaker_usd,
+        max_concurrent,
+    )
+    with _rules_evidence_cache_lock:
+        cached = _rules_evidence_cache.get(cache_key)
+        if cached is not None and now - cached[0] < _RULES_EVIDENCE_CACHE_TTL_SECONDS:
+            return cached[1]
+    try:
+        result = get_rules_evidence(
+            account_key,
+            build_id=build_id,
+            ticket_usd=ticket_usd,
+            daily_breaker_usd=daily_breaker_usd,
+            max_concurrent=max_concurrent,
+        )
+    except EpisodeRepositoryError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if result is None:
+        # 未构建不进缓存：导入后第一次构建完成即可立刻看到数据。
+        return RulesEvidenceResponse(
+            data_state="not_built",
+            account_key=account_key,
+        )
+    response = _rules_evidence_response(account_key, result)
+    with _rules_evidence_cache_lock:
+        _rules_evidence_cache[cache_key] = (now, response)
+    return response
 
 
 @router.get(

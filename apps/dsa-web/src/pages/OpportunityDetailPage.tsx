@@ -12,6 +12,8 @@ import {
 } from '../api/opportunities';
 import { stocksApi } from '../api/stocks';
 import { CandlestickChart, type Candle, type MAOverlay } from '../components/charts/CandlestickChart';
+import { NearExpiryContractPanel } from '../components/opportunities/NearExpiryContractPanel';
+import { OptionWallRatioPanel } from '../components/opportunities/OptionWallRatioPanel';
 import { WallLevelExpiryBreakdown } from '../components/opportunities/WallLevelExpiryBreakdown';
 import { Tabs } from '../components/ui';
 import type {
@@ -288,6 +290,8 @@ const OpportunityDetailPage: React.FC = () => {
   const [wall, setWall] = useState<OpportunityOptionWallItem | null>(null);
   const [wallLoading, setWallLoading] = useState(true);
   const [wallError, setWallError] = useState<string | null>(null);
+  // 临期合约面板按需展开：只有用户显式点击才发起 0–3 DTE 合约读取。
+  const [nearExpiryOpen, setNearExpiryOpen] = useState(false);
   const [eventItem, setEventItem] = useState<OpportunityOptionEventItem | null>(null);
   const [eventsLoading, setEventsLoading] = useState(true);
   const [eventsError, setEventsError] = useState<string | null>(null);
@@ -505,7 +509,7 @@ const OpportunityDetailPage: React.FC = () => {
   return (
     <div className="min-h-full bg-bg-0">
       <header className="border-b border-subtle bg-bg-1 px-4 py-4 sm:px-6">
-        <div className="mx-auto flex max-w-[1600px] flex-wrap items-start justify-between gap-4">
+        <div className="mx-auto flex max-w-[1720px] flex-wrap items-start justify-between gap-4">
           <div className="flex items-start gap-3">
             <button
               type="button"
@@ -553,7 +557,7 @@ const OpportunityDetailPage: React.FC = () => {
         </div>
       </header>
 
-      <main className="mx-auto max-w-[1600px] space-y-4 p-4 sm:p-6">
+      <main className="mx-auto max-w-[1720px] space-y-4 p-4 sm:p-6">
         <section
           className="flex flex-wrap items-center gap-x-5 gap-y-1 border border-subtle bg-bg-1 px-4 py-2 text-caption text-text-3"
           aria-label="数据时点"
@@ -934,6 +938,9 @@ const OpportunityDetailPage: React.FC = () => {
                 {!wallLoading && !wallError && wall && (wall.state === 'ready' || wall.state === 'partial') && (
                   <>
                     {wall.state === 'partial' && <div className="mb-4 border-l-2 border-warn-strong pl-3 text-caption text-text-2">链覆盖不完整，请结合覆盖率和失败批次数解读。</div>}
+                    <div className="mb-5 max-w-xl">
+                      <OptionWallRatioPanel item={wall} />
+                    </div>
                     <div className="grid gap-x-10 gap-y-6 md:grid-cols-2 xl:grid-cols-3">
                       {PRIMARY_WALL_KEYS.map((key) => (
                         <WallTable key={key} title={WALL_TITLES[key]} levels={wall.walls[key]} />
@@ -954,6 +961,23 @@ const OpportunityDetailPage: React.FC = () => {
                 )}
                 {!wallLoading && !wallError && wall && wall.state !== 'ready' && wall.state !== 'partial' && (
                   <p className="text-body-sm text-text-3">{wall.message}</p>
+                )}
+                {ticker && (
+                  <div className="mt-4 border-t border-subtle pt-3">
+                    <button
+                      type="button"
+                      onClick={() => setNearExpiryOpen((current) => !current)}
+                      className="rounded-ds-sm border border-subtle px-2 py-1 text-caption text-text-2 hover:bg-bg-2 hover:text-text-1"
+                      aria-expanded={nearExpiryOpen}
+                    >
+                      查看临期合约（0–3 DTE）{nearExpiryOpen ? ' ▴' : ' ▾'}
+                    </button>
+                    {nearExpiryOpen && (
+                      <div className="mt-3">
+                        <NearExpiryContractPanel symbol={ticker} />
+                      </div>
+                    )}
+                  </div>
                 )}
               </div>
             )}

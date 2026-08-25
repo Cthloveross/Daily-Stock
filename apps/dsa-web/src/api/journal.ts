@@ -2,6 +2,7 @@ import apiClient from './index';
 import { toCamelCase } from './utils';
 import { sessionCache } from '../utils/sessionCache';
 import type {
+  EdgePanelResponse,
   HealthCheckItem,
   ImportResponse,
   MoomooStatementPreview,
@@ -28,6 +29,7 @@ import type {
   PositionEpisodeAiReviewUserContext,
   PositionEpisodeFilters,
   PositionEpisodeListResponse,
+  PersonalEdgeResponse,
   PositionEpisodeReviewAnnotationHistoryResponse,
   PositionEpisodeReviewAnnotationLatestResponse,
   EpisodePlaybookLinksResponse,
@@ -39,6 +41,7 @@ import type {
   RetirePlaybookRuleResponse,
   RealityTestResponse,
   ReviewInsightsResponse,
+  RulesEvidenceResponse,
   SavePositionEpisodeReviewAnnotationRequest,
   SavePositionEpisodeReviewAnnotationResponse,
   TradeItem,
@@ -286,6 +289,54 @@ export async function fetchReviewInsights(): Promise<ReviewInsightsResponse> {
   return toCamelCase<ReviewInsightsResponse>(data);
 }
 
+/**
+ * 个人画像回灌（你的战绩）：默认 build 已平仓回合的描述统计。
+ *
+ * 会话缓存 TTL 收紧为 2 分钟（不是默认 10 分钟）：请求发出前无从得知
+ * 服务端默认 build 会解析到谁，缓存键里放不进 buildId——激活另一个 build
+ * 后，长 TTL 会让旧 build 的数字在页面上多活 10 分钟。选择短 TTL 而不是
+ * 键里塞 buildId，是两个诚实选项里更简单的那个（服务端缓存键已含解析后的
+ * build id，激活即失效）。not_built 不缓存（构建完成立即可见）。
+ */
+const PERSONAL_EDGE_CACHE_TTL_MS = 2 * 60 * 1000;
+
+export async function fetchPersonalEdge(refresh = false): Promise<PersonalEdgeResponse> {
+  const key = 'journal:personal-edge';
+  if (!refresh) {
+    const cached = sessionCache.get<PersonalEdgeResponse>(key);
+    if (cached) return cached;
+  }
+  const { data } = await apiClient.get(`${BASE}/v2/personal-edge`);
+  const camel = toCamelCase<PersonalEdgeResponse>(data);
+  if (camel.dataState === 'ready') {
+    sessionCache.set(key, camel, PERSONAL_EDGE_CACHE_TTL_MS);
+  }
+  return camel;
+}
+
+/**
+ * 交易纪律证据表（/rules 页）：与车道遵守度同一干净口径的后端读数。
+ *
+ * 所有统计量都在后端算完，前端只渲染。可选参数只改变「熔断触发算术」，
+ * 不改变样本；它们不落库，也不代表系统知道你的账户规模。
+ */
+export async function fetchRulesEvidence(
+  params: {
+    buildId?: number;
+    ticketUsd?: number;
+    dailyBreakerUsd?: number;
+    maxConcurrent?: number;
+  } = {},
+): Promise<RulesEvidenceResponse> {
+  const query: Record<string, number> = {};
+  if (params.buildId !== undefined) query.build_id = params.buildId;
+  if (params.ticketUsd !== undefined) query.ticket_usd = params.ticketUsd;
+  if (params.dailyBreakerUsd !== undefined) query.daily_breaker_usd = params.dailyBreakerUsd;
+  if (params.maxConcurrent !== undefined) query.max_concurrent = params.maxConcurrent;
+  const { data } = await apiClient.get(`${BASE}/v2/rules-evidence`, { params: query });
+  return toCamelCase<RulesEvidenceResponse>(data);
+}
+
 export async function fetchPlaybook(): Promise<PlaybookListResponse> {
   const { data } = await apiClient.get(`${BASE}/v2/playbook`);
   return toCamelCase<PlaybookListResponse>(data);
@@ -502,4 +553,11 @@ export async function askJournalQa(req: JournalQaRequest): Promise<JournalQaResp
     { timeout: 60000 },
   );
   return toCamelCase<JournalQaResponse>(data);
+}
+
+export async function fetchEdgePanel(): Promise<EdgePanelResponse> {
+  // 文档 16 固定契约：响应保持 snake_case 原样，不过 toCamelCase——
+  // camelcase-keys 会把 "0-1"/"2-7" 分桶键与 allow_0_1dte 改写掉。
+  const { data } = await apiClient.get(`${BASE}/edge-panel`);
+  return data as EdgePanelResponse;
 }

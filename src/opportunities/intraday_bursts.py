@@ -1,0 +1,1214 @@
+# -*- coding: utf-8 -*-
+"""Pure rolling 15-minute momentum-burst (波段爆发) detection on 5m bars.
+
+This module never fetches data.  Callers inject a symbol's raw 5m bars (the
+same rows the ``/stocks/{code}/history?period=5m`` loader returns, ``date`` as
+timezone-aware ISO 8601 strings) and get back a deterministic per-session
+burst profile:
+
+- **normalisation medians**: ``median_bar_range`` = median(high−low) and
+  ``median_bar_volume`` = median(volume) over the current session's bars so
+  far; when fewer than :data:`MEDIAN_FALLBACK_MIN_BARS` bars exist today the
+  prior session's bars supply both medians (explicit ``median_basis`` label);
+- **rolling window**: for each 3-bar (15-minute) window,
+  ``thrust_norm = |close_end − open_start| / median_bar_range``,
+  ``vol_norm = window volume / (3 × median_bar_volume)``,
+  ``burst_score = thrust_norm × vol_norm``, direction = sign of the thrust;
+- **current burst** = the latest window; **session legs** = the top distinct
+  windows (score ≥ :data:`LEG_MIN_SCORE`, window starts ≥
+  :data:`LEG_MIN_GAP_MINUTES` apart, at most :data:`LEG_MAX_COUNT`).
+
+Calibration basis (2026-07-31 regular session, legs labelled by the user,
+bars captured from the real history loader into
+``tests/fixtures/intraday_5m_2026-07-31_regular.json``):
+
+===========================  =========  ======================================
+labelled leg                 score      note
+===========================  =========  ======================================
+MU    09:45 plunge (down)      35.5     −5.2% in 15min @ 4.6× volume
+AMZN  09:30 opening wave (up)  18.7     @ 5.6× volume
+NVDA  09:40 wave (down)         9.3     first of two labelled waves
+NVDA  15:15 wave (up)           8.6     late-day second wave
+GOOGL best window (09:30)      15.2     v1 failure case: full-session
+                                        aggregates ranked GOOGL first even
+                                        though its best 15min burst is far
+                                        below MU's plunge
+===========================  =========  ======================================
+
+``LEG_MIN_SCORE = 8.0`` is the largest round number every labelled leg still
+clears (binding constraint: NVDA 15:15 at 8.6).  ``BURST_SUPPORT_MIN = 6.0``
+sits one notch below so a developing burst flags "supports" up to one bar
+before it fully clears the leg bar (NVDA's 09:35 run-up window scored 6.3).
+Both are documented v2 heuristics for research prioritisation — not validated
+edges, not signals; changing either must bump the intraday-top
+``signal_version``.
+
+近 30 分钟位移（recent displacement, v6）
+----------------------------------------
+
+同一批 5m K 线还回答另一个问题：**这个标的现在到底有没有在动**。
+
+证据来源是用户自己的 766 笔期权回合（2026-06-08→07-31，Journal build #3
+取证分析）：进场**几何**（追高 vs 回调）对结果没有预测力，真正把结果分开
+的是进场之后的**位移**——
+
+===============================  ==========  ==========  =====================
+分组                             30 分钟前向  30 分钟前向  达到 ≥0.5 ATR 有利位移
+                                 MFE 中位     MAE 中位
+===============================  ==========  ==========  =====================
+速死亏损单（持仓 <30 分钟）        0.18 ATR    −0.49 ATR   18.3%
+走出来的赢家（持仓 30 分钟–3 小时） 0.69 ATR    −0.13 ATR   71.2%
+===============================  ==========  ==========  =====================
+
+该样本 **84% 的合约 ≤1DTE**：进场后 30 分钟还不动的仓位在结构上已经死了，
+时间价值不会等人。因此工作台按标的给出「它**已经**在不在动」，并且用与那份
+取证分析**同一把 ATR 标尺**度量，把 0.5 ATR 画成用户自己的经验「活下来」线。
+
+.. warning::
+   **上面这段「活下来」的说法已被 v8 更正推翻，不要单独引用**——那张表按持仓
+   时长分组，循环性是构造性的；诚实记分下差异只剩 ~0.1pp。必读下方「近 30 分位移
+   的循环性更正（v8）」。0.5 现在只是**参考刻度**，不是存活门槛。
+
+口径（:func:`compute_recent_displacement`）：取当前时段（休市取最近一个交易
+时段）最后 :data:`DISPLACEMENT_WINDOW_BARS` 根 5m K 线，以窗口首根 K 线开盘价
+作为「30 分钟前的价格」参考点，输出 ``high_excursion`` /``low_excursion`` /
+``net_move`` /``abs_range`` 四个 ATR 归一化读数。ATR 标尺优先用日线 ATR14
+（``atr14_daily``，与取证分析同源）；缺失时按 v7 顺序回退——先用上一批交易时段
+真实波幅均值（``prior_sessions_true_range_mean``，日线量级、当日内恒定），无上一
+时段时才落回取证分析用过的盘中代理（最近 20 根 5m K 线波幅均值 × 3，
+``intraday_20bar_proxy_x3``）——并显式标注用了哪一种及其可比性
+（``atr_scale_comparability``）；全都不可得时显式 ``unavailable`` + 原因，
+绝不 0 回填。
+
+诚实边界：这是对**过去 30 分钟已经发生的事**的描述统计——不是预测、不是买卖
+信号；0.5 这条线来自用户自己**最差两个月**的回溯样本，且分组本身按持仓时长
+定义（与结果存在循环性）；K 线为非官方 5m 聚合。
+
+哑火形态与 ATR 标尺可比性（v7）
+--------------------------------
+
+2026-08 的起速回放研究（9,173 次爆发起点，21 个标的 × 123 个交易时段，
+2026-02-05→08-03，用户自己的 Moomoo 5m K 线，逐根重放、无未来函数，窗口口径
+直接复用本模块）给出的**首要结论是否定的**：
+
+- **起速那一刻分不出方向**。30 分钟后净位移仍在爆发方向的概率 = 50.6%；
+  19 个候选判别因子对「方向」的 AUC 全部落在 0.48–0.52。
+- 有利与不利偏移**同幅放大**：全样本 MFE/|MAE| 中位数 = 1.026——看起来像
+  「延续概率」的东西，实际只是**波动率读数穿了方向的外衣**。
+
+因此本模块**不提供**任何延续概率、真假速度评分或方向判断。经时间有序的样本外
+验证（Feb–May 拟合、Jun–Aug 检验）活下来的只有两件事，也就是 v7 只做的两件事：
+
+1. **哑火形态**（:func:`compute_fizzle_flag`）——``stratum == "intraday"`` 且
+   ``efficiency ≥ 0.9`` 且 ``vol_norm < 2.0`` 的当前窗口，30 分钟内达到
+   ≥0.5 ATR 有利位移的比例只有 26.8%（样本内 Feb–May，n=291）与 25.4%
+   （样本外 Jun–Aug，n=177），而同期基准为 47.8% / 50.5%；方向一致性
+   20/20 个标的、6/6 个月，且在三把标尺（生产盘中代理、重建日线 ATR14、
+   原始百分比）下同号。读法：**一段几乎不回撤、量能却平平的干净盘中推升——
+   最像「真速度」的形态，恰恰是这份样本里最常哑火的形态**。
+2. **ATR 标尺可比性修正**（见下）。
+
+同一研究还量化了本模块 ATR 回退代理的标定缺陷：``最近 20 根 5m 波幅均值 × 3``
+与真实日线 ATR14 之比在盘中从 0.28 → 0.42 → 0.20 漂移（开盘 / 10:30–11:00 /
+14:00–15:30），换算成同口径比较时 10:30–11:00 被低估约 18–20pp、15:00–15:30
+被高估约 10–15pp。v7 因此把回退顺序改为「日线 ATR14 → 上一批交易时段真实波幅
+均值（日线量级、当日内恒定）→ 旧盘中代理（仅在无上一时段时兜底）」，并在
+``atr_scale_comparability`` 上显式标注该读数能否与 ATR14 口径横向比较。
+**日线 ATR14 主路径的数值口径逐字未变。**
+
+K 线时间戳口径修正（v8）
+------------------------
+
+2026-08-04 用只读 OpenD 独立复核后确认：**Moomoo ``request_history_kline`` 的
+``time_key`` 是这根 K 线的结束时间**，而本模块自始至终按开始时间计算。三条互相
+独立的证据（NVDA/AAPL/MU/AMZN/GOOGL，2026-07-27→08-03）：
+
+1. **官方日线对齐**（决定性）：日线开盘价 == 标签 ``09:35`` 那根的开盘价，
+   日线收盘价 == 标签 ``16:00`` 那根的收盘价，**25/25 个标的-交易日逐分钱吻合**；
+   按开始时间解释（09:30 / 15:55）则 0/25 吻合。
+2. **成交量剖面**：标签 ``09:35`` 的中位量是标签 ``09:30`` 的 15–25 倍（开盘集合
+   竞价落在 09:35），标签 ``16:00`` 是全天最大（收盘集合竞价），标签 ``09:30``
+   只有几十万股——典型盘前量。
+3. **延伸时段端点**：首/末标签是 ``04:05`` 与 ``20:00``，而非 ``04:00`` 与 ``19:55``。
+
+后果：``09:30 ≤ 标签 < 16:00`` 在结束时间口径下实际取的是 **09:25–15:55**——
+多一根盘前 K 线、少一根收盘集合竞价。修正放在数据进入本模块**之前**
+（:func:`normalize_bar_label_convention`，只对已知按结束时间打标的源生效），
+本模块内部因此保持单一 start 口径。
+
+这次修正会**改变数值**：所有窗口、中位数、波段标签、速度与位移读数整体前移
+一根 K 线并换掉两侧边界样本。2026-07-31 校准 fixture 重跑结果（前 → 后）：
+MU 跳水 09:45→09:40（35.51→35.44，−5.18% @4.61×，与用户标注的 −5.2%/4.6× 反而
+更贴）、NVDA 两波 09:40→09:35 与 15:15→15:10、GOOGL 反例仍远弱于 MU 跳水——
+**阈值无需重新校准**。唯一变化的是 AMZN 开盘波：修正前那个标签 09:30 的窗口
+真实覆盖 09:25–09:40 且恰好收在日内尖顶，score 18.72；修正后真正的 09:30–09:45
+窗口 score 8.56，**仍 ≥ 强波段阈值 8.0**，只是被 15 分钟后分更高的窗口（11.05）
+按 30 分钟去重规则挤出 legs。详见 ``tests/test_intraday_bursts.py``。
+
+近 30 分位移的循环性更正（v8）
+------------------------------
+
+上面 v6 那张表（速死 18.3% vs 走出来 71.2%）**按持仓时长分组**，而持仓时长本身
+由结果决定——循环性是构造性的。2026-08 的 2m 回放研究用同一套机器把这份循环性
+量化了出来（3,492 次 EMA8/13 回踩持稳进场，21 标的 × 123 时段）：
+
+- **循环记分**（用整段 30 分钟窗口内速度是否存活去判该窗口的结果）：速度未死
+  均值 +0.071 / P(>0) 54.4%，速度已死 −0.476 / 16.8%——**37.6 个百分点**的鸿沟；
+- **诚实记分**（只从第 15 分钟检查点**向前**计分）：+0.005 / 49.9% vs
+  −0.013 / 49.8%——**0.1 个百分点**；
+- 样本内那点微弱的检查点效应**样本外直接反号**（样本内「第 5 分钟已走 ≥0.3 ATR」
+  → 其后 +0.122；样本外同一条件 → −0.128）。
+
+也就是说，**肉眼可见的那道鸿沟几乎全部是循环性**。位移读数本身仍然是对过去 30
+分钟的**诚实描述**（用户要的就是「它在不在动」）；不诚实的是让 0.5 这条线暗示
+「越过它就能活下来」。因此 v8 保留读数与 0.5 参考线，但**删除全部存活框架**：
+弱化态文案从「未达 0.5」改为纯描述的「不足 0.5 ATR」，tooltip 与完整口径以这条
+更正**开头**，并明确该列不承载任何前向信息。
+"""
+from __future__ import annotations
+
+import math
+import statistics
+from datetime import datetime, timedelta
+from typing import Any, Mapping, Optional, Sequence
+from zoneinfo import ZoneInfo
+
+_NEW_YORK = ZoneInfo("America/New_York")
+
+# 滚动窗口：3 根 5 分钟 K 线 = 15 分钟。
+BURST_WINDOW_BARS = 3
+BURST_BAR_MINUTES = 5
+BURST_WINDOW_MINUTES = BURST_WINDOW_BARS * BURST_BAR_MINUTES
+# 当日 K 线不足 6 根时（开盘前 30 分钟内），中位数基准回退到上一交易时段，
+# 避免用 2-3 根开盘 K 线自证归一化分母。
+MEDIAN_FALLBACK_MIN_BARS = 6
+# 记为「强波段」的最低 burst_score（校准依据见模块 docstring 表格：
+# 2026-07-31 用户标注的暴动波全部 ≥8.56）。
+LEG_MIN_SCORE = 8.0
+# 记为「中波段」的最低 burst_score。v2 分级校准：2026-08-03 上午 NVDA
+# 09:55→10:25 的真实可交易推升（用户实时指认「这一波应该有记录」）峰值
+# 5.03、持续段 2.5-3.1，而同日无波时段窗口 <1.1 —— 2.5 收录该波全程且
+# 不触及静默期。中波段只是记录与展示分级，不改变 supports 口径。
+LEG_MEDIUM_MIN_SCORE = 2.5
+# 当前窗口记为 supports 的最低 burst_score（比 LEG_MIN_SCORE 低一档，
+# 让正在发展中的爆发提前一根 K 线亮起）。
+BURST_SUPPORT_MIN = 6.0
+# 两个独立波段的窗口起点至少相隔 30 分钟，否则视为同一波并合并。
+LEG_MIN_GAP_MINUTES = 30
+# 单一交易时段最多报告 4 个波段（强弱合计，强波段优先保留）。
+LEG_MAX_COUNT = 4
+
+BURST_BASIS = "rolling_15m_thrust_over_median_range_times_volume_ratio"
+MEDIAN_BASIS_CURRENT = "current_session_bars_so_far"
+MEDIAN_BASIS_PRIOR = "prior_session_fallback"
+
+# v3 速度分级：相邻两个滚动 15 分钟窗口的爆发分之差。用户纪律（Playbook
+# 候选 R1）是「日内只交易加速；2 分钟级速度的波在 1 分钟速度熄火时离场」——
+# 本仓库的 K 线是 5 分钟粒度，诚实 v1 只能给出 5m 窗口级的加速/减速近似，
+# 不是 1m/2m 秒级速度；减速标签是用户自己的离场提示，不是系统信号。
+SPEED_BASIS = "consecutive_rolling_15m_window_burst_score_delta_5m_bars"
+
+# ---------------------------------------------------------------------------
+# v6 近 30 分钟位移（recent displacement）。
+#
+# 校准依据（用户自己的 766 笔期权回合，2026-06-08→07-31，Journal build #3
+# 取证分析；详见模块 docstring 的表格）：进场几何无预测力，进场后 30 分钟的
+# 位移把结果分得很开——速死亏损单（<30 分钟）前向 MFE 中位 0.18 ATR /
+# MAE −0.49 ATR，仅 18.3% 达到 ≥0.5 ATR 的有利位移；走出来的赢家
+# （30 分钟–3 小时）MFE 0.69 / MAE −0.13，71.2% 达到 ≥0.5 ATR。样本 84%
+# 的合约 ≤1DTE，对「不动」零容忍。
+#
+# 【v8 更正】上面那张表按**持仓时长**分组，而持仓时长由结果决定——分层按构造
+# 就是循环的。2m 回放研究（3,492 次回踩持稳进场）把这份循环性量化了：循环记分
+# 下速度未死 vs 已死的 P(>0) 差 37.6pp（54.4% vs 16.8%），只从第 15 分钟检查点
+# 向前计分后只剩 0.1pp（49.9% vs 49.8%），样本内微弱效应样本外反号
+# （+0.122 → −0.128）。因此 0.5 只是**参考刻度**，不是「越过就能活下来」的门槛；
+# 这一列只描述已经发生的事，不承载前向信息。文案不得再出现存活框架。
+#
+# 因此 DISPLACEMENT_SURVIVAL_LINE_ATR = 0.5 —— 它是**用户自己样本里的经验
+# 分界线**，不是市场常数、不是胜率模型、不是买卖信号；样本窗口正好是他最差
+# 的两个月，分组按持仓时长定义（与结果存在循环性）。改这两个常数必须同时
+# 重新校准并升 intraday-top 的 signal_version。
+# ---------------------------------------------------------------------------
+DISPLACEMENT_WINDOW_BARS = 6
+DISPLACEMENT_SURVIVAL_LINE_ATR = 0.5
+DISPLACEMENT_WINDOW_MINUTES = DISPLACEMENT_WINDOW_BARS * BURST_BAR_MINUTES
+# 断档诚实化：「近 30 分钟」只有在 6 根 K 线连续时才成立。窗口实际跨度＝
+# 末根开始 + 5 分钟 − 首根开始；含断档（停牌/缺 K 线）时如实带上
+# ``window_span_minutes``，跨度超过 45 分钟则整个读数按 fail-closed 标缺——
+# 一个横跨一小时的「30 分钟位移」不是位移读数，是文字游戏。
+DISPLACEMENT_MAX_WINDOW_SPAN_MINUTES = 45
+# ATR 标尺回退代理：取证分析在缺日线 ATR14 时用的正是「最近 20 根 5m K 线
+# 波幅均值 × 3」；这里逐字复用同一口径，并在 atr_basis 里如实标注。
+DISPLACEMENT_PROXY_BARS = 20
+DISPLACEMENT_PROXY_MULTIPLIER = 3.0
+DISPLACEMENT_ATR_BASIS_DAILY = "atr14_daily"
+DISPLACEMENT_ATR_BASIS_PROXY = "intraday_20bar_proxy_x3"
+
+# ---------------------------------------------------------------------------
+# v7 ATR 标尺可比性修正。
+#
+# 2026-08 起速回放研究实测：``intraday_20bar_proxy_x3`` 与真实日线 ATR14 之比
+# 在盘中从 0.28（开盘）→ 0.42（10:30–11:00）→ 0.20（14:00–15:30）漂移——它是
+# 一把**随时点伸缩的尺子**，因此按它归一化的读数既不能跨时点比较，也不能与
+# 走 ATR14 的行横向比较（同一条 0.5 ATR 经验线在两把尺子下含义不同）。
+#
+# 修正方式（least invasive）：回退顺序插入一层「上一批交易时段的真实波幅均值」
+# ——用已经取回的同一批 5m K 线聚合出每个**上一交易时段**的 true range
+# （max(高−低, |高−前收|, |低−前收|)，无前收时退化为高−低），对可得的最多
+# DISPLACEMENT_PRIOR_SESSION_MAX 个时段取均值。它是日线量级、当日内恒定，
+# 因此**不可能制造时点效应**；只有连一个上一时段都没有时才落回旧代理，且此时
+# 显式标注该读数不可与 ATR14 口径比较。日线 ATR14 主路径数值逐字未变。
+# ---------------------------------------------------------------------------
+DISPLACEMENT_PRIOR_SESSION_MAX = 3
+DISPLACEMENT_ATR_BASIS_PRIOR_SESSIONS = "prior_sessions_true_range_mean"
+# ATR 标尺可比性标签：读数能不能和「日线 ATR14 口径」放在一起比。
+ATR_SCALE_DAILY_ATR14 = "daily_atr14"
+ATR_SCALE_DAILY_PRIOR_SESSIONS = "daily_scale_prior_sessions_approximate"
+ATR_SCALE_INTRADAY_NOT_COMPARABLE = "intraday_scale_not_comparable"
+
+# ---------------------------------------------------------------------------
+# v7 哑火形态（fizzle flag）——研究口径与数字见模块 docstring。
+#
+# 这是**形态描述 + 历史频率**，不是卖出信号、不是方向判断：同一份样本里
+# 「起速那一刻」的方向 AUC 全部在 0.48–0.52，P(方向) = 50.6%，与掷硬币无
+# 实质差别。规则本身只用当前窗口的三个已有量：
+#
+#   stratum    = median_basis == MEDIAN_BASIS_PRIOR ? "open" : "intraday"
+#                （复用既有字段，不另立时钟规则）
+#   efficiency = |窗口末收 − 窗口首开| / (窗口最高 − 窗口最低)
+#   vol_norm   = 既有窗口字段
+#
+# 改动这三个常量或口径必须重新校准并升 intraday-top 的 signal_version。
+# ---------------------------------------------------------------------------
+FIZZLE_EFFICIENCY_MIN = 0.9
+FIZZLE_VOL_NORM_MAX = 2.0
+FIZZLE_STRATUM_OPEN = "open"
+FIZZLE_STRATUM_INTRADAY = "intraday"
+FIZZLE_BASIS = (
+    "current_15m_window_intraday_stratum_and_efficiency_ge_0.9_and_vol_norm_lt_2.0"
+)
+# 冻结的研究参考数字（fresh onsets、时间有序切分：Feb–May 拟合 / Jun–Aug 检验）。
+FIZZLE_REFERENCE = {
+    "sample": (
+        "9173_burst_onsets_21_underlyings_123_sessions_2026-02-05_to_2026-08-03"
+        "_fresh_onsets_time_ordered_split"
+    ),
+    "in_sample_rate": 0.268,
+    "out_of_sample_rate": 0.254,
+    "base_rate_in": 0.478,
+    "base_rate_out": 0.505,
+    "n_in": 291,
+    "n_out": 177,
+}
+FIZZLE_CAVEAT = (
+    "这是形态描述与历史频率，不是卖出信号；方向本身在样本中约 53%，"
+    "与掷硬币无实质差别。"
+)
+
+DISPLACEMENT_LIMITATION_LINE = (
+    f"近 {DISPLACEMENT_WINDOW_MINUTES} 分钟位移＝最近 {DISPLACEMENT_WINDOW_BARS} 根 5m K 线相对"
+    "「30 分钟前价格」（窗口首根开盘）的净位移与最高/最低偏移 ÷ ATR 标尺（优先日线 ATR14；"
+    "缺失时回退「上一批交易时段真实波幅均值」——日线量级、当日内恒定；连一个上一时段都没有时"
+    "才落回旧盘中代理「最近 20 根 5m 波幅均值 ×3」，并在 atr_scale_comparability 显式标注"
+    "该行读数不可与 ATR14 口径横向比较）。"
+    # v8 循环性更正放在最前面：先说这条线不能怎么读，再说它是什么。
+    f"【v8 更正】{DISPLACEMENT_SURVIVAL_LINE_ATR} ATR 这条线来自按**持仓时长**分组的分层"
+    "（速死 <30 分钟 vs 走出来 30 分钟–3 小时），而持仓时长本身由结果决定——**这个分层"
+    "按构造就是循环的**。2026-08 的 2m 回放研究用同一套机器量化了这份循环性（3,492 次"
+    "回踩持稳进场）：循环记分下「速度未死 vs 已死」的 P(>0) 差 37.6 个百分点"
+    "（54.4% vs 16.8%），改成只从第 15 分钟检查点**向前**计分后只剩 **0.1 个百分点**"
+    "（49.9% vs 49.8%），且样本内那点微弱效应样本外反号（+0.122 → −0.128）。"
+    "结论：肉眼可见的鸿沟几乎全部是循环性，**这一列只描述已经发生的事，不含任何前向信息**——"
+    "不要把 0.5 读成「越过就能活下来」。"
+    f"它描述过去 {DISPLACEMENT_WINDOW_MINUTES} 分钟已经发生的事，不是预测、不是买卖信号；"
+    f"{DISPLACEMENT_SURVIVAL_LINE_ATR} ATR 仍按你自己 766 笔回合（2026-06-08→07-31，"
+    "恰为最差两个月）的经验值保留为**参考刻度**，"
+    "K 线为非官方 5m 聚合；不足 6 根或标尺不可得时显式标缺，不以 0 冒充。"
+    "断档口径：6 根 K 线不保证连续（停牌/缺 K 线），窗口实际跨度以 "
+    "window_span_minutes 如实带出——超过 "
+    f"{DISPLACEMENT_MAX_WINDOW_SPAN_MINUTES} 分钟时整个读数按标缺处理（一个横跨"
+    "更久的窗口不再是「近 30 分钟」），30–45 分钟之间保留读数并须标注「含断档」。"
+)
+
+ATR_SCALE_LIMITATION_LINE = (
+    "ATR 标尺可比性（v7 修正）：旧盘中代理「最近 20 根 5m 波幅均值 ×3」与真实日线 ATR14 之比"
+    "在盘中从 0.28（开盘）→ 0.42（10:30–11:00）→ 0.20（14:00–15:30）漂移（2026-08 起速回放"
+    "研究 9,173 次实测），按它归一化的读数换算成同口径后 10:30–11:00 低估约 18–20pp、"
+    "15:00–15:30 高估约 10–15pp。因此回退顺序改为「日线 ATR14 → 上一批交易时段真实波幅均值"
+    "（当日内恒定）→ 旧代理兜底」，并逐行给出 atr_scale_comparability："
+    "daily_atr14（可比）/ daily_scale_prior_sessions_approximate（日线量级，"
+    "但仅 ≤3 个时段、比 ATR14 噪声大）/ intraday_scale_not_comparable（盘中量级，"
+    "不可与 ATR14 行或跨时点比较）。"
+)
+
+BURST_LIMITATIONS = (
+    "波段爆发＝15 分钟推力（|收−开| ÷ 当日 5 分钟 K 线波幅中位数）×量比"
+    "（窗口量 ÷ 3×5 分钟量中位数）；强波段阈值（≥8.0）按 2026-07-31 用户"
+    "标注暴动样本校准、中波段阈值（≥2.5）按 2026-08-03 NVDA 上午持续推升"
+    "校准，是确定性研究度量，不是买卖信号。",
+    "仅统计正股 09:30–16:00 ET 常规时段 5 分钟 K 线；盘前盘后不参与。",
+    # v8 口径修正：如实声明这是一次会改变历史读数的修正，不静默吸收。
+    "K 线时间戳口径修正（v8）：Moomoo ``time_key`` 按 K 线**结束**时间打标，此前被当成"
+    "开始时间使用，实际取到的「常规时段」是 09:25–15:55——混进一根盘前 K 线、又丢掉"
+    "收盘集合竞价那根。2026-08-04 用只读 OpenD 实测确认（官方日线开盘价 == 标签 09:35 那根的"
+    "开盘价、官方日线收盘价 == 标签 16:00 那根的收盘价，25/25 个标的-交易日逐分钱吻合；"
+    "标签 09:35 中位量是标签 09:30 的 15–25 倍）。修正后每根 K 线的时间戳整体前移 5 分钟，"
+    "因此**所有**窗口、中位数、波段标签、速度与位移读数都会变化，历史截图与本版不可逐值对照。",
+    "收盘集合竞价的口径性质（v8）：修正后最后一个 15 分钟窗口（15:45–16:00）真正含收盘集合"
+    "竞价那根，而它的成交量通常是当日中位 K 线的 5–20 倍，量比因此被机械放大——几乎每个"
+    "标的每天都会在 15:45 出现一个高分窗口。这是**口径产物**，只说明收盘竞价本身是全天最大的"
+    "成交事件，不代表尾盘更值得交易；与既有「开盘段占多数」一样，本版只如实声明、不改阈值。",
+    "开盘前 30 分钟（当日不足 6 根 K 线）中位数基准回退上一交易时段并显式标注。",
+    "速度分级＝相邻两个 15 分钟窗口爆发分之差（5m K 线近似，非 1m/2m 秒级速度）；"
+    "「减速」对应用户自身纪律 R1 的离场提示，不是系统买卖信号。",
+    # v7 起速回放研究（9,173 次爆发起点）实测的两条口径性质，如实声明，不改阈值。
+    f"阈值口径的已知性质：中波段阈值（≥{LEG_MEDIUM_MIN_SCORE}）平均每个「有爆发的标的-交易日」"
+    "触发 3.74 个窗口，其中 62.8% 落在开盘 stratum（当日不足 6 根 K 线、中位数基准回退上一"
+    "时段的时点，约 09:55 前）——因为回退基准让开盘 K 线天然显得超常。本版**不改阈值**，"
+    "只如实声明该性质：早段爆发占多数是口径产物，不代表早段更值得交易。",
+    "起速那一刻分不出方向（2026-08 回放研究，9,173 次起点、21 标的 × 123 时段）："
+    "30 分钟后净位移仍在爆发方向的概率 = 50.6%，19 个候选因子的方向 AUC 全在 0.48–0.52，"
+    "MFE/|MAE| 中位 = 1.026（有利与不利同幅放大）。因此本系统**不提供**延续概率或真假速度"
+    "评分；唯一经样本外验证保留的是「哑火形态」这一**回避型形态描述**（非卖出信号）。",
+)
+
+
+def compute_speed_state(
+    windows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """v3 speed grade from the last two rolling windows, fail-closed.
+
+    ``accelerating`` = latest window score > previous window score,
+    ``decelerating`` = latest < previous, ``flat`` = equal.  Fewer than two
+    windows or a missing score on either side is ``unknown`` with an explicit
+    reason — never a fabricated ``flat``.
+    """
+
+    if len(windows) < 2:
+        return {
+            "state": "unknown",
+            "current_score": None,
+            "previous_score": None,
+            "delta": None,
+            "basis": SPEED_BASIS,
+            "unavailable_reason": "fewer_than_2_windows",
+        }
+    current = _finite(windows[-1].get("score"))
+    previous = _finite(windows[-2].get("score"))
+    if current is None or previous is None:
+        return {
+            "state": "unknown",
+            "current_score": current,
+            "previous_score": previous,
+            "delta": None,
+            "basis": SPEED_BASIS,
+            "unavailable_reason": "missing_window_score",
+        }
+    delta = round(current - previous, 6)
+    if delta > 0:
+        state = "accelerating"
+    elif delta < 0:
+        state = "decelerating"
+    else:
+        state = "flat"
+    return {
+        "state": state,
+        "current_score": current,
+        "previous_score": previous,
+        "delta": delta,
+        "basis": SPEED_BASIS,
+        "unavailable_reason": None,
+    }
+
+
+def _finite(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+# ---------------------------------------------------------------------------
+# v7 哑火形态（fizzle flag）。校准与否定性结论见模块 docstring。
+# ---------------------------------------------------------------------------
+
+
+def burst_stratum(median_basis: Optional[str]) -> Optional[str]:
+    """把既有的 ``median_basis`` 翻译成研究分层，不另立时钟规则。
+
+    ``MEDIAN_BASIS_PRIOR``（当日不足 6 根 K 线、中位数回退上一时段）＝开盘段，
+    其余＝盘中段；``None``（无 K 线）保持 ``None``，绝不猜。
+    """
+
+    if median_basis == MEDIAN_BASIS_PRIOR:
+        return FIZZLE_STRATUM_OPEN
+    if median_basis is None:
+        return None
+    return FIZZLE_STRATUM_INTRADAY
+
+
+def compute_window_efficiency(
+    window_bars: Sequence[Mapping[str, Any]],
+) -> Optional[float]:
+    """|窗口末收 − 窗口首开| ÷ (窗口最高 − 窗口最低)，高低相等时返回 ``None``。
+
+    高低相等（停牌/无成交样本）意味着分母为 0，效率**未定义**——返回 ``None``
+    让调用方显式标缺，绝不回填 0 或 1。
+    """
+
+    if not window_bars:
+        return None
+    open_start = _finite(window_bars[0].get("open"))
+    close_end = _finite(window_bars[-1].get("close"))
+    highs = [_finite(bar.get("high")) for bar in window_bars]
+    lows = [_finite(bar.get("low")) for bar in window_bars]
+    if (
+        open_start is None
+        or close_end is None
+        or any(value is None for value in highs)
+        or any(value is None for value in lows)
+    ):
+        return None
+    span = max(highs) - min(lows)  # type: ignore[type-var]
+    if span <= 0:
+        return None
+    return round(abs(close_end - open_start) / span, 6)
+
+
+def unavailable_fizzle_flag(
+    reason: str,
+    *,
+    efficiency: Optional[float] = None,
+    vol_norm: Optional[float] = None,
+    stratum: Optional[str] = None,
+) -> dict[str, Any]:
+    """标缺的哑火读数：缺席不是结论，前端据此**什么都不渲染**。"""
+
+    return {
+        "state": "unavailable",
+        "efficiency": efficiency,
+        "vol_norm": vol_norm,
+        "stratum": stratum,
+        "reason": reason,
+        "basis": FIZZLE_BASIS,
+        "reference": dict(FIZZLE_REFERENCE),
+    }
+
+
+def compute_fizzle_flag(
+    window_bars: Sequence[Mapping[str, Any]],
+    *,
+    median_basis: Optional[str],
+    vol_norm: Optional[float],
+) -> dict[str, Any]:
+    """「哑火形态」：对**当前这个 15 分钟窗口**的形态描述 + 历史频率。
+
+    命中条件（三者同时成立）：
+
+    - ``stratum == "intraday"``（``median_basis`` 不是上一时段回退，即已过开盘段）；
+    - ``efficiency ≥ 0.9``：窗口内几乎没有回撤的单向推升
+      （|窗口末收 − 窗口首开| ÷ (窗口最高 − 窗口最低)）；
+    - ``vol_norm < 2.0``：量能平平（既有窗口字段）。
+
+    证据（2026-08 起速回放研究，9,173 次爆发起点、21 个标的 × 123 个交易时段，
+    2026-02-05→08-03，用户自己的 Moomoo 5m K 线逐根重放、无未来函数）：命中该
+    形态的窗口在 30 分钟内达到 ≥0.5 ATR **有利**位移的比例仅 26.8%（样本内
+    Feb–May，n=291）与 25.4%（样本外 Jun–Aug，n=177），而同期基准为 47.8% /
+    50.5%；方向一致性 20/20 个标的、6/6 个月，且在三把标尺（生产盘中代理、
+    重建日线 ATR14、原始百分比）下同号。
+
+    读法：**一段几乎不回撤、量能却平平的干净盘中推升——最像「真速度」的形态，
+    恰恰是这份样本里最常哑火的形态**。
+
+    诚实边界：这是形态描述与历史频率，**不是卖出信号、不是方向判断**——同一份
+    样本里起速那一刻的方向 AUC 全部落在 0.48–0.52、P(方向) = 50.6%，与掷硬币
+    无实质差别（见 :data:`FIZZLE_CAVEAT`）。约 200 次比较下 Bonferroni 无一存活，
+    该规则是按**方向一致性与样本外稳定性**判断保留的，不是按 p 值。
+
+    fail-closed：``median_basis`` 缺失、窗口 K 线不足、``vol_norm`` 缺失或窗口
+    最高 == 最低（效率未定义）一律 ``state="unavailable"`` + 原因，**绝不**返回
+    命中。
+    """
+
+    stratum = burst_stratum(median_basis)
+    efficiency = compute_window_efficiency(window_bars)
+    normalised_vol = _finite(vol_norm)
+
+    if stratum is None:
+        return unavailable_fizzle_flag(
+            "median_basis_unavailable",
+            efficiency=efficiency,
+            vol_norm=normalised_vol,
+        )
+    if len(window_bars) < BURST_WINDOW_BARS:
+        return unavailable_fizzle_flag(
+            f"fewer_than_{BURST_WINDOW_BARS}_window_bars",
+            efficiency=efficiency,
+            vol_norm=normalised_vol,
+            stratum=stratum,
+        )
+    if efficiency is None:
+        # 分子/分母缺输入与「分母为 0」是两回事：原因如实区分，都不判为命中。
+        usable = all(
+            _finite(bar.get(field)) is not None
+            for bar in window_bars
+            for field in ("open", "high", "low", "close")
+        )
+        return unavailable_fizzle_flag(
+            "window_high_equals_low_efficiency_undefined"
+            if usable
+            else "window_bar_ohlc_unavailable",
+            vol_norm=normalised_vol,
+            stratum=stratum,
+        )
+    if normalised_vol is None:
+        return unavailable_fizzle_flag(
+            "vol_norm_unavailable",
+            efficiency=efficiency,
+            stratum=stratum,
+        )
+
+    unmet: list[str] = []
+    if stratum != FIZZLE_STRATUM_INTRADAY:
+        unmet.append("stratum_open_not_intraday")
+    if efficiency < FIZZLE_EFFICIENCY_MIN:
+        unmet.append(f"efficiency_below_{FIZZLE_EFFICIENCY_MIN}")
+    if normalised_vol >= FIZZLE_VOL_NORM_MAX:
+        unmet.append(f"vol_norm_at_or_above_{FIZZLE_VOL_NORM_MAX}")
+    return {
+        "state": "not_flagged" if unmet else "flagged",
+        "efficiency": efficiency,
+        "vol_norm": normalised_vol,
+        "stratum": stratum,
+        "reason": (
+            "+".join(unmet)
+            if unmet
+            else "intraday_clean_thrust_with_unremarkable_volume"
+        ),
+        "basis": FIZZLE_BASIS,
+        "reference": dict(FIZZLE_REFERENCE),
+    }
+
+
+def _parse_bar_start_et(value: Any) -> Optional[datetime]:
+    """Parse one bar's ISO timestamp into an aware America/New_York datetime."""
+
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+    if parsed.tzinfo is None:
+        # 无时区的时间无法诚实换算到 ET；丢弃而不是猜测。
+        return None
+    return parsed.astimezone(_NEW_YORK)
+
+
+# ---------------------------------------------------------------------------
+# v8 K 线时间戳口径归一（bar label convention）
+#
+# 本模块（以及 intraday_setups、近 30 分钟位移）自始至终按「时间戳 = 这根 K 线
+# 的**开始**时间」计算：``filter_regular_session_bars`` 用 09:30 ≤ start < 16:00
+# 取常规时段，``_window_end_label`` 用「末根 start + 5 分钟」推末端标签。yfinance
+# 正是这个口径，但 **Moomoo ``request_history_kline`` 的 ``time_key`` 是这根 K 线
+# 的结束时间**。2026-08-04 实测（read-only OpenD，NVDA/AAPL/MU/AMZN/GOOGL，
+# 2026-07-27→08-03）：
+#
+#   - 官方日线开盘价 == 标签 09:35 那根的 open，官方日线收盘价 == 标签 16:00
+#     那根的 close，25/25 个「标的-交易日」逐分钱吻合，START 口径 0/25；
+#   - 标签 09:35 中位成交量是标签 09:30 的 15–25 倍（开盘集合竞价在 09:35），
+#     标签 16:00 是全天最大（收盘集合竞价），标签 09:30 只有几十万股（盘前）；
+#   - 盘前盘后延伸时段的首/末标签是 04:05 与 20:00，而非 04:00 与 19:55。
+#
+# 因此把 Moomoo 的标签当 start 用，实际取到的是 **09:25–15:55**：混进一根盘前
+# K 线、又丢掉收盘集合竞价那根。修正放在数据进入本模块之**前**（见
+# ``api/v1/endpoints/opportunities.py::_fetch_intraday_5m_bars``），只对已知按
+# 结束时间打标的数据源生效，其余数据源逐字不动——本模块因此保持「纯函数 +
+# 单一 start 口径」，不必在内部为不同供应商分叉。
+# ---------------------------------------------------------------------------
+BAR_LABEL_END_SOURCES = frozenset({"MoomooFetcher"})
+BAR_LABEL_NORMALIZATION_BASIS = (
+    "moomoo_time_key_is_bar_end_shifted_to_bar_start_by_one_interval"
+)
+
+
+def normalize_bar_label_convention(
+    bars: Sequence[Mapping[str, Any]],
+    *,
+    source: Optional[str],
+    bar_minutes: int = BURST_BAR_MINUTES,
+) -> list[dict[str, Any]]:
+    """把「按结束时间打标」的 K 线时间戳平移成本模块要求的开始时间。
+
+    只有 ``source`` 属于 :data:`BAR_LABEL_END_SOURCES` 时才平移；其它数据源
+    （yfinance 等本来就按开始时间打标）原样返回，未知/缺失 ``source`` 一律
+    视为已是 start 口径——**不猜测**，宁可保持现状也不误移。解析不出时间戳的
+    行原样保留，交给 :func:`filter_regular_session_bars` 统一丢弃。
+    """
+
+    if source not in BAR_LABEL_END_SOURCES:
+        return [dict(bar) for bar in bars or ()]
+    shift = timedelta(minutes=bar_minutes)
+    rows: list[dict[str, Any]] = []
+    for bar in bars or ():
+        row = dict(bar)
+        parsed = _parse_bar_start_et(row.get("date"))
+        if parsed is not None:
+            row["date"] = (parsed - shift).isoformat()
+        rows.append(row)
+    return rows
+
+
+def filter_regular_session_bars(
+    bars: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep only 09:30 ≤ ET start < 16:00 bars with a usable OHLC, sorted.
+
+    时间戳必须**已经**是这根 K 线的开始时间；按结束时间打标的数据源需先过
+    :func:`normalize_bar_label_convention`（见该函数的 v8 口径说明）。
+    """
+
+    rows: list[dict[str, Any]] = []
+    for bar in bars or ():
+        start = _parse_bar_start_et(bar.get("date"))
+        if start is None:
+            continue
+        minutes = start.hour * 60 + start.minute
+        if not (9 * 60 + 30 <= minutes < 16 * 60):
+            continue
+        open_ = _finite(bar.get("open"))
+        high = _finite(bar.get("high"))
+        low = _finite(bar.get("low"))
+        close = _finite(bar.get("close"))
+        if open_ is None or high is None or low is None or close is None:
+            continue
+        if open_ <= 0 or high < low:
+            continue
+        volume = _finite(bar.get("volume"))
+        rows.append(
+            {
+                "start_et": start,
+                "session_date_et": start.date().isoformat(),
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": volume if volume is not None and volume >= 0 else None,
+            }
+        )
+    rows.sort(key=lambda row: row["start_et"])
+    return rows
+
+
+def split_burst_session_bars(
+    bars: Sequence[Mapping[str, Any]],
+    *,
+    market_date_et: str,
+    quote_session_scope: str,
+) -> tuple[Optional[str], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split raw 5m bars into (target session date, its bars, prior-session bars).
+
+    ``current_session`` scope targets the ET market date itself (premarket may
+    legitimately have zero bars yet); ``latest_prior_session`` scope (closed
+    nights/weekends) targets the newest session with bars on or before the
+    market date, so the evening/weekend review still shows that session's legs.
+    """
+
+    rows = filter_regular_session_bars(bars)
+    dates = sorted({row["session_date_et"] for row in rows})
+    if quote_session_scope == "current_session":
+        target_date: Optional[str] = market_date_et
+    else:
+        eligible = [item for item in dates if item <= market_date_et]
+        target_date = eligible[-1] if eligible else None
+    if target_date is None:
+        return None, [], []
+    prior_dates = [item for item in dates if item < target_date]
+    prior_date = prior_dates[-1] if prior_dates else None
+    current = [row for row in rows if row["session_date_et"] == target_date]
+    prior = (
+        [row for row in rows if row["session_date_et"] == prior_date]
+        if prior_date
+        else []
+    )
+    return target_date, current, prior
+
+
+def _median_or_none(values: Sequence[float]) -> Optional[float]:
+    cleaned = [value for value in values if value is not None and value > 0]
+    if not cleaned:
+        return None
+    return float(statistics.median(cleaned))
+
+
+def _session_medians(
+    session_bars: Sequence[Mapping[str, Any]],
+    prior_bars: Sequence[Mapping[str, Any]],
+) -> tuple[Optional[float], Optional[float], Optional[str]]:
+    """(median_bar_range, median_bar_volume, basis) with early-session fallback."""
+
+    if len(session_bars) >= MEDIAN_FALLBACK_MIN_BARS:
+        basis_bars: Sequence[Mapping[str, Any]] = session_bars
+        basis = MEDIAN_BASIS_CURRENT
+    elif prior_bars:
+        basis_bars = prior_bars
+        basis = MEDIAN_BASIS_PRIOR
+    elif session_bars:
+        # 无上一时段可回退：只能用当日已有 K 线，仍显式标注口径。
+        basis_bars = session_bars
+        basis = MEDIAN_BASIS_CURRENT
+    else:
+        return None, None, None
+    median_range = _median_or_none(
+        [bar["high"] - bar["low"] for bar in basis_bars]
+    )
+    median_volume = _median_or_none(
+        [bar["volume"] for bar in basis_bars if bar.get("volume") is not None]
+    )
+    return median_range, median_volume, basis
+
+
+def _et_label(moment: datetime) -> str:
+    return moment.strftime("%H:%M")
+
+
+def _window_row(
+    chunk: Sequence[Mapping[str, Any]],
+    median_range: Optional[float],
+    median_volume: Optional[float],
+) -> dict[str, Any]:
+    open_start = chunk[0]["open"]
+    close_end = chunk[-1]["close"]
+    thrust = close_end - open_start
+    thrust_percent = round(thrust / open_start * 100.0, 6)
+    thrust_norm: Optional[float] = None
+    if median_range is not None and median_range > 0:
+        thrust_norm = round(abs(thrust) / median_range, 6)
+    volumes = [bar.get("volume") for bar in chunk]
+    vol_norm: Optional[float] = None
+    if (
+        median_volume is not None
+        and median_volume > 0
+        and all(value is not None for value in volumes)
+    ):
+        vol_norm = round(
+            sum(volumes) / (BURST_WINDOW_BARS * median_volume), 6
+        )
+    score: Optional[float] = None
+    if thrust_norm is not None and vol_norm is not None:
+        score = round(thrust_norm * vol_norm, 6)
+    if thrust > 0:
+        direction = "up"
+    elif thrust < 0:
+        direction = "down"
+    else:
+        direction = "flat"
+    start = chunk[0]["start_et"]
+    return {
+        "start_et": _et_label(start),
+        "end_et": _window_end_label(chunk[-1]["start_et"]),
+        "thrust_percent": thrust_percent,
+        "thrust_norm": thrust_norm,
+        "vol_norm": vol_norm,
+        "score": score,
+        "direction": direction,
+        "_start_minutes": start.hour * 60 + start.minute,
+    }
+
+
+def _window_end_label(last_bar_start: datetime) -> str:
+    total = last_bar_start.hour * 60 + last_bar_start.minute + BURST_BAR_MINUTES
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def compute_burst_windows(
+    session_bars: Sequence[Mapping[str, Any]],
+    median_range: Optional[float],
+    median_volume: Optional[float],
+) -> list[dict[str, Any]]:
+    """All rolling 3-bar windows over one session's regular bars, in order."""
+
+    if len(session_bars) < BURST_WINDOW_BARS:
+        return []
+    return [
+        _window_row(
+            session_bars[index : index + BURST_WINDOW_BARS],
+            median_range,
+            median_volume,
+        )
+        for index in range(len(session_bars) - BURST_WINDOW_BARS + 1)
+    ]
+
+
+def select_distinct_legs(windows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Top distinct windows: score ≥ LEG_MEDIUM_MIN_SCORE, starts ≥30min apart, ≤4.
+
+    Greedy by descending score so one violent move keeps its single best
+    window instead of flooding the list with overlapping neighbours; the
+    result is re-sorted chronologically for display.  v2 分级：每个波段带
+    ``grade``（strong ≥ LEG_MIN_SCORE / medium ≥ LEG_MEDIUM_MIN_SCORE）——
+    强波段是 2026-07-31 校准的暴动口径，中波段收录像 2026-08-03 NVDA
+    上午那样的持续推升；贪心按分数降序，强波段天然优先占据名额。
+    """
+
+    picked: list[Mapping[str, Any]] = []
+    ordered = sorted(
+        (row for row in windows if row.get("score") is not None),
+        key=lambda row: (-row["score"], row["_start_minutes"]),
+    )
+    for row in ordered:
+        if row["score"] < LEG_MEDIUM_MIN_SCORE:
+            break
+        if any(
+            abs(row["_start_minutes"] - other["_start_minutes"]) < LEG_MIN_GAP_MINUTES
+            for other in picked
+        ):
+            continue
+        picked.append(row)
+        if len(picked) >= LEG_MAX_COUNT:
+            break
+    picked.sort(key=lambda row: row["_start_minutes"])
+    legs = []
+    for row in picked:
+        leg = _public_window(row)
+        leg["grade"] = "strong" if row["score"] >= LEG_MIN_SCORE else "medium"
+        legs.append(leg)
+    return legs
+
+
+def _public_window(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in row.items() if not key.startswith("_")}
+
+
+def unavailable_burst_profile(
+    reason: str,
+    *,
+    source: Optional[str] = None,
+    fetched_at: Optional[str] = None,
+) -> dict[str, Any]:
+    """Explicit fail-closed profile: no bars means no burst claims at all."""
+
+    return {
+        "state": "unavailable",
+        "session_date_et": None,
+        "bar_count": 0,
+        "median_bar_range": None,
+        "median_bar_volume": None,
+        "median_basis": None,
+        "window_minutes": BURST_WINDOW_MINUTES,
+        "current": None,
+        "legs": [],
+        # 无 K 线时速度同样未知：绝不以「持平」冒充观测值。
+        "speed": compute_speed_state(()),
+        # v7 哑火形态：描述的是**当前窗口**；没有窗口就没有形态可谈。
+        "fizzle_flag": unavailable_fizzle_flag("burst_profile_unavailable"),
+        "unavailable_reason": reason,
+        "source": source,
+        "fetched_at": fetched_at,
+        "basis": BURST_BASIS,
+        "limitations": list(BURST_LIMITATIONS),
+    }
+
+
+def compute_session_burst_profile(
+    bars: Sequence[Mapping[str, Any]],
+    *,
+    market_date_et: str,
+    quote_session_scope: str,
+    source: Optional[str] = None,
+    fetched_at: Optional[str] = None,
+) -> dict[str, Any]:
+    """Full burst profile for one symbol from raw 5m history rows.
+
+    Deterministic and fail-closed: missing/short/unusable inputs produce an
+    explicit ``state`` + ``unavailable_reason`` instead of estimated values.
+    """
+
+    target_date, session_bars, prior_bars = split_burst_session_bars(
+        bars,
+        market_date_et=market_date_et,
+        quote_session_scope=quote_session_scope,
+    )
+    base = unavailable_burst_profile(
+        "no_regular_session_bars", source=source, fetched_at=fetched_at
+    )
+    base["session_date_et"] = target_date
+    if target_date is None:
+        return base
+    base["bar_count"] = len(session_bars)
+    if not session_bars:
+        base["state"] = "insufficient_bars"
+        base["unavailable_reason"] = "no_session_bars_yet"
+        return base
+
+    median_range, median_volume, median_basis = _session_medians(
+        session_bars, prior_bars
+    )
+    base["median_bar_range"] = median_range
+    base["median_bar_volume"] = median_volume
+    base["median_basis"] = median_basis
+    if median_range is None or median_volume is None:
+        base["state"] = "unavailable"
+        base["unavailable_reason"] = (
+            "zero_or_missing_median_bar_range"
+            if median_range is None
+            else "zero_or_missing_median_bar_volume"
+        )
+        return base
+
+    windows = compute_burst_windows(session_bars, median_range, median_volume)
+    if not windows:
+        base["state"] = "insufficient_bars"
+        base["unavailable_reason"] = (
+            f"fewer_than_{BURST_WINDOW_BARS}_session_bars"
+        )
+        return base
+
+    base["state"] = "ready"
+    base["unavailable_reason"] = None
+    base["current"] = _public_window(windows[-1])
+    base["legs"] = select_distinct_legs(windows)
+    base["speed"] = compute_speed_state(windows)
+    # v7 哑火形态：只描述**当前这个 15 分钟窗口**（进行中的窗口），不是整段
+    # 时段的结论；效率用的正是该窗口那 3 根 K 线的最高/最低。
+    if len(session_bars) < MEDIAN_FALLBACK_MIN_BARS and not prior_bars:
+        # 当日不足 6 根 K 线且无上一时段可回退：中位数分母由 3–5 根开盘
+        # K 线自证（退化基准），据它算出的量比不可判读——哑火形态按标缺
+        # 处理，绝不在退化基准上「硬算」出一个命中/未命中。
+        base["fizzle_flag"] = unavailable_fizzle_flag(
+            "median_basis_insufficient",
+            vol_norm=_finite(windows[-1].get("vol_norm")),
+        )
+    else:
+        base["fizzle_flag"] = compute_fizzle_flag(
+            session_bars[-BURST_WINDOW_BARS:],
+            median_basis=median_basis,
+            vol_norm=windows[-1].get("vol_norm"),
+        )
+    return base
+
+
+# ---------------------------------------------------------------------------
+# v6 近 30 分钟位移（recent displacement）——校准说明见模块 docstring 与上方
+# 常量注释。零新增请求：复用 burst 通道已取回的同一批 5m K 线。
+# ---------------------------------------------------------------------------
+
+
+def unavailable_recent_displacement(
+    reason: str,
+    *,
+    state: str = "unavailable",
+    bar_count: int = 0,
+    window_span_minutes: Optional[int] = None,
+) -> dict[str, Any]:
+    """Fail-closed displacement reading: an explicit state + reason, never 0.
+
+    ``window_span_minutes`` 仅在「窗口跨度超限」这类原因下携带实际跨度，
+    让消费端能把「为什么标缺」的数字如实展示出来。
+    """
+
+    return {
+        "state": state,
+        "window_minutes": DISPLACEMENT_WINDOW_MINUTES,
+        "net_move_atr": None,
+        "high_excursion_atr": None,
+        "low_excursion_atr": None,
+        "abs_range_atr": None,
+        "atr_basis": None,
+        # v7：标尺缺席时可比性同样无从谈起——显式 None，不冒充「可比」。
+        "atr_scale_comparability": None,
+        "atr_prior_session_count": None,
+        "survival_line_atr": DISPLACEMENT_SURVIVAL_LINE_ATR,
+        "bar_count": bar_count,
+        "window_span_minutes": window_span_minutes,
+        "unavailable_reason": reason,
+    }
+
+
+def _intraday_atr_proxy(session_bars: Sequence[Mapping[str, Any]]) -> Optional[float]:
+    """取证分析用过的盘中 ATR 代理：最近 20 根 5m K 线波幅均值 × 3。
+
+    当日 K 线不足 20 根时用已有的全部（调用方已保证 ≥
+    :data:`DISPLACEMENT_WINDOW_BARS` 根），口径标签不变——``bar_count`` 会如实
+    暴露样本大小。全部波幅为 0（停牌样本）时返回 ``None`` 而不是 0 分母。
+    """
+
+    tail = list(session_bars)[-DISPLACEMENT_PROXY_BARS:]
+    ranges = [
+        bar["high"] - bar["low"]
+        for bar in tail
+        if _finite(bar.get("high")) is not None and _finite(bar.get("low")) is not None
+    ]
+    if not ranges:
+        return None
+    mean_range = sum(ranges) / len(ranges)
+    proxy = mean_range * DISPLACEMENT_PROXY_MULTIPLIER
+    return proxy if proxy > 0 else None
+
+
+def _prior_sessions_true_range_mean(
+    bars: Sequence[Mapping[str, Any]],
+    *,
+    target_date: str,
+) -> tuple[Optional[float], int]:
+    """v7 日线量级 ATR 回退：最多 3 个**上一交易时段**真实波幅的均值。
+
+    每个时段的 true range = ``max(高−低, |高−前收|, |低−前收|)``（能拿到再前一个
+    时段收盘时才含跳空项，否则退化为高−低）。它由**已经结束的**时段算出，因此
+    当日内恒定——不可能像滚动 20 根 5m 均值那样随时点伸缩（研究实测该代理与真实
+    日线 ATR14 之比在盘中 0.28 → 0.42 → 0.20 漂移）。
+
+    返回 ``(unit, session_count)``；无可用上一时段或全部波幅为 0 时返回
+    ``(None, 0)``，由调用方继续回退，绝不 0 分母。
+    """
+
+    rows = filter_regular_session_bars(bars)
+    by_date: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_date.setdefault(row["session_date_et"], []).append(row)
+    dates = sorted(item for item in by_date if item < target_date)
+    if not dates:
+        return None, 0
+    used = dates[-DISPLACEMENT_PRIOR_SESSION_MAX:]
+    true_ranges: list[float] = []
+    for date_key in used:
+        session = by_date[date_key]
+        high = max(bar["high"] for bar in session)
+        low = min(bar["low"] for bar in session)
+        index = dates.index(date_key)
+        prior_close = by_date[dates[index - 1]][-1]["close"] if index > 0 else None
+        if prior_close is None:
+            true_range = high - low
+        else:
+            true_range = max(
+                high - low, abs(high - prior_close), abs(low - prior_close)
+            )
+        if true_range > 0:
+            true_ranges.append(true_range)
+    if not true_ranges:
+        return None, 0
+    return sum(true_ranges) / len(true_ranges), len(true_ranges)
+
+
+def compute_recent_displacement(
+    bars: Sequence[Mapping[str, Any]],
+    *,
+    market_date_et: str,
+    quote_session_scope: str,
+    atr14: Optional[float] = None,
+) -> dict[str, Any]:
+    """「它现在有没有在动」：最近 30 分钟的 ATR 归一化位移，确定性且 fail-closed。
+
+    窗口＝该时段最后 :data:`DISPLACEMENT_WINDOW_BARS` 根常规时段 5m K 线；
+    参考点 ``close_30m_ago`` 取窗口首根 K 线的**开盘价**（即 30 分钟前的成交
+    价，与 burst 窗口 ``thrust`` 的 ``open_start`` 同一口径），因此恰好 6 根
+    K 线的时段起点边界即可给出读数，而不必等到第 7 根。
+
+    - ``high_excursion_atr = (窗口最高价 − close_30m_ago) / atr_unit``
+    - ``low_excursion_atr  = (窗口最低价 − close_30m_ago) / atr_unit``
+    - ``net_move_atr       = (窗口末收盘 − close_30m_ago) / atr_unit``
+    - ``abs_range_atr      = (窗口最高价 − 窗口最低价) / atr_unit``
+
+    ``atr_unit`` 的回退顺序（v7）：
+
+    1. 调用方注入的日线 ``atr14``（``atr14_daily``，与 766 笔取证分析同一把尺，
+       ``atr_scale_comparability = daily_atr14`` 可比）——**数值口径逐字未变**；
+    2. 缺失/非正时回退**上一批交易时段真实波幅均值**
+       （``prior_sessions_true_range_mean``，最多 3 个已结束时段，当日内恒定，
+       ``daily_scale_prior_sessions_approximate`` 日线量级但样本更少）；
+    3. 连一个上一时段都没有（只拿到当日 K 线）时才落回旧盘中代理
+       （``intraday_20bar_proxy_x3``），并显式标
+       ``intraday_scale_not_comparable``——研究实测它与真实日线 ATR14 之比在
+       盘中 0.28 → 0.42 → 0.20 漂移，该行读数**不可**与走 ATR14 的行横向比较、
+       也不可跨时点比较；
+    4. 全都不可得时 ``state="unavailable"`` + 原因。
+
+    K 线不足 6 根时 ``state="insufficient_bars"`` 并带上实际根数。
+
+    休市（``quote_session_scope="latest_prior_session"``）落在最近一个交易时段
+    的最后 30 分钟上，与该时段的 as-of 标注一致。
+    """
+
+    target_date, session_bars, _prior_bars = split_burst_session_bars(
+        bars,
+        market_date_et=market_date_et,
+        quote_session_scope=quote_session_scope,
+    )
+    bar_count = len(session_bars)
+    if bar_count < DISPLACEMENT_WINDOW_BARS:
+        return unavailable_recent_displacement(
+            f"fewer_than_{DISPLACEMENT_WINDOW_BARS}_session_bars",
+            state="insufficient_bars",
+            bar_count=bar_count,
+        )
+
+    # 断档检测：6 根 K 线不保证连续（停牌/供应商缺 K 线）。实际跨度 =
+    # 末根开始 + 5 分钟 − 首根开始；== 30 分钟才是无断档的「近 30 分钟」。
+    # 跨度超过 45 分钟时这个读数已经不是「近 30 分钟位移」，按 fail-closed
+    # 标缺并附上实际跨度；30 < 跨度 ≤ 45 时保留读数，但 additive 字段
+    # ``window_span_minutes`` 如实带出，消费端必须据此标注「含断档」。
+    window = session_bars[-DISPLACEMENT_WINDOW_BARS:]
+    window_span_minutes = (
+        int(
+            (window[-1]["start_et"] - window[0]["start_et"]).total_seconds()
+            // 60
+        )
+        + BURST_BAR_MINUTES
+    )
+    if window_span_minutes > DISPLACEMENT_MAX_WINDOW_SPAN_MINUTES:
+        return unavailable_recent_displacement(
+            "window_bars_not_contiguous_span_"
+            f"{window_span_minutes}m_exceeds_"
+            f"{DISPLACEMENT_MAX_WINDOW_SPAN_MINUTES}m",
+            bar_count=bar_count,
+            window_span_minutes=window_span_minutes,
+        )
+
+    prior_session_count = 0
+    atr_unit = _finite(atr14)
+    if atr_unit is not None and atr_unit > 0:
+        atr_basis = DISPLACEMENT_ATR_BASIS_DAILY
+        comparability = ATR_SCALE_DAILY_ATR14
+    else:
+        atr_unit, prior_session_count = _prior_sessions_true_range_mean(
+            bars, target_date=target_date or ""
+        )
+        if atr_unit is not None and atr_unit > 0:
+            atr_basis = DISPLACEMENT_ATR_BASIS_PRIOR_SESSIONS
+            comparability = ATR_SCALE_DAILY_PRIOR_SESSIONS
+        else:
+            prior_session_count = 0
+            atr_unit = _intraday_atr_proxy(session_bars)
+            atr_basis = DISPLACEMENT_ATR_BASIS_PROXY
+            comparability = ATR_SCALE_INTRADAY_NOT_COMPARABLE
+    if atr_unit is None or atr_unit <= 0:
+        return unavailable_recent_displacement(
+            "no_usable_atr_unit_atr14_prior_sessions_and_intraday_proxy_all_unavailable",
+            bar_count=bar_count,
+        )
+
+    reference = window[0]["open"]
+    window_high = max(bar["high"] for bar in window)
+    window_low = min(bar["low"] for bar in window)
+    last_close = window[-1]["close"]
+    return {
+        "state": "ready",
+        "window_minutes": DISPLACEMENT_WINDOW_MINUTES,
+        "net_move_atr": round((last_close - reference) / atr_unit, 6),
+        "high_excursion_atr": round((window_high - reference) / atr_unit, 6),
+        "low_excursion_atr": round((window_low - reference) / atr_unit, 6),
+        "abs_range_atr": round((window_high - window_low) / atr_unit, 6),
+        "atr_basis": atr_basis,
+        # v7：这一行的读数能不能和「日线 ATR14 口径」放一起比，显式说清楚。
+        "atr_scale_comparability": comparability,
+        "atr_prior_session_count": prior_session_count or None,
+        "survival_line_atr": DISPLACEMENT_SURVIVAL_LINE_ATR,
+        "bar_count": bar_count,
+        # 断档诚实化（additive）：窗口实际跨度；== window_minutes 即无断档。
+        "window_span_minutes": window_span_minutes,
+        "unavailable_reason": None,
+    }

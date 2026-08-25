@@ -86,6 +86,60 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "validation": {"min_items": 1},
         "display_order": 10,
     },
+    "INTRADAY_WATCHLIST": {
+        "title": "Intraday Watchlist (two-tier scan)",
+        "description": (
+            "日内 Top 扫描的宽层清单（逗号分隔美股代码）。留空＝保持现状"
+            "（STOCK_LIST 回退，单层扫描）；配置后启用两层模式：全清单每轮一次"
+            "批量快照，按 |涨跌幅|→成交额 晋升 Top K 进入深度层。"
+        ),
+        "category": "base",
+        "data_type": "array",
+        "ui_control": "textarea",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "",
+        "options": [],
+        "validation": {},
+        "display_order": 11,
+    },
+    "INTRADAY_DEEP_LANE_MAX": {
+        "title": "Intraday Deep Lane Max (K)",
+        "description": (
+            "两层模式下异动闸门每轮晋升到深度层的标的数上限（1..20，默认 12）。"
+            "仅约束按异动排名晋升的名额；当日冻结盘前计划标的始终占深度位。"
+        ),
+        "category": "base",
+        "data_type": "number",
+        "ui_control": "number",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "12",
+        "options": [],
+        "validation": {"min": 1, "max": 20},
+        "display_order": 12,
+    },
+    "INTRADAY_PINNED_TICKERS": {
+        "title": "Intraday Pinned Tickers (always deep-scanned)",
+        "description": (
+            "两层模式下的用户钉选清单（逗号分隔美股代码）。钉选标的保证每轮"
+            "进入深度层（与当日冻结盘前计划同权：不占 K 名额、并入同一批快照"
+            "、按当日额度去重）。留空＝无钉选；仅在 INTRADAY_WATCHLIST 已配置"
+            "时生效。"
+        ),
+        "category": "base",
+        "data_type": "array",
+        "ui_control": "textarea",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "",
+        "options": [],
+        "validation": {},
+        "display_order": 13,
+    },
     # ------------------------------------------------------------------
     # AI Model – LiteLLM unified config
     # ------------------------------------------------------------------
@@ -1522,6 +1576,82 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "options": [],
         "validation": {},
         "display_order": 11,
+    },
+    "INTRADAY_REFRESH_SCHEDULER_ENABLED": {
+        "title": "Intraday Warm Cache Scheduler",
+        "description": (
+            "Keep the default intraday-top scan cache warm on weekdays "
+            "09:00-16:15 ET warm window so the page default poll never hits the "
+            "10-45s cold path. Goes through the same single-flight scan "
+            "path as user requests; read-only, never places orders. "
+            "Requires a process restart."
+        ),
+        "category": "system",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "false",
+        "options": [],
+        "validation": {},
+        "display_order": 12,
+    },
+    "INTRADAY_REFRESH_INTERVAL_SECONDS": {
+        "title": "Intraday Warm Cache Interval (seconds)",
+        "description": (
+            "Warm-loop cadence in seconds (default 45). Values below 30 "
+            "(the base single-flight lease) are clamped to 30."
+        ),
+        "category": "system",
+        "data_type": "number",
+        "ui_control": "number",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "45",
+        "options": [],
+        "validation": {"min": 30},
+        "display_order": 13,
+    },
+    "INTRADAY_ALERTS_ENABLED": {
+        "title": "Intraday Opportunity Alerts (Telegram)",
+        "description": (
+            "Push factual intraday alerts (premarket movers, volume "
+            "bursts, strong legs, 30-min displacement, 0DTE day type) "
+            "to Telegram, detected on the warm-scan payload with zero "
+            "extra provider fetches. Facts only, never trade advice. "
+            "Requires INTRADAY_REFRESH_SCHEDULER_ENABLED plus Telegram "
+            "credentials, and a process restart."
+        ),
+        "category": "system",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "false",
+        "options": [],
+        "validation": {},
+        "display_order": 14,
+    },
+    "INTRADAY_ALERTS_MAX_PER_DAY": {
+        "title": "Intraday Alerts Daily Cap",
+        "description": (
+            "Maximum alerts per ET day (default 20, minimum 1). When the "
+            "cap is reached one final notice is sent and alerting stops "
+            "for the rest of the day."
+        ),
+        "category": "system",
+        "data_type": "number",
+        "ui_control": "number",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "20",
+        "options": [],
+        "validation": {"min": 1},
+        "display_order": 15,
     },
     "SCHEDULE_RUN_IMMEDIATELY": {
         "title": "Schedule Run Immediately",

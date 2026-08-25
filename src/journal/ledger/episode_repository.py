@@ -444,6 +444,9 @@ class PositionEpisodeEvidenceItem:
     allocation_ratio: Optional[Decimal]
     broker_order_observation_id: Optional[int]
     broker_fill_observation_id: Optional[int]
+    # 成交证据的父订单 id（fill 行经 BrokerFillObservation 联表补出）；
+    # 证据行本身受 order XOR fill 约束，不能直接携带两个 id。
+    parent_broker_order_observation_id: Optional[int]
     allocation_evidence: Mapping[str, Any]
     provenance: Mapping[str, Any]
 
@@ -4346,6 +4349,25 @@ def _position_episode_detail_for_build(
             PositionEpisodeEvidence.id,
         )
     ).scalars()
+    allocation_rows = list(allocations)
+    fill_ids = {
+        int(item.broker_fill_observation_id)
+        for item in allocation_rows
+        if item.broker_fill_observation_id is not None
+    }
+    fill_parent_order_ids: dict[int, Optional[int]] = {}
+    if fill_ids:
+        fill_parent_order_ids = {
+            int(fill_id): (
+                int(parent_order_id) if parent_order_id is not None else None
+            )
+            for fill_id, parent_order_id in session.execute(
+                select(
+                    BrokerFillObservation.id,
+                    BrokerFillObservation.broker_order_observation_id,
+                ).where(BrokerFillObservation.id.in_(fill_ids))
+            )
+        }
     evidence = tuple(
         PositionEpisodeEvidenceItem(
             evidence_id=int(item.id),
@@ -4368,10 +4390,15 @@ def _position_episode_detail_for_build(
                 if item.broker_fill_observation_id is not None
                 else None
             ),
+            parent_broker_order_observation_id=(
+                fill_parent_order_ids.get(int(item.broker_fill_observation_id))
+                if item.broker_fill_observation_id is not None
+                else None
+            ),
             allocation_evidence=_parse_json(item.allocation_evidence_json),
             provenance=_parse_json(item.provenance_json),
         )
-        for item in allocations
+        for item in allocation_rows
     )
     return PositionEpisodeDetail(
         episode=_position_item(position, strategy, latest_review),

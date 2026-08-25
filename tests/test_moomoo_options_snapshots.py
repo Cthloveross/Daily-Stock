@@ -10,6 +10,16 @@ import pandas as pd
 import pytest
 
 from data_provider import moomoo_options
+from src.services.moomoo_runtime import MOOMOO_RPC_BREAKER
+
+
+@pytest.fixture(autouse=True)
+def _reset_moomoo_breaker():
+    """共享断路器状态不得跨用例泄漏（含用桩故意制造的失败）。"""
+
+    MOOMOO_RPC_BREAKER.reset_for_tests()
+    yield
+    MOOMOO_RPC_BREAKER.reset_for_tests()
 
 
 class _QuoteContext:
@@ -108,7 +118,7 @@ def _prepare_wall_context(monkeypatch, ctx, *, spot: float = 181.0):
     monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
 
     @contextmanager
-    def lease_test_context():
+    def lease_test_context(*_args, **_kwargs):
         yield ctx, moomoo_options._ctx_lock
 
     monkeypatch.setattr(
@@ -188,6 +198,105 @@ def test_option_underlying_overview_fails_closed_on_provider_error(monkeypatch):
     monkeypatch.setattr(moomoo_options, "_get_ctx", lambda: ctx)
 
     assert moomoo_options.fetch_option_underlying_overviews_moomoo(["AAPL"]) == {}
+
+
+class _SessionSnapshotContext:
+    def __init__(self, frame: pd.DataFrame):
+        self.frame = frame
+        self.calls: list[list[str]] = []
+
+    def get_market_snapshot(self, codes):
+        self.calls.append(list(codes))
+        return 0, self.frame
+
+
+def test_underlying_session_quote_parses_pre_fields_present_absent_invalid(
+    monkeypatch,
+):
+    """盘前字段解析：present 保留（负 pre_change_rate 合法）、缺列/非法一律 None。
+
+    Moomoo 盘前时段常规字段仍指向上一常规时段，真实盘前变动只在 pre_*：
+    pre_change_rate 为相对上一常规收盘的百分比、可为负；pre_price 零/负、
+    pre_volume/pre_turnover 负值、无法解析的值全部保持 None，绝不 0 回填。
+    """
+
+    _install_fake_moomoo(monkeypatch)
+    frame = pd.DataFrame(
+        [
+            {
+                # 盘前字段齐全：负 pre_change_rate 是合法读数。
+                "code": "US.NVDA",
+                "last_price": 130.5,
+                "prev_close_price": 124.0,
+                "pre_price": 128.7,
+                "pre_change_rate": -2.35,
+                "pre_volume": 12_000,
+                "pre_turnover": 1_218_000.0,
+            },
+            {
+                # 快照缺盘前列（pandas 混排下为 NaN）：全部 None。
+                "code": "US.MU",
+                "last_price": 100.5,
+                "prev_close_price": 99.0,
+            },
+            {
+                # 值非法：pre_price=0、pre_change_rate 不可解析、量额为负。
+                "code": "US.AMD",
+                "last_price": 150.0,
+                "prev_close_price": 149.0,
+                "pre_price": 0.0,
+                "pre_change_rate": "not_a_number",
+                "pre_volume": -5,
+                "pre_turnover": -1.0,
+            },
+            {
+                # pre_price 为负 → None；同行合法的 pre_change_rate 照常保留。
+                "code": "US.TSLA",
+                "last_price": 300.0,
+                "prev_close_price": 305.0,
+                "pre_price": -3.0,
+                "pre_change_rate": -1.2,
+                "pre_volume": 800,
+                "pre_turnover": 240_000.0,
+            },
+        ]
+    )
+    ctx = _SessionSnapshotContext(frame)
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+    monkeypatch.setattr(moomoo_options, "_get_ctx", lambda: ctx)
+
+    result = moomoo_options.fetch_underlying_session_quotes_moomoo(
+        ["NVDA", "MU", "AMD", "TSLA"]
+    )
+
+    assert ctx.calls == [["US.NVDA", "US.MU", "US.AMD", "US.TSLA"]]
+    assert set(result) == {"NVDA", "MU", "AMD", "TSLA"}
+
+    nvda = result["NVDA"]
+    # 常规字段照旧解析（additive：盘前字段不改变既有语义）。
+    assert nvda.last_price == pytest.approx(130.5)
+    assert nvda.pre_price == pytest.approx(128.7)
+    assert nvda.pre_change_rate == pytest.approx(-2.35)
+    assert nvda.pre_volume == 12_000
+    assert nvda.pre_turnover == pytest.approx(1_218_000.0)
+
+    mu = result["MU"]
+    assert mu.pre_price is None
+    assert mu.pre_change_rate is None
+    assert mu.pre_volume is None
+    assert mu.pre_turnover is None
+
+    amd = result["AMD"]
+    assert amd.pre_price is None  # 零价不是价格。
+    assert amd.pre_change_rate is None
+    assert amd.pre_volume is None
+    assert amd.pre_turnover is None
+
+    tsla = result["TSLA"]
+    assert tsla.pre_price is None  # 负价不是价格。
+    assert tsla.pre_change_rate == pytest.approx(-1.2)
+    assert tsla.pre_volume == 800
+    assert tsla.pre_turnover == pytest.approx(240_000.0)
 
 
 def test_chain_joins_static_contracts_with_dynamic_snapshots(monkeypatch):
@@ -843,3 +952,288 @@ def test_option_wall_context_pool_leases_five_exclusive_reusable_lanes(
     finally:
         release.set()
         moomoo_options._reset_wall_context_pool_for_tests()
+
+
+# --- 今日车道可用性（V2-E）：最省额度的到期日元数据读取 ----------------------
+
+
+class _ExpiryOnlyContext(_WallQuoteContext):
+    """到期日元数据可读，但链窗口/快照一旦被调用即判定测试失败。"""
+
+    def get_option_chain(self, **kwargs):  # pragma: no cover - must not run
+        raise AssertionError("availability read must not query the option chain")
+
+    def get_market_snapshot(self, codes):  # pragma: no cover - must not run
+        raise AssertionError("availability read must not request snapshots")
+
+
+def test_expiry_availability_reads_only_expiration_metadata(monkeypatch):
+    """只发 get_option_expiration_date：不发链窗口、不取 spot、不发快照批次。"""
+
+    ctx = _ExpiryOnlyContext(
+        {},
+        pd.DataFrame(),
+        ["2026-08-05", "2026-08-07", "2026-08-10", "2026-09-18"],
+    )
+    _install_fake_moomoo(monkeypatch)
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+
+    @contextmanager
+    def lease_test_context(*_args, **_kwargs):
+        yield ctx, moomoo_options._ctx_lock
+
+    monkeypatch.setattr(moomoo_options, "_lease_wall_context", lease_test_context)
+
+    def forbidden_spot(*_args, **_kwargs):  # pragma: no cover - must not run
+        raise AssertionError("availability read must not fetch an underlying spot")
+
+    monkeypatch.setattr(
+        moomoo_options, "_spot_with_time_from_ctx", forbidden_spot
+    )
+
+    result = moomoo_options.fetch_expiry_availability_moomoo(
+        "NVDA", max_dte=7, ref_date=date(2026, 8, 4)
+    )
+
+    assert result is not None
+    assert result.symbol == "NVDA"
+    assert result.market_date == "2026-08-04"
+    # 2026-09-18 超窗口被排除；输出按 (dte, expiry) 升序。
+    assert result.expiries == (
+        ("2026-08-05", 1),
+        ("2026-08-07", 3),
+        ("2026-08-10", 6),
+    )
+    assert ctx.chain_calls == []
+
+
+def test_expiry_availability_zero_dte_is_reported_for_same_day_expiry(monkeypatch):
+    ctx = _ExpiryOnlyContext({}, pd.DataFrame(), ["2026-08-04", "2026-08-07"])
+    _install_fake_moomoo(monkeypatch)
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+
+    @contextmanager
+    def lease_test_context(*_args, **_kwargs):
+        yield ctx, moomoo_options._ctx_lock
+
+    monkeypatch.setattr(moomoo_options, "_lease_wall_context", lease_test_context)
+
+    result = moomoo_options.fetch_expiry_availability_moomoo(
+        "QQQ", max_dte=7, ref_date=date(2026, 8, 4)
+    )
+
+    assert result is not None
+    assert result.expiries[0] == ("2026-08-04", 0)
+
+
+def test_expiry_availability_empty_window_is_honest_empty_not_none(monkeypatch):
+    """窗口内没有到期日：空 expiries（诚实空态），不是 None（失败）。"""
+
+    ctx = _ExpiryOnlyContext({}, pd.DataFrame(), ["2026-09-18"])
+    _install_fake_moomoo(monkeypatch)
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+
+    @contextmanager
+    def lease_test_context(*_args, **_kwargs):
+        yield ctx, moomoo_options._ctx_lock
+
+    monkeypatch.setattr(moomoo_options, "_lease_wall_context", lease_test_context)
+
+    result = moomoo_options.fetch_expiry_availability_moomoo(
+        "AAOI", max_dte=7, ref_date=date(2026, 8, 4)
+    )
+
+    assert result is not None
+    assert result.expiries == ()
+
+
+def test_expiry_availability_fails_closed_on_metadata_error(monkeypatch):
+    class _BrokenContext(_ExpiryOnlyContext):
+        def get_option_expiration_date(self, **_kwargs):
+            return 1, "rate limited"
+
+    ctx = _BrokenContext({}, pd.DataFrame(), [])
+    _install_fake_moomoo(monkeypatch)
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+
+    @contextmanager
+    def lease_test_context(*_args, **_kwargs):
+        yield ctx, moomoo_options._ctx_lock
+
+    monkeypatch.setattr(moomoo_options, "_lease_wall_context", lease_test_context)
+
+    assert (
+        moomoo_options.fetch_expiry_availability_moomoo(
+            "MU", max_dte=7, ref_date=date(2026, 8, 4)
+        )
+        is None
+    )
+
+
+def test_expiry_availability_validates_bounds_and_enablement(monkeypatch):
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: False)
+    assert moomoo_options.fetch_expiry_availability_moomoo("MU") is None
+
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+    _install_fake_moomoo(monkeypatch)
+    with pytest.raises(ValueError):
+        moomoo_options.fetch_expiry_availability_moomoo("MU", max_dte=8)
+    with pytest.raises(ValueError):
+        moomoo_options.fetch_expiry_availability_moomoo("MU", max_dte=-1)
+
+
+# --- Tier-1 批量快照的未知代码恢复（一个坏代码不再拖垮整批）-----------------
+
+
+class _UnknownCodeContext:
+    """Reject any batch containing a bad code; name it only when asked to."""
+
+    def __init__(self, frame: pd.DataFrame, bad_codes: set[str], *, name_codes: bool):
+        self.frame = frame
+        self.bad_codes = bad_codes
+        self.name_codes = name_codes
+        self.calls: list[list[str]] = []
+
+    def get_market_snapshot(self, codes):
+        requested = list(codes)
+        self.calls.append(requested)
+        bad = [code for code in requested if code in self.bad_codes]
+        if bad:
+            if self.name_codes:
+                return 1, f"ret != RET_OK. Unknown stock: {','.join(bad)}"
+            return 1, "ret != RET_OK. Unknown stock"
+        return 0, self.frame[self.frame["code"].isin(requested)]
+
+
+def _session_frame(*symbols: str) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "code": f"US.{symbol}",
+                "last_price": 100.0 + index,
+                "prev_close_price": 99.0 + index,
+            }
+            for index, symbol in enumerate(symbols)
+        ]
+    )
+
+
+def test_session_snapshot_filters_named_unknown_code_and_keeps_valid(monkeypatch):
+    """错误详情点名未知代码：过滤后一次重试，有效代码全部照常返回。
+
+    2026-08 LIVE 复现：清单里 1 个 'Unknown stock' 让整批 69 个代码全部
+    失败——修复后未知代码只影响它自己。
+    """
+
+    _install_fake_moomoo(monkeypatch)
+    ctx = _UnknownCodeContext(
+        _session_frame("NVDA", "MU"), {"US.BADX"}, name_codes=True
+    )
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+    monkeypatch.setattr(moomoo_options, "_get_ctx", lambda: ctx)
+
+    result = moomoo_options.fetch_underlying_session_quotes_moomoo(
+        ["NVDA", "BADX", "MU"]
+    )
+
+    assert set(result) == {"NVDA", "MU"}
+    # 1 次原始调用 + 1 次过滤重试（≤3 次额外调用的硬顶之内）。
+    assert ctx.calls == [
+        ["US.NVDA", "US.BADX", "US.MU"],
+        ["US.NVDA", "US.MU"],
+    ]
+    # 业务型拒绝不得触发断路器。
+    assert MOOMOO_RPC_BREAKER.is_open() is False
+
+
+def test_session_snapshot_binary_splits_unnamed_unknown_code(monkeypatch):
+    """错误详情不点名代码：二分重试，额外调用有界（≤3），有效代码尽量解析。"""
+
+    _install_fake_moomoo(monkeypatch)
+    ctx = _UnknownCodeContext(
+        _session_frame("AAA", "BBB", "DDD"), {"US.CCC"}, name_codes=False
+    )
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+    monkeypatch.setattr(moomoo_options, "_get_ctx", lambda: ctx)
+
+    result = moomoo_options.fetch_underlying_session_quotes_moomoo(
+        ["AAA", "BBB", "CCC", "DDD"]
+    )
+
+    # 前半批 [AAA, BBB] 解析成功；坏代码所在的后半批在预算内继续二分，
+    # 预算耗尽的代码如实缺席（端点按 snapshot_unresolved 披露），绝不整批失败。
+    assert {"AAA", "BBB"} <= set(result)
+    assert "CCC" not in result
+    # 1 次原始调用 + 至多 3 次额外调用。
+    assert len(ctx.calls) <= 4
+    assert MOOMOO_RPC_BREAKER.is_open() is False
+
+
+def test_session_snapshot_transport_failure_still_fails_closed(monkeypatch):
+    """非未知代码型失败：整批 fail closed 返回空 mapping（既有语义不变）。"""
+
+    _install_fake_moomoo(monkeypatch)
+
+    class _TransportFail:
+        def __init__(self):
+            self.calls = 0
+
+        def get_market_snapshot(self, codes):
+            self.calls += 1
+            return 1, "request timeout"
+
+    ctx = _TransportFail()
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+    monkeypatch.setattr(moomoo_options, "_get_ctx", lambda: ctx)
+
+    assert moomoo_options.fetch_underlying_session_quotes_moomoo(["NVDA"]) == {}
+    assert ctx.calls == 1  # 传输失败不做未知代码恢复重试
+
+
+def test_session_snapshot_fails_fast_while_breaker_is_open(monkeypatch):
+    """断路器打开：不再触碰 ctx，直接返回空 mapping（调用方 fail closed）。"""
+
+    _install_fake_moomoo(monkeypatch)
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+    monkeypatch.setattr(
+        moomoo_options,
+        "_get_ctx",
+        lambda: pytest.fail("open breaker must not reach the quote context"),
+    )
+    for _ in range(3):
+        MOOMOO_RPC_BREAKER.record_failure("request timeout")
+
+    assert moomoo_options.fetch_underlying_session_quotes_moomoo(["NVDA"]) == {}
+
+
+def test_expiry_availability_short_wait_raises_busy_instead_of_failure(
+    monkeypatch,
+):
+    """lane 正忙 + 有界短等待：抛 MoomooWallLaneBusyError（推迟），不是 None（失败）。"""
+
+    _install_fake_moomoo(monkeypatch)
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+    waits: list[float] = []
+
+    def busy_claim(wait_seconds=None):
+        waits.append(wait_seconds)
+        return None
+
+    monkeypatch.setattr(
+        moomoo_options, "_claim_wall_context_lane", busy_claim
+    )
+
+    with pytest.raises(moomoo_options.MoomooWallLaneBusyError):
+        moomoo_options.fetch_expiry_availability_moomoo(
+            "NVDA", max_dte=7, ref_date=date(2026, 8, 4), lane_wait_seconds=2.5
+        )
+    assert waits == [2.5]
+
+    # 未传短等待（默认路径）：保持既有 fail-closed None 语义。
+    assert (
+        moomoo_options.fetch_expiry_availability_moomoo(
+            "NVDA", max_dte=7, ref_date=date(2026, 8, 4)
+        )
+        is None
+    )
+    assert waits == [2.5, None]

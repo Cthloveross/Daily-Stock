@@ -44,6 +44,8 @@ async def app_lifespan(app: FastAPI):
     premarket_evidence_scheduler = None
     premarket_scheduler = None
     outcome_scheduler = None
+    intraday_warm_scheduler = None
+    intraday_alerter = None
     try:
         from src.config import get_config
 
@@ -92,10 +94,86 @@ async def app_lifespan(app: FastAPI):
             outcome_scheduler = CanonicalOpportunityOutcomeScheduler()
             outcome_scheduler.start()
             app.state.opportunity_outcome_scheduler = outcome_scheduler
+        if bool(
+            getattr(config, "intraday_refresh_scheduler_enabled", False)
+        ):
+            # Warm the page's default intraday-top poll through the exact
+            # single-flight path the endpoint uses; join-not-duplicate.
+            from api.v1.endpoints.opportunities import (
+                warm_default_intraday_top_scan,
+            )
+            from src.services.intraday_warm_cache_scheduler import (
+                IntradayWarmCacheScheduler,
+                execute_intraday_warm_tick,
+            )
+
+            warm_runner = warm_default_intraday_top_scan
+            if bool(getattr(config, "intraday_alerts_enabled", False)):
+                # 盘中机会提示器：只挂在预热载荷上（零新增取数），预热
+                # 关闭时本分支不可达——提示器随之零检测（文档已注明）。
+                from src.notification_sender.telegram_sender import (
+                    TelegramSender,
+                )
+                from src.services.intraday_opportunity_alerter import (
+                    IntradayOpportunityAlerter,
+                )
+
+                # 凭据缺失时不构造提示器：否则 TelegramSender 会对每条消息
+                # 各刷一行 WARNING（最多日上限条/天）——对抗复核修正为一次
+                # 启动警告 + 干净禁用。
+                if not (
+                    getattr(config, "telegram_bot_token", None)
+                    and getattr(config, "telegram_chat_id", None)
+                ):
+                    logger.warning(
+                        "INTRADAY_ALERTS_ENABLED=true 但 Telegram 凭据缺失"
+                        "（TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID）；提示器已禁用"
+                    )
+                else:
+                    intraday_alerter = IntradayOpportunityAlerter(
+                        TelegramSender(config).send_to_telegram,
+                        max_alerts_per_day=getattr(
+                            config, "intraday_alerts_max_per_day", 20
+                        ),
+                    )
+                    intraday_alerter.start()
+                    app.state.intraday_opportunity_alerter = intraday_alerter
+                    observer = intraday_alerter.observe
+
+                    def warm_runner():  # noqa: D401 - closure over the warm scan
+                        return warm_default_intraday_top_scan(
+                            payload_observer=observer
+                        )
+
+            # 通道看门狗：Moomoo 熔断器打开/闭合时给手机各推一次系统通知
+            # （2026-08-14 OpenD 崩溃后静默降级 6 天无人知晓——G-31 修复）。
+            # 仅在提示器存在（Telegram 可用）时接线。
+            channel_watch = None
+            channel_notifier = None
+            if intraday_alerter is not None:
+                from src.services.moomoo_runtime import MOOMOO_RPC_BREAKER
+
+                channel_watch = lambda: MOOMOO_RPC_BREAKER.is_tripped  # noqa: E731
+                channel_notifier = intraday_alerter.notify_system
+
+            intraday_warm_scheduler = IntradayWarmCacheScheduler(
+                lambda: execute_intraday_warm_tick(
+                    warm_runner=warm_runner,
+                ),
+                channel_watch=channel_watch,
+                channel_notifier=channel_notifier,
+                interval_seconds=getattr(
+                    config, "intraday_refresh_interval_seconds", 45
+                ),
+            )
+            intraday_warm_scheduler.start()
+            app.state.intraday_warm_cache_scheduler = intraday_warm_scheduler
         yield
     finally:
         for scheduler_name, scheduler in (
             ("moomoo_premarket_prefetch", premarket_evidence_scheduler),
+            ("intraday_warm_cache", intraday_warm_scheduler),
+            ("intraday_opportunity_alerter", intraday_alerter),
             ("opportunity_outcome", outcome_scheduler),
             ("premarket_research", premarket_scheduler),
         ):
@@ -109,6 +187,10 @@ async def app_lifespan(app: FastAPI):
                     scheduler_name,
                     type(exc).__name__,
                 )
+        if hasattr(app.state, "intraday_warm_cache_scheduler"):
+            delattr(app.state, "intraday_warm_cache_scheduler")
+        if hasattr(app.state, "intraday_opportunity_alerter"):
+            delattr(app.state, "intraday_opportunity_alerter")
         if hasattr(app.state, "opportunity_outcome_scheduler"):
             delattr(app.state, "opportunity_outcome_scheduler")
         if hasattr(app.state, "premarket_research_scheduler"):

@@ -86,6 +86,20 @@ describe('PlaybookPanel', () => {
     expect(screen.getByText(/还没有晋升过的规则/)).toBeInTheDocument();
   });
 
+  it('renders frozen rule_text and preserves its paragraph breaks', async () => {
+    // R5–R8 这类取证候选靠空行分段；rule_text 是 append-only 冻结文本，
+    // 只能靠渲染保留换行，不能改数据。
+    const multiline = '样本：13,136 次事件。\n\n1) 进场择时没有边际。\n\n边界：数据描述供本人复核。';
+    fetchPlaybookMock.mockResolvedValue(
+      response({ candidates: [candidate({ ruleText: multiline })] }),
+    );
+    render(<PlaybookPanel />);
+
+    const body = await screen.findByText(/进场择时没有边际/);
+    expect(body).toHaveClass('whitespace-pre-line');
+    expect(body.textContent).toBe(multiline);
+  });
+
   it('promotes a candidate only after an explicit confirmation', async () => {
     fetchPlaybookMock.mockResolvedValue(response({ candidates: [candidate()] }));
     promoteMock.mockResolvedValue({

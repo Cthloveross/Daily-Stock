@@ -2,6 +2,10 @@ import apiClient from './index';
 import { toCamelCase } from './utils';
 import type {
   DailyOpportunityRun,
+  IntradayPulseResponse,
+  IntradayTopResponse,
+  IntradayTrackingResponse,
+  NearExpiryContractResponse,
   OpportunityLearningSummaryResponse,
   OpportunityOptionContextResponse,
   OpportunityOptionEventResponse,
@@ -33,6 +37,18 @@ const optionContextInFlight = new Map<string, Promise<OpportunityOptionContextRe
 const optionEventInFlight = new Map<string, Promise<OpportunityOptionEventResponse>>();
 const optionOverviewInFlight = new Map<string, Promise<OpportunityOptionOverviewResponse>>();
 const optionWallInFlight = new Map<string, Promise<OpportunityOptionWallResponse>>();
+const nearExpiryInFlight = new Map<string, Promise<NearExpiryContractResponse>>();
+// 服务端 30 秒 TTL + single-flight；客户端同样只缓存 30 秒，保证盘中读数
+// 不被长缓存冻结。
+const NEAR_EXPIRY_TIMEOUT_MS = 30_000;
+const NEAR_EXPIRY_CACHE_TTL_MS = 30_000;
+const intradayTrackingInFlight = new Map<string, Promise<IntradayTrackingResponse>>();
+const INTRADAY_TRACKING_TIMEOUT_MS = 30_000;
+const intradayTopInFlight = new Map<string, Promise<IntradayTopResponse>>();
+// 服务端装配含逐标的异动读取，lease 45 秒；客户端预算需覆盖它。
+const INTRADAY_TOP_TIMEOUT_MS = 50_000;
+let intradayPulseInFlight: Promise<IntradayPulseResponse> | null = null;
+const INTRADAY_PULSE_TIMEOUT_MS = 30_000;
 const premarketStatusInFlight = new Map<string, Promise<PremarketCycleResponse>>();
 const premarketRunInFlight = new Map<string, Promise<PremarketCycleResponse>>();
 
@@ -299,6 +315,127 @@ export async function fetchOpportunityOptionEvents(
   });
 
   optionEventInFlight.set(key, request);
+  return request;
+}
+
+/**
+ * 临期合约面板（0–maxDte DTE）：合约选择参考，不构成推荐。
+ * 服务端 30 秒 TTL + single-flight；客户端 30 秒缓存 + 在途去重，
+ * refresh 只绕过已完成缓存。
+ */
+export async function fetchNearExpiryContracts(
+  symbol: string,
+  maxDte = 3,
+  options: { refresh?: boolean } = {},
+): Promise<NearExpiryContractResponse> {
+  const normalized = normalizeSupportedUsOptionUnderlying(symbol);
+  if (!normalized) {
+    throw new Error(`不支持的美股期权标的：${symbol}`);
+  }
+  const key = `opportunities:near-expiry:${normalized}:${maxDte}`;
+  if (!options.refresh) {
+    const cached = sessionCache.get<NearExpiryContractResponse>(key);
+    if (cached) return cached;
+  }
+
+  const pending = nearExpiryInFlight.get(key);
+  if (pending) return pending;
+
+  const request = apiClient.post<Record<string, unknown>>(
+    '/api/v1/opportunities/near-expiry-contracts',
+    { symbol: normalized, max_dte: maxDte, refresh: Boolean(options.refresh) },
+    { timeout: NEAR_EXPIRY_TIMEOUT_MS },
+  ).then((response) => {
+    const result = toCamelCase<NearExpiryContractResponse>(response.data);
+    sessionCache.set(key, result, NEAR_EXPIRY_CACHE_TTL_MS);
+    return result;
+  }).finally(() => {
+    nearExpiryInFlight.delete(key);
+  });
+
+  nearExpiryInFlight.set(key, request);
+  return request;
+}
+
+/**
+ * 盘中跟踪：对照冻结盘前计划读取实时行情与首批专业指标。
+ * 服务端已有 30 秒 TTL + single-flight，本函数只做在途去重，不写 sessionCache，
+ * 保证每次轮询拿到的都是服务端允许的最新数据时点。
+ */
+export async function fetchIntradayTracking(
+  symbols: string[],
+  options: { refresh?: boolean } = {},
+): Promise<IntradayTrackingResponse> {
+  const requestedSymbols = normalizedOptionContextSymbols(symbols).slice(0, 5);
+  const key = `opportunities:intraday-tracking:${requestedSymbols.join(',')}:${options.refresh ? 'refresh' : 'cached'}`;
+  const pending = intradayTrackingInFlight.get(key);
+  if (pending) return pending;
+
+  const request = apiClient.post<Record<string, unknown>>(
+    '/api/v1/opportunities/intraday-tracking',
+    { symbols: requestedSymbols, refresh: Boolean(options.refresh) },
+    { timeout: INTRADAY_TRACKING_TIMEOUT_MS },
+  ).then((response) => toCamelCase<IntradayTrackingResponse>(response.data))
+    .finally(() => {
+      intradayTrackingInFlight.delete(key);
+    });
+
+  intradayTrackingInFlight.set(key, request);
+  return request;
+}
+
+/**
+ * 日内 Top 滚动扫描：盘中持续重排，不冻结、不入统计。
+ * 服务端 60 秒 TTL + single-flight；本函数只做在途去重，不写 sessionCache，
+ * 保证每次轮询拿到的都是服务端允许的最新时点。空 symbols 由服务端回退 STOCK_LIST。
+ *
+ * `focusSymbols`（盘中计划提升，≤8）是**加法字段**：它不进 `symbols`，因此
+ * 不会把服务端的两层扫描模式关掉；服务端只把它并入深度层（与用户钉选同
+ * 语义，不新增取数路径）。
+ */
+export const INTRADAY_FOCUS_MAX_SYMBOLS = 8;
+
+export async function fetchIntradayTop(
+  symbols: string[],
+  options: { limit?: number; refresh?: boolean; focusSymbols?: string[] } = {},
+): Promise<IntradayTopResponse> {
+  const requestedSymbols = normalizedSymbols(symbols).slice(0, 20);
+  const focusSymbols = normalizedSymbols(options.focusSymbols ?? [])
+    .slice(0, INTRADAY_FOCUS_MAX_SYMBOLS);
+  const limit = options.limit ?? 5;
+  const key = `opportunities:intraday-top:${requestedSymbols.join(',')}:${focusSymbols.join(',')}:${limit}:${options.refresh ? 'refresh' : 'cached'}`;
+  const pending = intradayTopInFlight.get(key);
+  if (pending) return pending;
+
+  const request = apiClient.post<Record<string, unknown>>(
+    '/api/v1/opportunities/intraday-top',
+    {
+      symbols: requestedSymbols,
+      limit,
+      refresh: Boolean(options.refresh),
+      focus_symbols: focusSymbols,
+    },
+    { timeout: INTRADAY_TOP_TIMEOUT_MS },
+  ).then((response) => toCamelCase<IntradayTopResponse>(response.data))
+    .finally(() => {
+      intradayTopInFlight.delete(key);
+    });
+
+  intradayTopInFlight.set(key, request);
+  return request;
+}
+
+/** 市场脉搏（SPY/QQQ/VIX 快照读数）：服务端 60 秒 TTL；缺失显式标缺。 */
+export async function fetchIntradayPulse(): Promise<IntradayPulseResponse> {
+  if (intradayPulseInFlight) return intradayPulseInFlight;
+  const request = apiClient.get<Record<string, unknown>>(
+    '/api/v1/opportunities/intraday-pulse',
+    { timeout: INTRADAY_PULSE_TIMEOUT_MS },
+  ).then((response) => toCamelCase<IntradayPulseResponse>(response.data))
+    .finally(() => {
+      intradayPulseInFlight = null;
+    });
+  intradayPulseInFlight = request;
   return request;
 }
 

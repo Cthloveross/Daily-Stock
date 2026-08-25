@@ -18,9 +18,10 @@ import csv
 import hashlib
 import io
 import json
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping, Optional
 from zoneinfo import ZoneInfo
@@ -28,6 +29,7 @@ from zoneinfo import ZoneInfo
 __all__ = [
     "CSV_PARSER_VERSION",
     "MoomooStatementError",
+    "StatementComboLeg",
     "StatementFill",
     "StatementOrder",
     "StatementParseResult",
@@ -38,7 +40,7 @@ __all__ = [
 ]
 
 
-CSV_PARSER_VERSION = "moomoo-statement-v2"
+CSV_PARSER_VERSION = "moomoo-statement-v3"
 READONLY_EXPORT_SCHEMA = "dsa.moomoo.readonly-export.v1"
 ET = ZoneInfo("America/New_York")
 
@@ -95,6 +97,24 @@ class StatementFill:
 
 
 @dataclass(frozen=True)
+class StatementComboLeg:
+    """One combo leg display row nested under a combo parent order.
+
+    These rows repeat the broker's own leg display (symbol, side, stated
+    quantity and fill records).  They carry no status, order time or fee
+    columns, so they are retained as evidence on the parent and are never
+    promoted to standalone single-leg orders.
+    """
+
+    source_row: int
+    symbol: str
+    name: str
+    side: str
+    order_quantity: Optional[Decimal]
+    fills: tuple[StatementFill, ...] = ()
+
+
+@dataclass(frozen=True)
 class StatementOrder:
     """One CSV order plus its available fill evidence."""
 
@@ -121,6 +141,21 @@ class StatementOrder:
     total_fee: Decimal
     evidence_level: str
     evidence_warnings: tuple[str, ...] = field(default_factory=tuple)
+    # Combo (multi-leg spread) parent orders.  ``order_quantity`` and the
+    # ``Filled@Avg Price`` summary of such rows are stated in combo units,
+    # not shares or contracts, and ``total_fee`` is the broker's group-scope
+    # fee.  Leg-level economics are deliberately NOT reconstructed here.
+    order_kind: str = "single"
+    combo_unit_quantity: Optional[Decimal] = None
+    combo_underlying: Optional[str] = None
+    combo_expiry: Optional[date] = None
+    combo_option_right: Optional[str] = None
+    combo_strikes_text: Optional[str] = None
+    combo_legs: tuple[StatementComboLeg, ...] = ()
+
+    @property
+    def is_combo_parent(self) -> bool:
+        return self.order_kind == "combo_parent"
 
     @property
     def is_filled(self) -> bool:
@@ -182,6 +217,9 @@ class StatementParseResult:
             for order in self.orders
             if order.evidence_level == "inconsistent"
         ]
+        combo_parents = [
+            order for order in self.orders if order.is_combo_parent
+        ]
         order_times = [order.order_time for order in self.orders]
         fill_times = [
             fill.filled_at for order in self.orders for fill in order.fills
@@ -197,6 +235,13 @@ class StatementParseResult:
             "aggregate_only_filled_orders": len(aggregate_only),
             "inconsistent_filled_orders": len(inconsistent),
             "fill_records": sum(len(order.fills) for order in self.orders),
+            "combo_parent_orders": len(combo_parents),
+            "combo_parent_leg_rows": sum(
+                len(order.combo_legs) for order in combo_parents
+            ),
+            "combo_parent_fee_total": _decimal_text(
+                sum((order.total_fee for order in combo_parents), Decimal("0"))
+            ),
             "orphan_fill_rows": self.orphan_fill_rows,
             "filled_fee_total": _decimal_text(
                 sum((order.total_fee for order in filled), Decimal("0"))
@@ -398,18 +443,70 @@ def _normalise_api_status(value: Any) -> str:
     }.get(text, text or "UNKNOWN")
 
 
-def _parse_fill_summary(value: str) -> tuple[Optional[Decimal], Optional[Decimal]]:
+_UNIT_QUANTITY_RE = re.compile(r"^([0-9][0-9,.]*)\s*unit\(s\)$", re.IGNORECASE)
+
+# Combo spread display symbols such as ``MU260731P745/760``.  The strike
+# fragment is a broker display value, not an OCC strike code, so it is kept
+# verbatim instead of being decoded into a fake single strike.
+_COMBO_SPREAD_SYMBOL_RE = re.compile(
+    r"^(?P<underlying>[A-Z][A-Z.]{0,9})"
+    r"(?P<expiry>\d{6})"
+    r"(?P<right>[CP])"
+    r"(?P<strikes>\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)+)$"
+)
+
+
+def _parse_order_quantity(value: str) -> tuple[Decimal, bool]:
+    """Parse an order quantity, detecting combo-unit ``N unit(s)`` values."""
+    text = value.strip()
+    match = _UNIT_QUANTITY_RE.match(text)
+    if match:
+        quantity = _parse_decimal(match.group(1), allow_missing=False)
+        assert quantity is not None
+        return quantity, True
+    quantity = _parse_decimal(text, allow_missing=False)
+    assert quantity is not None
+    return quantity, False
+
+
+def _parse_combo_spread_symbol(symbol: str) -> Optional[dict[str, Any]]:
+    match = _COMBO_SPREAD_SYMBOL_RE.match(symbol.strip().upper())
+    if match is None:
+        return None
+    try:
+        expiry = datetime.strptime(match.group("expiry"), "%y%m%d").date()
+    except ValueError:
+        return None
+    return {
+        "underlying": match.group("underlying"),
+        "expiry": expiry,
+        "option_right": match.group("right"),
+        "strikes_text": match.group("strikes"),
+    }
+
+
+def _parse_fill_summary(
+    value: str,
+) -> tuple[Optional[Decimal], Optional[Decimal], bool]:
     text = value.strip()
     if not text:
-        return None, None
+        return None, None, False
     if "@" not in text:
         # Older exports displayed only the average price.  Detail-backed rows
         # remain exact because quantity comes from their fill records.
-        return None, _parse_decimal(text, allow_missing=False)
+        return None, _parse_decimal(text, allow_missing=False), False
     quantity_text, price_text = text.rsplit("@", 1)
+    unit_match = _UNIT_QUANTITY_RE.match(quantity_text.strip())
+    if unit_match:
+        return (
+            _parse_decimal(unit_match.group(1), allow_missing=False),
+            _parse_decimal(price_text, allow_missing=False),
+            True,
+        )
     return (
         _parse_decimal(quantity_text, allow_missing=False),
         _parse_decimal(price_text, allow_missing=False),
+        False,
     )
 
 
@@ -451,21 +548,42 @@ def _build_order(
     row: list[str],
     headers: _HeaderMap,
     fills: list[StatementFill],
+    combo_legs: tuple[StatementComboLeg, ...] = (),
 ) -> StatementOrder:
     symbol = _normalise_symbol(headers.get(row, "Symbol"))
     side = _normalise_side(headers.get(row, "Side"))
     status = _normalise_statement_status(headers.get(row, "Status"))
-    order_quantity = _parse_decimal(
-        headers.get(row, "Order Qty"), allow_missing=False
+    order_quantity, quantity_in_combo_units = _parse_order_quantity(
+        headers.get(row, "Order Qty")
     )
-    assert order_quantity is not None
     order_time = _parse_time(headers.get(row, "Order Time"))
-    summary_quantity, summary_price = _parse_fill_summary(
-        headers.get(row, "Filled@Avg Price")
+    summary_quantity, summary_price, summary_in_combo_units = (
+        _parse_fill_summary(headers.get(row, "Filled@Avg Price"))
     )
     fee_components = tuple(
         (name, _decimal_or_zero(headers.get(row, name))) for name in _FEE_COLUMNS
     )
+    is_combo_parent = (
+        quantity_in_combo_units or summary_in_combo_units or "/" in symbol
+    )
+    if is_combo_parent:
+        return _build_combo_parent_order(
+            source_row=source_row,
+            row=row,
+            headers=headers,
+            fills=fills,
+            combo_legs=combo_legs,
+            symbol=symbol,
+            side=side,
+            status=status,
+            order_quantity=order_quantity,
+            quantity_in_combo_units=quantity_in_combo_units,
+            order_time=order_time,
+            summary_quantity=summary_quantity,
+            summary_price=summary_price,
+            summary_in_combo_units=summary_in_combo_units,
+            fee_components=fee_components,
+        )
     evidence_warnings: list[str] = []
     evidence_level = "not_filled"
     if fills:
@@ -538,6 +656,103 @@ def _build_order(
     )
 
 
+def _build_combo_parent_order(
+    *,
+    source_row: int,
+    row: list[str],
+    headers: _HeaderMap,
+    fills: list[StatementFill],
+    combo_legs: tuple[StatementComboLeg, ...],
+    symbol: str,
+    side: str,
+    status: str,
+    order_quantity: Decimal,
+    quantity_in_combo_units: bool,
+    order_time: datetime,
+    summary_quantity: Optional[Decimal],
+    summary_price: Optional[Decimal],
+    summary_in_combo_units: bool,
+    fee_components: tuple[tuple[str, Decimal], ...],
+) -> StatementOrder:
+    """Classify a combo (multi-leg spread) parent row without disguising it.
+
+    The parent quantity and the ``Filled@Avg Price`` summary are combo-unit
+    values, the fee tail is the broker's group-scope total, and no contract
+    multiplier or per-leg allocation is ever derived here.
+    """
+    evidence_warnings: list[str] = []
+    if not quantity_in_combo_units:
+        evidence_warnings.append("combo_unit_quantity_missing")
+    if summary_price is not None and not summary_in_combo_units:
+        evidence_warnings.append("combo_summary_not_in_units")
+    if status == "FILLED" and summary_price is None:
+        evidence_warnings.append("missing_filled_summary")
+    if (
+        status == "FILLED"
+        and summary_quantity is not None
+        and summary_quantity <= 0
+    ):
+        evidence_warnings.append("non_positive_filled_summary_quantity")
+    if fills:
+        # Fill rows directly under the parent (outside any leg display row)
+        # have no defined combo semantics; keep them but flag the shape.
+        evidence_warnings.append("combo_parent_direct_fill_rows")
+    for leg in combo_legs:
+        if leg.order_quantity is not None and leg.fills:
+            leg_filled = sum(
+                (fill.quantity for fill in leg.fills), Decimal("0")
+            )
+            if leg_filled != leg.order_quantity:
+                evidence_warnings.append("combo_leg_fill_quantity_mismatch")
+                break
+    combo_spec = _parse_combo_spread_symbol(symbol)
+    return StatementOrder(
+        source_row=source_row,
+        derived_order_id=_derived_order_id(
+            symbol=symbol,
+            side=side,
+            quantity=order_quantity,
+            order_time=order_time,
+        ),
+        symbol=symbol,
+        name=headers.get(row, "Name"),
+        side=side,
+        status=status,
+        order_quantity=order_quantity,
+        order_price=_parse_decimal(headers.get(row, "Order Price")),
+        order_price_text=headers.get(row, "Order Price"),
+        order_amount=_parse_decimal(headers.get(row, "Order Amount")),
+        order_time=order_time,
+        order_type=headers.get(row, "Order Type"),
+        time_in_force=headers.get(row, "Time-in-Force"),
+        session=headers.get(row, "Session"),
+        market=headers.get(row, "Markets", 0),
+        currency=headers.get(row, "Currency", 0) or "USD",
+        summary_filled_quantity=summary_quantity,
+        summary_average_price=summary_price,
+        fills=tuple(fills),
+        fee_components=fee_components,
+        total_fee=_decimal_or_zero(headers.get(row, "Total")),
+        evidence_level="combo_parent",
+        evidence_warnings=tuple(evidence_warnings),
+        order_kind="combo_parent",
+        combo_unit_quantity=(
+            order_quantity if quantity_in_combo_units else None
+        ),
+        combo_underlying=(
+            None if combo_spec is None else combo_spec["underlying"]
+        ),
+        combo_expiry=None if combo_spec is None else combo_spec["expiry"],
+        combo_option_right=(
+            None if combo_spec is None else combo_spec["option_right"]
+        ),
+        combo_strikes_text=(
+            None if combo_spec is None else combo_spec["strikes_text"]
+        ),
+        combo_legs=combo_legs,
+    )
+
+
 def parse_statement(content: bytes) -> StatementParseResult:
     """Parse a complete Moomoo history export without discarding old orders."""
     try:
@@ -561,12 +776,15 @@ def parse_statement(content: bytes) -> StatementParseResult:
     orders: list[StatementOrder] = []
     current_row: Optional[list[str]] = None
     current_source_row: Optional[int] = None
+    current_is_combo_parent = False
     current_fills: list[StatementFill] = []
+    current_legs: list[dict[str, Any]] = []
     orphan_fill_rows = 0
     rows_total = 0
 
     def flush_current() -> None:
         nonlocal current_row, current_source_row, current_fills
+        nonlocal current_is_combo_parent, current_legs
         if current_row is None or current_source_row is None:
             return
         orders.append(
@@ -575,11 +793,35 @@ def parse_statement(content: bytes) -> StatementParseResult:
                 row=current_row,
                 headers=header_map,
                 fills=current_fills,
+                combo_legs=tuple(
+                    StatementComboLeg(
+                        source_row=leg["source_row"],
+                        symbol=leg["symbol"],
+                        name=leg["name"],
+                        side=leg["side"],
+                        order_quantity=leg["order_quantity"],
+                        fills=tuple(leg["fills"]),
+                    )
+                    for leg in current_legs
+                ),
             )
         )
         current_row = None
         current_source_row = None
+        current_is_combo_parent = False
         current_fills = []
+        current_legs = []
+
+    def _row_is_combo_parent(row: list[str]) -> bool:
+        quantity_text = header_map.get(row, "Order Qty").strip()
+        if _UNIT_QUANTITY_RE.match(quantity_text):
+            return True
+        summary_text = header_map.get(row, "Filled@Avg Price").strip()
+        if "@" in summary_text and _UNIT_QUANTITY_RE.match(
+            summary_text.rsplit("@", 1)[0].strip()
+        ):
+            return True
+        return "/" in _normalise_symbol(header_map.get(row, "Symbol"))
 
     for source_row, row in enumerate(reader, start=2):
         rows_total += 1
@@ -591,9 +833,33 @@ def parse_statement(content: bytes) -> StatementParseResult:
             header_map.get(row, "Side") and header_map.get(row, "Symbol")
         )
         if is_main:
-            flush_current()
-            current_row = row
-            current_source_row = source_row
+            # Combo parents are followed by leg display rows that repeat
+            # Side/Symbol but have no order status or order time of their
+            # own.  Those rows are leg evidence, not new orders.
+            if (
+                current_is_combo_parent
+                and not header_map.get(row, "Status")
+                and not header_map.get(row, "Order Time")
+            ):
+                current_legs.append(
+                    {
+                        "source_row": source_row,
+                        "symbol": _normalise_symbol(
+                            header_map.get(row, "Symbol")
+                        ),
+                        "name": header_map.get(row, "Name"),
+                        "side": _normalise_side(header_map.get(row, "Side")),
+                        "order_quantity": _parse_decimal(
+                            header_map.get(row, "Order Qty")
+                        ),
+                        "fills": [],
+                    }
+                )
+            else:
+                flush_current()
+                current_row = row
+                current_source_row = source_row
+                current_is_combo_parent = _row_is_combo_parent(row)
 
         fill_quantity_text = header_map.get(row, "Fill Qty")
         if not fill_quantity_text:
@@ -610,19 +876,21 @@ def parse_statement(content: bytes) -> StatementParseResult:
             raise MoomooStatementError(
                 f"row {source_row} has a non-positive fill quantity"
             )
-        current_fills.append(
-            StatementFill(
-                source_row=source_row,
-                quantity=quantity,
-                price=price,
-                amount=_parse_decimal(header_map.get(row, "Fill Amount")),
-                filled_at=_parse_time(header_map.get(row, "Fill Time")),
-                market=header_map.get(row, "Markets", 1),
-                currency=header_map.get(row, "Currency", 1),
-                counterparty=header_map.get(row, "Counterparty"),
-                remarks=header_map.get(row, "Remarks"),
-            )
+        fill = StatementFill(
+            source_row=source_row,
+            quantity=quantity,
+            price=price,
+            amount=_parse_decimal(header_map.get(row, "Fill Amount")),
+            filled_at=_parse_time(header_map.get(row, "Fill Time")),
+            market=header_map.get(row, "Markets", 1),
+            currency=header_map.get(row, "Currency", 1),
+            counterparty=header_map.get(row, "Counterparty"),
+            remarks=header_map.get(row, "Remarks"),
         )
+        if current_legs:
+            current_legs[-1]["fills"].append(fill)
+        else:
+            current_fills.append(fill)
 
     flush_current()
     derived_ids = Counter(order.derived_order_id for order in orders)
@@ -755,10 +1023,19 @@ def reconcile_statement_with_readonly_export(
     if not all(isinstance(row, Mapping) for row in api_orders + api_deals + api_fees):
         raise MoomooStatementError("export records must be objects")
 
+    # Combo parents have no CSV-provable leg-level truth and are stored as
+    # audit-only parent observations, so they are excluded here explicitly
+    # instead of being matched as if they were ordinary single-leg orders.
+    statement_window_combo_parents = sum(
+        order.is_combo_parent
+        and window_start <= order.order_time <= window_end
+        for order in statement.orders
+    )
     statement_window_orders = [
         order
         for order in statement.orders
-        if window_start <= order.order_time <= window_end
+        if not order.is_combo_parent
+        and window_start <= order.order_time <= window_end
     ]
     statement_window_inconsistent = sum(
         order.evidence_level == "inconsistent"
@@ -968,6 +1245,11 @@ def reconcile_statement_with_readonly_export(
         abs(statement_fee_total - api_fee_total) <= Decimal("0.000001")
     )
     warnings: list[str] = []
+    if statement_window_combo_parents:
+        warnings.append(
+            "csv_combo_parent_orders_excluded_from_reconciliation="
+            f"{statement_window_combo_parents}"
+        )
     if not api_ready:
         warnings.append("api_export_not_analysis_ready")
     if not statement_quality_ok:

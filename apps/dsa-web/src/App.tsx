@@ -6,6 +6,9 @@ import LoginPage from './pages/LoginPage';
 import NotFoundPage from './pages/NotFoundPage';
 import JournalPage from './pages/JournalPage';
 import JournalEpisodeReviewPage from './pages/JournalEpisodeReviewPage';
+import JournalDailyReviewPage from './pages/JournalDailyReviewPage';
+import RulesPage from './pages/RulesPage';
+import IntradayPage from './pages/IntradayPage';
 import RegimePage from './pages/RegimePage';
 import OpportunityDetailPage from './pages/OpportunityDetailPage';
 import WatchlistPage from './pages/WatchlistPage';
@@ -61,12 +64,15 @@ const AppContent: React.FC = () => {
     <Routes>
       <Route element={<Shell />}>
         <Route path="/" element={<Navigate to="/regime" replace />} />
+        <Route path="/intraday" element={<IntradayPage />} />
         <Route path="/regime" element={<RegimePage />} />
         <Route path="/regime/opportunity/:ticker" element={<OpportunityDetailPage />} />
         <Route path="/watchlist" element={<WatchlistPage />} />
         <Route path="/stocks/:ticker" element={<StockDetailPage />} />
         <Route path="/journal" element={<JournalPage />} />
+        <Route path="/journal/review/daily" element={<JournalDailyReviewPage />} />
         <Route path="/journal/review/:episodeId" element={<JournalEpisodeReviewPage />} />
+        <Route path="/rules" element={<RulesPage />} />
         <Route path="/backtest" element={<BacktestPage />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="/design-lab" element={<DesignLabPage />} />

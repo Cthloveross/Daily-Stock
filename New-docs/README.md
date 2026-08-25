@@ -31,6 +31,7 @@
 | 配置 Moomoo、Alpaca、Finnhub、OpenAI 并判断哪些付费 API 暂不需要 | [`integrations/options-research-data-setup.md`](./integrations/options-research-data-setup.md) |
 | 看 5D/20D 结果如何在收盘后自动成熟及其统计门槛 | [`phase1/09_AUTOMATIC_OUTCOME_MAINTENANCE.md`](./phase1/09_AUTOMATIC_OUTCOME_MAINTENANCE.md) |
 | 看 Moomoo 当前期权持仓如何只读双采样、显式确认并作为未来边界锚点 | [`phase1/11_CURRENT_POSITION_SNAPSHOTS.md`](./phase1/11_CURRENT_POSITION_SNAPSHOTS.md) |
+| 看每条交易纪律和它的证据、call/put 比例的诚实边界与期权墙逐日快照 | [`phase1/15_TRADING_DISCIPLINE_EVIDENCE.md`](./phase1/15_TRADING_DISCIPLINE_EVIDENCE.md) |
 | 查看旧版本文档 | [`archive/`](./archive/) |
 
 > **变更日志** 不在这里 —— 在 [`docs/CHANGELOG.md`](../docs/CHANGELOG.md)（自动化与 AGENTS.md 硬规则依赖该路径）。

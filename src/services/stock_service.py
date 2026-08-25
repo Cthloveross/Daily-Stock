@@ -10,12 +10,37 @@
 """
 
 import logging
+import threading
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 
 from src.repositories.stock_repo import StockRepository
 
 logger = logging.getLogger(__name__)
+
+# 进程级共享 DataFetcherManager（盘中波段爆发车道修复）：
+# 历史实现每次请求（波段爆发甚至每标的、每 60 秒轮询）都新建 manager →
+# 新建 MoomooFetcher → 新的 OpenD 连接握手，把轮询变成连接放大器。
+# DataFetcherManager 自身线程安全（逐 fetcher 调用锁），MoomooFetcher 的
+# ctx 每次调用都做健康检查并自愈重连，因此进程级单例无需显式 close。
+# 按类身份缓存：测试 monkeypatch ``data_provider.base.DataFetcherManager``
+# 时自动重建，互不串味。
+_shared_manager_lock = threading.Lock()
+_shared_manager: Optional[Any] = None
+_shared_manager_cls: Optional[Any] = None
+
+
+def _get_shared_fetcher_manager():
+    """Return the process-wide DataFetcherManager, rebuilding on class swap."""
+
+    global _shared_manager, _shared_manager_cls
+    from data_provider.base import DataFetcherManager
+
+    with _shared_manager_lock:
+        if _shared_manager is None or _shared_manager_cls is not DataFetcherManager:
+            _shared_manager = DataFetcherManager()
+            _shared_manager_cls = DataFetcherManager
+        return _shared_manager
 
 
 class StockService:
@@ -40,10 +65,8 @@ class StockService:
             实时行情数据字典
         """
         try:
-            # 调用数据获取器获取实时行情
-            from data_provider.base import DataFetcherManager
-            
-            manager = DataFetcherManager()
+            # 调用数据获取器获取实时行情（进程级共享 manager，见模块注释）
+            manager = _get_shared_fetcher_manager()
             quote = manager.get_realtime_quote(stock_code)
             
             if quote is None:
@@ -161,9 +184,7 @@ class StockService:
     ) -> Dict[str, Any]:
         """日线 / 周线（W-FRI 聚合）/ 月线（ME 聚合）"""
         try:
-            from data_provider.base import DataFetcherManager
-
-            manager = DataFetcherManager()
+            manager = _get_shared_fetcher_manager()
 
             # 周/月需要更多日线作为聚合原料
             if period == "weekly":
@@ -221,7 +242,7 @@ class StockService:
             "time_bucket_2m_ohlcv" if interval == "2m" else None
         )
         try:
-            from data_provider.base import DataFetcherManager, DataFetchError
+            from data_provider.base import DataFetchError
         except ImportError:
             logger.warning("DataFetcherManager 未找到，返回空数据")
             return self._history_result(
@@ -232,7 +253,7 @@ class StockService:
                 aggregation_method=aggregation_method,
             )
 
-        manager = DataFetcherManager()
+        manager = _get_shared_fetcher_manager()
         source_interval = "1m" if interval == "2m" else interval
         try:
             df, source = manager.get_intraday_data(

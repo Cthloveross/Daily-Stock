@@ -2,6 +2,8 @@ import type React from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import JournalImport from '../components/journal/JournalImport';
+import EpisodeBuildManagementPanel from '../components/journal/EpisodeBuildManagementPanel';
+import ReviewWorkbenchHeader from '../components/journal/ReviewWorkbenchHeader';
 import DTEDistribution from '../components/journal/DTEDistribution';
 import MonthlyReviewPanel from '../components/journal/MonthlyReviewPanel';
 import RealityTestCard from '../components/journal/RealityTestCard';
@@ -12,8 +14,13 @@ import FrameworkPanel from '../components/journal/FrameworkPanel';
 import AskJournalChat from '../components/journal/AskJournalChat';
 import PositionEpisodesPanel from '../components/journal/PositionEpisodesPanel';
 import ReviewInsightsPanel from '../components/journal/ReviewInsightsPanel';
+import DisciplineMonthlyPanel from '../components/journal/DisciplineMonthlyPanel';
+import RuleCompliancePanel from '../components/journal/RuleCompliancePanel';
+import JournalOptionEventReview from '../components/journal/JournalOptionEventReview';
 import PlaybookPanel from '../components/journal/PlaybookPanel';
 import CurrentPositionsSnapshotCard from '../components/journal/CurrentPositionsSnapshotCard';
+import EdgePanelCard from '../components/journal/EdgePanelCard';
+import { DailyReviewEntryCard } from '../components/journal/DailyReviewEntryCard';
 import { positionReviewPath } from '../components/journal/review/journalReviewRouting';
 import { useJournalStore } from '../stores/journalStore';
 import { usePositionEpisodes } from '../hooks/usePositionEpisodes';
@@ -32,7 +39,7 @@ const TAB_ORDER: Tab[] = ['positions', 'import', 'overview', 'analysis', 'trades
 
 const TAB_LABEL: Record<Tab, string> = {
   positions: '仓位复盘',
-  import: '交易证据',
+  import: '数据与构建',
   overview: 'Overview · Legacy 存档',
   analysis: 'Analysis · Legacy',
   trades: 'Trades · Legacy',
@@ -113,10 +120,13 @@ const JournalPage: React.FC = () => {
     };
   }, [params]);
 
+  // The controller feeds both the review workspace (positions) and the
+  // build/activation management area now living on the data tab (import).
   const positionController = usePositionEpisodes({
-    active: tab === 'positions',
+    active: tab === 'positions' || tab === 'import',
     filters: positionFilters,
   });
+  const dailyRefreshSectionRef = useRef<HTMLDivElement | null>(null);
 
   const setTab = (next: Tab) => {
     // keep url in sync for deep links (StyleBreakdown clicks `?tab=trades&style=xxx`)
@@ -266,7 +276,20 @@ const JournalPage: React.FC = () => {
 
       {tab === 'positions' && (
         <div className="space-y-4">
-          <CurrentPositionsSnapshotCard onOpenEvidence={() => setTab('import')} />
+          {/* 日终复盘入口（蓝图 17 Phase A）：未开始/进行中/已密封/休息日。 */}
+          <DailyReviewEntryCard />
+          {/* Edge 面板（doc 16 E-5）：今日 0-1DTE gate 档位 + 分桶期望 + R2/R3
+              纪律红灯。gate 仅作防御（只关不开），行情取不到时 fail closed。 */}
+          <EdgePanelCard />
+          <ReviewWorkbenchHeader
+            build={positionController.list?.build ?? null}
+            reviewQueue={positionController.list?.reviewQueue ?? null}
+            notBuilt={positionController.list?.dataState === 'not_built'}
+            loading={positionController.loading}
+            viewingBuildId={positionFilters.buildId}
+            onOpenReview={openPositionReview}
+            onOpenBuildTools={() => setTab('import')}
+          />
           <PositionEpisodesPanel
             key={`${positionFilters.buildId ?? 'default'}:${positionFilters.underlying ?? ''}:${positionFilters.lifecycleStatus ?? ''}:${positionFilters.completenessStatus ?? ''}:${positionFilters.caseFocus ?? ''}:${positionFilters.reviewStatus ?? ''}:${positionFilters.page ?? 1}`}
             filters={positionFilters}
@@ -275,10 +298,18 @@ const JournalPage: React.FC = () => {
             onPageChange={changePositionPage}
             onSelectBuild={selectPositionBuild}
             onOpenReview={openPositionReview}
+            onOpenBuildTools={() => setTab('import')}
           />
           <ReviewInsightsPanel
             onCandidateSaved={() => setPlaybookRefreshToken((token) => token + 1)}
           />
+          {/* 模式观察的同层兄弟：规模与频率（每美元回报才是真账）按月摊开。 */}
+          <DisciplineMonthlyPanel />
+          {/* 规模与频率的同层兄弟：两车道规则的遵守度记账（合规单 vs 违规单）。 */}
+          <RuleCompliancePanel />
+          {/* 期权异动 feed（2026-08-14 自 /intraday 迁入）：复盘证据——回看
+              当天/最近时段发生了什么；只读一次、不轮询，分类不证明方向。 */}
+          <JournalOptionEventReview />
           <PlaybookPanel refreshToken={playbookRefreshToken} />
         </div>
       )}
@@ -475,15 +506,39 @@ const JournalPage: React.FC = () => {
       )}
 
       {tab === 'import' && (
-        <div className="space-y-4">
-          <JournalImport onImported={refreshPositionEvidence} />
-          <div className="rounded-ds-md border border-subtle bg-bg-1 p-4 text-body-sm text-text-3">
-            <p>
-              文件会先做只读证据检查。CSV 可在明确确认后幂等追加到可信证据账本；
-              OpenAPI JSON 会先生成零证据行写入计划，明确确认后原子、幂等追加。
-              旧 FIFO、交易备注、历史复盘和 Episode 不会被自动重建。
-            </p>
+        <div className="space-y-8">
+          <div ref={dailyRefreshSectionRef} className="space-y-4">
+            <JournalImport onImported={refreshPositionEvidence} />
+            <div className="rounded-ds-md border border-subtle bg-bg-1 p-4 text-body-sm text-text-3">
+              <p>
+                文件会先做只读证据检查。CSV 可在明确确认后幂等追加到可信证据账本；
+                OpenAPI JSON 会先生成零证据行写入计划，明确确认后原子、幂等追加。
+                旧 FIFO、交易备注、历史复盘和 Episode 不会被自动重建。
+              </p>
+            </div>
           </div>
+
+          <section className="space-y-4" aria-label="当前持仓快照与未来构建">
+            <div>
+              <div className="text-label uppercase tracking-label text-text-3">Data · Snapshot</div>
+              <h2 className="mt-0.5 text-h2 text-text-1">当前持仓快照与未来构建</h2>
+            </div>
+            <CurrentPositionsSnapshotCard
+              onOpenEvidence={() => dailyRefreshSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+            />
+          </section>
+
+          <section className="space-y-4" aria-label="构建与默认视图管理">
+            <div>
+              <div className="text-label uppercase tracking-label text-text-3">Data · Builds</div>
+              <h2 className="mt-0.5 text-h2 text-text-1">构建与默认视图管理</h2>
+            </div>
+            <EpisodeBuildManagementPanel
+              filters={positionFilters}
+              controller={positionController}
+              onSelectBuild={selectPositionBuild}
+            />
+          </section>
         </div>
       )}
 
