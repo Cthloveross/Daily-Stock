@@ -545,6 +545,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] OpenD 网关崩溃致行情通道静默降级 6 天（2026-08-14 22:25 起熔断器打开、页面大片标缺无人知晓）：清理僵尸进程重启 OpenD 后自愈；根因为外部进程崩溃，系统侧按设计降级但缺少告警。
 - [新功能] 行情通道看门狗（G-31）：预热调度器逐 tick 观测 Moomoo 熔断器 `is_tripped`（探针成功前恒为断开，与 `is_open()` 的冷却语义区分以防恢复/断开刷屏），状态翻转时经提示器 `notify_system` 向 Telegram 各推一次「通道断开/已恢复」；系统通知不占每日提示上限。
 - [测试] 看门狗状态机（断开一次/持续不重复/恢复一次/watch 与 notifier 异常吞噬/未接线零行为）+ `is_tripped` 生命周期 + `notify_system` 不占上限；lifespan 假对象同步新签名。
+- [文档] 新增 `New-docs/phase1/16_EDGE_FORENSICS_AND_REGIME_GATE.md`：2026 年 1–7 月真实交易取证（月度盈亏、DTE 期望翻转、费用拖累、频率升级、集中度）、文献基础（Coval-Shumway/Goyal-Saretto/Barbon-Buraschi/Moreira-Muir/Lo-MacKinlay 等）、规则 R1–R5 与实施计划 E-1..E-5；阈值校准阻塞于 2026-08 CSV 导入。
+- [新功能] Journal 新增 `src/journal/edge_stats.py` 纯函数统计模块：expectancy bootstrap 置信区间、距统计显著所需样本、0-1/2-7 DTE 分桶期望、费用拖累比、交易频率、Kelly 估计（n<30 fail closed）与月度分解；只读、不接存储层。
+- [新功能] Regime 新增 `src/regime/varratio.py`：Lo-MacKinlay 方差比 VR(q)（含异方差稳健 z）、趋势/均值回归形态分类、Moreira-Muir 逆方差仓位缩放与 0-1DTE 准入门（缺输入一律 fail closed）；纯函数，不改变现有评分链路。
+- [测试] 新增 `src/journal/tests/test_edge_stats.py` 与 `src/regime/tests/test_varratio.py`：已知答案用例、bootstrap 确定性、AR(1) 合成序列方向性、边界与 fail-closed 回归。
+- [新功能] Journal 导入 2026-08 Moomoo CSV（folder_watcher 正式链路，+3,600 事件、去重 681，全账本 2,671 笔）；`New-docs/phase1/16` 增补 §1.7 全账本终版口径（2-7DTE 连续 5 个月为正 +$195,292，0-1DTE 6–8 月 −$131,034，累计 7/31 达峰 +$208,366）。
+- [新功能] Regime 新增 `tsmom_mm_gate`（QQQ/SOXX 20 日时序动量 + Moreira-Muir 逆方差 scale 的 0-1DTE 准入门）：训练 4–6 月保留全部利润、样本外 7–8 月屏蔽 80% 亏损、五个最差日全红灯；校准协议与诚实限制记录于 doc 16 §5.1。
+- [测试] `test_varratio.py` 新增 tsmom_mm_gate 真值表与 2026-08-03 真实特征重放判决测试（28 passed）。
+- [文档] doc 16 增补 §5.2（E-4 第 2 部分）：日内 VR 判别（VR≥1 动量态 16 天 0-1DTE 合计 −$162k，与 gamma-fragility 文献一致，记为 H4 待实时验证）；R6 熔断真实序列模拟（$5k 救 +$72k 但非单调）；叠加测试证明 gate 为主防线、R6 仅灾备不叠加。
+- [文档] doc 16 增补 §5.3 投产级验收：PBO 62.9%（CSCV）、DSR 49%、H1 t=1.79（HLZ 门槛 3.0）三道关均未过；裁定 gate 仅作防御部署（禁止绿灯加仓）、H1 记 promising/证据不足（估需再 ~247 交易日）、上线即逐日记录并预注册季度重验与升格/废除判据。
+- [新功能] 新增 `GET /api/v1/journal/edge-panel`（`src/journal/edge_panel.py` 服务层）：tsmom_mm_gate 实时档位（QQQ/SOXX 20 日动量 + MM scale，yfinance 30 分钟缓存，行情失败一律 fail closed 红灯）、DTE 分桶期望、H1 日度 t 值 vs HLZ 3.0 门槛、当日频率与本月费率纪律指标。
+- [新功能] Web `/journal` 新增「今日武器档位」卡片（EdgePanelCard）：gate 红绿灯与中文拦截原因、特征行、0-1/2-7 分桶表、H1 证据状态行（含距显著剩余样本）、纪律行（今日 x/8 笔、本月费率超 30% 标红）；行情不可用渲染红色 fail-closed 横幅，不空白。
+- [测试] 新增 edge_panel 服务与端点测试（含行情失败 fail-closed、空账本路径）及 EdgePanelCard 渲染测试；api 全套 280 passed、journal 全套 527 passed、web lint 0 errors、build 通过（Node 22）。
+- [文档] `New-docs/phase1/17_PRO_PRACTICE_BLUEPRINT.md`：基于 5 份深度研究简报（日内动量/期权流文献、机构扫描与复盘实践、工具基准，含引用与证据强度）的设计蓝图——贴合度评审、推送四级分级（P0≤1/日可打断休息）、深度复盘界面规格（盲评式日终流 S0-S4/单笔深潜含 MAE-MFE 诚实用法与机械 what-if/过程与结果物理分离）与 Phase A-C 实施计划；研究结论与用户自身已证明负结果冲突处均以用户数据为准并明示。
 
 ## [3.11.0] - 2026-03-27
 

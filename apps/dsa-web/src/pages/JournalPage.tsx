@@ -19,6 +19,7 @@ import RuleCompliancePanel from '../components/journal/RuleCompliancePanel';
 import JournalOptionEventReview from '../components/journal/JournalOptionEventReview';
 import PlaybookPanel from '../components/journal/PlaybookPanel';
 import CurrentPositionsSnapshotCard from '../components/journal/CurrentPositionsSnapshotCard';
+import EdgePanelCard from '../components/journal/EdgePanelCard';
 import { positionReviewPath } from '../components/journal/review/journalReviewRouting';
 import { useJournalStore } from '../stores/journalStore';
 import { usePositionEpisodes } from '../hooks/usePositionEpisodes';
@@ -274,6 +275,9 @@ const JournalPage: React.FC = () => {
 
       {tab === 'positions' && (
         <div className="space-y-4">
+          {/* Edge 面板（doc 16 E-5）：今日 0-1DTE gate 档位 + 分桶期望 + R2/R3
+              纪律红灯。gate 仅作防御（只关不开），行情取不到时 fail closed。 */}
+          <EdgePanelCard />
           <ReviewWorkbenchHeader
             build={positionController.list?.build ?? null}
             reviewQueue={positionController.list?.reviewQueue ?? null}

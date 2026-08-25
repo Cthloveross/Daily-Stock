@@ -1339,3 +1339,74 @@ export interface RulesEvidenceResponse {
   overnightGapNote: string | null;
   limitations: string[];
 }
+
+// ---------------------------------------------------------------------------
+// Edge 面板（Phase 1 E-5 · New-docs/phase1/16_EDGE_FORENSICS_AND_REGIME_GATE.md）
+//
+// 注意：该端点的形状是文档 16 固定契约，前后端都逐字对齐它——字段保持
+// snake_case 原样，不过 toCamelCase（camelcase-keys 会把 "0-1"/"2-7" 这类
+// 分桶键与 allow_0_1dte 改写成无法回读的键名）。
+// ---------------------------------------------------------------------------
+
+export type EdgePanelBlockedReason =
+  | 'market_momentum'
+  | 'sector_momentum'
+  | 'volatility_scale'
+  | 'market_data_unavailable';
+
+export interface EdgePanelGateFeatures {
+  mom_q_20d: number | null;
+  mom_s_20d: number | null;
+  mm_scale: number | null;
+}
+
+export interface EdgePanelGate {
+  allow_0_1dte: boolean;
+  default_bucket: '2-7';
+  blocked_by: EdgePanelBlockedReason[];
+  features: EdgePanelGateFeatures;
+  data_status: 'ok' | 'unavailable';
+}
+
+export interface EdgePanelBucketStat {
+  n: number;
+  total: number;
+  mean: number | null;
+  win_rate: number | null;
+}
+
+export interface EdgePanelExpectancy {
+  n: number;
+  mean: number | null;
+  ci95_low: number | null;
+  ci95_high: number | null;
+}
+
+export interface EdgePanelEvidence {
+  h1_t_stat: number | null;
+  hlz_hurdle: number;
+  status: 'insufficient' | 'significant';
+  n_needed: number | null;
+  n_remaining: number | null;
+}
+
+export interface EdgePanelEdge {
+  buckets: Record<string, EdgePanelBucketStat>;
+  expectancy: EdgePanelExpectancy;
+  evidence: EdgePanelEvidence;
+}
+
+export interface EdgePanelDiscipline {
+  trades_today: number;
+  daily_cap: number;
+  month_fees: number;
+  month_gross: number;
+  fee_ratio: number | null;
+}
+
+export interface EdgePanelResponse {
+  as_of: string;
+  gate: EdgePanelGate;
+  edge: EdgePanelEdge;
+  discipline: EdgePanelDiscipline;
+}

@@ -2,6 +2,7 @@ import apiClient from './index';
 import { toCamelCase } from './utils';
 import { sessionCache } from '../utils/sessionCache';
 import type {
+  EdgePanelResponse,
   HealthCheckItem,
   ImportResponse,
   MoomooStatementPreview,
@@ -552,4 +553,11 @@ export async function askJournalQa(req: JournalQaRequest): Promise<JournalQaResp
     { timeout: 60000 },
   );
   return toCamelCase<JournalQaResponse>(data);
+}
+
+export async function fetchEdgePanel(): Promise<EdgePanelResponse> {
+  // 文档 16 固定契约：响应保持 snake_case 原样，不过 toCamelCase——
+  // camelcase-keys 会把 "0-1"/"2-7" 分桶键与 allow_0_1dte 改写掉。
+  const { data } = await apiClient.get(`${BASE}/edge-panel`);
+  return data as EdgePanelResponse;
 }
