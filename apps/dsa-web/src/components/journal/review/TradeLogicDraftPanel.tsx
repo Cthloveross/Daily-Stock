@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { MISTAKE_LABELS, MISTAKE_VOCABULARY } from './reviewHardLines';
 import {
   CheckCircle2,
   ChevronDown,
@@ -452,6 +453,32 @@ export function TradeLogicDraftPanel({
           <div className="space-y-3">
             {renderQuickChips('错误类型', ERROR_TYPE_PRESETS, 'errorTypes')}
             {renderQuickChips('交易风格标签', STYLE_TAG_PRESETS, 'tags')}
+            {/* 损耗归因轨（蓝图 17 §三(b) 固定 mistake 词表）：写入的是英文
+                词条本身，与自由文本共用 errorTypes 字段并去重。 */}
+            <div role="group" aria-label="损耗归因词表快速标注">
+              <div className="text-caption text-text-3">损耗归因（蓝图固定词表）</div>
+              <div className="mt-1.5 flex flex-wrap gap-1.5">
+                {MISTAKE_VOCABULARY.map((term) => {
+                  const active = draft.errorTypes.includes(term);
+                  return (
+                    <button
+                      key={term}
+                      type="button"
+                      aria-pressed={active}
+                      className={`rounded-full border px-2.5 py-1 font-mono text-caption transition-colors ${
+                        active
+                          ? 'border-warn-strong/40 bg-warn-subtle text-warn-strong'
+                          : 'border-subtle bg-bg-2 text-text-2 hover:border-default hover:text-text-1'
+                      }`}
+                      onClick={() => toggleQuickLabel('errorTypes', term)}
+                    >
+                      {term}
+                      {MISTAKE_LABELS[term] ? ` ${MISTAKE_LABELS[term]}` : ''}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
           </div>
         </fieldset>
 

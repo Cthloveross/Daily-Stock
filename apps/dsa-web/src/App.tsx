@@ -6,6 +6,7 @@ import LoginPage from './pages/LoginPage';
 import NotFoundPage from './pages/NotFoundPage';
 import JournalPage from './pages/JournalPage';
 import JournalEpisodeReviewPage from './pages/JournalEpisodeReviewPage';
+import JournalDailyReviewPage from './pages/JournalDailyReviewPage';
 import RulesPage from './pages/RulesPage';
 import IntradayPage from './pages/IntradayPage';
 import RegimePage from './pages/RegimePage';
@@ -69,6 +70,7 @@ const AppContent: React.FC = () => {
         <Route path="/watchlist" element={<WatchlistPage />} />
         <Route path="/stocks/:ticker" element={<StockDetailPage />} />
         <Route path="/journal" element={<JournalPage />} />
+        <Route path="/journal/review/daily" element={<JournalDailyReviewPage />} />
         <Route path="/journal/review/:episodeId" element={<JournalEpisodeReviewPage />} />
         <Route path="/rules" element={<RulesPage />} />
         <Route path="/backtest" element={<BacktestPage />} />

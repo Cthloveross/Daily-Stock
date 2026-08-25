@@ -20,6 +20,7 @@ import JournalOptionEventReview from '../components/journal/JournalOptionEventRe
 import PlaybookPanel from '../components/journal/PlaybookPanel';
 import CurrentPositionsSnapshotCard from '../components/journal/CurrentPositionsSnapshotCard';
 import EdgePanelCard from '../components/journal/EdgePanelCard';
+import { DailyReviewEntryCard } from '../components/journal/DailyReviewEntryCard';
 import { positionReviewPath } from '../components/journal/review/journalReviewRouting';
 import { useJournalStore } from '../stores/journalStore';
 import { usePositionEpisodes } from '../hooks/usePositionEpisodes';
@@ -275,6 +276,8 @@ const JournalPage: React.FC = () => {
 
       {tab === 'positions' && (
         <div className="space-y-4">
+          {/* 日终复盘入口（蓝图 17 Phase A）：未开始/进行中/已密封/休息日。 */}
+          <DailyReviewEntryCard />
           {/* Edge 面板（doc 16 E-5）：今日 0-1DTE gate 档位 + 分桶期望 + R2/R3
               纪律红灯。gate 仅作防御（只关不开），行情取不到时 fail closed。 */}
           <EdgePanelCard />

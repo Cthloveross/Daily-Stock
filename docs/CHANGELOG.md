@@ -558,6 +558,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] Web `/journal` 新增「今日武器档位」卡片（EdgePanelCard）：gate 红绿灯与中文拦截原因、特征行、0-1/2-7 分桶表、H1 证据状态行（含距显著剩余样本）、纪律行（今日 x/8 笔、本月费率超 30% 标红）；行情不可用渲染红色 fail-closed 横幅，不空白。
 - [测试] 新增 edge_panel 服务与端点测试（含行情失败 fail-closed、空账本路径）及 EdgePanelCard 渲染测试；api 全套 280 passed、journal 全套 527 passed、web lint 0 errors、build 通过（Node 22）。
 - [文档] `New-docs/phase1/17_PRO_PRACTICE_BLUEPRINT.md`：基于 5 份深度研究简报（日内动量/期权流文献、机构扫描与复盘实践、工具基准，含引用与证据强度）的设计蓝图——贴合度评审、推送四级分级（P0≤1/日可打断休息）、深度复盘界面规格（盲评式日终流 S0-S4/单笔深潜含 MAE-MFE 诚实用法与机械 what-if/过程与结果物理分离）与 Phase A-C 实施计划；研究结论与用户自身已证明负结果冲突处均以用户数据为准并明示。
+- [新功能] 引导式日终复盘流（蓝图 17 Phase A）：新路由 `/journal/review/daily` 的 S0 检票（休息日一键确认＝过程指标）→S1 违规扫描（classify_rule_lane 机械判定，逐条违规强制一句话确认）→S2 七项过程打分（自动优先/手填兜底/缺席标缺）→S3 持仓出场预登记（写既有 append-only 复盘链）→S4 封卷步进器；盲评为核心机制——密封并自愿点击「揭示当日结果」前，页面与 API 载荷均不含任何盈亏字段，揭示顺序本身入库。
+- [新功能] 新增 `GET/POST /api/v1/journal/review-flow/daily`（`api/v1/endpoints/journal_review_flow.py` + `src/journal/review_flow.py`）：服务端计算车道判定、Duke 四象限（违规∧盈利＝「侥幸」标红）与可自动化过程指标，密封要求违规全确认、揭示要求已密封；会话落 `journal_v2_daily_review_sessions` append-only 修订链（deny trigger 拒绝 UPDATE/DELETE，按 account+ET 日幂等，含 sha256）。
+- [新功能] MAE/MFE 标的 5m 近似口径（蓝图 17 §三(b)诚实用法）：纯函数 `src/journal/excursions.py`（exposure 判定表、U0/逐 bar 公式、ATR14 标尺、fail-closed status），append-only `journal_v2_episode_excursions`（(build,episode,code_version) 唯一幂等）＋本地 `market_5m_bars` 持久层（只写已完结 RTH bar，覆盖率随时间趋近 100%）；`scripts/backfill_excursions.py` 回填近 ~60 天并兼任每日增量任务（`--daily`，挂既有调度，不新增守护进程），超窗回合写永久标缺、绝不以 0 或日线冒充。
+- [新功能] 单笔复盘页改造为蓝图强制顺序：区① 决策时快照（车道判定/在册出场计划/regime 与推送标缺徽章）→区② 折叠揭示（揭示前无 Net、无 K 线请求、保存按钮禁用）→区③ 四象限＋双轨标签（新增蓝图 mistake 词表 chips）→区④ 机械反事实（仅「仅合规车道」与「gate 执行」两个、永不叠加；gate 逐日记录未回填前标缺）；新增只读 MAE/MFE 偏移诊断（单笔读数＋按持有结构分层的 |MAE|×R 散点，永久免责「不用于设置止损；持仓分组存在内生性」由测试逐字锁定）。
+- [新功能] 新增 `GET /api/v1/journal/episodes/{id}/excursion` 与 `GET /api/v1/journal/review-flow/excursions`（单笔记录或标缺原因＋机械判定；聚合散点数据），Journal 首页新增「今日复盘」入口卡（未开始/进行中/已密封/休息日）。
+- [测试] 新增 excursions 纯函数 18 例（深 MAE 后大 MFE/short put/跨日跳空/无 bar 标缺/组合腿不适用/partial 覆盖/ATR 标尺）、daily_review 修订链与密封-揭示顺序及 deny-trigger、review_flow 四象限与七项指标、端点 TestClient 全流程走查（载荷级盲评断言：密封揭示前 JSON 不含 pnl）；前端新增日终流步进器、ExcursionDiagnostics 免责逐字锁定与禁用指标（SQN/Zella 类合成分、hold-time 最优、MAE 止损）负断言测试。backend offline 全绿、web vitest 91 文件 839 用例全过、lint 0 errors、tsc 干净（Node 22）。
+- [chore] 对真实账本执行回填：build 1 的 1,437 笔已平仓回合全部落 excursion 行（ready 355 / partial 9 / missing_bars 1,051（多为超出 60 天保留窗口的永久标缺）/ not_applicable 22），30 个 underlying 共持久化 94,020 根 5m bar（2026-06-29→08-25，各 41 个交易日）。
+- [文档] 新增 `New-docs/phase1/18_DEEP_REVIEW_PHASE_A.md`（Phase A 实现注记：表 DDL、端点契约、七项指标 Phase A 可得性、5m 持久化调度方式、与蓝图的偏差清单）；README 未改动——本次为 `/journal` 子页面新增能力，入门/部署面无变化，专题细节按 §1 归档于 New-docs/phase1。
+- [修复] 日终复盘「揭示」改为服务端逐字重放已密封修订（最小请求：日期＋可选 expected_revision 链位校验，内容字段一律忽略）：页面重载丢手填分、封卷后注解写入、指标 3 因会话行出现翻面等客户端漂移不再把揭示卡死为 422；保持揭示须晚于密封、不可与密封同修订、不可撤销，前端揭示按钮同步改走最小请求。
+- [修复] MAE/MFE exposure 判定接受账本真实资产词汇 `equity`（保留 `stock` 别名）：22 笔正股回合不再被假 `not_applicable`；excursion 行所有时间戳统一 UTC 入库、按 UTC 读出（旧 ET wall-clock 行保留在 1.0 版本下）；短于一根 5m bar 的持有改判 `not_applicable`（原因 `sub_bar_hold_below_5m_granularity`，粒度限制不再谎称缺数据）；u0_flag 区分「盘外开仓」（时钟）与「入场日无 bar」（数据缺口）并更新前端文案。
+- [修复] excursion 回填不再永久冻结瞬时抓取失败：唯一键扩为 (build, episode, code_version, attempt)（SQLite 重建表迁移，旧行 attempt=1 原样保留、append-only 触发器重装），保留窗口内 missing_bars/partial 行在 bars 后到且结果严格更好时以 attempt+1 追加，无新 bar 重跑零写，读取取最优/最新 attempt。
+- [修复] 日终复盘流的 ET 换算改用真实 America/New_York（DST 感知）：EST 时段 11:30 的 0DTE 入场不再被 UTC−4 近似误判为 late_0dte；personal_edge 自身的文档化近似口径不变。
+- [修复] 日终复盘 POST 重排为「先校验后落笔」：被拒请求（无效 ack、密封冻结、超长内容等）不再留下出场预登记写入；过程指标 6（决策日志完整率）只认 thesis/trigger/rationale 至少一项非空，S3 出场预登记（附 exit_plan_registration tag 留痕）不再抬高该指标。
+- [改进] EXCURSION_LIMITATIONS 与前端偏移诊断如实声明「出场 bar 溢出」（平仓所在整根 5m bar 计入，平仓后至多约 5 分钟行情被计入）；excursion 口径版本递增至 underlying-5m/1.1。
+- [chore] 对真实账本以 underlying-5m/1.1 重跑回填：1,437 笔已平仓回合全部追加新版本行——ready 356 / partial 9 / missing_bars 1,039 / not_applicable 33（22 笔正股按 bar 可得性落 1 ready + 21 missing_bars；33 笔亚 bar 持有拿到诚实标注；episode 1064 改判入场日数据缺口）；5m 持久层增至 94,860 根 / 30 underlying。
+- [chore] 新增 launchd 模板 `scripts/launchagents/com.dailystock.excursion-daily.plist`（每日收盘后 5m 持久化＋增量回填；仓库不代为加载，加载命令由 `--daily` 运行结束打印，是否调度为用户动作）。
+- [测试] 新增揭示三场景回归（重载丢手填分/注解漂移/一步封卷后揭示）、被拒 POST 零写、UTC round-trip、attempt 重试严格更好才写、SQLite attempt 迁移重建、EST 车道判定、亚 bar 粒度与入场日缺口 flag、指标 6 排除规则、前端 S2 禁用词负断言扩展；后端新增跨语言免责常量守卫测试（读取前端 reviewHardLines.ts 断言逐字节一致）。
 
 ## [3.11.0] - 2026-03-27
 

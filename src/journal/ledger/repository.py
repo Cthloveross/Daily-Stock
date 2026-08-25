@@ -60,6 +60,12 @@ import src.journal.ledger.playbook_models as _playbook_models  # noqa: F401
 # way so its deny triggers install with ``init_ledger_schema``.
 import src.journal.ledger.artifact_gc_models as _artifact_gc_models  # noqa: F401
 
+# Register the Phase A deep-review tables (blueprint 17 §三(e)): the daily
+# review session chain and the episode excursion ledger get deny triggers;
+# ``market_5m_bars`` is a market-data cache created by the same metadata but
+# intentionally left out of the append-only guard list (see its docstring).
+import src.journal.ledger.review_flow_models as _review_flow_models  # noqa: F401
+
 __all__ = [
     "DEFAULT_LEDGER_ACCOUNT_KEY",
     "LEDGER_APPEND_ONLY_GUARD_MESSAGE",
@@ -125,6 +131,8 @@ _APPEND_ONLY_TABLE_NAMES = (
     "journal_v2_playbook_candidates",
     "journal_v2_playbook_rules",
     "journal_v2_artifact_gc_receipts",
+    "journal_v2_daily_review_sessions",
+    "journal_v2_episode_excursions",
 )
 _LEDGER_SCHEMA_LOCK = threading.RLock()
 
@@ -383,10 +391,106 @@ def get_latest_data_health(
         )
 
 
+_EXCURSION_TABLE_NAME = "journal_v2_episode_excursions"
+_EXCURSION_LEGACY_TABLE_NAME = "journal_v2_episode_excursions_pre_attempt"
+# 迁移用的索引 DDL（与 review_flow_models 的 ix_jv2_excursion_scope 同构；
+# resume 场景 create_all 会跳过既有表的索引，只能显式补）。
+_EXCURSION_SCOPE_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS ix_jv2_excursion_scope ON "
+    f"{_EXCURSION_TABLE_NAME} (account_key, episode_build_id, status)"
+)
+# 迁移复制的列清单（旧表全部列；新表在 code_version 后新增 attempt=1）。
+_EXCURSION_COPY_COLUMNS = (
+    "id, account_key, episode_build_id, position_episode_id, code_version, "
+    "source, status, status_reason, exposure, u0, u0_at, u0_flag, "
+    "mfe_underlying_pct, mfe_at, mae_underlying_pct, mae_at, mae_before_mfe, "
+    "atr14, mfe_atr, mae_atr, bars_used, coverage_start, coverage_end, "
+    "missing_sessions_json, computed_at"
+)
+
+
+def _migrate_excursion_attempt_column(engine: Any) -> None:
+    """One-time SQLite rebuild adding ``attempt`` to the excursion table.
+
+    旧表的唯一键是 ``(build, episode, code_version)``；attempt 列（2026-08-25
+    复核修复 5）要求进唯一键，SQLite 无法原位改约束，只能诚实重建：
+    DROP 两个 deny trigger → RENAME 旧表 → create_all 建新表 → 整行复制
+    （旧行 attempt=1，id 保留）→ DROP 旧表 → 触发器由 ``init_ledger_schema``
+    统一重装。全程 append-only 语义不破坏：没有任何行内容被改写。
+    """
+    raw = engine.raw_connection()
+    try:
+        cursor = raw.cursor()
+        legacy_exists = cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (_EXCURSION_LEGACY_TABLE_NAME,),
+        ).fetchone() is not None
+        if not legacy_exists:
+            exists = cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                (_EXCURSION_TABLE_NAME,),
+            ).fetchone()
+            if exists is None:
+                return
+            columns = {
+                row[1]
+                for row in cursor.execute(
+                    f"PRAGMA table_info({_EXCURSION_TABLE_NAME})"
+                )
+            }
+            if "attempt" in columns:
+                # 自愈：resume 场景下 create_all 会因表已存在而跳过索引。
+                cursor.execute(_EXCURSION_SCOPE_INDEX_DDL)
+                raw.commit()
+                return
+            for operation in ("UPDATE", "DELETE"):
+                cursor.execute(
+                    "DROP TRIGGER IF EXISTS "
+                    + ledger_guard_trigger_name(
+                        _EXCURSION_TABLE_NAME, operation
+                    )
+                )
+            cursor.execute(
+                f"ALTER TABLE {_EXCURSION_TABLE_NAME} "
+                f"RENAME TO {_EXCURSION_LEGACY_TABLE_NAME}"
+            )
+        # RENAME 不改索引名：旧显式索引仍占用 ix_jv2_excursion_scope，
+        # 必须先删（create_all 会为新表重建同名索引）。
+        cursor.execute("DROP INDEX IF EXISTS ix_jv2_excursion_scope")
+        raw.commit()
+    finally:
+        raw.close()
+    # 新表由 create_all 按当前模型创建（含 attempt 与新唯一键）。
+    Base.metadata.create_all(engine)
+    raw = engine.raw_connection()
+    try:
+        cursor = raw.cursor()
+        # 整表复制期间关闭 FK 强制（复制的是既有合法行，且 FK 目标表
+        # 不参与本迁移；PRAGMA 仅对本连接生效，结束后恢复）。复制按 id
+        # 去重（幂等）：中途失败重跑可续传，绝不重复也绝不丢行。
+        cursor.execute("PRAGMA foreign_keys=OFF")
+        cursor.execute(
+            f"INSERT INTO {_EXCURSION_TABLE_NAME} "
+            f"({_EXCURSION_COPY_COLUMNS}, attempt) "
+            f"SELECT {_EXCURSION_COPY_COLUMNS}, 1 "
+            f"FROM {_EXCURSION_LEGACY_TABLE_NAME} "
+            f"WHERE id NOT IN (SELECT id FROM {_EXCURSION_TABLE_NAME})"
+        )
+        cursor.execute(f"DROP TABLE {_EXCURSION_LEGACY_TABLE_NAME}")
+        # resume 场景下 create_all 因表已存在而跳过索引：显式补齐（幂等）。
+        cursor.execute(_EXCURSION_SCOPE_INDEX_DDL)
+        raw.commit()
+        cursor.execute("PRAGMA foreign_keys=ON")
+    finally:
+        raw.close()
+
+
 def init_ledger_schema() -> None:
     """Create only missing tables; existing legacy Journal rows are untouched."""
     with _LEDGER_SCHEMA_LOCK:
         db = get_db()
+        if db._engine.dialect.name == "sqlite":
+            _migrate_excursion_attempt_column(db._engine)
         Base.metadata.create_all(db._engine)
         if db._engine.dialect.name == "sqlite":
             with db._engine.begin() as connection:

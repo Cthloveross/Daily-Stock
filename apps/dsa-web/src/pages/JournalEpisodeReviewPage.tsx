@@ -43,6 +43,14 @@ import {
 } from '../components/journal/review/evidenceConsolidation';
 import { findNextReviewEpisode } from '../components/journal/review/nextReviewEpisode';
 import {
+  DecisionSnapshotPanel,
+  EpisodeWhatIfPanel,
+  QuadrantChip,
+} from '../components/journal/review/episodeReviewZones';
+import { ExcursionDiagnostics } from '../components/journal/review/ExcursionDiagnostics';
+import { fetchEpisodeExcursion } from '../api/journalReviewFlow';
+import type { EpisodeVerdictBlock } from '../types/journalReviewFlow';
+import {
   clearEpisodeReviewDraft,
   compactEpisodeReviewUserContext,
   emptyEpisodeReviewDraft,
@@ -976,6 +984,10 @@ const JournalEpisodeReviewPage: React.FC = () => {
   const [reviewHistoryError, setReviewHistoryError] = useState<string | null>(null);
   const [queueBusy, setQueueBusy] = useState<'skip' | 'draft' | 'complete' | null>(null);
   const [queueNotice, setQueueNotice] = useState<string | null>(null);
+  // 区②折叠揭示：布局强制顺序（蓝图 17 §三(b)）——结果默认折叠，
+  // 揭示后才可见盈亏/K 线/成交路径，且区③标签才可编辑。
+  const [resultsRevealed, setResultsRevealed] = useState(false);
+  const [verdictBlock, setVerdictBlock] = useState<EpisodeVerdictBlock | null>(null);
 
   const returnToJournal = useCallback(() => {
     navigate(journalReturnPath(searchParams));
@@ -1004,6 +1016,8 @@ const JournalEpisodeReviewPage: React.FC = () => {
       setReviewHistoryError(null);
       setQueueBusy(null);
       setQueueNotice(null);
+      setResultsRevealed(false);
+      setVerdictBlock(null);
     });
     void fetchPositionEpisodeDetail(episodeId, buildId)
       .then((response) => {
@@ -1011,6 +1025,14 @@ const JournalEpisodeReviewPage: React.FC = () => {
           setDetail(response);
           setSelectedEvidenceKey(response.evidence[0]?.evidenceKey ?? null);
           setTradeLogicDraft(loadEpisodeReviewDraft(response.build.id, episodeId));
+          // 区①/③/④的机械判定（车道、四象限、两个反事实）由服务端计算。
+          void fetchEpisodeExcursion(episodeId, response.build.id)
+            .then((excursionResponse) => {
+              if (!cancelled) setVerdictBlock(excursionResponse.verdict ?? null);
+            })
+            .catch(() => {
+              if (!cancelled) setVerdictBlock(null);
+            });
         }
       })
       .catch((reason) => {
@@ -1064,7 +1086,8 @@ const JournalEpisodeReviewPage: React.FC = () => {
   }, [detail, episodeId]);
 
   useEffect(() => {
-    if (!detail) return;
+    // K 线属于区②（结果）：揭示前不加载，也不请求任何行情。
+    if (!detail || !resultsRevealed) return;
     let cancelled = false;
     queueMicrotask(() => {
       if (cancelled) return;
@@ -1094,7 +1117,7 @@ const JournalEpisodeReviewPage: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [detail, requestedPeriod]);
+  }, [detail, requestedPeriod, resultsRevealed]);
 
   const chartCandles = useMemo(() => {
     const candles = historyState?.candles ?? [];
@@ -1323,11 +1346,13 @@ const JournalEpisodeReviewPage: React.FC = () => {
               条件性结果 · 不进 Headline
             </span>
           )}
-          <span className="inline-flex items-baseline gap-1.5">
-            <span className="text-caption text-text-3">Net</span>
-            <span className={`font-mono text-mono-sm ${moneyTone(displayedNet)}`}>
-              {item.lifecycleStatus === 'closed' ? formatDecimal(displayedNet, true) : '窗口末未归零'}
-            </span>
+          {/* 反 outcome-bias：结果（含 Net）折叠在区②，揭示后才显示。 */}
+          <span className={`rounded-full border px-2.5 py-1 text-caption ${
+            resultsRevealed
+              ? 'border-accent-subtle-border bg-accent-subtle-bg text-accent'
+              : 'border-subtle bg-bg-2 text-text-3'
+          }`}>
+            {resultsRevealed ? '结果已揭示' : '盲评中 · 结果已折叠'}
           </span>
           <div className="ml-auto flex flex-wrap items-center gap-2">
             <button
@@ -1341,7 +1366,7 @@ const JournalEpisodeReviewPage: React.FC = () => {
             <button
               type="button"
               className="btn-secondary"
-              disabled={queueBusy != null || reviewSaving}
+              disabled={queueBusy != null || reviewSaving || !resultsRevealed}
               onClick={() => void saveAndNextEpisode('in_progress')}
             >
               {queueBusy === 'draft' ? '保存草稿中…' : '保存草稿并下一笔'}
@@ -1349,7 +1374,7 @@ const JournalEpisodeReviewPage: React.FC = () => {
             <button
               type="button"
               className="btn-primary"
-              disabled={queueBusy != null || reviewSaving}
+              disabled={queueBusy != null || reviewSaving || !resultsRevealed}
               onClick={() => void saveAndNextEpisode('completed')}
             >
               {queueBusy === 'complete' ? '完成复盘中…' : '完成复盘并下一笔'}
@@ -1378,18 +1403,6 @@ const JournalEpisodeReviewPage: React.FC = () => {
         )}
       </div>
 
-      {/*
-        ≥1280px（xl）双列：左列 = 摘要 + K 线与事件 + 成交证据时间线；
-        右列 = 复盘工作单（sticky，可独立滚动）。窄屏单列且工作单紧跟
-        顶部操作条（order-1），证据区随后。
-      */}
-      <section
-        className="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(400px,460px)]"
-        aria-label="复盘主区"
-        data-testid="review-columns"
-      >
-        <div className="order-2 min-w-0 space-y-4 xl:order-1" data-testid="review-evidence-column">
-
       {item.quality.assumedFlatUnverified && (
         <InlineAlert
           variant="warning"
@@ -1404,6 +1417,50 @@ const JournalEpisodeReviewPage: React.FC = () => {
           message="系统没有证据窗口末之后的完整成交与持仓快照；证据窗口末数量只表示回放到该 as-of 时点时尚未归零。"
         />
       )}
+
+      {/* 区①：决策时快照——默认展开，只列进场时刻可知的信息。 */}
+      <DecisionSnapshotPanel
+        detail={detail}
+        verdict={verdictBlock}
+        annotation={reviewAnnotation}
+      />
+
+      {/* 区②：结果揭示——默认折叠（代码层约束，反 outcome-bias）。 */}
+      {!resultsRevealed && (
+        <section
+          className="card-base p-6 text-center"
+          aria-label="结果揭示"
+          data-testid="reveal-gate"
+        >
+          <h2 className="text-h2 text-text-1">区② 结果揭示（默认折叠）</h2>
+          <p className="mx-auto mt-2 max-w-xl text-body-sm text-text-3">
+            先读决策快照、在心里给过程结论；点击揭示后才显示盈亏、K 线、成交路径与
+            AI 分析，区③双轨标签也才可编辑。先决策快照、后结果——顺序是机制，不是排版。
+          </p>
+          <button
+            type="button"
+            className="btn-primary mt-4"
+            data-testid="reveal-results"
+            onClick={() => setResultsRevealed(true)}
+          >
+            揭示结果
+          </button>
+        </section>
+      )}
+
+      {resultsRevealed && (
+      <>
+      {/*
+        ≥1280px（xl）双列：左列 = 摘要 + K 线与事件 + 成交证据时间线 + 偏移
+        诊断（区②）；右列 = 四象限 + 复盘工作单（区③，sticky）。窄屏单列且
+        工作单紧跟顶部操作条（order-1），证据区随后。
+      */}
+      <section
+        className="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(400px,460px)]"
+        aria-label="复盘主区"
+        data-testid="review-columns"
+      >
+        <div className="order-2 min-w-0 space-y-4 xl:order-1" data-testid="review-evidence-column">
 
       <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6" aria-label="回合摘要">
         {[
@@ -1557,10 +1614,27 @@ const JournalEpisodeReviewPage: React.FC = () => {
             />
           </div>
         </aside>
+
+        {/* 偏移诊断（区②）：只读 MAE/MFE + 聚合散点，永久免责。 */}
+        <ExcursionDiagnostics
+          key={`excursion:${episodeId}:${detail.build.id}`}
+          episodeId={episodeId}
+          buildId={detail.build.id}
+        />
         </div>
 
         <div className="order-1 min-w-0 xl:order-2" data-testid="review-worksheet-column">
           <div className="xl:sticky xl:top-24 xl:max-h-[calc(100vh-7rem)] xl:overflow-y-auto xl:pr-1">
+            {/* 区③：四象限落格（服务端判定；「侥幸」标红）+ 双轨标签。 */}
+            {verdictBlock && (
+              <div className="mb-3 flex flex-wrap items-center gap-2 rounded-ds-md border border-subtle bg-bg-1 px-3 py-2" data-testid="quadrant-strip">
+                <span className="text-caption text-text-3">四象限（过程轴 × 结果轴，永不合成）</span>
+                <QuadrantChip
+                  quadrant={verdictBlock.quadrant}
+                  label={verdictBlock.quadrantLabel}
+                />
+              </div>
+            )}
             <TradeLogicDraftPanel
               key={`draft:${episodeId}:${detail.build.id}`}
               episodeId={episodeId}
@@ -1596,6 +1670,11 @@ const JournalEpisodeReviewPage: React.FC = () => {
         buildId={detail.build.id}
         userContext={tradeLogicDraft}
       />
+
+      {/* 区④：机械反事实（只读，两个、永不叠加）。 */}
+      <EpisodeWhatIfPanel verdict={verdictBlock} />
+      </>
+      )}
 
       <EpisodePlaybookLinksPanel
         key={`playbook-links:${episodeId}:${detail.build.id}`}
