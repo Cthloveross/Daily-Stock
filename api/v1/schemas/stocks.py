@@ -119,6 +119,13 @@ class StockHistoryResponse(BaseModel):
         None,
         description="派生 K 线的聚合方法；原生周期为 null",
     )
+    aggregation_contract: Optional[str] = Field(
+        None,
+        description=(
+            "派生 K 线的版本化聚合契约；严格 2m 为 "
+            "session_anchored_exact_2m_v2"
+        ),
+    )
     data: List[KLineData] = Field(default_factory=list, description="K 线数据列表")
 
     class Config:

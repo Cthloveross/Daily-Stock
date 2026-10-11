@@ -1,0 +1,58 @@
+{
+  "schema_version": "p0_2m_case_regression_v1",
+  "source": "Moomoo K_1M history refetched after the 2026-09-10 close; provider end labels shifted to ET minute starts before exact 2m aggregation",
+  "verified_at": "2026-09-10T20:56:54-04:00",
+  "specification": {
+    "signal_version": "p0_2m_signal_v1",
+    "baseline_sessions": 60,
+    "price_percentile_min": 0.95,
+    "rvol_8m_min": 1.5,
+    "displacement_atr_min": 0.5,
+    "same_direction_required": true
+  },
+  "cases": [
+    {
+      "symbol": "TSLA",
+      "market_date_et": "2026-08-31",
+      "strict_qualified": true,
+      "first_strict_crossing": {
+        "window_end": "2026-08-31T09:52:00-04:00",
+        "direction": "up",
+        "price_percentile": 0.966667,
+        "rvol_8m": 2.13526,
+        "displacement_atr": 0.545315,
+        "failed_checks": []
+      },
+      "earlier_checkpoint": {
+        "window_end": "2026-08-31T09:48:00-04:00",
+        "direction": "up",
+        "price_percentile": 0.916667,
+        "rvol_8m": 1.642519,
+        "displacement_atr": 0.835589,
+        "strict_qualified": false,
+        "failed_checks": ["price_percentile_below_0.95"]
+      },
+      "note": "The 09:48 checkpoint fails the frozen 60-session P95 gate; the first full-day strict crossing is four minutes later at 09:52."
+    },
+    {
+      "symbol": "META",
+      "market_date_et": "2026-09-01",
+      "window_end": null,
+      "direction": null,
+      "max_abs_displacement_atr_rth": 0.480754,
+      "strict_qualified": false,
+      "failed_checks": ["no_rth_window_reached_0.50_atr"]
+    },
+    {
+      "symbol": "META",
+      "market_date_et": "2026-09-10",
+      "window_end": "2026-09-10T09:52:00-04:00",
+      "direction": "down",
+      "price_percentile": 0.966667,
+      "rvol_8m": 2.343205,
+      "displacement_atr": 0.75442,
+      "strict_qualified": true,
+      "failed_checks": []
+    }
+  ]
+}
