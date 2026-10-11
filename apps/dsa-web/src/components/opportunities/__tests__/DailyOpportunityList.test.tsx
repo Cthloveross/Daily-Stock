@@ -5,6 +5,7 @@ import { DailyOpportunityList } from '../DailyOpportunityList';
 import {
   evaluateOpportunitySnapshot,
   fetchDailyOpportunities,
+  fetchIntradayTracking,
   fetchPremarketCycleStatus,
   fetchOpportunityLearningSummary,
   fetchOpportunityOptionContext,
@@ -16,6 +17,7 @@ import {
 } from '../../../api/opportunities';
 import type {
   DailyOpportunityRun,
+  IntradayTrackingResponse,
   OpportunityLearningSummaryResponse,
   OpportunityOptionEvent,
   OpportunityOptionEventItem,
@@ -38,6 +40,7 @@ vi.mock('../../../api/opportunities', async (importOriginal) => {
     ...actual,
     evaluateOpportunitySnapshot: vi.fn(),
     fetchDailyOpportunities: vi.fn(),
+    fetchIntradayTracking: vi.fn(),
     fetchPremarketCycleStatus: vi.fn(),
     fetchOpportunityLearningSummary: vi.fn(),
     fetchOpportunityOptionContext: vi.fn(),
@@ -748,6 +751,19 @@ function opportunityQualification({
   };
 }
 
+function intradayTrackingResponse(): IntradayTrackingResponse {
+  return {
+    schemaVersion: 'intraday-tracking/1.0',
+    generatedAt: '2026-07-22T14:30:00+00:00',
+    marketDateEt: '2026-07-22',
+    sessionState: 'closed',
+    sessionStateBasis: 'america_new_york_clock_v1',
+    trackingBasis: 'frozen_premarket_plan_readonly',
+    items: [],
+    limitations: [],
+  };
+}
+
 function snapshotList(items: OpportunitySnapshot[]): OpportunitySnapshotListResponse {
   return { schemaVersion: 'opportunity-snapshot-list/1.0', items };
 }
@@ -893,6 +909,8 @@ describe('DailyOpportunityList', () => {
     vi.mocked(evaluateOpportunitySnapshot).mockResolvedValue(evaluationResponse());
     vi.mocked(fetchDailyOpportunities).mockReset();
     vi.mocked(fetchDailyOpportunities).mockResolvedValue(run);
+    vi.mocked(fetchIntradayTracking).mockReset();
+    vi.mocked(fetchIntradayTracking).mockResolvedValue(intradayTrackingResponse());
     vi.mocked(fetchPremarketCycleStatus).mockReset();
     vi.mocked(fetchPremarketCycleStatus).mockResolvedValue(premarketCycleResponse());
     vi.mocked(fetchOpportunityLearningSummary).mockReset();
@@ -991,6 +1009,11 @@ describe('DailyOpportunityList', () => {
     expect(await screen.findByText('NVDA')).toBeInTheDocument();
     expect(screen.getByText('默认美股池 · 扫描 1 只')).toBeInTheDocument();
     expect(screen.getByText(/Top 5 规则匹配候选由/)).toBeInTheDocument();
+    // 周内榜的诚实副标题：日线结构口径 + 数日至数周研究周期 + 日内入口。
+    expect(
+      screen.getByText(/基于上一完整交易日日线结构 · 数日至数周研究周期/),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '进入日内工作台 →' })).toBeInTheDocument();
     expect(screen.queryByText(/最有可能/)).not.toBeInTheDocument();
     expect(fetchDailyOpportunities).toHaveBeenCalledWith([], 10, { refresh: false });
   });
@@ -1647,7 +1670,7 @@ describe('DailyOpportunityList', () => {
     expect(await screen.findByText('刷新中 · 显示旧结果')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '刷新只读预览' })).toBeDisabled();
     expect(screen.getByText(/当前继续显示 2026-07-22 08:00 ET 的上一次成功结果/)).toBeInTheDocument();
-    expect(screen.getByText('NVDA')).toBeInTheDocument();
+    expect(screen.getAllByText('NVDA').length).toBeGreaterThan(0);
 
     await act(async () => {
       refreshRequest.reject(new Error('daily source timeout'));
@@ -1657,7 +1680,7 @@ describe('DailyOpportunityList', () => {
     expect(await screen.findByText('刷新失败 · 显示旧结果')).toBeInTheDocument();
     expect(screen.getByText(/daily source timeout.*2026-07-22 08:00 ET 的上一次可用结果/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '刷新只读预览' })).toBeEnabled();
-    expect(screen.getByText('NVDA')).toBeInTheDocument();
+    expect(screen.getAllByText('NVDA').length).toBeGreaterThan(0);
   });
 
   it('names the actual base-data blocker instead of calling every gap insufficient evidence', async () => {

@@ -9,12 +9,17 @@ import base64
 import hashlib
 import hmac
 import os
+import socket
 import sys
 import unittest
+from datetime import datetime, timezone
 from email.header import decode_header, make_header
 from email.utils import parseaddr
-from unittest import mock
 from typing import Optional
+from unittest import mock
+
+import requests
+import urllib3
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -32,6 +37,9 @@ from src.notification_sender import (
     TelegramSender,
     WechatSender,
     WECHAT_IMAGE_MAX_BYTES,
+)
+from src.notification_sender.telegram_sender import (
+    _definite_pre_send_transport_failure,
 )
 
 
@@ -572,11 +580,28 @@ class TestSlackSender(unittest.TestCase):
 class TestTelegramSender(unittest.TestCase):
     """Unit tests for TelegramSender."""
 
+    def setUp(self):
+        self._dns_patch = mock.patch(
+            "src.notification_sender.telegram_sender.socket.getaddrinfo",
+            return_value=[
+                (
+                    2,
+                    1,
+                    6,
+                    "",
+                    ("203.0.113.10", 443),
+                )
+            ],
+        )
+        self.mock_getaddrinfo = self._dns_patch.start()
+        self.addCleanup(self._dns_patch.stop)
+
     def test_send_returns_false_when_not_configured(self):
         cfg = _config()
         sender = TelegramSender(cfg)
         result = sender.send_to_telegram("hello")
         self.assertFalse(result)
+        self.mock_getaddrinfo.assert_not_called()
 
     @mock.patch("src.notification_sender.telegram_sender.requests.post")
     def test_send_success_returns_true(self, mock_post):
@@ -586,6 +611,338 @@ class TestTelegramSender(unittest.TestCase):
         result = sender.send_to_telegram("hello")
         self.assertTrue(result)
         self.assertIn("sendMessage", mock_post.call_args[0][0])
+        # One startup lookup and one refresh after a successful HTTPS exchange.
+        self.assertEqual(self.mock_getaddrinfo.call_count, 2)
+
+    @mock.patch("src.notification_sender.telegram_sender.requests.post")
+    def test_http_200_invalid_json_is_indeterminate_not_retried(self, mock_post):
+        response = _response(200)
+        response.json.side_effect = ValueError("malformed body")
+        mock_post.return_value = response
+        sender = TelegramSender(
+            _config(telegram_bot_token="BOT", telegram_chat_id="CHAT")
+        )
+
+        self.assertIsNone(sender.send_to_telegram("one logical message"))
+
+        mock_post.assert_called_once()
+
+    def test_partial_chunk_success_is_indeterminate_not_whole_message_retry(self):
+        sender = TelegramSender(
+            _config(telegram_bot_token="BOT", telegram_chat_id="CHAT")
+        )
+        content = ("A" * 3000) + "\n---\n" + ("B" * 3000)
+        with mock.patch.object(
+            sender,
+            "_send_telegram_message",
+            side_effect=[True, False],
+        ) as send_chunk:
+            outcome = sender.send_to_telegram(content)
+
+        self.assertIsNone(outcome)
+        self.assertEqual(send_chunk.call_count, 2)
+
+    @mock.patch(
+        "src.notification_sender.telegram_sender.urllib3.HTTPSConnectionPool"
+    )
+    @mock.patch("src.notification_sender.telegram_sender.requests.post")
+    def test_connection_error_uses_cached_ipv4_with_telegram_tls_identity(
+        self,
+        mock_post,
+        mock_pool_cls,
+    ):
+        mock_post.side_effect = requests.exceptions.ConnectTimeout("dns down")
+        direct = mock.MagicMock()
+        direct.status = 200
+        direct.data = b'{"ok":true}'
+        direct.headers = {}
+        mock_pool_cls.return_value.urlopen.return_value = direct
+        sender = TelegramSender(
+            _config(telegram_bot_token="BOT", telegram_chat_id="CHAT")
+        )
+
+        self.assertTrue(sender.send_to_telegram("real signal"))
+
+        mock_post.assert_called_once()
+        pool_kwargs = mock_pool_cls.call_args.kwargs
+        self.assertEqual(pool_kwargs["host"], "203.0.113.10")
+        self.assertEqual(pool_kwargs["assert_hostname"], "api.telegram.org")
+        self.assertEqual(pool_kwargs["server_hostname"], "api.telegram.org")
+        direct_call = mock_pool_cls.return_value.urlopen.call_args
+        self.assertEqual(direct_call.args[0], "POST")
+        self.assertEqual(
+            direct_call.kwargs["headers"]["Host"],
+            "api.telegram.org",
+        )
+        self.assertIn("/botBOT/sendMessage", direct_call.args[1])
+        mock_pool_cls.return_value.close.assert_called_once()
+
+    @mock.patch(
+        "src.notification_sender.telegram_sender.urllib3.HTTPSConnectionPool"
+    )
+    @mock.patch("src.notification_sender.telegram_sender.requests.post")
+    def test_http_error_does_not_use_cached_ipv4_or_duplicate_request(
+        self,
+        mock_post,
+        mock_pool_cls,
+    ):
+        mock_post.return_value = _response(400, {"ok": False})
+        sender = TelegramSender(
+            _config(telegram_bot_token="BOT", telegram_chat_id="CHAT")
+        )
+
+        self.assertFalse(sender.send_to_telegram("bad request"))
+
+        mock_post.assert_called_once()
+        mock_pool_cls.assert_not_called()
+
+    @mock.patch(
+        "src.notification_sender.telegram_sender.urllib3.HTTPSConnectionPool"
+    )
+    @mock.patch("src.notification_sender.telegram_sender.time.sleep")
+    @mock.patch("src.notification_sender.telegram_sender.requests.post")
+    def test_missing_cached_ipv4_preserves_existing_retry_path(
+        self,
+        mock_post,
+        _mock_sleep,
+        mock_pool_cls,
+    ):
+        mock_post.side_effect = requests.exceptions.ConnectTimeout("timeout")
+        sender = TelegramSender(
+            _config(telegram_bot_token="BOT", telegram_chat_id="CHAT")
+        )
+        sender._telegram_ipv4 = None
+
+        self.assertFalse(sender.send_to_telegram("hello"))
+
+        self.assertEqual(mock_post.call_count, 3)
+        mock_pool_cls.assert_not_called()
+
+    @mock.patch("src.notification_sender.telegram_sender.time.sleep")
+    @mock.patch("src.notification_sender.telegram_sender.requests.post")
+    def test_transport_error_log_never_exposes_bot_token(
+        self,
+        mock_post,
+        _mock_sleep,
+    ):
+        secret = "123456:VERY_SECRET_BOT_TOKEN"
+        mock_post.side_effect = requests.exceptions.ConnectTimeout(
+            "failed URL https://api.telegram.org/"
+            f"bot{secret}/sendMessage"
+        )
+        sender = TelegramSender(
+            _config(telegram_bot_token=secret, telegram_chat_id="CHAT")
+        )
+        # This test isolates the ordinary retry/logging path.  Cached-IP
+        # behavior is covered separately without making a real connection.
+        sender._telegram_ipv4 = None
+
+        with self.assertLogs(
+            "src.notification_sender.telegram_sender",
+            level="WARNING",
+        ) as captured:
+            self.assertFalse(sender.send_to_telegram("hello"))
+
+        output = "\n".join(captured.output)
+        self.assertIn("error_type=ConnectTimeout", output)
+        self.assertNotIn(secret, output)
+        self.assertNotIn("/bot", output)
+
+    @mock.patch(
+        "src.notification_sender.telegram_sender.urllib3.HTTPSConnectionPool"
+    )
+    @mock.patch("src.notification_sender.telegram_sender.requests.post")
+    def test_read_timeout_is_indeterminate_and_never_retried(
+        self,
+        mock_post,
+        mock_pool_cls,
+    ):
+        mock_post.side_effect = requests.exceptions.ReadTimeout(
+            "response lost"
+        )
+        sender = TelegramSender(
+            _config(telegram_bot_token="BOT", telegram_chat_id="CHAT")
+        )
+
+        self.assertIsNone(sender.send_to_telegram("one logical message"))
+
+        mock_post.assert_called_once()
+        mock_pool_cls.assert_not_called()
+
+    @mock.patch(
+        "src.notification_sender.telegram_sender.urllib3.HTTPSConnectionPool"
+    )
+    @mock.patch("src.notification_sender.telegram_sender.requests.post")
+    def test_cached_ipv4_read_timeout_is_indeterminate_and_never_retried(
+        self,
+        mock_post,
+        mock_pool_cls,
+    ):
+        mock_post.side_effect = requests.exceptions.ConnectTimeout(
+            "primary connect timeout"
+        )
+        mock_pool_cls.return_value.urlopen.side_effect = (
+            urllib3.exceptions.ReadTimeoutError(
+                mock_pool_cls.return_value,
+                "/botBOT/sendMessage",
+                "response lost",
+            )
+        )
+        sender = TelegramSender(
+            _config(telegram_bot_token="BOT", telegram_chat_id="CHAT")
+        )
+
+        self.assertIsNone(sender.send_to_telegram("one logical message"))
+
+        mock_post.assert_called_once()
+        mock_pool_cls.return_value.urlopen.assert_called_once()
+
+    @mock.patch(
+        "src.notification_sender.telegram_sender.urllib3.HTTPSConnectionPool"
+    )
+    @mock.patch("src.notification_sender.telegram_sender.time.sleep")
+    @mock.patch("src.notification_sender.telegram_sender.requests.post")
+    def test_dns_failure_then_cached_ip_read_timeout_does_not_resend(
+        self,
+        mock_post,
+        mock_sleep,
+        mock_pool_cls,
+    ):
+        dns_error = urllib3.exceptions.NameResolutionError(
+            "api.telegram.org", None, socket.gaierror(-2, "DNS lookup failed")
+        )
+        primary_error = requests.exceptions.ConnectionError(dns_error)
+        fallback_error = urllib3.exceptions.ReadTimeoutError(
+            mock_pool_cls.return_value,
+            "/botBOT/sendMessage",
+            "response lost",
+        )
+        mock_post.side_effect = primary_error
+        mock_pool_cls.return_value.urlopen.side_effect = fallback_error
+        sender = TelegramSender(
+            _config(telegram_bot_token="BOT", telegram_chat_id="CHAT")
+        )
+
+        self.assertIsNone(sender.send_to_telegram("one logical message"))
+
+        self.assertIs(fallback_error.__context__, primary_error)
+        mock_post.assert_called_once()
+        mock_pool_cls.return_value.urlopen.assert_called_once()
+        mock_pool_cls.return_value.close.assert_called_once()
+        mock_sleep.assert_not_called()
+
+    def test_pre_send_classifier_keeps_explicit_connection_wrappers(self):
+        reasons = (
+            socket.gaierror(-2, "DNS lookup failed"),
+            urllib3.exceptions.NameResolutionError(
+                "api.telegram.org", None, socket.gaierror(-2, "DNS failed")
+            ),
+            urllib3.exceptions.NewConnectionError(None, "connection refused"),
+            urllib3.exceptions.ConnectTimeoutError("connect timed out"),
+        )
+        for reason in reasons:
+            with self.subTest(reason=type(reason).__name__):
+                self.assertTrue(_definite_pre_send_transport_failure(reason))
+                wrapped = requests.exceptions.ConnectionError(
+                    urllib3.exceptions.MaxRetryError(None, "/redacted", reason)
+                )
+                self.assertTrue(_definite_pre_send_transport_failure(wrapped))
+                explicit_cause = requests.exceptions.ConnectionError("failed")
+                explicit_cause.__cause__ = reason
+                self.assertTrue(
+                    _definite_pre_send_transport_failure(explicit_cause)
+                )
+
+    def test_pre_send_classifier_ignores_previous_request_context(self):
+        previous_dns = socket.gaierror(-2, "previous DNS lookup failed")
+        uncertain = (
+            requests.exceptions.ReadTimeout("response lost"),
+            urllib3.exceptions.ReadTimeoutError(None, "/redacted", "lost"),
+            urllib3.exceptions.ProtocolError("connection closed after POST"),
+            requests.exceptions.ConnectionError("opaque connection loss"),
+        )
+        for error in uncertain:
+            with self.subTest(error=type(error).__name__):
+                error.__context__ = previous_dns
+                self.assertFalse(_definite_pre_send_transport_failure(error))
+
+    def test_pre_send_classifier_read_or_protocol_failure_overrides_dns(self):
+        previous_dns = socket.gaierror(-2, "DNS lookup failed")
+        for uncertain in (
+            requests.exceptions.ReadTimeout("response lost"),
+            urllib3.exceptions.ProtocolError("connection closed after POST"),
+        ):
+            with self.subTest(error=type(uncertain).__name__):
+                # Even an explicit/nested DNS error cannot establish that a
+                # read/protocol failure happened before this POST was sent.
+                uncertain.__cause__ = previous_dns
+                wrapped = requests.exceptions.ConnectionError(uncertain)
+                self.assertFalse(_definite_pre_send_transport_failure(wrapped))
+
+    @mock.patch("src.notification_sender.telegram_sender.time.sleep")
+    @mock.patch("src.notification_sender.telegram_sender.requests.post")
+    @mock.patch("src.notification_sender.telegram_sender._utc_now")
+    def test_delivery_deadline_stops_internal_retry_after_opening_minute(
+        self,
+        mock_now,
+        mock_post,
+        mock_sleep,
+    ):
+        before_expiry = datetime(2026, 8, 31, 13, 32, 40, tzinfo=timezone.utc)
+        expiry = datetime(2026, 8, 31, 13, 33, 0, tzinfo=timezone.utc)
+        mock_now.side_effect = [before_expiry, expiry]
+        mock_post.side_effect = [
+            requests.exceptions.ConnectTimeout("connect timeout"),
+            _response(200, {"ok": True}),
+        ]
+        sender = TelegramSender(
+            _config(telegram_bot_token="BOT", telegram_chat_id="CHAT")
+        )
+        sender._telegram_ipv4 = None
+
+        self.assertFalse(
+            sender.send_to_telegram(
+                "09:32 opening",
+                delivery_deadline=expiry,
+            )
+        )
+
+        mock_post.assert_called_once()
+        mock_sleep.assert_not_called()
+
+    @mock.patch(
+        "src.notification_sender.telegram_sender.urllib3.HTTPSConnectionPool"
+    )
+    @mock.patch("src.notification_sender.telegram_sender.time.sleep")
+    @mock.patch("src.notification_sender.telegram_sender.requests.post")
+    @mock.patch("src.notification_sender.telegram_sender._utc_now")
+    def test_delivery_deadline_blocks_cached_ip_post_after_primary_timeout(
+        self,
+        mock_now,
+        mock_post,
+        mock_sleep,
+        mock_pool_cls,
+    ):
+        before_expiry = datetime(2026, 8, 31, 13, 32, 59, tzinfo=timezone.utc)
+        expiry = datetime(2026, 8, 31, 13, 33, 0, tzinfo=timezone.utc)
+        mock_now.side_effect = [before_expiry, expiry, expiry]
+        mock_post.side_effect = requests.exceptions.ConnectTimeout(
+            "primary consumed the remaining minute"
+        )
+        sender = TelegramSender(
+            _config(telegram_bot_token="BOT", telegram_chat_id="CHAT")
+        )
+
+        self.assertFalse(
+            sender.send_to_telegram(
+                "09:32 opening",
+                delivery_deadline=expiry,
+            )
+        )
+
+        mock_post.assert_called_once()
+        mock_pool_cls.assert_not_called()
+        mock_sleep.assert_not_called()
 
     @mock.patch("src.notification_sender.telegram_sender.requests.post")
     def test_send_retries_plain_text_when_markdown_http_400(self, mock_post):
@@ -623,8 +980,41 @@ class TestTelegramSender(unittest.TestCase):
         sender = TelegramSender(cfg)
         result = sender.send_to_telegram("*ST宝实")
 
-        self.assertFalse(result)
+        self.assertIsNone(result)
         self.assertEqual(mock_post.call_count, 2)
+
+
+    @mock.patch("src.notification_sender.telegram_sender.requests.post")
+    def test_disable_notification_flag_is_additive(self, mock_post):
+        """P1 静默投递（蓝图 17 §2.2）：flag 传入才出现，默认零改动。"""
+        mock_post.return_value = _response(200, {"ok": True})
+        cfg = _config(telegram_bot_token="BOT", telegram_chat_id="CHAT")
+        sender = TelegramSender(cfg)
+        self.assertTrue(
+            sender.send_to_telegram("silent", disable_notification=True)
+        )
+        payload = mock_post.call_args[1]["json"]
+        self.assertIs(payload.get("disable_notification"), True)
+        # 默认路径与旧行为逐字节一致：payload 里没有这个键。
+        self.assertTrue(sender.send_to_telegram("loud"))
+        payload = mock_post.call_args[1]["json"]
+        self.assertNotIn("disable_notification", payload)
+
+    @mock.patch("src.notification_sender.telegram_sender.requests.post")
+    def test_disable_notification_survives_plain_text_fallback(self, mock_post):
+        markdown_error = _response(400)
+        markdown_error.text = (
+            '{"ok":false,"error_code":400,'
+            '"description":"Bad Request: can\'t parse entities"}'
+        )
+        plain_text_success = _response(200, {"ok": True})
+        mock_post.side_effect = [markdown_error, plain_text_success]
+        cfg = _config(telegram_bot_token="BOT", telegram_chat_id="CHAT")
+        sender = TelegramSender(cfg)
+        result = sender.send_to_telegram("*ST宝实", disable_notification=True)
+        self.assertTrue(result)
+        second_payload = mock_post.call_args_list[1][1]["json"]
+        self.assertIs(second_payload.get("disable_notification"), True)
 
 
 if __name__ == "__main__":

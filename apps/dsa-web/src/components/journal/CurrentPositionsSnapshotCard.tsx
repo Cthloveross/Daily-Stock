@@ -238,13 +238,13 @@ function EpisodeBoundaryReadiness({
       title: '还没有可核对的未来边界',
       message: continuityReady
         ? '账户证据锚点已经具备；下一步是执行只读检查并显式确认一份当前仓位快照。'
-        : '先在“交易证据”确认一次同账户的只读刷新，再执行并确认当前仓位快照。',
+        : '先在上方「每日刷新」确认一次同账户的只读刷新，再执行并确认当前仓位快照。',
     },
     awaiting_refresh: {
       label: '等待后续刷新',
       tone: 'border-warn-strong/30 bg-warn-subtle text-warn-strong',
       title: '快照已冻结，仍缺快照之后的成交覆盖',
-      message: '下一完整交易日结束后，在“交易证据”确认一次覆盖采集区间的只读刷新。快照即使已经过 30 分钟，仍可接受这项历史连续性核对。',
+      message: '下一完整交易日结束后，在上方「每日刷新」确认一次覆盖采集区间的只读刷新。快照即使已经过 30 分钟，仍可接受这项历史连续性核对。',
     },
     blocked: {
       label: '门禁阻断',
@@ -319,7 +319,7 @@ function EpisodeBoundaryReadiness({
           <button type="button" className="btn-ghost ml-auto" onClick={onRetry}>重新核对状态</button>
         )}
         {!snapshotIdentityIssue && onOpenEvidence && (assessment.status === 'awaiting_refresh' || assessment.status === 'blocked' || (!continuityReady && assessment.status === 'no_snapshot')) && (
-          <button type="button" className="btn-ghost ml-auto" onClick={onOpenEvidence}>前往交易证据</button>
+          <button type="button" className="btn-ghost ml-auto" onClick={onOpenEvidence}>前往每日刷新</button>
         )}
       </div>
     </section>
@@ -739,9 +739,9 @@ const CurrentPositionsSnapshotCard: React.FC<CurrentPositionsSnapshotCardProps> 
             title="尚无账户连续性锚点"
             message={latest.continuityReason
               ? warningLabel(latest.continuityReason)
-              : '请先在“交易证据”页确认一次 OpenD 只读刷新，再把当前仓位证据保存为面向未来的连续性起点。'}
+              : '请先在上方「每日刷新」确认一次 OpenD 只读刷新，再把当前仓位证据保存为面向未来的连续性起点。'}
             action={onOpenEvidence ? (
-              <button type="button" className="btn-ghost" onClick={onOpenEvidence}>前往交易证据</button>
+              <button type="button" className="btn-ghost" onClick={onOpenEvidence}>前往每日刷新</button>
             ) : undefined}
           />
         )}
@@ -883,9 +883,9 @@ const CurrentPositionsSnapshotCard: React.FC<CurrentPositionsSnapshotCardProps> 
               <InlineAlert
                 variant="warning"
                 title="可以检查，但暂不能确认"
-                message="请先去“交易证据”页确认一次 OpenD 刷新，建立同一账户的连续性锚点。"
+                message="请先在上方「每日刷新」确认一次 OpenD 刷新，建立同一账户的连续性锚点。"
                 action={onOpenEvidence ? (
-                  <button type="button" className="btn-ghost" onClick={onOpenEvidence}>前往交易证据</button>
+                  <button type="button" className="btn-ghost" onClick={onOpenEvidence}>前往每日刷新</button>
                 ) : undefined}
               />
             )}

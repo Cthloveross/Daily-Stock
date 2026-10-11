@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import src.regime.fetchers as regime_fetchers
 from src.regime.fetchers import RegimeDataFetcher, SECTOR_ETFS
 from src.regime.scorers import score_premarket_activity
 
@@ -662,3 +663,196 @@ class TestMoomooFirstProviderPath:
         assert vix["_status"] == "ready"
         assert vix["level"] == 11.0
         yf_mock.Ticker.assert_not_called()
+
+    def test_vix_retries_cboe_once_after_transport_failure(self):
+        import requests
+
+        class EmptyManager:
+            def _get_fetchers_snapshot(self):
+                return []
+
+        response = MagicMock()
+        response.text = (
+            "DATE,CLOSE\n"
+            "04/08/2026,18\n"
+            "04/09/2026,17\n"
+            "04/10/2026,16\n"
+            "04/13/2026,15\n"
+            "04/14/2026,14\n"
+            "04/15/2026,13\n"
+            "04/16/2026,12\n"
+            "04/17/2026,11\n"
+        )
+        response.raise_for_status.return_value = None
+        yf_mock = MagicMock()
+
+        with patch(
+            "requests.get",
+            side_effect=[requests.ConnectionError("temporary DNS failure"), response],
+        ) as request:
+            fetcher = RegimeDataFetcher(
+                yf=yf_mock,
+                manager=EmptyManager(),
+                alpaca=None,
+                finnhub=None,
+            )
+            vix = fetcher.get_vix(date(2026, 4, 17))
+
+        assert request.call_count == 2
+        assert vix["_source"] == "Cboe"
+        assert vix["level"] == 11.0
+        yf_mock.Ticker.assert_not_called()
+
+    def test_vix_uses_yfinance_when_both_cboe_attempts_fail(self):
+        import pandas as pd
+        import requests
+
+        class EmptyManager:
+            def _get_fetchers_snapshot(self):
+                return []
+
+        dates = pd.bdate_range(end="2026-04-17", periods=10)
+        history = pd.DataFrame(
+            {"Close": [20.0 - index for index in range(10)]},
+            index=dates,
+        )
+        ticker = MagicMock()
+        ticker.history.return_value = history
+        yf_mock = MagicMock()
+        yf_mock.Ticker.return_value = ticker
+
+        with patch(
+            "requests.get",
+            side_effect=requests.ConnectionError("Cboe DNS unavailable"),
+        ) as request:
+            fetcher = RegimeDataFetcher(
+                yf=yf_mock,
+                manager=EmptyManager(),
+                alpaca=None,
+                finnhub=None,
+            )
+            vix = fetcher.get_vix(date(2026, 4, 17))
+
+        assert request.call_count == 2
+        assert vix["_source"] == "yfinance"
+        assert vix["_status"] == "ready"
+        assert vix["level"] == 11.0
+        yf_mock.Ticker.assert_called_once_with("^VIX")
+
+    def test_shared_core_cache_bridges_separate_premarket_attempts(self):
+        class SuccessfulMoomoo:
+            name = "MoomooFetcher"
+            priority = 2
+
+            def __init__(self):
+                self.calls = 0
+
+            def get_daily_data(self, **kwargs):
+                self.calls += 1
+                return TestMoomooFirstProviderPath._frame()
+
+        class FailingMoomoo(SuccessfulMoomoo):
+            def get_daily_data(self, **kwargs):
+                self.calls += 1
+                raise RuntimeError("OpenD temporarily unavailable")
+
+        class FakeManager:
+            def __init__(self, fetcher):
+                self.fetcher = fetcher
+
+            def _get_fetchers_snapshot(self):
+                return [self.fetcher]
+
+            def _call_fetcher_method(self, fetcher, method, **kwargs):
+                return getattr(fetcher, method)(**kwargs)
+
+        target = date(2026, 4, 20)
+        first_source = SuccessfulMoomoo()
+        second_source = FailingMoomoo()
+        regime_fetchers._clear_core_daily_cache_for_tests()
+        try:
+            with patch(
+                "src.regime.fetchers._latest_completed_xnys_session",
+                return_value=date(2026, 4, 17),
+            ):
+                first = RegimeDataFetcher(
+                    yf=None,
+                    manager=FakeManager(first_source),
+                    alpaca=None,
+                    finnhub=None,
+                    shared_core_cache=True,
+                ).get_spy_snapshot(target)
+                second = RegimeDataFetcher(
+                    yf=None,
+                    manager=FakeManager(second_source),
+                    alpaca=None,
+                    finnhub=None,
+                    shared_core_cache=True,
+                ).get_spy_snapshot(target)
+        finally:
+            regime_fetchers._clear_core_daily_cache_for_tests()
+
+        assert first["_source"] == "MoomooFetcher"
+        assert second["_source"] == "MoomooFetcher:shared-core-cache"
+        assert second["close"] == first["close"]
+        assert first_source.calls == 1
+        assert second_source.calls == 0
+
+    def test_shared_core_cache_and_live_frame_reject_stale_completed_session(self):
+        class SuccessfulMoomoo:
+            name = "MoomooFetcher"
+            priority = 2
+
+            def get_daily_data(self, **kwargs):
+                return TestMoomooFirstProviderPath._frame()
+
+        class StaleMoomoo(SuccessfulMoomoo):
+            def __init__(self):
+                self.calls = 0
+
+            def get_daily_data(self, **kwargs):
+                self.calls += 1
+                return TestMoomooFirstProviderPath._frame()
+
+        class FakeManager:
+            def __init__(self, fetcher):
+                self.fetcher = fetcher
+
+            def _get_fetchers_snapshot(self):
+                return [self.fetcher]
+
+            def _call_fetcher_method(self, fetcher, method, **kwargs):
+                return getattr(fetcher, method)(**kwargs)
+
+        target = date(2026, 4, 20)
+        stale_source = StaleMoomoo()
+        regime_fetchers._clear_core_daily_cache_for_tests()
+        try:
+            with patch(
+                "src.regime.fetchers._latest_completed_xnys_session",
+                return_value=date(2026, 4, 17),
+            ):
+                seeded = RegimeDataFetcher(
+                    yf=None,
+                    manager=FakeManager(SuccessfulMoomoo()),
+                    alpaca=None,
+                    finnhub=None,
+                    shared_core_cache=True,
+                ).get_spy_snapshot(target)
+            with patch(
+                "src.regime.fetchers._latest_completed_xnys_session",
+                return_value=date(2026, 4, 20),
+            ):
+                unavailable = RegimeDataFetcher(
+                    yf=None,
+                    manager=FakeManager(stale_source),
+                    alpaca=None,
+                    finnhub=None,
+                    shared_core_cache=True,
+                ).get_spy_snapshot(target)
+        finally:
+            regime_fetchers._clear_core_daily_cache_for_tests()
+
+        assert seeded["_status"] == "ready"
+        assert unavailable == {}
+        assert stale_source.calls == 1

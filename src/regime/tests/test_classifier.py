@@ -25,6 +25,21 @@ class TestClassify:
         label, _ = classify(60, aggressive=50, standard=30, cautious=10)
         assert label == "aggressive"
 
+    @pytest.mark.parametrize("score", [80, 60, 40, 20])
+    def test_action_hints_are_context_not_dte_prohibitions(self, score):
+        _, hint = classify(score)
+        lowered = hint.lower()
+        assert "same-et-day" in lowered
+        assert "0dte" not in lowered or "does not prohibit 0dte" in lowered
+        assert "stand aside" not in lowered
+        assert "full size" not in lowered
+
+    def test_cautious_context_keeps_zero_dte_eligible_with_strict_friction(self):
+        label, hint = classify(40)
+        assert label == "cautious"
+        assert "does not prohibit 0DTE" in hint
+        assert "spread and quote-freshness" in hint
+
 
 class TestMarketDate:
     def test_uses_new_york_date_not_server_calendar_date(self):
@@ -276,7 +291,7 @@ class TestComputeRegimeScore:
 
         assert res.snapshot["quality"]["state"] == "ready"
         assert res.snapshot["quality"]["authoritative"] is True
-        assert res.version == "v2"
+        assert res.version == "v3"
 
     def test_save_to_db(self):
         with patch("src.regime.classifier.RegimeDataFetcher", return_value=StubFetcher(_rosy_snapshot())):

@@ -502,6 +502,21 @@ class Config:
     # === 自选股配置 ===
     stock_list: List[str] = field(default_factory=list)
 
+    # === 日内扫描两层清单（watchlist v1）===
+    # INTRADAY_WATCHLIST：日内 Top 扫描的宽层清单（逗号分隔美股代码）。
+    # 未配置时日内扫描 universe 完全等同现状（STOCK_LIST 回退）；配置后启用
+    # 「全清单一次批量快照 → 异动闸门 → 深度层」两层模式（见
+    # api/v1/endpoints/opportunities.py 与 New-docs/phase1/06 §2.11）。
+    intraday_watchlist: List[str] = field(default_factory=list)
+    # INTRADAY_DEEP_LANE_MAX：异动闸门每轮晋升到深度层的标的数上限（1..20）。
+    # 只约束按异动排名晋升的名额；当日冻结盘前计划标的始终占深度位。
+    intraday_deep_lane_max: int = 12
+    # INTRADAY_PINNED_TICKERS：两层模式下的用户钉选清单（逗号分隔美股代码）。
+    # 钉选标的保证每轮进入深度层（与当日冻结盘前计划同权：不占 K 名额、
+    # 并入同一批快照、按当日额度去重，deep_lane_reason=user_pinned）。
+    # 未配置＝无钉选（现状不变）；仅两层模式（INTRADAY_WATCHLIST 已配置）消费。
+    intraday_pinned_tickers: List[str] = field(default_factory=list)
+
     # === 飞书云文档配置 ===
     feishu_app_id: Optional[str] = None
     feishu_app_secret: Optional[str] = None
@@ -742,6 +757,29 @@ class Config:
     premarket_research_scheduler_enabled: bool = False
     # XNYS 收盘后自动成熟 5D/20D 结果；只写 append-only 研究结果，不影响排名。
     opportunity_outcome_scheduler_enabled: bool = False
+    # 盘中默认扫描的服务端预热循环：工作日 04:00–20:00 ET 内按固定节奏刷新
+    # 页面默认轮询命中的两层扫描缓存；默认关闭，不配置＝行为零变化。
+    intraday_refresh_scheduler_enabled: bool = False
+    # 常规预热最长间隔（秒）：默认 60；服务端在每个
+    # 已完成分钟后 +5s 唤醒，2m P0 仅在新的完整 2m 框出现时评估。
+    # 低于 30（基础单飞租约）会被钳制到 30。
+    intraday_refresh_interval_seconds: int = 60
+    # 旧盘中提示流开关：控制 P1-O、P2/旧 P1 与系统通知；挂在预热循环上。
+    # 严格 2m P0 的研究与手机出口分别由下面两个独立开关控制。
+    # 默认关闭＝不启用这条旧提示流。
+    intraday_alerts_enabled: bool = False
+    # 新 2m P0 研究车道。启用时全量读取 INTRADAY_WATCHLIST，新票以
+    # baseline_warming/shadow 进入，不借用其他标的基线。
+    intraday_p0_2m_enabled: bool = True
+    # 手机 P0/P0X 的显式总开关。即使开启，仍必须有与当前
+    # universe_hash 一致且全部上线门槛通过的校准 artifact；否则只入网页/台账。
+    intraday_p0_2m_action_enabled: bool = False
+    intraday_p0_2m_activation_artifact: Optional[str] = None
+    # 未通过 action 校准期间的独立研究提醒。只发送明确标注为「尚未校准、
+    # 不可据此行动」的严格四条件事实；不计入正式 P0/P0X 预算或 passed 率。
+    intraday_p0_2m_shadow_mobile_enabled: bool = False
+    # 每日提示上限（条，最小 1）：触顶后补发一条「今日提示已达上限」并当日停发。
+    intraday_alerts_max_per_day: int = 20
     schedule_time: str = "18:00"              # 每日推送时间（HH:MM 格式）
     schedule_run_immediately: bool = True     # 启动时是否立即执行一次
     run_immediately: bool = True              # 启动时是否立即执行一次（非定时模式）
@@ -858,6 +896,8 @@ class Config:
             "MOOMOO_PREMARKET_PREFETCH_ENABLED",
             "PREMARKET_RESEARCH_SCHEDULER_ENABLED",
             "OPPORTUNITY_OUTCOME_SCHEDULER_ENABLED",
+            "INTRADAY_REFRESH_SCHEDULER_ENABLED",
+            "INTRADAY_ALERTS_ENABLED",
             "SCHEDULE_TIME",
             "SCHEDULE_RUN_IMMEDIATELY",
         }
@@ -982,6 +1022,27 @@ class Config:
         # 如果没有配置，使用默认的示例股票
         if not stock_list:
             stock_list = ['600519', '000001', '300750']
+
+        # 日内扫描宽层清单（watchlist v1）：未配置＝空列表＝保持现状，
+        # 不设默认值——两层模式必须由用户显式开启。
+        intraday_watchlist = [
+            (c or "").strip().upper()
+            for c in os.getenv('INTRADAY_WATCHLIST', '').split(',')
+            if (c or "").strip()
+        ]
+        intraday_deep_lane_max = parse_env_int(
+            os.getenv('INTRADAY_DEEP_LANE_MAX'),
+            12,
+            field_name='INTRADAY_DEEP_LANE_MAX',
+            minimum=1,
+            maximum=20,
+        )
+        # 用户钉选（两层模式下保证深扫）：未配置＝空列表＝无钉选。
+        intraday_pinned_tickers = [
+            (c or "").strip().upper()
+            for c in os.getenv('INTRADAY_PINNED_TICKERS', '').split(',')
+            if (c or "").strip()
+        ]
         
         # === LiteLLM multi-key parsing ===
         # GEMINI_API_KEYS (comma-separated) > GEMINI_API_KEY (single)
@@ -1207,6 +1268,9 @@ class Config:
         
         return cls(
             stock_list=stock_list,
+            intraday_watchlist=intraday_watchlist,
+            intraday_deep_lane_max=intraday_deep_lane_max,
+            intraday_pinned_tickers=intraday_pinned_tickers,
             feishu_app_id=os.getenv('FEISHU_APP_ID'),
             feishu_app_secret=os.getenv('FEISHU_APP_SECRET'),
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),
@@ -1442,6 +1506,51 @@ class Config:
                 default='false',
                 prefer_env_file=True,
             ).lower() == 'true',
+            intraday_refresh_scheduler_enabled=cls._resolve_env_value(
+                'INTRADAY_REFRESH_SCHEDULER_ENABLED',
+                default='false',
+                prefer_env_file=True,
+            ).lower() == 'true',
+            intraday_refresh_interval_seconds=parse_env_int(
+                os.getenv('INTRADAY_REFRESH_INTERVAL_SECONDS'),
+                60,
+                field_name='INTRADAY_REFRESH_INTERVAL_SECONDS',
+                minimum=30,
+            ),
+            intraday_alerts_enabled=cls._resolve_env_value(
+                'INTRADAY_ALERTS_ENABLED',
+                default='false',
+                prefer_env_file=True,
+            ).lower() == 'true',
+            intraday_p0_2m_enabled=cls._resolve_env_value(
+                'INTRADAY_P0_2M_ENABLED',
+                default='true',
+                prefer_env_file=True,
+            ).lower() == 'true',
+            intraday_p0_2m_action_enabled=cls._resolve_env_value(
+                'INTRADAY_P0_2M_ACTION_ENABLED',
+                default='false',
+                prefer_env_file=True,
+            ).lower() == 'true',
+            intraday_p0_2m_activation_artifact=(
+                cls._resolve_env_value(
+                    'INTRADAY_P0_2M_ACTIVATION_ARTIFACT',
+                    default='',
+                    prefer_env_file=True,
+                ).strip()
+                or None
+            ),
+            intraday_p0_2m_shadow_mobile_enabled=cls._resolve_env_value(
+                'INTRADAY_P0_2M_SHADOW_MOBILE_ENABLED',
+                default='false',
+                prefer_env_file=True,
+            ).lower() == 'true',
+            intraday_alerts_max_per_day=parse_env_int(
+                os.getenv('INTRADAY_ALERTS_MAX_PER_DAY'),
+                20,
+                field_name='INTRADAY_ALERTS_MAX_PER_DAY',
+                minimum=1,
+            ),
             schedule_time=(schedule_time_value or '18:00').strip() or '18:00',
             schedule_run_immediately=schedule_run_immediately,
             run_immediately=legacy_run_immediately,

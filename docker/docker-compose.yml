@@ -2,21 +2,21 @@
 # A股自选股智能分析系统 - Docker Compose
 # ===================================
 # 
-# 使用方式:
-#   定时模式: docker-compose -f ./docker/docker-compose.yml up -d
-#   FastAPI模式: docker-compose -f ./docker/docker-compose.yml up -d server
-#   同时启动: docker-compose -f ./docker/docker-compose.yml up -d analyzer server
+# Linux VPS 使用方式（OpenD 在宿主机 loopback 常驻）:
+#   盘中 FastAPI/提示器: docker compose -f ./docker/docker-compose.yml up -d server
+#   可选传统定时分析:   docker compose -f ./docker/docker-compose.yml --profile analyzer up -d analyzer
+#   完整说明: New-docs/deployment/intraday-cloud.md
 
 name: daily-stock-analysis
-version: '3.8'
 
 x-common: &common
   build:
     context: ..
     dockerfile: docker/Dockerfile
   restart: unless-stopped
+  stop_grace_period: 60s
 
-  # 环境变量（从 .env 文件加载）
+  # 环境变量只注入进程；不要再把含密钥的 .env 挂进容器文件系统。
   env_file:
     - ../.env
 
@@ -24,16 +24,16 @@ x-common: &common
     - ../data:/app/data
     - ../logs:/app/logs
     - ../reports:/app/reports
-    - ../.env:/app/.env
     - ../strategies:/app/strategies:ro
     # 如需覆盖前端静态资源，可挂载本地 static 目录
     # - ../static:/app/static:ro
 
   environment:
-    - TZ=Asia/Shanghai
+    - TZ=America/New_York
 
-    # Web/API service bind address (must be 0.0.0.0 inside container)
-    - WEBUI_HOST=0.0.0.0
+    # 本 Compose 文件面向 Linux VPS：host networking 让容器能通过
+    # 127.0.0.1 访问仅绑定宿主机 loopback 的 OpenD，避免暴露 11111。
+    - WEBUI_HOST=127.0.0.1
     # API_PORT 从 .env 文件读取，无需在此硬编码
 
     # 代理设置（如果需要）
@@ -44,25 +44,25 @@ x-common: &common
     options:
       max-size: "10m"
       max-file: "3"
-  # 资源限制
-  deploy:
-    resources:
-      limits:
-        memory: 512M
-      reservations:
-        memory: 256M
 
 services:
   # 定时任务模式
   analyzer:
     <<: *common
     container_name: stock-analyzer
+    profiles: ["analyzer"]
+    command: ["python", "main.py", "--schedule"]
+    # analyzer 不提供 HTTP；其启停由进程退出码与 restart policy 管理。
+    healthcheck:
+      disable: true
+    network_mode: host
 
   # FastAPI 模式
   server:
     <<: *common
     container_name: stock-server
-    command: ["python", "main.py", "--serve-only", "--host", "0.0.0.0", "--port", "${API_PORT:-8000}"]
-    # 若使用 network_mode: host，则以下 ports 映射无效，端口由 command 中的 --port 指定
-    ports:
-      - "${API_PORT:-8000}:${API_PORT:-8000}"
+    # 必须保持单进程/单 worker：盘中 scheduler、动量历史和快重试是进程内状态。
+    command: ["python", "-m", "uvicorn", "server:app", "--host", "127.0.0.1", "--port", "${API_PORT:-8000}", "--workers", "1"]
+    # Linux host networking 使 127.0.0.1 同时可达宿主机 OpenD；API 也只在
+    # loopback 暴露。远程 Web 访问请走 SSH tunnel、VPN 或受保护的反向代理。
+    network_mode: host

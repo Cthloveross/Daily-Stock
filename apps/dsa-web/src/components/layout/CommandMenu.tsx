@@ -6,6 +6,7 @@ import {
   Gauge,
   CandlestickChart,
   NotebookPen,
+  ScrollText,
   Rewind,
   Settings,
   RefreshCw,
@@ -140,6 +141,11 @@ export const CommandMenu: React.FC<CommandMenuProps> = ({ open, onOpenChange }) 
                 label="Journal"
                 meta="g j"
                 onSelect={() => goToPage('/journal')}
+              />
+              <Item
+                icon={<ScrollText size={14} strokeWidth={1.5} />}
+                label="交易纪律"
+                onSelect={() => goToPage('/rules')}
               />
               <Item
                 icon={<Rewind size={14} strokeWidth={1.5} />}

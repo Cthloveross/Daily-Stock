@@ -1,5 +1,12 @@
 # 07 · Breakout Filter
 
+> **策略语义覆盖声明（2026-09-08）**：本文的模块结构与历史过滤证据继续保留，
+> 其中 09:30–10:00 硬禁、仓位/加仓和隔夜建议不是现行交易规则。当前只允许
+> 0–7DTE 同一 ET 日平仓，开盘提醒与 P0 分级分别以
+> [`../phase1/21_OPENING_5M_ALERT_RESEARCH.md`](../phase1/21_OPENING_5M_ALERT_RESEARCH.md)
+> 和 [`../phase1/19_PUSH_TIERING_PHASE_B.md`](../phase1/19_PUSH_TIERING_PHASE_B.md)
+> 为准。
+
 > **模块**：假突破过滤系统（代码实现版）  
 > **位置**：`src/breakout/` + 扩展 `trades` 表字段 + 前端 Breakout Status 面板  
 > **前置**：`BREAKOUT_FILTER_PLAYBOOK.md`（心法版）、`05_JOURNAL_MODULE.md`、`06_REGIME_CLASSIFIER.md`  

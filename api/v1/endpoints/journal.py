@@ -1035,6 +1035,9 @@ def get_position_episode_v2(
                 broker_fill_observation_id=(
                     item.broker_fill_observation_id
                 ),
+                parent_broker_order_observation_id=getattr(
+                    item, "parent_broker_order_observation_id", None
+                ),
                 allocation=_stringify_nested_decimals(
                     dict(item.allocation_evidence)
                 ),
@@ -1390,11 +1393,18 @@ async def preview_moomoo_statement(
         warnings.append("no_order_rows")
     elif summary["inconsistent_filled_orders"] or summary["orphan_fill_rows"]:
         analysis_level = "blocked"
-    elif summary["aggregate_only_filled_orders"]:
+    elif summary["aggregate_only_filled_orders"] or summary[
+        "combo_parent_orders"
+    ]:
         analysis_level = "partial"
-        warnings.append("older_filled_orders_have_aggregate_evidence_only")
+        if summary["aggregate_only_filled_orders"]:
+            warnings.append(
+                "older_filled_orders_have_aggregate_evidence_only"
+            )
     else:
         analysis_level = "exact"
+    if summary["combo_parent_orders"]:
+        warnings.append("combo_parent_orders_are_audit_only_evidence")
 
     response_data = dict(summary)
     response_data.update(
@@ -1656,10 +1666,13 @@ async def import_moomoo_statement_v2(
         analysis_level=result.analysis_level,
         order_observations=result.order_observations,
         fill_observations=result.fill_observations,
+        execution_group_observations=result.execution_group_observations,
         legacy_journal_written=False,
         message=(
             f"evidence batch {action}: {result.order_observations} orders, "
-            f"{result.fill_observations} fills; legacy Journal unchanged."
+            f"{result.fill_observations} fills, "
+            f"{result.execution_group_observations} combo parents; "
+            "legacy Journal unchanged."
         ),
     )
 

@@ -12,6 +12,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
 <!-- 每条独立一行追加到本段末尾，无需分类标题，合并时冲突最小 -->
 
+- [修复] 严格2m去重按盘段、标的、方向隔离并保持重启恢复一致；盘外研究事件不再误占RTH首次crossing，与常规时段离线审计口径统一，30分钟阈值与发送预算不变。
+- [改进] 清除无生产调用的旧P0七条件、双5m确认状态及其专用辅助函数；Regime晨报和量表仅展示风险背景，不再产生禁开仓或放宽止损建议，旧枚举保持兼容。
+- [修复] 开盘与异步期权补充统一R6未知/触发边界，仅保留标的事实；报价合格不再表述为执行许可，移除旧5m期权预取与确认不可达的正式盘外发送代码。
+- [改进] 手动执行窗口改由后端XNYS日历统一给出实际收盘、原因及有效期；前端不再自行按固定时钟判断，暂停刷新后旧准入也会过期，窗口仍不参与P0信号。
+- [修复] 校准按保存的复权因子、价格/成交量口径及纯正比例缩放等价性审核，不因公司行动一律拒绝整票；尾盘收盘截尾与缺数/待成熟分开，单票基线缺口不再否决整个资产类别，原联合门槛不变。
+- [改进] 实时与离线共享必要的纯计算核心，保留回放索引缓存；补充逐窗口等价与原始分钟案例重放入口。
+- [改进] 现有前瞻表兼容追加可空窗口收盘价，准确配对同轮同票同日t+20m并绑定导出证据；保留旧轮和旧空价格，仅在首开前且零观察时允许幂等同窗替代登记。
+- [修复] 旧自定义交易框架和聊天保留为同一存储内只读历史，不再自动喂给AI；浏览器临时快照排除出Git和Docker构建上下文，避免公开个人交易页面内容。
+- [文档] 修正Andersen–Bollerslev DOI，明确论文未验证项目联合阈值、P95不等于胜率、当前仅为日内异常发现与人工复核；同步规则、导出格式、README及中英指南。
+- [修复] 健康检查核验快调度器、扫描完成龄期与120秒宽限；前瞻显式区分待开始/采集中/已结束/未知，登记失败清旧ready，结束停止越界写入，记录错误可见且不阻塞研究提醒。
+- [修复] 开盘1m、readiness和全天2m共用启动时冻结的完整自选，移除20只截断并扩充缓存；盘前预热，开盘关键窗只读订阅及历史缓存，缺共享monitor时fail closed。
+- [修复] 开盘逐票计算异常隔离，09:30–09:36普通页面的旧5m和日线冷缓存也不临时查询历史行情，避免刷新页面争抢快速提醒链路。
+- [新功能] 现有P0校准脚本增加显式Moomoo额度/三类首尾历史预检、固定180日分段采集与按完整股票hash恢复、复权一致性证据及幂等新前瞻登记入口；不隐式串联采集、登记与上线。
+- [改进] 历史校准补齐独立80日开发诊断，保留冻结40日审计及样本选择偏差标记；校准凭证仅覆盖RTH检测与投递，不证明盈利，盘外即使RTH通过仍只发研究提醒，失败资产类别保持shadow。
+- [测试] 新增完整69只开盘零历史RPC、缓存跨日容量、扫描停滞、前瞻生命周期与写入恢复、采集边界/中断/hash/复权、开发段隔离及RTH正式提醒不重复发送研究副本回归。
+- [修复] 离线RTH回放的18m窗口不再跨入盘前，20m结果不借盘后价格；同票历史8m参考缓存只复用已固定过去窗口，保持分位与缺口语义，避免180日全自选重复计算。
+- [修复] 仅将供应商明确成功返回的空历史记录为缺口，继续其余分片和标的并保留覆盖率分母；权限、网络、分页异常仍终止采集，不能伪装成正常缺数据。
+- [修复] 历史复权核验按票隔离，失败票保留69只覆盖分母并退出正式信号及ATR-only证据，不误加69/69硬门；原始完整量与排除原因单列，身份或hash损坏仍阻断输入。
+- [修复] 新前瞻合并核对登记时冻结输入的文件hash，拒绝换历史输入套用同一轮现场证据；离线首次crossing去重按票方向保留最后有效事件，避免全历史二次遍历，30分钟边界不变。
+- [修复] strict-2m 在确认 dispatch 接受前原子持久化 decision/outbox；队列满或提交失败回滚本 tick 去重/预算，台账重建失败拒绝并重试，不再用进程内状态冒充重启去重。
+- [修复] 普通提醒排队超过原始 6 分钟期限即终止，首发及内部重试均传递固定截止；09:35 开盘最终确认也在 09:36 过期，不能延迟补发。
+- [修复] Telegram 运输错误分类不再追溯无关的隐式异常上下文，避免旧 DNS 失败把本次响应超时误判为可重试；提醒器启动使用现有锁防止并发创建双份 worker。
+- [改进] 逐分钟 2m/1m 信号调度与慢 Top/期权网页预热分开，开盘暂缓慢预热；移除正式 P0 判定中的不可达旧 5m 分支及开盘原生 5m 预热。
+- [修复] 基线就绪按当前同钟槽完整 60 日及实时订阅判断，保留部分有效缓存、受控重试并区分历史载入与真正就绪；订阅故障立即停用，手机断开/恢复通知分别连续确认 60/30 秒，减少抖动噪声。
+- [修复] 健康快照区分明确休市/扫描窗外与基线故障，不把预期的当前槽 0/N 标为 down；日历不确定保持 unknown，真正线程或盘中订阅故障仍 fail closed。
+- [修复] 校准显式接受真实研究提醒队列回执及 no-send 受信回执，保留来源、时间和数据库绑定校验；设置页补齐现有研究手机开关，默认关闭且重启生效。
+- [改进] 提醒流新增兼容性 delivery_status 投影与独立研究预算，正确合并失败后成功回执，区分等待、受理与未确认；研究提醒不再显示为普通“P2 页面”，不宣称手机已响。
+- [文档] 同步规则、离线格式、中英用户指南和部署说明，明确阈值非机构标准、20 日覆盖失败不能补写、export/activation receipt 会写库以及正式 P0 仍需真实校准。
+- [新功能] strict-2m 新增显式未校准手机研究出口：严格四条件首次命中可用 P2 响铃并固定标注“尚未校准、不可据此行动”，独立恢复 RTH 2/日、7/周与盘外每盘段 1/日、5/周预算，保留 30 分钟去重和 R6，且不发期权补充、不进入正式 P0/P0-X 预算或 passed 率。
+- [测试] 新增 strict-2m 研究响铃默认关闭、Telegram 接线、RTH/盘外独立预算、重启恢复、实际队列回执、R6 与正式指标隔离回归，并让健康层明确区分研究响铃和正式 action 状态。
+- [修复] Telegram 文本投递在系统 DNS 短暂失效时可回退到启动时缓存的 IPv4，同时继续校验 `api.telegram.org` 的 SNI、证书主机名与 Host；真实盘中消息首次失败后进入独立有界重试队列，不再约 6 秒后永久丢弃。
+- [改进] 盘中投递在首次外部发送前把 decision 与持久化 outbox 同事务落库，任一失败都禁止外发；重试最长保留 6 分钟并按 15/45/120/120 秒退避，服务重启恢复原正文与固定截止时间，逐分钟 opening 消息不进入延迟队列。
+- [修复] Telegram read-timeout 等可能已送达的结果不再经缓存 IP 或 outbox 自动重发；pending 尝试不提前写失败 receipt，只有最终成功或确定终止失败才改变预算，避免重复响铃和重启时错误释放预算。
+- [测试] 新增 Telegram 缓存 IPv4 的 TLS 身份校验、缓存直连 read-timeout 不重发、非网络错误不重复发送、无缓存降级，以及真实消息先持久化、跨重启恢复、固定截止、终止失败释放预算和 opening 过期不补发回归。
+- [新功能] 新增 `p0_2m_signal_v1` / P0-X：从原生 1m 按盘前、XNYS RTH 与盘后严格聚合完整 2m，以同盘段同钟点 60 日基线核验 8m P95、RVOL 1.5 和同向 18m/0.5 ATR 四条件；0.3–0.5 ATR 只作网页“形成中”，旧 5m `burst_score` 退出 P0 判定、排序与提醒。
+- [改进] P0 发送预算调整为 2 次/日、7 次/周，P0-X 为每盘段 1 次/日、5 次/周；相同标的方向 30 分钟仅发首次 crossing，预算只抑制发送、不改写信号事实，Regime、财报、DTE 和合约摩擦改为上下文。
+- [新功能] RTH P0 先发送含方向、8m/18m、同钟分位、RVOL、ATR 与数据时间的 underlying 消息，再异步补充最多三个方向匹配且每到期日一个的 0–7DTE 候选；无合约、陈旧报价或宽点差不撤销信号，盘外 P0-X 只报告正股。
+- [新功能] 新增固定 69 只的 P0 离线校准与 activation artifact 门禁：60/80/40 历史切分加 20 个交易日前瞻 shadow，覆盖样本量、频次、预算抑制、集中度、20m 收益、按日聚类比较区间、完整性、可用率、延迟和资产分层；任一门禁失败时手机 action 保持关闭。
+- [新功能] strict-2m monitor 默认新增独立 append-only SQLite 前瞻 shadow enrollment 与三阶段遥测：首次 enrollment 盘中拒绝并延至收盘后以下一 XNYS 日为首日，已有 enrollment 可在盘中重启恢复，20:00 ET 后及周末/休市日预热下一 XNYS 日；逐标的 RTH endpoint 仅在结束后 0–75 秒（含）追加 first observation、completed evaluation 和独立 message-id notification attempt，+5 秒缺数可在 +65 秒新增完成证据而不改写首次事实，失败不阻塞信号。
+- [改进] action=false 的 qualified P0 使用真实消息装配并以 `counterfactual_no_send_same_queue` 进入同一个有界 dispatch queue；probe worker 绝不调用 Telegram、写 delivery 或占真实预算；实际发送仅接受 `actual_telegram_queue_receipt`，通用 web work item 不再冒充 Telegram 入队证据。
+- [改进] 新增严格 20 个连续 XNYS 日 × 69 只的 shadow 聚合导出；日期/标的必须匹配冻结 enrollment，正常日/半日市按真实 195/105 endpoints 展开，重复数仅从已接受的 append-only attempt 计算，缺股票日、窗口、component finality、分级回执或延迟均显式保留并令门禁失败，离线回放不能声明 `live_forward_shadow`。
+- [改进] strict-2m 历史预热只保留 ET 同钟只读索引和当日切片、释放重复的完整 bars 副本；盘中每票只向信号函数传当前 8m 的四个历史 clock slots，并把当日输入切到最近 18m 所需窗口，避免每个 2m tick 为 69 只重复扫描和重建整段历史索引。
+- [修复] strict-2m 启动预热改为按 XNYS 动态只拉覆盖目标日前恰好 60 个交易日的最小分钟区间；Moomoo 历史 RPC 在全进程单并发下按首分页 0.6 秒、续页 0.05 秒节流，OpenD/TCP 或共享断路器失效后立即停止剩余标的并保留已完成基线供恢复续跑，不再连续轰炸 69 只。
+- [修复] Web 鉴权中间件由 `BaseHTTPMiddleware` 改为透明的纯 ASGI guard，保持 StaticFiles 与流式响应原始 `more_body` 终止语义，修复并发资源请求出现 `Content-Length` 不匹配、连接重置和页面无法打开的问题。
+- [修复] strict-2m 健康快照直接读取当前历史缓存与实时订阅状态，服务在 04:00 ET 首次合法扫描前也会持续显示 69 只预热进度，不再把已经完成的基线长期误报为启动时的 0/N。
+- [改进] strict-2m 的 1m→2m 热路径改用 positional iterator 与 ISO 时间快路径，避免 57,600 行全量 record-dict 物化；60 日同钟索引常驻为 7 字段紧凑记录，仅在扫描时恢复所需四槽，保持逐字段结果一致并降低预热 CPU、GIL 占用与内存。
+- [修复] strict-2m shadow 新增显式运行身份和事故重跑：保留旧失败 enrollment/observations 及不可变触发器，新运行用稳定 request id、原因和 supersedes 关系隔离唯一键；逐行导出、校准和数据库 attestation 全部绑定 exact enrollment，并拒绝盘中登记、延迟伪窗口和跨运行混合。
+- [测试] 新增 ASGI 响应消息透明性、并发静态资源、OpenD 历史分页节流/断路恢复、shadow legacy 迁移回滚与内容守恒、事故重跑幂等、运行身份篡改和 RTH enrollment 拒绝回归。
+- [新功能] P0 校准 CLI 新增原始导出输入：从逐票 1m 与日线 CSV 复用生产严格 2m 聚合，锁定 t0 前 60/80/40、生成 holdout 信号与 0.5 ATR 对照；离线重放与真实 `live_forward_shadow` 强制分离，即使补造延迟字段也不能把历史数据变成可启用 artifact。
+- [修复] P0 原始导出校准的同钟基线与线上统一为目标日前恰好 60 个 XNYS 交易日；半日市缺目标钟点时基线不足即 fail closed，不再用更早的第 61 日补齐。
+- [修复] P0 live-shadow 导出与最终 activation artifact 新增同一持久 SQLite 的 append-only digest attestations；运行时按 exact artifact SHA 复核来源 export/shadow binding，阻止手改 gate/metrics 后重算 JSON 自哈希或只搬 artifact 文件绕过上线门禁。
+- [修复] 收紧推送台账的重启预算恢复：Telegram decision 已落库但 delivery 结果缺失时保守占用 P0/P0-X/P1 与全局预算，明确失败才释放；decision 无法落库时禁止外部发送，关闭“已发送但重启后预算归零”的裂缝。
+- [改进] 校准 artifact 新增 `mobile_eligible_symbols` 与股票/普通 ETF/杠杆及反向 ETF 分层状态；已知但证据不足的类别保持 shadow，不连带取消通过类别，运行时只允许经过基线与类别验证的标的进入手机出口；未知资产类别仍使全局门禁失败。
+- [修复] R6 触发或状态标缺不再吞掉已经成立的 strict-2m underlying P0/P0-X：事实型手机消息照常发送并附警告，但移除行动性措辞且不查询、不发送期权候选。
+- [改进] `/api/v1/system/health-layers` 新增 `intraday_p0_2m` 只读健康层，区分研究关闭、monitor/stream 故障、基线 warming、action=false shadow、artifact/投递门禁失败与手机已就绪，并暴露当前 universe hash 和 mobile eligible 数量。
+- [文档] Linux VPS 手册补齐 strict-2m action/artifact 持久路径与健康验收，并明确分钟基线仍为进程内状态：重启期间不补发，尚不能承诺异常重启后仍捕获最早窗口。
+- [修复] Moomoo 1m 结束标签在 2m 聚合前回移一分钟，并按 04:00、XNYS 真实开盘和真实收盘独立锚定；缺失、重复、未完成、非法或跨盘段分钟全部 fail closed，半日市不再误用正常收盘。
+- [改进] P1-O 09:35 最终确认取消原生 5m 依赖，改用 09:30 起五根完整 1m 累计证据；盘中调度从此前的 3 分钟方案再次调整为默认每 60 秒运行，严格 2m 车道只评估新的完整 `window_end`。
+- [文档] 新增 `phase1/22_P0_2M_SIGNAL_AND_CALIBRATION.md`，并更新 README、每日手册及 phase1/06/19/20/21 的覆盖声明，明确文献只支持同钟季节性标准化和微观结构噪音边界，不为项目阈值背书。
+- [改进] `intraday-top` 升为 `intraday_session_evidence_v9`：旧 5m `burst_score` 和波段列表仅作 API/复盘兼容展示，证据固定为 neutral/unknown，不再进入支持项计数或任何时段排序；响应新增明确 legacy 标记。
+- [改进] 常规盘中扫描曾从 45 秒调整为 3 分钟，本次严格 2m 改造最终统一为每 60 秒运行；09:31-09:35 开盘关键窗仍逐分钟检查，严格 2m 只评估新的完整 `window_end`。
+- [新功能] 开盘发现层升级为 `opening_impulse_v2` / P1-O 顺序提醒：09:31 起只读已完成 1m 累计证据，09:32-09:34 要求相邻两次同向通过严格门，09:35 使用五根完整 1m 累计结果最终确认且不读取原生 5m；候选最多 3 票合并响铃，首条不等待期权链，合规 0-7DTE 合约随后静默补充。
+- [改进] 盘中预热调度在 09:31-09:35 每个整分钟后约 5 秒运行 opening-only 快路径；09:00 起为计划、钉选与 `STOCK_LIST` 核心清单预热精确前 20 个 XNYS 交易日的同进度分钟基准，供应商定稿延迟才每 2 秒有界补抓最多 4 次，等待下一确认分钟不会空转。
+- [修复] v1/v2 开盘提醒共用标的日内 canonical 去重键；早期 checkpoint 排队跨分钟即抑制并释放预算，Telegram 失败也释放预算，09:35 最终消息不会误写首根 5m 未完成。
+- [改进] 系统健康层新增 `opening_v2_1m_provider`：只检查当日进程内缓存，只有 Moomoo 同源精确 20/20 基准才显示就绪；Yahoo 短分钟历史、缺失目标、关闭调度和部分预热分别明确降级，不用健康检查反向触发行情抓取。
+- [改进] opening v2 日内缓存只保留精确 20 个交易日的 09:30-09:34 共 100 根证据，不再反复深拷贝供应商返回的整段 45 天分钟历史，保持相同 fail-closed 数学并显著降低常驻与峰值内存。
+- [修复] 盘中调度与纯日内时段闸改用 fail-closed XNYS 官方日历：假日零扫描，半日市按真实收盘派生 close−90/45 分钟开仓截止、close−30 分钟提醒和 close−15 分钟退出，不再误沿用 16:00 正常日墙钟。
+- [修复] Journal 持仓与当日盈亏上下文只有 EpisodeBuild 创建时间和 source cutoff 同属目标 ET 日时才可作为 P0/退出提醒证据；旧 build 返回标缺，不再把历史空仓或零盈亏冒充实时券商状态。
+- [修复] 推送 worker 正常停止前排空已接收队列；P0 passed 率只统计存在 `telegram_ok=true` delivery 证据的决定；畸形非正或越界 OHLC 在 opening/burst 数学前 fail closed；推送日期 API 拒绝不存在的日历日期。
+- [测试] 新增 TSLA 2026-08-31 顺序无前视回放、09:31 不响与 09:32-09:34 相邻同向确认、09:35 五根完整 1m 累计确认、精确 20 日与同源门禁、过期队列抑制、健康层零取数、XNYS 假日/半日市、重启去重和失败投递回归；另固定严格 60 日 P0 回放：TSLA 8/31 的 09:48 因 P91.67 不合格但 09:52 首次向上合格，META 9/1 无命中，META 9/10 09:52 向下合格。
+- [文档] 新增 09:31-09:35 顺序开盘提醒的论文与机构证据综述、纯日内 0-7DTE 迁移说明和 Linux VPS 常驻部署手册；README 仅增加部署入口，完整规则保留在 phase1/21、phase1/20 与 phase1/19。
+- [文档] 为旧每日手册、Regime、Breakout 与 Agent Skill Registry 文档增加策略覆盖声明，防止 09:30-10:00 硬禁、4-7DTE 隔夜、固定加仓倍数和 7-90DTE 等历史建议被误当成现行纯日内规则。
+- [修复] 加固机会推送时序与记账：拒绝倒退/重复 5m 证据覆盖 P0 连续确认，只按首次成功 Telegram delivery 计预算和交易前关联，缺 Episode/source-cutoff 时指标标缺且历史 API 禁止未来证据回填；P1-O 用实际观察时刻和 XNYS 真实收盘封窗，09:35 pending 有界让路、不完整同槽基准短缓存，发送失败释放预算但保留事实去重，尾盘持仓上下文恢复后仍可补发真正的平仓提醒。
+- [新功能] 历史 `INTRA-0-7/v1` 迁移把推荐池统一为 0-7DTE 且要求同一 ET 日平仓；其中 09:45-15:15、0DTE 14:30 与合约摩擦曾作为旧 P0 确认门槛，现已由 `p0_2m_signal_v1` 覆盖，不再决定 underlying P0/P0-X，15:30/15:45 仅保留为同日平仓纪律。
+- [修复] 清除盘中扫描与计划检查残留的旧 R1「减速即离场」指令语义；速度状态现在统一为中性观察值，不参与现行交易判定。
+- [修复] 旧默认两层 warm 路径曾把 0-7DTE Bid/Ask/Mid/Delta、点差与报价龄作为 P0 条件⑤；strict-2m 迁移后这些检查只筛选异步期权补充，无合约或不合格报价不再撤销 underlying P0。
+- [改进] `INTRA-0-7/v1`、`same_et_day_only` 与 0-7DTE 证据继续作为合约选择和同日平仓上下文；它们不再充当 strict-2m underlying P0/P0-X 的成立条件。
+- [修复] 旧 0-1DTE P0 门禁曾接入 Journal edge panel 同源的 QQQ/SOXX 动量与波动 gate；strict-2m 迁移后 Regime/gate 只作为警告上下文，不再改变四条件信号事实。
+- [改进] Journal Edge 面板退役旧 R2“每日 8 笔”和 R3“月费率 30%”主动红线：继续展示今日笔数与费用拖累事实，但不再把旧阈值渲染成当前交易规则；P0/P1 推送预算仅用于手机降噪，不限制交易笔数。
+- [修复] 15:30 ET 同日平仓提醒与 R6 风险通告不再被早盘 P1 近失机会或全局机会提示上限挤掉，重启后只恢复风险提醒去重、不误占机会预算。
+- [文档] 冻结 phase1 旧 V2/4-7DTE 隔夜蓝图与取证结论，补充现行纯日内规则的覆盖关系；README 未重复专题细节，当前合同记录在 phase1/06 与 phase1/19。
+- [修复] 增强官方盘前 Regime 的 SPY/VIX 核心日线可用性：09:12/09:17 attempt 可复用严格对齐最近已完成 XNYS session 的进程内成功缓存，Cboe VIX 增加受总预算约束的两次请求与 `^VIX` yfinance 回退；过期、未来或无日期数据继续拒绝放行。
+- [修复] Telegram 网络失败日志不再输出 requests 异常原文或完整 Bot API URL，只记异常类型，避免 bot token 随 URL path 落入日志；历史日志不自动改写。
 - [新功能] Journal“仓位复盘”新增 Moomoo LIVE/US 期权当前持仓只读双采样、短期服务端 preview、显式 future-only confirm 与独立 append-only 快照账本；完整空仓可保存，查询失败或边界变化不会伪装为空仓，且全链路不解锁或执行交易。
 - [修复] 当前持仓证据保存两轮规范化边界并重算 hash/差异，逐字段交叉验证采集与 summary 计数，只接受规范 Decimal 字符串，并拒绝未来偏差超过 2 分钟、采集超过 5 分钟或完成后超过 30 分钟的陈旧首次确认，防止伪造稳定性或把旧 payload 当作当前锚点。
 - [改进] 当前持仓确认冻结并事务内重验最新 Journal refresh publication、账户 binding 与连续性 hash；读取确认记录时重算表头、provenance、member/instrument key 和成员集合，并保持当前状态与历史 opening boundary、证据窗口末数量及券商成本上下文严格隔离。
@@ -312,47 +395,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] data-health（journal refresh status）对激活的 fence build 按其冻结目标事实集对齐：目标集即最新 canonical set 时不再要求重复 activate 最新 canonical build，其余水位与阶段判定不变；激活响应消息按 build 来源标注 canonical / snapshot-fence future。
 - [改进] Web「仓位复盘」显式查看 canonical / snapshot-fence build 时新增独立「设为默认复盘构建」卡片：按目标 build 实际口径强制 assumed-flat / 组费 / left-censored 勾选，确认区明示「激活后默认视图切换，可再激活其他构建切回，但无法回到零激活的 CSV 默认状态」；future build 写入成功提示同步改为「激活前默认复盘视图不变，需显式打开该构建后单独激活」。
 - [测试] 新增 fence build 激活回归：happy path 默认读取切换与幂等重放、缺 left-censored 确认零写拒绝、陈旧 CAS 拒绝、fence link 指纹篡改在激活与默认读取双向 fail closed、激活前 CSV fallback 不变、data-health 三阶段对齐；API 补新 flag 透传与 409 映射；前端补两处激活卡片的勾选门禁、请求载荷与文案回归。
-
-### 发布亮点
-
-- 📊 **回测页新增"次日验证"视图** — 可按股票与日期范围查看 AI 预测 vs 次日实际涨跌，复用历史分析与 1 日回测结果，快速验证分析准确率。
-- 🔧 **LLM 接入体验简化** — 用户侧文案统一收口为"主模型 / 备选模型 / 模型渠道"，不再把 LiteLLM 当作普通用户必学概念，现有配置键保持兼容。
-- 🐳 **Docker / WebUI 运行时稳态补强** — 修复系统设置保存后配置不生效、启动早期日志缺失、预构建静态资源复用等问题，降低容器化部署的运维摩擦。
-- 🔒 **安全与并发稳定性同步增强** — Discord 入站 Webhook 补齐 Ed25519 验签，修复并发执行时共享状态未加锁、单股推送模式通知并发复用等问题。
-- 🖥️ **桌面端与定时任务细节打磨** — Windows 安装器支持自选安装目录，内置定时调度器感知运行中 SCHEDULE_TIME 变更，断点续传改按市场时区判断。
-
-### 新功能
-
-- 📊 **回测页新增"次日验证 / 1 日窗口"视图** — 可按股票代码与分析日期范围查看 AI 预测、次日实际涨跌及筛选区间准确率，复用历史分析与 1 日回测结果实现。
-- 🏷️ **Web 设置页新增版本信息卡片** — `apps/dsa-web` 现在会在构建时注入前端包版本与构建时间，系统设置页新增只读"版本信息"区块，展示 `WebUI 版本 / 构建标识 / 构建时间`；当 `package.json` 仍为占位版本 `0.0.0` 时，会自动回退为构建标识，方便 Docker 重建后快速确认当前静态资源是否已经生效。
-- 🪟 **Windows 桌面安装器支持自选安装目录** — 安装器改为支持在安装向导中自定义安装目录，安装到非默认盘符后仍沿用现有打包态目录逻辑在安装目录旁读写 `.env`、`data/stock_analysis.db` 和 `logs/desktop.log`，同时保留 `win-unpacked` 免安装分发方式。安装器仅支持当前用户安装、已禁用管理员提权（`allowElevation: false`），并通过 NSIS `.onVerifyInstDir` 阻止选择系统保护目录。
-
-### 改进
-
-- 🔎 **SerpAPI 正文补抓范围收敛** — 自然搜索结果不再逐条同步抓取网页正文；现在仅对极少数高位且摘要明显不足的结果，在更短超时预算内做延迟补抓，并优先复用 SerpAPI 已返回的结构化摘要，降低搜索链路尾延迟与慢站点放大风险。
-- 🤖 **LLM 接入体验简化** — 面向用户的 AI 模型接入文案已统一收口为"主模型 / Agent 主模型 / 备选模型 / 模型渠道 / 高级模型路由配置"；Web 设置页、配置元数据、校验提示与中英文文档不再把 LiteLLM 当作普通用户默认必学概念，现有 `LITELLM_*` / `LLM_CHANNELS` 配置键仍保持兼容。
-
-### 修复
-
-- 🚀 **启动早期失败时暴露真实根因** — `python main.py` 现在通过 stderr 暴露真实根因，bootstrap 阶段不再向硬编码 `logs/` 目录写入文件日志，文件日志推迟到 `config.log_dir` 可用后创建，避免健康启动在非预期路径残留日志文件。
-- 🐳 **Docker WebUI 运行时优先复用预构建静态资源** — `prepare_webui_frontend_assets()` 现在会先检查镜像内已有的 `static/index.html` 是否可直接复用；当容器运行时不包含 `apps/dsa-web` 源码目录且未安装 `npm` 时，也不会误报"未找到前端项目，无法自动构建"，从而恢复 Docker 部署后的 WebUI 打开能力。
-- 🐳 **Docker WebUI 系统设置保存后配置生效** — Docker 场景下 WebUI 保存 `STOCK_LIST`、`SCHEDULE_ENABLED`、`SCHEDULE_TIME`、`SCHEDULE_RUN_IMMEDIATELY`、`RUN_IMMEDIATELY` 后，`Config` 会优先读取持久化 `.env` 中的新值，避免被容器创建时注入的旧环境变量覆盖。
-- 📈 **市场复盘 LLM max_tokens 提升** — 市场复盘生成链路将 LLM `max_tokens` 从 `2048` 提升到 `8192`，降低长复盘输出因 `MAX_TOKENS` 提前截断导致内容未完成的概率。
-- ⏰ **内置定时调度器感知 SCHEDULE_TIME 运行时变更** — 调度器现在会在运行中感知 WebUI 保存后的 `SCHEDULE_TIME` 变化，并在下一轮检查时重绑 daily job。
-- 🪟 **Windows Release 渠道编辑器保留 MiniMax 模型前缀** — 渠道模式下填写 `minimax/<模型名>` 时，后端归一化与 Web 设置页运行时模型列表都会保留该值原样，不再误改写成 `openai/minimax/<模型名>`。
-- 🤖 **Discord 入站 Webhook 补齐 Ed25519 验签** — `DiscordPlatform` 现在会基于 `X-Signature-Ed25519`、`X-Signature-Timestamp` 和原始请求体校验 Discord Interaction 签名；缺失签名头、公钥格式非法或签名不匹配时直接拒绝请求，同时对 timestamp 做 ±5 分钟时效窗口校验以防御重放攻击。
-- ⚙️ **STOCK_GROUP_N / EMAIL_GROUP_N 配置关系明确化** — 明确与 `STOCK_LIST` 的关系，并在配置校验中对超出 `STOCK_LIST` 的邮件分组给出 warning。
-- 🗓️ **断点续传改按市场时区和交易日历判断**（fixes #880）— 股票数据存在性检查不再直接使用服务器自然日，而是按 A 股 / 港股 / 美股各自市场时区解析"最新可复用交易日"。
-- 📨 **单股推送模式不再并发复用共享通知实例** — `StockAnalysisPipeline.run()` 现在会保留个股分析并发，但把 `SINGLE_STOCK_NOTIFY=true` 下的即时通知挪到结果收集侧串行发送。
-- 🔇 **实时行情降级提示收口为单次告警** — 分析主流程获取股票名称时不再提前触发一次实时行情查询，只有在全部数据源都不可用时才提示已降级为历史收盘价继续分析。
-- 🔍 **A 股中文资讯搜索恢复中文优先** — `search_stock_news()` 现在会在首个 provider 主要返回英文资讯时继续尝试后续引擎，并将同批结果中的中文资讯排到前面。
-- 🔒 **并发执行时共享状态补齐统一加锁** — 修复并发执行时共享状态缺少统一加锁的问题，避免多线程场景下的数据竞争。
-
-### 测试
-
-- 🧪 **补充设置页版本信息回归测试** — 新增 Web 设置页版本信息渲染断言，并覆盖占位版本 `0.0.0` 自动回退为构建标识的逻辑。
-- 🧪 **UI 治理与关键路径回归补强** — 补充 `SidebarNav`、`ChatPage`、`BacktestPage` 等组件测试，并新增 UI governance 守卫，持续防止交互元素重新引入原生 `title` 属性或旧 `input-terminal` 样式回流。同步更新 smoke / markdown drawer 相关验证，覆盖主题升级后的关键主链路。
-
+- [新功能] 发布亮点：📊 **回测页新增"次日验证"视图** — 可按股票与日期范围查看 AI 预测 vs 次日实际涨跌，复用历史分析与 1 日回测结果，快速验证分析准确率。
+- [改进] 发布亮点：🔧 **LLM 接入体验简化** — 用户侧文案统一收口为"主模型 / 备选模型 / 模型渠道"，不再把 LiteLLM 当作普通用户必学概念，现有配置键保持兼容。
+- [修复] 发布亮点：🐳 **Docker / WebUI 运行时稳态补强** — 修复系统设置保存后配置不生效、启动早期日志缺失、预构建静态资源复用等问题，降低容器化部署的运维摩擦。
+- [修复] 发布亮点：🔒 **安全与并发稳定性同步增强** — Discord 入站 Webhook 补齐 Ed25519 验签，修复并发执行时共享状态未加锁、单股推送模式通知并发复用等问题。
+- [改进] 发布亮点：🖥️ **桌面端与定时任务细节打磨** — Windows 安装器支持自选安装目录，内置定时调度器感知运行中 SCHEDULE_TIME 变更，断点续传改按市场时区判断。
+- [新功能] 📊 **回测页新增"次日验证 / 1 日窗口"视图** — 可按股票代码与分析日期范围查看 AI 预测、次日实际涨跌及筛选区间准确率，复用历史分析与 1 日回测结果实现。
+- [新功能] 🏷️ **Web 设置页新增版本信息卡片** — `apps/dsa-web` 现在会在构建时注入前端包版本与构建时间，系统设置页新增只读"版本信息"区块，展示 `WebUI 版本 / 构建标识 / 构建时间`；当 `package.json` 仍为占位版本 `0.0.0` 时，会自动回退为构建标识，方便 Docker 重建后快速确认当前静态资源是否已经生效。
+- [新功能] 🪟 **Windows 桌面安装器支持自选安装目录** — 安装器改为支持在安装向导中自定义安装目录，安装到非默认盘符后仍沿用现有打包态目录逻辑在安装目录旁读写 `.env`、`data/stock_analysis.db` 和 `logs/desktop.log`，同时保留 `win-unpacked` 免安装分发方式。安装器仅支持当前用户安装、已禁用管理员提权（`allowElevation: false`），并通过 NSIS `.onVerifyInstDir` 阻止选择系统保护目录。
+- [改进] 🔎 **SerpAPI 正文补抓范围收敛** — 自然搜索结果不再逐条同步抓取网页正文；现在仅对极少数高位且摘要明显不足的结果，在更短超时预算内做延迟补抓，并优先复用 SerpAPI 已返回的结构化摘要，降低搜索链路尾延迟与慢站点放大风险。
+- [改进] 🤖 **LLM 接入体验简化** — 面向用户的 AI 模型接入文案已统一收口为"主模型 / Agent 主模型 / 备选模型 / 模型渠道 / 高级模型路由配置"；Web 设置页、配置元数据、校验提示与中英文文档不再把 LiteLLM 当作普通用户默认必学概念，现有 `LITELLM_*` / `LLM_CHANNELS` 配置键仍保持兼容。
+- [修复] 🚀 **启动早期失败时暴露真实根因** — `python main.py` 现在通过 stderr 暴露真实根因，bootstrap 阶段不再向硬编码 `logs/` 目录写入文件日志，文件日志推迟到 `config.log_dir` 可用后创建，避免健康启动在非预期路径残留日志文件。
+- [修复] 🐳 **Docker WebUI 运行时优先复用预构建静态资源** — `prepare_webui_frontend_assets()` 现在会先检查镜像内已有的 `static/index.html` 是否可直接复用；当容器运行时不包含 `apps/dsa-web` 源码目录且未安装 `npm` 时，也不会误报"未找到前端项目，无法自动构建"，从而恢复 Docker 部署后的 WebUI 打开能力。
+- [修复] 🐳 **Docker WebUI 系统设置保存后配置生效** — Docker 场景下 WebUI 保存 `STOCK_LIST`、`SCHEDULE_ENABLED`、`SCHEDULE_TIME`、`SCHEDULE_RUN_IMMEDIATELY`、`RUN_IMMEDIATELY` 后，`Config` 会优先读取持久化 `.env` 中的新值，避免被容器创建时注入的旧环境变量覆盖。
+- [修复] 📈 **市场复盘 LLM max_tokens 提升** — 市场复盘生成链路将 LLM `max_tokens` 从 `2048` 提升到 `8192`，降低长复盘输出因 `MAX_TOKENS` 提前截断导致内容未完成的概率。
+- [修复] ⏰ **内置定时调度器感知 SCHEDULE_TIME 运行时变更** — 调度器现在会在运行中感知 WebUI 保存后的 `SCHEDULE_TIME` 变化，并在下一轮检查时重绑 daily job。
+- [修复] 🪟 **Windows Release 渠道编辑器保留 MiniMax 模型前缀** — 渠道模式下填写 `minimax/<模型名>` 时，后端归一化与 Web 设置页运行时模型列表都会保留该值原样，不再误改写成 `openai/minimax/<模型名>`。
+- [修复] 🤖 **Discord 入站 Webhook 补齐 Ed25519 验签** — `DiscordPlatform` 现在会基于 `X-Signature-Ed25519`、`X-Signature-Timestamp` 和原始请求体校验 Discord Interaction 签名；缺失签名头、公钥格式非法或签名不匹配时直接拒绝请求，同时对 timestamp 做 ±5 分钟时效窗口校验以防御重放攻击。
+- [修复] ⚙️ **STOCK_GROUP_N / EMAIL_GROUP_N 配置关系明确化** — 明确与 `STOCK_LIST` 的关系，并在配置校验中对超出 `STOCK_LIST` 的邮件分组给出 warning。
+- [修复] 🗓️ **断点续传改按市场时区和交易日历判断**（fixes #880）— 股票数据存在性检查不再直接使用服务器自然日，而是按 A 股 / 港股 / 美股各自市场时区解析"最新可复用交易日"。
+- [修复] 📨 **单股推送模式不再并发复用共享通知实例** — `StockAnalysisPipeline.run()` 现在会保留个股分析并发，但把 `SINGLE_STOCK_NOTIFY=true` 下的即时通知挪到结果收集侧串行发送。
+- [修复] 🔇 **实时行情降级提示收口为单次告警** — 分析主流程获取股票名称时不再提前触发一次实时行情查询，只有在全部数据源都不可用时才提示已降级为历史收盘价继续分析。
+- [修复] 🔍 **A 股中文资讯搜索恢复中文优先** — `search_stock_news()` 现在会在首个 provider 主要返回英文资讯时继续尝试后续引擎，并将同批结果中的中文资讯排到前面。
+- [修复] 🔒 **并发执行时共享状态补齐统一加锁** — 修复并发执行时共享状态缺少统一加锁的问题，避免多线程场景下的数据竞争。
+- [测试] 🧪 **补充设置页版本信息回归测试** — 新增 Web 设置页版本信息渲染断言，并覆盖占位版本 `0.0.0` 自动回退为构建标识的逻辑。
+- [测试] 🧪 **UI 治理与关键路径回归补强** — 补充 `SidebarNav`、`ChatPage`、`BacktestPage` 等组件测试，并新增 UI governance 守卫，持续防止交互元素重新引入原生 `title` 属性或旧 `input-terminal` 样式回流。同步更新 smoke / markdown drawer 相关验证，覆盖主题升级后的关键主链路。
 - [修复] 🐳 **Docker WebUI 运行时优先复用预构建静态资源** — `prepare_webui_frontend_assets()` 现在会先检查镜像内已有的 `static/index.html` 是否可直接复用；当容器运行时不包含 `apps/dsa-web` 源码目录且未安装 `npm` 时，也不会误报“未找到前端项目，无法自动构建”，从而恢复 Docker 部署后的 WebUI 打开能力。
 - [改进] 🔎 **SerpAPI 正文补抓范围收敛** — 自然搜索结果不再逐条同步抓取网页正文；现在仅对极少数高位且摘要明显不足的结果，在更短超时预算内做延迟补抓，并优先复用 SerpAPI 已返回的结构化摘要，降低搜索链路尾延迟与慢站点放大风险。
 - [修复] A 股和中文股票名称场景下的相关资讯搜索恢复中文优先策略：`search_stock_news()` 现在会在首个 provider 主要返回英文资讯时继续尝试后续引擎，并将同批结果中的中文资讯排到前面；同时非美股查询不再默认沿用 Brave 的 `en/US` 区域语言偏好，避免更新后被英文新闻结果占满。
@@ -384,6 +451,233 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [测试] artifact GC 合同 T1-T10 全绿（`src/journal/tests/test_artifact_gc.py`）：死行删除与回执一致、被引用行永不删除、宽限期/未过期保留、每账户最新一条保留且 `get_journal_refresh_status` 逐字段不变、dry-run 零写且候选集与 apply 将删集合一致、幂等二次 apply 删 0 行、触发器在位/外部写仍被 ABORT/rowcount 注入失败回滚、禁区表 count+content hash 不变、无备份或备份损坏或非 SQLite fail closed、回执表 append-only 且 `deleted_ids_sha256` 可由 `deleted_ids_json` 复算。
 - [文档] `New-docs/phase1/14_ARTIFACT_GC_CONTRACT.md` 状态行标记 F-2a 已实现（正式库 apply 仍待用户确认 + 当日备份）；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` F-2 行同步；`New-docs/HANDOFF.md` §5.2 / §15 P3.7 过期清理技术债措辞更新为已实现，可恢复异步 job 与持久化 last failure 仍为技术债。
 - [文档] F-4 clean-clone 演练完成并更新 `New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` F-4 行为 ✅（2026-08-01，clone bc74bc6）：干净克隆 pushed 分支后 `pip install -r requirements.txt`（含 scipy）、`pip install flake8 pytest` + `./scripts/ci_gate.sh`（2636 passed / 6 network deselected）、`npm ci && npm run build`、`main.py --serve-only`（隔离空库 + 全开关关闭，/api/health 与 /api/v1/system/health-layers 均 200）全部通过，零依赖原工作树/.env/数据库；README 待改小缺口仅记录未修：方式二把 `cp .env.example .env` 呈现为必需步骤（serve-only 冒烟无 .env 可跑）、启动方式自动构建写 `npm install` 而贡献节写 `npm ci` 不一致、未演练无 Node 环境下 `WEBUI_AUTO_BUILD` 默认自动构建的失败路径。
+- [改进] G-3 Journal 信息架构重构：`/journal?tab=positions` 收敛为纯复盘工作台（新增「复盘工作台」头部条：默认构建标识 + Review Queue 计数 + 「继续复盘下一笔」CTA——优先续上进行中、其次按 top_loss 案例精选取亏损最大的未复盘已平仓回合、无命中退回最近未开始；回合列表/筛选、模式观察与 Playbook 保留），全部数据管线迁入更名后的「数据与构建」tab（原「交易证据」，`?tab=import` 深链不变）并分组为 每日刷新 / 历史导入 / 当前持仓快照与未来构建 / 构建与默认视图管理；canonical 构建预览、assumed-flat 构建与激活管理拆出为 `EpisodeBuildManagementPanel`，所有既有按钮与确认流保留，vitest + Playwright smoke 断言同步更新。
+- [新功能] G-2 盘中跟踪面板：新增 `POST /api/v1/opportunities/intraday-tracking`（最多 5 个美股期权 underlying，复用期权墙同款 Moomoo Quote-only `get_market_snapshot` 机制 + 共享 30s TTL/single-flight，ATR/量能中位等日线派生输入按 symbol+ET 交易日另行 15 分钟记忆）与 `/regime` 机会看板下方的 `IntradayTrackingPanel`：对照冻结盘前计划展示 现价（as-of）/距确认位/距失效位（$ 与 ATR 倍数）/VWAP 上下方/量能节奏/盘段状态，确认与失效价直接取冻结候选结构化证据（前 20 日高低、EMA13），不解析展示字符串；手动刷新 + 仅页面可见（document.visibilityState）且盘段为盘前/盘中时 60 秒自动轮询；不重新排序、不生成买卖信号，Moomoo 未启用/不可用逐标的显式 not_configured/unavailable，绝不以 0 冒充实时数据。
+- [新功能] G-4 首批专业指标（`src/opportunities/intraday.py`，纯函数 + 显式标缺）：ATR14（已完成日线 Wilder 平滑，公式在代码内文档化）、VWAP 近似（当日累计成交额 ÷ 累计成交量，basis 标签 `session_turnover_over_volume`，输入缺失给显式 reason 绝不回填）、量能节奏（当日累计 vs 前 20 交易日全日成交量中位数，明示未按盘中时点折算）、盘段状态（America/New_York 时钟，未接入交易所假日日历）；相对强度 vs SPY 留待后续切片。
+- [测试] 盘中跟踪确定性测试：`src/opportunities/tests/test_intraday.py`（VWAP 有/无、ATR14 种子与平滑步手工核对、量能中位与比值、盘段时钟边界含周末/UTC 换算/naive 拒绝）；`api/v1/tests/test_intraday_tracking_endpoint.py`（disabled/unavailable fail-closed 不吐零值、ready 全指标合同、缺量 VWAP 标缺、盘段时钟 monkeypatch、TTL 缓存 + refresh 旁路 + 日线记忆、single-flight 并发共享、symbols 边界校验）；前端 `IntradayTrackingPanel.test.tsx`（冻结锚点推导与 ATR 距离符号、as-of 列渲染、VWAP 标缺、not_configured 不伪造数字、fake timers 验证 60 秒轮询仅在页面可见且盘前/盘中、手动刷新带 refresh 旁路、非美股候选不渲染）。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` 新增 §2.7 盘中跟踪（语义与诚实边界：量能对比为全日中位未按时点折算、VWAP 为近似口径、无买卖信号），`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` G-2/G-4 行同步为代码落地、盘中真实验证待服务重启后进行。
+- [改进] 复盘流 v2（G-5）：单笔复盘页 `/journal/review/:id` 重构为队列化逐笔复盘——顶部 sticky 快捷操作条（回合标识 + Net + 「跳过，下一笔 →」/「保存草稿并下一笔」/「完成复盘并下一笔」，保存失败停留当前页并显示错误）；「下一笔」与复盘工作台 CTA 收敛为单一实现 `apps/dsa-web/src/components/journal/review/nextReviewEpisode.ts`（进行中 → top_loss 未开始 → 最近未开始，排除当前回合，队列清空如实提示「全部回合已完成复盘」并提供返回列表），导航保持 `/journal/review/:id` push history 且查询上下文保留；≥1280px 双列布局（左 = K 线与成交证据时间线，右 = sticky 交易逻辑草稿，窄屏工作单先行，容器加宽至 1720px）；工作单默认快速复盘模式（错误类型/交易风格预设 chip 一键写入既有 tags/error_types 并去重、与自由文本共用一份数据，默认仅进场逻辑回忆与复盘反思两栏，「展开完整工作单」显示其余四项），保存校验、字符上限与 annotation 语义不变；证据窗口/窗口末投影与 Matching/Completeness/Provenance 折叠进默认收起的「证据明细」。
+- [新功能] 复盘页订单级分批成交合并（display-only，`evidenceConsolidation.ts`）：同一 broker order 的多笔 fill 在成交证据时间线合并为一行（方向、总数量、现金流加权均价 = ∑|现金流| ÷ (∑数量 × 合约乘数)，BigInt 十进制精确、half-up 保留 4 位、成交时间范围、合计费用、「分 N 笔成交」徽标），费用证据不全时显式标注「费用不完整」而非部分和；可展开逐笔审阅全部原始 fill（底层 evidence 不变）；K 线默认每单一个合并 marker（点击选中合并行），同单 fill 相距超过一根 K 线时保留逐笔 marker，全部未映射时不伪造位置；单笔订单与订单时间代理证据保持原样且代理标注保留。
+- [测试] 复盘流 v2 前端回归：新增 `nextReviewEpisode` 单测（三档优先级、排除当前回合、耗尽返回 null）与 `evidenceConsolidation` 单测（加权均价精确与 half-up、费用完整性、单笔透传、代理标注保留、marker 合并含相邻 bar 合并/跨 bar 拆分/日线不同 bar 拆分/未映射跳过、混合方向降级 unknown）；`JournalEpisodeReviewPage` 测试更新并新增（操作条渲染、双列结构断言、快速 chip 写入与取消、compact/展开工作单、保存并下一笔导航、跳过不保存、保存失败停留、队列耗尽提示、证据明细默认折叠、合并行聚合值与逐笔展开、合并 marker 点击选中）；`ReviewWorkbenchHeader` 断言同步共享 helper；`npm run lint` + vitest 全量（73 文件 / 629 测试）+ `npm run build` + `npx playwright test e2e/smoke.spec.ts`（5/5）全绿。
+- [文档] `New-docs/phase1/05_SINGLE_POSITION_REVIEW_WORKSPACE.md` 新增 §1.1 复盘流 v2 与 §3.1 订单级分批成交合并口径并更新状态行；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` 新增 G-5 行（复盘流 v2，✅ 2026-08-01）。
+- [新功能] G-6 日内/周内看板分离：新增 `POST /api/v1/opportunities/intraday-top` 盘中滚动 Top 5（复用 G-2 Moomoo 会话快照 + 共享日线加载器的 ATR14/量能中位/上一日结构 + 逐标的有界异动页；缺口/量能节奏/VWAP 位置/波幅扩张/异动活跃五项 v1 启发式阈值做确定性证据计数排名，`signal_version=intraday_session_evidence_v1`，60 秒 TTL + single-flight）；响应固定 `statistics_track=none_intraday_v1_unscored`，不冻结、不写快照/qualification/5D/20D 结果，休市时段仍可读但显式标注「最近一个交易时段」并把缺口分母切换为快照自带前收；缺可用现价快照的标的 fail-closed 为「数据不足」。
+- [新功能] 新增 `GET /api/v1/opportunities/intraday-pulse` 市场脉搏（SPY/QQQ/VIX 快照现价与当日涨跌，分母为快照自带前收）；VIX 与 SPY/QQQ 隔离请求，供应商不可得时逐代码显式标缺，绝不以 0 或旧值冒充。
+- [新功能] Web 新增 `/intraday` 日内工作台（导航首位「日内」）：sticky 市场脉搏条（读数 + 盘段 + ET 时点 + 刷新指示）、今日计划（复用盘中跟踪面板对照冻结盘前 Top 5，无冻结计划时诚实空态）、可点列头排序的日内扫描表（行点击进入即时扫描详情页）与跨标的期权异动 feed（≤20 条按时间倒序，固定标注 Moomoo 分类不证明开平仓方向）；页头明示「盘中滚动研究 · 不是信号 · 不进入统计」，自动刷新 60 秒且仅页面可见、盘段为盘前/盘中时运行。
+- [改进] `/regime` 周内机会榜副标题如实标注「基于上一完整交易日日线结构 · 数日至数周研究周期」，并新增「进入日内工作台 →」入口；既有官方盘前冻结与统计行为不变。
+- [测试] 日内 Top 确定性测试：`src/opportunities/tests/test_intraday_top.py`（五项阈值双向、缺快照 fail-closed、Moomoo sentiment 聚合诚实性——中性多数记中性、平票记 mixed、无分类记 unknown、绝不发明方向，休市缺口口径切换、排序确定性、异动 feed 时间倒序）；`api/v1/tests/test_intraday_top_endpoint.py`（响应合同与 statistics_track、未启用零 Moomoo 调用、60 秒 TTL/refresh 旁路/single-flight、逐标的异动失败隔离、STOCK_LIST 回退与请求边界、pulse 未配置与 VIX 降级）；前端 `IntradayPage.test.tsx`（区块渲染与 as-of、客户端排序三态、轮询门控、休市停表与标注、手动刷新 refresh 旁路、失败诚实降级）+ Shell 导航首位断言 + Playwright smoke 新增 `/intraday` 诚实空态用例。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` 新增 §2.8 日内工作台与日内 Top（日内/周内语义分界、v1 阈值表、诚实合同）；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` 新增 G-6 行；`New-docs/HANDOFF.md` §7.1 路由表新增 `/intraday`。
+- [新功能] G-7 波段爆发（momentum burst）成为日内扫描主排序信号：新增纯函数模块 `src/opportunities/intraday_bursts.py`（5m K 线滚动 15 分钟窗口，`burst_score = |收−开|/当日 5m 波幅中位 × 窗口量比`，当日不足 6 根 K 线时中位数回退上一交易时段并显式标注）；`intraday-top` 升 `signal_version=intraday_session_evidence_v2`，盘中 `ranking_method=burst_score_first_then_evidence_count`（当前爆发分优先、证据计数次之），休市退回证据计数排序但候选仍附最近一个交易时段的波段列表；候选新增 `session_bursts`（当前窗口 + ≤4 个相隔 ≥30 分钟的独立波段）与「波段爆发」证据项（当前窗口 ≥6.0 记 supports）。阈值按 2026-07-31 用户标注行情校准（MU 09:45 跳水 35.5、AMZN 09:30 开盘波 18.7、NVDA 09:40/15:15 两波 9.3/8.6 全部 ≥ LEG_MIN_SCORE 8.0；GOOGL——v1 全时段聚合误排第一的失败样本——最佳窗口仅 15.2）。
+- [新功能] intraday-top 执行器逐标的服务端读取 5m K 线（复用 `/stocks/{code}/history?period=5m` 的同一 StockService 加载器，仅当前 + 上一交易时段、有界线程池并发、逐标的 60 秒 TTL 缓存）；单标的 5m 读取失败只把该标的的波段爆发显式 `unavailable`，绝不阻塞缺口/量能/波幅/异动等聚合证据，也不影响响应可用性。
+- [改进] `/intraday` 日内扫描表新增首个数据列「当前爆发」（爆发分 + 方向箭头 + 15 分钟推力%）与「今日波段」列（如「2 波：09:40↓ · 15:15↑」，悬停展示每波明细；休市显示最近一个交易时段），默认排序＝服务端排名（盘中爆发分优先），页脚公式行与页头排名标注同步 v2；期权异动 feed 不变。
+- [测试] 波段爆发校准回归与单元测试：真实 2026-07-31（用户标注日）常规时段 5m K 线固化为永久 fixture `src/opportunities/tests/fixtures/intraday_5m_2026-07-31_regular.json`（记录来源与 captured_at），`src/opportunities/tests/test_intraday_bursts.py` 断言 MU 09:40-09:50 向下波段、AMZN 09:30 开盘波、NVDA ≥2 波且含 15:00 后一波、GOOGL 最佳波段分 < MU 跳水分（v1 失败样本永久钉住），另含归一化数学手算核对、开盘初段中位数回退、独立波段合并、休市时段归属、无 K 线 fail-closed；`test_intraday_top.py` 新增爆发证据阈值双向/盘中爆发优先排序/休市 v1 排序附波段/缺失不阻塞聚合断言；`test_intraday_top_endpoint.py` 新增 5m 失败隔离与逐标的爆发缓存跨 refresh 命中断言；前端 `IntradayPage.test.tsx` 同步新列渲染、标缺诚实与爆发列排序断言。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` §2.8 更新为 v2：波段爆发语义、阈值表新增波段爆发行、2026-07-31 校准记录（标注人＝用户）与休市排序退回说明；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` 新增 G-7 行。
+- [新功能] G-8 临期合约面板：新增 `POST /api/v1/opportunities/near-expiry-contracts`（单个美股期权 underlying，`max_dte` 默认 3、上限 7、含 0DTE），补「选中标的 → 选中合约」缺口的只读合约级数据——近价窗口（±5% ∪ 现价上下各 8 档）内 Call/Put 合约的 bid/ask/mid/点差%/最新价/当日量/T-1 OI/供应商 IV/delta 与逐合约 as-of，按到期日中性分组；显式非推荐引擎：不打分、不偏好排序、不生成买卖建议，响应固定携带 OI 结算口径、点差随时变化、IV 供应商模型值、不构成推荐、以券商实时盘口为准的 limitations。
+- [新功能] 临期合约数据路径复用既有 Moomoo 链机制并直读同批 `get_market_snapshot` 的期权 `bid_price/ask_price`（单到期 fetch_chain 一直在读，期权墙只是未保留该字段）：1 次链日期窗口 + 1 个快照批次，独占 wall QuoteContext lane，30 秒 TTL + single-flight，`refresh` 只绕过已完成 TTL；bid/ask 任一缺失时 mid 与点差显式 null + reason 绝不 0 回填，快照缺行保留静态行逐字段标缺，逐到期隔离，窗口内无到期日返回诚实 `empty`。
+- [新功能] Web 新增 `NearExpiryContractPanel`：`/intraday` 日内扫描表行尾「临期合约」按钮内联展开（整行点击仍是既有详情页导航、同一时刻只展开一行以保持表格可用），`/regime/opportunity/:ticker` 期权墙标签底部「查看临期合约（0–3 DTE）」按需展开；ATM 行高亮为位置标记、点差 >15% 标「流动性差」（v1 启发式展示阈值，未经交易结果验证）、缺失字段显示「标缺」，页头固定「合约选择参考 · 不构成推荐 · 以券商实时盘口为准」。
+- [测试] 临期合约确定性测试：`src/opportunities/tests/test_near_expiry_contracts.py`（18：近价窗口 ±5%/稀疏链扩到 8 档/边界含入、点差数学与缺 bid/ask null-not-zero/交叉盘口标缺、逐到期隔离、ATM 双边标记、失败批次降级）；`api/v1/tests/test_near_expiry_contracts_endpoint.py`（17：未启用零 Moomoo 调用、TTL 复用/refresh 旁路/single-flight、max_dte 隔离缓存 key、非法 symbol 与 max_dte 422、诚实空态与 unavailable 降级）；前端 `NearExpiryContractPanel.test.tsx` + `IntradayScanTable.test.tsx`（分组与 as-of + 诚实页头、流动性差阈值严格大于、标缺渲染、按钮展开不触发行导航、单行展开）。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` 新增 §2.9 临期合约面板（bid/ask 来源结论、额度成本、近价窗口、诚实边界与交互选择）；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` 新增 G-8 行。
+- [新功能] Moomoo History CSV parser 升级到 `moomoo-statement-v3`：识别组合单（多腿价差）父单行的 `Nunit(s)` 组合 unit 数量、`2unit(s)@7.00` unit 成交摘要与 `MU260731P745/760` 型价差符号（保留原始符号并在无歧义时解析 underlying/到期/方向/行权价文本，不做 OCC 单行权价伪解码），父单后的腿展示行与其成交续行作为腿证据保留在父单上；含组合父单的 CSV 不再整体解析失败，父单永不伪装成普通单腿订单。
+- [改进] CSV 组合父单入账为 audit-only `BrokerExecutionGroupObservation`（组合 unit 语义）+ 组级费用观测：不分摊费用到腿、不推导合约乘数或腿级数量、不写腿/成交观测；canonical 选择将 CSV 组合父单显式排除（provenance `canonical_scope=excluded_csv_combo_parent`），腿级真相仍由 OpenAPI execution group 提供；preview 新增 `combo_parent_orders` 等 additive 计数并把含组合父单的 CSV 至少判为 `partial`，旧版 CSV↔readonly 对账将窗口内组合父单显式排除并输出警示。
+- [测试] 新增真实导出行文本的组合父单解析回归（unit 数量/成交摘要/组级费用尾列/价差符号/两条腿展示行、邻近普通单不受影响）、对账排除警示、账本组合父单 audit-only 入账与 canonical fail-closed 排除、preview/import API 组合计数与部分级别断言；既有 parser 与账本测试全部保持通过。
+- [文档] `New-docs/phase1/01_MOOMOO_EVIDENCE_LEDGER.md` 新增 §4.3 组合单父单解析与 canonical 排除语义；`New-docs/HANDOFF.md` §4.2 更新 parser 条目；根 README 未涉及该专题细节，故未改动。
+- [新功能] 日内扫描噪音过滤 v3（`intraday_session_evidence_v3`）：把用户自身交易纪律（Playbook 候选 R1/R3，1,653 笔已平仓交易统计核验）编码为四类诚实上下文标注——时段上下文（ET 时钟九段 + 硬编码 v1 纪律提示，pulse 与 intraday-top 双响应携带、脉搏条首醒目展示）、财报临近（Finnhub 一次区间调用覆盖全 universe，≤3 天醒目「财报 N 天内 · 期权贵」）、大盘对齐（SPY 并入同批快照，会话 VWAP 位置 vs 候选爆发方向 → 顺势/逆势/标缺）、速度分级（相邻 15 分钟窗口爆发分之差 → 加速/减速/持平/标缺）。设计规则固定「系统标注，用户过滤」：全部信号只加标签，不自动过滤行、不隐藏候选、不参与排序或证据计数。
+- [改进] 日内扫描表新增「速度」「大盘」「财报」三列（财报列可按距财报天数排序、标缺行恒排最后）并扩展 footer 公式行（含「减速=你的离场信号（R1）」与设计规则）；市场脉搏条新增时段标签（可访问 Tooltip 说明其为用户历史统计的硬编码文案）与 SPY/QQQ 会话 VWAP 位置。
+- [修复] v3 上下文全部 fail-closed：财报日历不可得时 `within_blackout=null` 显式标缺（绝不以「无财报」冒充安全，成功但窗口内无财报才是诚实 `false`）、SPY 或爆发方向任一侧缺失时大盘对齐标缺、速度窗口不足显式 unknown；日历失败只短缓存 10 分钟且不阻断其余证据。
+- [测试] 新增时段 ET 时钟边界（含 09:30/10:00/13:00/15:00 等 18 个断言点与周末/UTC 换算）、速度分级（加速/减速/持平/单窗口与缺分数 unknown）、财报临近（0/3/4 天回避窗边界、窗口外排除、unavailable 诚实）、大盘对齐矩阵（up/above=顺势等四象限 + flat/缺失标缺）、日历单次区间调用跨 refresh 与 universe 的按日缓存、SPY 并入同批快照零新增请求，以及前端列/badge/时段标签渲染与 E2E 时段标签断言；周日休市 TestClient 连本机 OpenD + 真实 Finnhub 验收（closed 诚实标注 + 最近交易时段速度状态 + MU 逆势样本）。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` §2.8 新增 v3 上下文信号小节（四类信号口径、财报额度成本、设计规则）；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` 新增 G-9 行；根 README 不承载日内列级细节，故未改动。
+- [新功能] 日内扫描形态相似度 styleMatch v1（`intraday_session_evidence_v4`）：纯函数 `src/opportunities/intraday_setups.py` 把当前时段几何形状与用户自己的三个 Playbook setup 做形状对比——S1 十五分钟低点抬高突破（5m 按 09:30 ET 栅格聚合 15m，尾部连续抬高 swing low ≥2 + 突破结构高点）、S2 跳空高开托举（向上跳空达缺口证据同阈值 0.75×ATR/1.5% + 缺口未回补 + 现价 ≥ 会话 VWAP）、S3 高开遇阻回落（跳空 + 现价跌破开盘/VWAP + SPY 处于会话 VWAP 下方，做空 setup）；每 setup 恰好一个状态 matched/partial/not_matched/unavailable（附中文理由与证据行），可多 setup 同时相似，`matched_setups`/`partial_setups` 为顶层摘要。复用波段爆发通道同一批 5m K 线与 G-2 快照派生字段，零新增供应商请求；纯标注，不参与排序、不隐藏行、不是买卖信号。
+- [改进] 日内扫描表新增「形态」列：matched 实底徽标 / partial 描边徽标加「· 似」（tooltip 展示理由、证据行与只读 Playbook 对应「对应 Playbook: S1（候选/已晋升）」）、无相似「—」、输入不足「标缺」；footer 固定附「形态相似度为 v1 几何检测（5m近似），不含你的进场确认帧（2m/1m 回踩8/13EMA），不是信号」。服务端只读读取 journal_v2 Playbook 候选（标题 S1/S2/S3 前缀，5 分钟缓存），无任何晋升或写入逻辑，读取失败仅缺 Playbook 标注。
+- [修复] styleMatch 全程 fail-closed：S1 不足 3 根 15m K 线、缺口输入缺失、托举/回落输入缺失、SPY 状态标缺分别给显式 reason（SPY 标缺时 S3 最多 partial，绝不冒充「大盘走弱」）；休市按最近一个交易时段评估并以 `session_date_et` + `quote_session_scope=latest_prior_session` 如实标注；缺口阈值单一真源迁至 `intraday_setups`（`intraday_top` 原名别名导入，数值语义不变）。
+- [测试] 新增 `src/opportunities/tests/test_intraday_setups.py`（25：S1 抬高+突破/未突破 partial/低点走低/K 线不足/平坦无 swing low、S2 阈值双向与同源断言/单边托举 partial/回补 not_matched/输入标缺、S3 大盘走弱 matched/大盘强 partial/标缺 partial、多 setup 同时相似、休市 as-of、Playbook 只读透传、15m 栅格聚合）；`test_intraday_top.py` +4（setup_match 携带且不改证据计数、S1 K 线接线、Playbook refs 注入、休市 scope）；endpoint 合同断言 v4 + setup_match 状态矩阵 + Playbook 只读标注 + 5m 失败仅 S1 标缺；前端形态列徽标/tooltip/—/标缺渲染测试。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` 新增 §2.10 形态相似度（三 setup v1 规则表、显式不检查项、Playbook 只读对应、诚实边界）；`New-docs/architecture/06_MATURITY_EXECUTION_PLAN.md` 新增 G-10 行；根 README 不承载日内列级细节，故未改动。
+- [新功能] 临期合约面板（G-8）页头接入 v3 财报临近警示：`near-expiry-contracts` 响应新增 additive `earnings_proximity` 字段（与日内扫描表候选同形状，复用同一份逐 ET 日 Finnhub 日历缓存与 `compute_earnings_proximity`，零新增抓取路径、零新增常量），回避窗内（≤3 天）面板页头醒目标注「财报 N 天内 · 期权贵 · 你的回避规则」（0 天为「今日财报…」），ready 且窗外不加任何标注；该字段与面板自身 state 正交（Moomoo 未启用/失败照常返回）。
+- [修复] 临期面板财报字段 fail-closed：日历不可得时 `state=unavailable`、`within_blackout=null`，前端小字「财报日历标缺 · 未知≠安全」；旧会话缓存缺该字段的载荷同样按标缺处理，绝不以缺失冒充安全。
+- [测试] `test_near_expiry_contracts_endpoint.py` +5（回避窗内 3/5/basis 断言、窗外 ready 不标注且不串其他标的、日历 unavailable 诚实、Moomoo 禁用仍带字段、扫描车道已加载日历时临期面板零第二次区间调用）+ autouse Finnhub 日历桩（既有用例绝不打真实 Finnhub）；前端面板 +5（回避窗徽标、今日财报文案、窗外零标注、标缺小字、旧载荷缺字段按标缺）；真实 TestClient 验收：SNDK 财报 2026-08-05（3 天内 → within_blackout=true）、AAPL 窗口内无财报（false），两标的共享一次日历区间调用。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` §2.9 前端小节新增财报临近一行（字段形状、复用口径、三种渲染状态）；根 README 不承载面板级细节，故未改动。
+- [文档] `New-docs/HANDOFF.md` §1「一屏结论」与 §1.1 同步 2026-08-02 真实状态（分支已推送 + PR #3、canonical set #2 与 build #3 未激活、日内工作台 G-1..G-10、周内榜 21:12 自动发布就绪、moomoo-sync 旧 LaunchAgent 待 F-1 清理），§1.2 浏览器核对清单新增 `/intraday` 交易日主屏。
+- [新功能] 日内扫描新增 watchlist v1 两层 universe（`INTRADAY_WATCHLIST` + `INTRADAY_DEEP_LANE_MAX`，默认不配置＝行为与现状逐字节一致）：宽层每 60 秒仅 1 次 Moomoo 批量快照覆盖全清单（≤200 档，官方单次上限 400），异动闸门按 |当日涨跌幅|→成交额 晋升前 K 档（默认 12，1..20）进入既有 v4 深度管线，当日冻结盘前计划标的始终占深度位不占 K 名额；响应新增 additive `universe_scan` 块与逐候选 `scan_tier`/`deep_lane_reason`，宽层行只有快照字段、深度读数缺席即缺席。
+- [改进] 深度层 5m K 线额度按 Moomoo `request_history_kline` 真实配额语义设计（30 天滚动窗口去重标的数、账户档位 100 起、同标的重复请求不扣额）：晋升去重上界＝清单长度，另设每 ET 日新晋升去重标的数护栏 30 档（内部常量），触顶如实标注 `day_promotion_cap_reached`；前端页头/footer 改为「全清单 N 檔快照 · 深度分析前 K 檔 · 其余仅快照」，表下新增「仅快照 · 未做深度分析」紧凑列表（含快照未解析点名与截断警示），深度行附「计划钉选/异动 #n」徽标。
+- [测试] 新增 `api/v1/tests/test_intraday_top_two_tier.py`（8：未配置清单回归锁定、显式 symbols 绕过两层、单快照批次+闸门排序+宽层无深度字段、计划钉选去重不占 K、日晋升护栏、Moomoo 禁用诚实降级、清单显式截断、K 值钳制）；既有空 symbols 回归用例固定清单未配置；前端 IntradayScanTable +4（两层页头/footer/徽标、仅快照列表与未解析点名、无 universeScan 单层渲染回归、日护栏警示行）。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` 新增 §2.11 两层扫描（启用条件与回滚＝取消 `INTRADAY_WATCHLIST`、闸门口径、K 线配额语义、每周期请求预算、additive 响应合同）；`.env.example` 新增两键中文说明与用户实际 69 档清单示例值；根 README 不承载日内 universe 细节，故未改动。
+- [修复] 日内两层扫描盘前时段（ET 04:00–09:30）改按真实盘前口径晋升与排序（`gate_basis=premarket_pre_price_change_then_pre_turnover_v1`：|pre_change_rate|（盘前价 vs 上一常规收盘，可为负）→ pre_turnover）：Moomoo 常规快照字段在盘前仍指向上一常规时段，原口径会把昨天的异动复现成今晨深度榜；缺盘前字段的行不可晋升且宽层恒排最后，整批无盘前字段时显式回退常规口径并在 `universe_scan.gate_warnings` 携带 `premarket_fields_unavailable_ranking_reflects_prior_session`；宽层行 additive 携带 `pre_change_percent`/`pre_turnover`（缺列＝null 绝不 0 回填）；前端盘前口径下页头/footer 附「盘前异动排序（盘前价 vs 前收 · 盘前成交额次序）」、仅快照行展示「盘前 ±x%」与盘前成交额（缺盘前字段显式「盘前标缺」）、回退时显示「盘前字段不可用 · 当前排序反映上一常规时段」警示。
+- [测试] 盘前闸门契约测试 +3（盘前口径按 |盘前涨跌|→盘前成交额 晋升且上一时段最大异动因缺盘前字段绝不晋升、整批无盘前字段显式回退+警示、常规时段无视盘前字段且口径与警示逐字节回归）+ Moomoo 快照解析器盘前字段单测（负 pre_change_rate 合法、pre_price 零/负与非法值/缺列一律 None）；前端 IntradayScanTable +3（盘前口径页头/footer 标注、盘前读数 chip 与盘前标缺行诚实渲染、回退警示 chip、常规时段无盘前标注回归）。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` §2.11 新增盘前口径小节（常规快照字段盘前指向上一常规时段的语义、pre_change_rate 相对上一常规收盘口径、回退警示诚实边界与前端标注）；根 README 不承载日内闸门细节，故未改动。
+- [改进] 日内扫描表改为两级布局：默认网格收敛为 9 列交易关键读数（排名/标的/涨跌%/当前爆发/今日波段/速度/形态/波段vs大盘/详情），深度位与财报警示徽标并入标的格次行（日历标缺显式「财报标缺 · 未知≠安全」），「大盘」列改名「波段vs大盘」并加列头 tooltip 澄清「当前波段方向 vs SPY VWAP 位置、非个股涨跌方向」；量能节奏/缺口/波幅扩张/VWAP/期权异动/财报全文/研究状态移入行内展开的「研究读数」网格（临期合约面板上方），仅快照列表默认只显示前 5 檔可一键展开，footer 收敛为一行口径说明 +「完整口径」切换（完整公式墙原文逐字保留）——重排可见性不删除任何读数，标缺语义与共享 Tooltip 无障碍标注不变。
+- [新功能] 日内扫描「今日波段」列接入 signal v5 波段分级：burst leg 类型新增 additive `grade` 字段（strong＝爆发分 ≥8 暴动 / medium＝≥2.5 持续推升），前端以「09:45↓ 强」实底警示 chip 与「10:00↑ 中」描边 chip 呈现，每波分级并入 aria-label 波段明细；缺 grade 的旧载荷渲染无分级 chip，绝不发明分级。
+- [测试] IntradayScanTable 测试更新至两级布局（20 例全过）：新增 9 列默认网格与次要指标不入首屏、强/中/无分级波段 chip 与空态/标缺、仅快照列表前 5 檔折叠与展开切换、展开行研究读数网格、footer 短行 + 完整口径切换、按当前爆发排序标缺行恒最后且服务端排名不改写等回归。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` §2.8 扫描表列清单更新为 9 列默认网格并注明两级布局与 v5 波段分级 chips；根 README 不承载日内列级细节，故未改动。
+- [新功能] 日内波段记录分级（signal v5）：强波段 ≥8（2026-07-31 暴动样本校准，阈值不变）之外新增中波段 ≥2.5（2026-08-03 NVDA 上午 09:55→10:25 持续推升实时校准，峰值 5.03/持续段 2.5-3.1/无波时段 <1.1），持续推升型可交易波不再漏记；波段携带 grade（strong/medium）additive 字段，强波段贪心优先占据 ≤4 名额。
+- [修复] 日内两层扫描异动闸门升级 v2（`gate_basis=momentum15m_then_day_change_v2`，2026-08-03 首个实盘日校准：普涨跳空日 |当日涨跌| 单口径让 +5%~+11% 隔夜跳空标的挤满深度层，用户唯一认定可交易的 NVDA +2.5% 稳步爬升整日未晋升）：非盘前时段 K 名额拆两档——ceil(2K/3) 按最近 15 分钟动量 |mom15|（宽层批量快照喂养的进程内滚动历史，取 12–18 分钟窗内最老样本，零新增请求）、其余按 |当日涨跌幅| 兜底，两侧成交额次序、动量先占位后去重；冷启动（重启/开盘/样本过期）显式回退 v1 并在 `gate_warnings` 携带 `momentum_history_warming_up_ranking_by_day_change`，绝不静默；动量历史 ET 日切换即清空，盘前口径（pre_*）完全不变。
+- [新功能] 新增 `INTRADAY_PINNED_TICKERS` 用户钉选（仅两层模式生效，留空＝现状不变）：钉选标的与当日冻结盘前计划同权——始终深扫、不占 K 名额、并入同一批快照、计入当日额度去重，`deep_lane_reason.promoted_by` 新增 `user_pinned`（兼具计划身份时计划钉选优先标注），`universe_scan` 新增 `user_pinned` 字段；前端深度行附「钉选」徽标、footer 如实报告钉选占位。
+- [新功能] 日内扫描响应新增「今日曾深扫」账本（`universe_scan.day_ledger` + `day_ledger_basis`，additive）：当日曾晋升深度层、被 movers 轮换出的标的以最后一次深扫摘要 as-of 保留（分级波段/形态匹配/最后涨跌/`state=rotated_out`），绝不与当前深度层重复；进程内展示缓存——不写数据库、重启清空并以 basis 字段如实声明「重启后从当前时刻累计」；前端主表下方渲染「今日曾深扫 · 波段保留」紧凑行（空账本不渲染）。
+- [改进] /intraday 命名与主次整理：扫描表标题改「实时扫描 · 现在谁在动」（两层模式附「深度层实时排名，下方为今日曾深扫账本」副标注），原「盘中跟踪」面板改名「今日计划跟踪 · 盘前冻结计划走到哪了」，页面顺序调整为 市场脉搏 → 实时扫描（主表）→ 今日计划跟踪 → 期权事件流；v2 口径页头/footer 附「15分动量优先（谁现在在动）· 当日涨跌兜底」，预热回退显式「动量样本预热中 · 暂按当日涨跌排序」警示 chip。
+- [测试] 两层扫描契约测试 +6（钉选去重/不占 K/并入同批快照、清单未配置时钉选零影响回归、mom15 12–18 分钟窗数学（假时钟）、ET 日切换清空动量历史、冷启动回退警示 → 15 分钟后 v2 双子额度排名（动量位不给横盘标的）、账本轮换保留最后深扫载荷且不与当前深度层重复）；常规时段回归用例更新为断言冷启动警示；前端 IntradayScanTable +6（改名页头与副标注、「钉选」徽标与钉选计数、v2 口径标注、预热警示 chip、账本行渲染与空账本不渲染）、IntradayPage 组合顺序与 9 列布局断言更新、IntradayTrackingPanel 改名断言更新。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` §2.11 更新（闸门 v2 规则与 2026-08-03 NVDA/跳空日校准背景、用户钉选、今日曾深扫账本、前端命名与主次整理、additive 响应合同）；`.env.example` 新增 `INTRADAY_PINNED_TICKERS` 中文说明并补充闸门 v2 注释；根 README 不承载日内闸门细节，故未改动。
+- [新功能] 个人画像回灌（personal-edge）：新增只读 `GET /api/v1/journal/v2/personal-edge`（`src/journal/personal_edge.py` 零写聚合），对 Journal 当前默认 episode build（复用既有 `_resolve_effective_episode_build` 解析，激活新 build 自动跟随）的已平仓回合做描述统计——按标的（仅 n≥5）`{n, net, win_rate, fees}`、持仓时长桶（<10m/10-30m/30-60m/1-3h/3-6h/6h-1d/>1d，含 avg_win/avg_loss）、进场 DTE 桶（0/1-3/4-7/8-30/>30，DTE 缺失单独报 `dte_unknown`）与月度 `{n, net, fees, win_rate}`；响应固定携带 build_id + 日期范围 + computed_at（as-of 诚实），服务端进程内缓存约 10 分钟；月度按 ET≈UTC−4 近似换算并以 `month_basis` 与 limitations（内生性 caveat + 时区注记）原文声明。
+- [新功能] 实时扫描表新增第 10 列「你的战绩」（深度行 + 今日曾深扫账本行）：该标的的个人净盈亏（紧凑 $ 格式）· 胜率 · 笔数，净亏损且 n≥20 加警示 tint + tooltip「你的历史亏钱标的 · n 笔 · 净 −$X · 胜率 Y%」，n<5 显式「样本不足」，端点失败或 Journal 未构建显式「标缺」——系统标注，用户过滤：不隐藏行、不改排序、不是信号；前端经 `usePersonalEdge` hook 读取（fetch 层 10 分钟 sessionCache，每会话最多一次请求）。
+- [新功能] 临期合约面板头部下方新增个人 DTE 提示行「你的 DTE 战绩：0DTE ±$…(x%) · 1-3DTE … · 4-7DTE … · 样本 YYYY-MM→YYYY-MM · 描述非因果」：数值全部来自 personal-edge 端点实时重算（绝不硬编码），空档位显式「无样本」、端点缺席显式「标缺」，tooltip 原文携带内生性 caveat——在 0–7 DTE 合约选择的决策瞬间给出用户自己的 DTE 分层历史。
+- [新功能] 经既有 Playbook 候选路径显式创建「R4 · 持仓时间纪律（30分钟-3小时是你的盈利区）」候选（free-form 证据快照、幂等）：rule_text 内嵌创建时 personal-edge 端点返回的持仓时长分层数字、进场质量读数（<10 分钟单极低胜率对应「追高进场/速度不足强做」）与内生性提醒，定位为数据描述供本人复核，不构成建议。
+- [测试] personal-edge 单元测试（无 build → None、持仓/DTE/标的/月度桶数学、n≥5 门槛、开仓中与缺净盈亏回合只计数不入统计、UTC−4 月度边界、非法阈值拒绝）+ 端点契约测试（not_built 诚实空态、ready 合同、10 分钟缓存命中与重置、非法 account_key 422）；前端 IntradayScanTable +6（盈利普通展示、亏损 n≥20 警示 tooltip、亏损 n<20 不警示、样本不足、端点缺席/not_built 标缺、账本行同语义标注）、NearExpiryContractPanel +4（DTE 提示行数值与内生性 tooltip、空档位无样本、端点缺席与 not_built 显式标缺）、既有 10 列布局断言更新。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` 新增 §2.12「个人画像回灌」（端点合同、build 解析与 as-of 语义、三个消费面、诚实边界）；根 README 不承载日内列级细节，故未改动。
+- [新功能] 日内候选新增「近 30 分钟位移」纯函数读数 `recent_displacement`（`src/opportunities/intraday_bursts.py::compute_recent_displacement`，复用波段爆发通道已取回的同一批 5m K 线，零新增请求）：取当前时段（休市取最近一个交易时段）最后 6 根 5m K 线，以窗口首根开盘价为「30 分钟前价格」参考点，输出 ATR 归一化的 `net_move / high_excursion / low_excursion / abs_range`；ATR 标尺优先日线 ATR14（`atr14_daily`），缺失时回退取证分析同款盘中代理「最近 20 根 5m 波幅均值 ×3」（`intraday_20bar_proxy_x3`）并显式标注基准，两者都不可得显式 `unavailable`，K 线不足 6 根显式 `insufficient_bars` + 实际根数，绝不 0 回填。
+- [新功能] `POST /api/v1/opportunities/intraday-top` 候选行新增 additive `recent_displacement` 字段（`IntradayRecentDisplacement`），`signal_version` 升至 `intraday_session_evidence_v6`，并新增一条位移口径 limitations：它是标注，不进证据计数、不参与排序、不隐藏行。
+- [新功能] 实时扫描表默认网格新增「近30分位移」列（紧跟「速度」，交易关键顺序＝涨跌/爆发/波段/速度/位移/形态）：`≥ +0.5` 或 `≤ −0.5 ATR` 用涨跌色强调并给出区间高低偏移，介于 ±0.5 之间弱化显示 +「未达 0.5」，K 线不足或 ATR 标尺不可得显式「标缺」；tooltip 原文携带 0.5 ATR 经验线的来源与实际使用的 ATR 基准；为保持默认 10 列，「波段vs大盘」下沉到展开行「研究读数」区（口径与 tooltip 原样保留）。
+- [新功能] 经既有 Playbook 候选路径显式创建「R5 · 进场要求「已经在动」（近30分钟位移 ≥0.5 ATR）」候选（free-form 证据快照、幂等）：rule_text 内嵌 766 笔回合取证数字（进场几何无预测力、速死单 18.3% vs 赢家 71.2% 达到 ≥0.5 ATR、MFE/MAE 中位、84% 合约 ≤1DTE 零容忍）与全部 caveat（样本恰为最差两个月、按持仓时长分组的循环性、非官方 5m K 线、描述统计非建议）。
+- [测试] 位移纯函数测试 +9（恰好 6 根 K 线边界窗口数学、窗口只取最后 6 根不吃早盘涨幅、负向/横盘保号、ATR14 与盘中代理基准选择及标注、非正 ATR14 回退、不足 6 根/零 K 线显式 insufficient、零波幅无 ATR14 显式 unavailable、休市按最近交易时段且与同日盘中口径一致）、builder 接线测试 +5（ATR14 标尺读数、代理回退、无 K 线不足、休市时段、run limitations 携带口径）、端点契约测试补 v6 版本与 `recent_displacement` 全字段断言；前端 IntradayScanTable +5（越线强调 up/down、未达 0.5 弱化、三类标缺、tooltip 基准原文、「波段vs大盘」下沉后仍在研究读数区可达）与默认 10 列断言更新，IntradayPage 列表断言同步。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` 新增 §2.13「近 30 分钟位移」（取证证据表、窗口与 ATR 标尺口径、additive 响应合同、前端列与降列决策、R5 候选、诚实边界）；根 README 不承载日内列级细节，故未改动。
+- [新功能] 规模与频率监控：`GET /api/v1/journal/v2/personal-edge` 响应新增 additive `discipline` 区块（既有字段一字不改，复用同一默认 build 与同一 10 分钟缓存），按月与「build 内实际存在的最后 20 个交易日」窗口输出 `trades_per_day`（笔数 ÷ 有入场的 ET 自然日）、`median/total_premium_at_risk`（`|opening_cash_flow|`）、`pnl_per_dollar_risked`（Σ净盈亏 ÷ Σ风险金额）、`median_episode_pnl`、`body_pnl`（去掉当月最好/最差各 5 笔，仅 n≥15）、`zero_dte_share`、`exact_fill_share`；取证背景为本人 1,554 笔期权回合全样本研究——进场几何（χ² p=0.105）、行情跟随（Kruskal p=0.337）、止损纪律三者皆平，真正变化的是每美元回报塌约 24 倍（5.83%→0.24%）、中位仓位 2.4 倍、日均笔数 +44%、盈亏集中到尾部赢家。
+- [新功能] `/intraday` 脉搏条下方新增「规模与频率」一行 chip（`IntradayDisciplineStrip`）：近 20 个交易日的每美元回报 / 日均笔数 / 中位仓位 / 本体盈亏，注脚为端点返回的最早可得月份同口径基线（前端不硬编码任何数字），行尾恒显示「基于已发布证据 build #N · 截至 YYYY-MM-DD」；中性排版、无涨跌色、无建议措辞（镜子不是警报），tooltip 原文携带端点 limitations，缺分母显式「标缺」。
+- [新功能] Journal「模式观察」下方新增同层兄弟区块「规模与频率」（`DisciplineMonthlyPanel`）：月度表（笔数/日均/中位仓位/风险金额合计/每美元回报/中位盈亏/本体盈亏/0DTE 占比/精确成交占比）+ 当前窗口脚注，`exact_fill_share<1` 的月份显式标注「成交明细为重建，时点仅供参考」，缺分母的读数显示「标缺」并把原因挂在 title 上。
+- [改进] personal-edge `limitations` 追加两条诚实声明：重建成交明细（`has_exact_fill_times=0`，集中在 2026-04 前半段）月份的时点与每美元回报仅供参考；规模与频率的派生比率一律 fail-closed（分母为 0、无可用开仓现金流、本体盈亏样本 <15 笔时返回 null + 原因）。
+- [新功能] 经既有 Playbook 候选路径显式创建「R6 · 规模与频率纪律（每美元回报才是真账）」候选（free-form 证据快照、幂等，id=9）：rule_text 内嵌 24 倍每美元衰减与三个统计上持平的对照、仓位 2.4 倍、频率 +44%、本体/尾部拆解、4 月重建成交明细 caveat（精确成交口径 4 月 0.72% / 5 月 0.95% / 6 月 0.16% / 7 月 0.24%）以及工作台按自身口径重算 build #3 的对照值，定位为数据描述供本人复核，不构成建议。
+- [测试] 规模与频率服务单元测试 +5（ET≈UTC−4 自然日去重的日均笔数与 UTC 跨日边界、每美元回报与中位仓位数学、开仓现金流缺失只计缺席、本体盈亏 n≥15 门槛与 <15 的 null+原因、近 20 交易日窗口选取与起止日期、无现金流/合计为 0/无已知 DTE 三类零分母各自的原因区分、limitations 追加项）；端点契约测试 +2（`discipline` 为 additive 且既有字段逐字不变、窗口读数与重建成交标志）；前端 `IntradayDisciplineStrip` +5、`DisciplineMonthlyPanel` +5（数值与基线注脚、标缺与原因、limitations 原文 tooltip、重建成交行标注、未构建空态）。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` 新增 §2.12.1「规模与频率」（三个对照皆平的取证表、additive 端点合同、前端两个消费面、R6 候选、重建成交与 fail-closed 诚实边界、与研究样本的口径差异）；根 README 不承载日内面板级细节，故未改动。
+- [新功能] 日内实时扫描新增「哑火形态」标注（`fizzle_flag`，`signal_version` 升至 `intraday_session_evidence_v7`）：当前 15 分钟窗口同时满足 intraday 分层（`median_basis` 非上一时段回退）、窗口效率 ≥0.9（|收−开| ÷ 窗口高低差，几乎无回撤）与量比 <2.0 时命中；9,173 次爆发起点回放（21 标的 × 123 个交易时段，2026-02-05→08-03，用户自己的 5m K 线逐根重放、无未来函数）实测该形态 30 分钟内达到 ≥0.5 ATR 有利位移仅 26.8%（样本内 n=291）/ 25.4%（样本外 n=177），基准 47.8%/50.5%，方向一致性 20/20 标的、6/6 月、三把 ATR 标尺同号。additive 标注：不进 supports 计数、不参与排序、不隐藏行，不是卖出信号。
+- [改进] 前端在既有「当前爆发」单元格内渲染 warning-muted 小徽标「哑火形态」（**不新增列**），tooltip 携带样本内外频率、基准、样本描述与固定诚实边界「这是形态描述与历史频率，不是卖出信号；方向本身在样本中约 53%，与掷硬币无实质差别」；未命中与标缺一律不渲染——缺席不是结论。
+- [修复] 近 30 分钟位移的 ATR 回退标尺可比性缺陷：旧盘中代理（最近 20 根 5m 波幅均值 ×3）与真实日线 ATR14 之比在盘中 0.28→0.42→0.20 漂移（10:30–11:00 低估约 18–20pp、15:00–15:30 高估约 10–15pp）。回退顺序改为「日线 ATR14 →『上一批交易时段真实波幅均值』（≤3 个已结束时段、当日内恒定，`prior_sessions_true_range_mean`）→ 旧代理仅在无上一时段时兜底」，并新增 `atr_scale_comparability` / `atr_prior_session_count` 逐行标注该读数能否与 ATR14 口径横向比较；**日线 ATR14 主路径数值口径逐字未变**（有/无上一时段 K 线时结果完全相同，测试断言）。
+- [改进] 波段爆发 `limitations` 追加两条实测性质：起速那一刻**方向不可预测**（P(方向)=50.6%、19 个候选因子方向 AUC 0.48–0.52、MFE/|MAE| 中位 1.026，因此系统不提供延续概率或真假速度评分）；中波段阈值 2.5 平均每个「有爆发的标的-交易日」触发 3.74 个窗口、其中 62.8% 落在开盘 stratum（回退基准让开盘 K 线天然显得超常）——**不改阈值**，只如实声明该口径产物。同时记录本版**刻意不做**「起速幅度分档」列（只描述波动幅度、无方向含义，表格已过密）。
+- [新功能] 经既有 Playbook 候选路径显式创建「R7 · 起速那一刻分不出方向（哑火形态是唯一稳的回避）」候选（free-form 证据快照、幂等）：rule_text 内嵌方向 AUC 0.48–0.52、P(方向) 50.6%、MFE/|MAE| 1.026、哑火规则与样本内外频率、**已证伪**的「突破前 15 分钟区间」假设（AUC 0.496，三把标尺一致，记录以免重复尝试），以及「约 200 次比较，Bonferroni 下无一存活；按方向一致性与样本外稳定性判断」，定位为数据描述供本人复核，不构成建议。
+- [测试] 哑火形态真值表 +12（命中、三个条件各自否定与多条件同时未满足、开盘分层永不命中、窗口高低相等即标缺、缺 median_basis/vol_norm/窗口 K 线不足、profile 只描述当前窗口、fail-closed profile 携带标缺读数）；ATR 标尺 +5（ATR14 主路径逐字不变、上一时段回退口径与跳空 true range、时点伪影消除对照、旧代理降为兜底并标不可比）；候选接线 +4（verbatim 复制、不改 supports/研究状态、缺字段与缺 profile 各自标缺）；端点契约 v7 + additive-only + limitations 断言；前端标记 +5（命中渲染且不新增列、tooltip 数字与诚实边界、未命中/标缺/旧载荷三种不渲染）。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` 新增 §2.14「哑火形态与 ATR 标尺可比性修正」：把回放研究的**否定性结论**（起速那一刻方向不可预测）放在最前，列明本版刻意**不做**的四件事（延续概率/真假速度评分、起速幅度分档列、改阈值、重试已证伪的前 15 分钟区间突破假设）、哑火规则与样本内外证据、ATR 回退与可比性标签、阈值触发密度的已知性质与后续跟进判断、R7 候选与诚实边界；§2.13 加 v7 回退层变更指引。根 README 不承载日内面板级细节，故未改动。
+- [修复] 盘中 5m K 线时间戳口径：Moomoo `request_history_kline` 的 `time_key` 按 K 线**结束**时间打标，此前被当成开始时间使用，`09:30 ≤ 标签 < 16:00` 实际取到的是 **09:25–15:55**——混进一根盘前 K 线、又丢掉收盘集合竞价那根。2026-08-04 用只读 OpenD 独立复核确认（官方日线开盘价 == 标签 09:35 那根的开盘价、官方日线收盘价 == 标签 16:00 那根的收盘价，**25/25 个标的-交易日逐分钱吻合**，START 口径 0/25；标签 09:35 中位量是标签 09:30 的 15–25 倍；延伸时段端点为 04:05 与 20:00）。新增 `normalize_bar_label_convention(bars, source=...)` 只对已知按结束时间打标的源（`BAR_LABEL_END_SOURCES`）整体前移一个 K 线周期，未知/缺失 source 一律不猜测；调用点为 5m K 线进入研究管线的唯一入口 `_fetch_intraday_5m_bars`，波段爆发 / 近30分位移 / v4 形态对比一次性修正，`intraday_bursts` 保持纯函数不为供应商分叉；`/stocks/{code}/history` 公开载荷未改动。
+- [改进] 因上条为**数值口径变更**，`INTRADAY_TOP_SIGNAL_VERSION` 升至 `intraday_session_evidence_v8`（响应 Literal、TS 类型与前端注脚同步）：所有窗口、中位数、波段标签、速度与位移读数整体前移一根 K 线并换掉两侧边界样本，历史截图与本版不可逐值对照。真实端点抽样（TestClient，2026-08-03 时段，ATR14 标尺）当前窗口分 NVDA 3.49→10.02、MU 0.80→4.04（方向 up→down）、AMZN 0.80→9.44（方向 up→down），近30分位移 net NVDA −0.228→−0.155、MU +0.111→+0.032、AMZN +0.074→−0.062（变号）。
+- [改进] 波段爆发 `limitations` 追加两条：K 线时间戳口径修正本身（含复核证据与「历史读数会变」的显式声明）；以及修正后**收盘集合竞价的口径性质**——最后一个 15 分钟窗口（15:45–16:00）现在真正含收盘竞价那根，其成交量通常是当日中位 K 线的 5–20 倍，量比被机械放大，几乎每个标的每天都会在 15:45 出现高分窗口。**不改阈值**，只如实声明该口径产物。
+- [修复] 近 30 分位移的**循环性更正**：0.5 这条线源自按**持仓时长**分组的分层，而持仓时长由结果决定——该分层按构造即循环。2m 回放研究（3,492 次 EMA8/13 回踩持稳进场）量化：循环记分下「速度未死 vs 已死」P(>0) 差 **37.6 个百分点**（54.4% vs 16.8%），改为只从第 15 分钟检查点**向前**计分后只剩 **0.1 个百分点**（49.9% vs 49.8%），且样本内微弱效应**样本外反号**（+0.122 → −0.128）。保留读数与 0.5 参考刻度（它仍是对「有没有在动」的诚实描述），但**删除全部存活框架**：弱化态文案 `未达 0.5` → `不足 0.5 ATR`，列头与逐行 tooltip 以更正**开头**，完整口径文本在取证数字紧后接整段更正，简短口径行同步；后端 `DISPLACEMENT_LIMITATION_LINE`、`IntradayRecentDisplacement` docstring 与模块常量注释同步。
+- [新功能] 经既有 Playbook 候选路径显式创建「R8 · 进场择时没有边际（两个时间框架、13,136 次事件）」候选（free-form 证据快照、幂等，**id=11**）：rule_text 内嵌回踩持稳 P(方向)=49.9% vs 时间匹配随机对照 49.8%（n=3,492 / 对照 10,476，MFE/|MAE|=0.994、95% CI [48.2, 51.5] 含 50%）、用户自己写下的 S1 形状 `hold_8`=47.6%**比随机还低**、唯一为正的 `hold_13`=55.6%（17/20 标的、5/6 个月）却是 S1 的**反面**且只值约 6.4 bps 正股位移（小于 0-3DTE 来回价差）、**99.97%** 的冲量 40 分钟内都会回到 2m EMA8 区域（「等回调」不是过滤器）、1 分钟减速离场不改善均值（−0.008 vs +0.005）但砍掉 38% 标准差（0.753→0.463，故 R1 的价值是波动与时间价值成本管理而非预测），以及上条循环性更正；标注样本仅 6 个月、以正股位移而非期权 P&L 度量、Bonferroni 无一存活，定位为数据描述供本人复核，不构成建议。
+- [改进] `PlaybookPanel` 候选与规则正文补 `whitespace-pre-line`：`rule_text` 是 append-only 冻结文本、分段靠换行，此前 R5–R8 这类多段取证记录会塌成一坨。只改渲染，不动数据。
+- [测试] 时段边界回归 +2（四个标的逐一断言常规时段恰 78 根、首末为 09:30/15:55、**收盘集合竞价那根被保留**且 OHLCV 等于供应商标签 16:00 那根、**盘前那根被排除**、开盘那根等于供应商标签 09:35；归一函数只对已知源生效、不就地改写入参、未知源与不可解析时间戳原样返回）；校准回归重跑（fixture 重采为供应商原始时间戳并放宽到 09:00–16:30，因此现在真正在测这条链路）——阈值**无需重新校准**，仅 AMZN 开盘波断言改为「仍是强 up 窗口」（score 18.72→8.56，仍 ≥8.0，是被 30 分钟去重规则挤出 legs，不是检测失败）；前端位移文案断言改写 +12（更正必须打头、37.6→0.1pp 与 n=3,492 原文、`不足 0.5 ATR` 取代 `未达 0.5` 且旧文案不得残留、完整口径携带两种记分数字与样本外反号）；`PlaybookPanel` 换行保留 +1。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` §2.13 新增 v8 两节（循环性更正的双记分对照表与文案变更清单；K 线时间戳口径修正的三条独立复核证据、修正方式与调用点、真实端点前后抽样表、校准重跑结论与 AMZN 唯一变化项、收盘竞价的新口径性质）并在旧 tooltip 原文处加作废指引；新增 §2.15 记录 R8 候选与 append-only 不可改写的处置方式。根 README 不承载日内面板级细节，故未改动。
+- [修复] 规模与频率的口径来源判据改用 `evidence_summary_json.fill_allocations > 0`（是否由明细成交构建），不再用 `has_exact_fill_times`；两者在 build #3 的 4 月有 3 笔不一致，差异如实下发不隐藏。解析对 NULL/空串/非法 JSON/非对象/缺键/布尔/非整数/负数一律 fail-closed 记为「来源不可判定」，绝不当作全明细。
+- [新功能] `discipline` 每行新增 `fill_detailed_share`、`basis_break`(+reason) 与三分来源计数；任一区间非 100% 明细成交即置位断裂标记，供消费端断开显示。
+- [新功能] `discipline` 新增 `fee_pct_of_premium_at_risk`（恒定过路费）与 `gross_pct_of_premium_at_risk`（毛＝净＋费用，同分母恒等），以及 `pnl_per_dollar_excluding_top_n` / `gross_pct_excluding_top_n`（剔除最好 N 笔后的每美元回报，N＝`exclude_top_n`＝5，门槛 n≥15）；缺 `total_fee` 时整体 fail-closed，过路费不以 0 冒充。
+- [改进] Journal「规模与频率」表按 `basis_break` 分组断开显示（行内标注 + 显式断口行 + 说明段，写明分母源自管线自标 `audit_only_not_execution_cash_flow` 的汇总 ORDER 行，并给出同在 4 月内 9.53% vs 2.42% 的对照）；新增毛每美元/费用门槛/剔除最好 5 笔/明细成交占比四列，毛口径不及门槛的月份显式标记。
+- [改进] `/intraday` 规模与频率条新增毛每美元与费用门槛 chip；基线拒绝与断裂月份比较，改取最早的全明细成交月份并写明取的是哪个月，无干净月份时宁可不显示基线。
+- [新功能] 经既有 Playbook 候选路径显式创建「R9 · 没有「好做的行情」，也没有边际衰减（衰减 75% 是口径假象）」候选（**id=12**，未晋升）：内嵌 regime 零结果（132 项检验仅 5 项名义显著 < 期望 6.6、BH q<0.20 无一存活、族向置换 p=0.12、样本外相关号一致率 45.3%、岭回归 R²_out=−3.85、日度边际 lag-1 −0.053 与游程检验 p=0.94，并纠正「4 月是回调后磨」——实为近乎不间断上涨 +9.68%、最大回撤 −0.85%）、75% 口径假象拆解、可比窗口无衰减（两两置换 p≥0.756、Kruskal p=0.887）、真实变化（单笔风险 +68% 而美元盈亏持平、恒定约 125bp 门槛、7 月净 −0.19%）与尾部事实（top 5/1,410 ＝ 80% 毛盈亏、剔尾后四个月全负）；定位为数据描述供本人复核，非建议。
+- [测试] 后端 +9（判据形状边界含 bool/浮点/负数/缺键/额外键与 bytes、与 `has_exact_fill_times` 的不一致必须暴露、汇总与不可判定两类断裂、费用/毛口径恒等与三种 fail-closed、剔尾数学与 n≥15 门槛按「风险金额已知」样本判定）；前端 +8（断裂序列渲染与断口行、不可比说明段含 9.53%/2.42% 对照、费用门槛并排与「不及门槛」标记、剔尾列与窗口脚注、污染基线跳过与全污染时不显示基线、窗口自身断裂警示）。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` 新增自足的 §8，记录口径订正的证据链、判据改动、additive 端点合同、消费面与 R9，并声明与 §2.12.1 旧表述冲突时以 §8 为准。
+- [新功能] Journal `personal-edge` 端点新增 additive `rule_compliance` 车道遵守度区块：按用户自采纳的两车道规则 v2 纯机械分类每一笔已平仓回合（只读 DTE、入场 ET 小时、开/平仓 ET 自然日与 |开仓现金流|），给出逐车道与合规/违规汇总的毛每美元、过路费、胜率与剔除最好 5 笔读数，并新增可选 `since` 查询切出采纳后的前向样本。
+- [新功能] `/intraday` 新增「开仓前车道检查」面板：按日内 / 过夜车道逐条对照用户自己的规则（合约期限、ET 开仓时点、财报回避窗）并列出 V2-C 三条硬禁止与 V2-D 每日额度；三态判定为符合／不符合／标缺，缺输入一律标缺并给原因，不推荐、不含概率、不下任何单。
+- [新功能] Journal 新增「规则遵守度」区块（规模与频率的同层兄弟）：以合规单 vs 违规单的毛每美元为头条读数，采纳后与全历史两个切片并列，并写明全历史那一列因规则由它推出而必然好看。
+- [改进] 车道遵守度只取干净口径样本（已平仓、净盈亏与开仓现金流均已知、由明细成交构建、ET 入场日 ≥ 2026-04-21），三类排除各自计数并原文给出理由；剔除最好 N 笔复用规模与频率同一实现与同一 n≥15 门槛。
+- [改进] 车道额度读数携带证据 build 的 as-of 交易日；build 不含今日、端点不可得或市场日无法确定时显式标缺并说明原因，绝不以 0 冒充「今天还没开过单」；采纳后尚无样本时显示「尚无采纳后样本」而非一张全 0 的表。
+- [修复] `personal-edge` 进程内 TTL 缓存改按 `(account_key, since)` 分键，避免不同前向切点共用同一条缓存条目。
+- [测试] 新增车道判定真值表（DTE 0/1/3/4/7/8 边界、当日/隔夜按 ET 自然日的边界、ET 12:00 边界、缺 DTE/缺日期 fail-closed）、剔尾门槛复用、干净口径三类排除、`since` 切片与空前向切片、端点 additive 合同回归；前端补检查清单三态与硬禁止渲染、额度标缺，以及遵守度区块的有样本与空采纳后样本渲染。
+- [文档] 更新 `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` 新增第 9 节，记录规则 v2 的干净口径依据数字、车道判定表与边界语义、端点 additive 合同、两个消费面行为、build #1 与 build #3 的真实读数交叉核对及诚实边界；专题细节未重复写入根 README。
+- [新功能] `/intraday` 日内扫描响应新增 additive `lane_availability` 今日车道可用性区块：对**深度层**标的从当日真实期权到期日元数据判定 0..7DTE 可用性并聚合 `day_type`（日内车道可用／过夜日／标缺），复用临期合约链读取路径的第一步（同一独占 QuoteContext lane + 到期日元数据查询），不发链窗口、不取现价、不发合约快照批次，也不向宽层清单扇出。
+- [新功能] 开仓前车道检查面板新增顶部「今日车道可用性」一行（规则出处 V2-E）：点名今天**哪几个**标的有 0DTE；今日无 0DTE 时选中日内车道给出 V2-E 硬阻断并一行写清证据（周二/周四历史 −2.61%/−3.74%，1DTE 当日 −4.97%），提醒绝不退而买 1-3DTE；选中过夜车道不阻断。
+- [新功能] 车道可用性叠加用户自身标的黑名单（PLTR/AMD/QQQ/SMCI，出处为 Playbook R3 与 V2-E 附带禁令，定义为前端有出处常量）：确证有 0DTE 但全部落在黑名单上时显示「今日仅黑名单标的有 0DTE」并同样阻断日内车道，存在非黑名单标的时照常放行且黑名单标的在提示中如实列出。
+- [新功能] `near-expiry-contracts` 响应新增 additive `has_zero_dte` / `available_dte_list` / `availability_unavailable_reason`，由已在手的到期日分组推导，零额外抓取。
+- [改进] 车道可用性一律 fail closed：链读不到时 `has_zero_dte` 显式为空并附原因，只有「全部标的都读到了链且都没有 0DTE」才判定为过夜日；判定不含任何星期逻辑（假日与特殊到期会让星期规则失效）。
+- [改进] 车道可用性额度护栏：逐标的按 ET 交易日缓存 1 小时（失败仅短缓存 5 分钟）、单轮新增读取上限 8、单轮参与判定标的上限 12；超限标的显式列入 `deferred_tickers` 并在下一轮补齐，绝不把「没查」说成「没有 0DTE」。
+- [测试] 新增车道可用性纯判定层用例（有/无 0DTE/链读不到三态、越界与畸形到期日行、day_type 三态优先级含「正向证据不因部分读不到而作废」与「一个读不到就不敢说过夜日」、星期无关性）、适配器用例（只查到期日元数据、链窗口/快照/现价一旦被调用即失败、诚实空态、元数据失败 fail closed、参数边界）、端点 additive 合同用例（两层模式三态、Moomoo 未启用零供应商读取、逐标的缓存跨轮询、额度预算推迟、单层模式恒为 null）与临期合约面板可用性字段用例；前端补车道日类型四态渲染、V2-E 硬阻断证据文案、黑名单专属与混合场景。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` 新增 §10，记录星期效应实为合约可用性的取证依据（周一/三/五全部盈利 vs 周二 −2.61%、周四 −3.74%；1DTE 当日 −4.97% 是全样本最差桶）、判定规则与 fail-closed 语义、零新增抓取路径与额度护栏、端点 additive 合同、面板四态与黑名单叠加，以及 2026-08-04 周二的真实读数（12 个深度层标的均无 0DTE → 过夜日）。
+- [新功能] 新增 `/rules`「交易纪律」页与 `GET /api/v1/journal/v2/rules-evidence`：把合约价格甜蜜区、DTE × 持有方式、时段、星期 × 0DTE 可用性、手续费门槛、仓位与回撤算术、相关性簇集中为后端可复算读数，与车道遵守度共用同一干净口径（`fill_allocations>0` 且 ET 入场日 ≥ 2026-04-21，毛口径＝净＋费用，风险＝`ABS(opening_cash_flow)`），前端只渲染不硬编码任何统计量。
+- [新功能] 交易纪律页新增手续费门槛计算器（单笔金额 × 每天笔数）：费率与默认锚点由后端下发，输入仅存在于组件 state，不落库、不上报，系统不猜账户规模。
+- [新功能] `POST /opportunities/option-walls` 升到 option-wall/1.3，additive 新增 `totals`、`ratios.call_put_oi_ratio`、`ratios.call_put_volume_ratio`（各带 metric basis，分母为 0 时显式 null + 原因）与 `oi_weighted_center`，并在既有期权墙 UI 呈现。
+- [新功能] 新增 append-only `option_wall_daily_snapshots`（键 `(market_date_et, ticker)`）与 `POST /opportunities/option-walls/daily-snapshot` 显式写入端点：复用既有墙位车道与缓存、零新增取数路径、逐 `(日期, 标的)` 幂等、有界不扇出，抓取失败不写入任何行，部分覆盖如实记录 `coverage_percent`。
+- [改进] call/put 比例与墙位一律作为事实描述呈现，随响应下发标准告警并逐字渲染：本仓库尚无历史 OI 序列，「高 call 比例＝会涨」与「价格会向最大痛点靠拢」两个说法均**尚未被检验**；不计算也不展示 max pain 预测，唯一相关读数严格标注为「未平仓分布的加权中心（描述，未验证是否有引力）」并带 `validated_as_price_magnet: false`。
+- [改进] `rules-evidence` 端点始终回显 `build_id`/`build_key` 并接受显式 `build_id`：本仓库当前无 activation 记录，默认解析会落在 CSV build #1（n=1,191）而非 canonical build #3（n=1,407），页面据此显示「这页在读哪个 build」，绝不静默替换。
+- [测试] 新增证据表聚合算术用例（金额加权 vs 逐笔平均、毛＝净＋费用、分档边界 `[lower, upper)`、当日平/过夜按 ET 交易日切分、剔尾门槛 fail closed、星期表排除缺 DTE、分位数线性插值、熔断触发笔数与回撤单路径）、端点合同用例（未构建态、各表齐备、横幅与 limitations 逐字、参数改变算术不改变样本、未知 build_id 422）、期权墙比例用例（零分母 null+原因、未配置态、告警进入 limitations）与快照写入器用例（幂等、append-only deny trigger、部分覆盖、失败不写、有界不扇出）。
+- [测试] 前端新增 `/rules` 页用例（各表渲染、计算器算术与不持久化、横幅与合规面板链接、Playbook 读取失败降级）与期权墙比例面板用例（双口径标注、告警逐字、加权中心不得被称作 max pain、零分母显示）。
+- [文档] 新增 `New-docs/phase1/15_TRADING_DISCIPLINE_EVIDENCE.md`，记录干净口径定义、build 解析现实与两个 build 的真实读数、七张证据表的实测数字、call/put 比例的诚实边界、逐日快照表 DDL 与写入器约束、显式触发方式及 2026-08-04 首条 NVDA 真实记录。
+- [新功能] `/intraday` 拆成「盘中计划（上）+ 实时扫描（下）」：扫描表逐行可「加入盘中计划」，计划按 ET 交易日作用域存本机（换日自动为空、可清空），逐标的给车道/规则四态核对、按今日车道的合约候选（$2-8 甜蜜区高亮、<$1 灰显警示）、张数与手续费换算及中性失效位提示。
+- [新功能] `POST /opportunities/intraday-top` additive 新增 `focus_symbols`（≤8）：与既有用户钉选同语义并入深度层（不占异动额度、与计划/钉选去重、并入同一批快照、进缓存 key），标注 `deep_lane_reason.promoted_by="user_focus"`；不参与 universe 解析，单层路径不受影响。
+- [改进] 开仓前车道检查改为零输入可用：新增「要求」态直接写出今天只能开的期限与 ET 约束窗口（不再显示标缺），今日无 0DTE 时整块大字警示并禁用日内车道，冷启动显示「读取中」而非标缺，删除无标的的财报行，额度改为按 ET 日归零的手动计数，正文样板话收敛为一行、长口径 caveat 移入 tooltip。
+- [测试] 新增计划清单/手动计数按 ET 日作用域与不劫持两层扫描、`focus_symbols` 并入去重/上界/off-quota/缓存 key/单层不变、逐标的规则四态、合约分档与张数手续费算术、页面区块顺序等用例。
+- [修复] 机会扫描单飞并发合同重写（16 分钟悬挂缺陷链）：工厂改在共享有界线程池执行，发起方与跟随方一样在租约到点得到可重试 504；超租约完成的结果不再丢弃而是发布进完成态缓存供下一次轮询命中；在途计算存续期间绝不接纳第二个 leader（重复扫描不再自我放大）；此前缺 504 翻译的期权端点（overview/context/walls/daily-snapshot/events）补上统一超时响应。
+- [修复] 新增 Moomoo 进程级断路器（无新增环境变量）：连续 3 次传输类失败（RPC 异常/连接失败/超时断连详情）后打开，60 秒冷却期内快照、期权异动、到期日可用性、wall lane 获取与 history kline 全部快速失败并保持既有 unavailable+reason 语义，冷却后放行单个带租约的探针；业务型拒绝不计入失败。
+- [修复] Tier-1 批量快照的未知代码恢复：单个 `Unknown stock` 不再拖垮整批（实测 69 码全败）——点名代码即过滤重试、未点名则二分重试（额外调用 ≤3 次硬顶），未解析代码经既有 `snapshot_unresolved_symbols` 如实披露；传输类失败仍整批 fail closed。
+- [修复] `MoomooFetcher` 每笔 RPC 与健康检查 `close()` 改持同一把生命周期锁，杜绝 RPC 执行中途连接被拆的竞态。
+- [改进] 车道可用性在日内榜 leader 内改用 2.5 秒 wall lane 短等待，lane 正忙以 `deferred_wall_lane_busy` 推迟到下一轮且不缓存失败；当日晋升账本只提交真正深扫的标的（被总数硬顶挤掉的不再消耗配额记录）；mom15 动量历史改时间制保留并由单层/两层每轮 tier-1 快照共同喂养；扫描完成态缓存上限 32→128；`StockService` 改用进程级共享 `DataFetcherManager`，5m 波段车道不再每标的每轮新建 OpenD 连接。
+- [测试] 新增确定性并发/断路器/批量拆分回归：慢工厂＋短租约证明 leader 按租约 504、迟到结果发布、同 key 不启动第二工厂、失败清账可重算；假时钟断路器覆盖三连败打开、冷却单探针、失败探针重冷却、探针租约自愈与传输/业务分类；混合有效/未知代码批次的点名过滤与二分重试、lane 忙推迟不缓存、账本只记深扫、动量时间制保留、共享 manager 复用与 close-RPC 互斥。
+- [文档] `New-docs/phase1/06_DAILY_OPPORTUNITY_BOARD.md` 新增 §12，记录单飞截止时间/迟到发布/单 leader 合同、Moomoo 断路器语义、lane 短等待推迟、未知代码批量恢复与 G-7a–e 修复及其确定性测试位置。
+
+- [修复] 盘中车道可用性「今日仅黑名单标的有 0DTE」判定收紧：仍有非黑名单标的未读（链读不到/本轮延后未查）时不再断言日内车道关闭，改为显式标缺（未读 ≠ 无 0DTE）。
+- [修复] 日内榜休市排序口径文案与实现对齐：v2 起休市按最近交易时段最强波段分排序（缺波段读数的行退回证据计数序），limitations 不再声称「休市退回证据计数排序」。
+- [修复] 近 30 分位移断档诚实化：additive `window_span_minutes` 报告 6 根 5m K 线窗口的实际跨度，超过 45 分钟按 fail-closed 标缺；前端在单元格与 tooltip 标注「含断档，跨 X 分钟」。
+- [修复] 实时扫描概览行分母改为「有位移读数的 N 檔」并如实计数标缺檔（未读不并入未达）；量比中位改为标准中位数（偶数个取中间两值平均）。
+- [修复] 实时扫描表头在载荷缺 signal_version 时显示「版本未声明」，不再回退硬编码的 intraday_session_evidence_v8。
+- [改进] 盘中计划合约候选表新增逐行报价 as-of 列与「报价以逐行 as-of 时点为准」脚注，bid/ask/点差不再冒充此刻盘口。
+- [改进] 盘中计划位移行改为中性描述态（达/未达 0.5 ATR 参考线 + v8 循环性更正随行携带），不再渲染成符合/不符合；今日车道未知时合约区同时显示 0DTE 与 4-7DTE 两个合规窗口（绝不 1-3DTE），不再默认 0DTE。
+- [修复] 交易纪律证据（rules-evidence）缺 total_fee 的回合不再按 0 费用进毛口径/费率：从两个比率的分子分母中排除，以 `fee_unknown_count` + limitations 报告排除口径；DTE×持有方式剔尾读数补上其声称的 n≥15 门槛（低于门槛 null + 原因）。
+- [修复] journal personal-edge / rules-evidence 进程内缓存键并入解析后的默认 build id：build 激活即自然失效，不再把旧 build 的数字多端上最长 10 分钟；Web 侧 personal-edge 会话缓存 TTL 收紧为 2 分钟。
+- [修复] 期权墙逐日快照写入器在缺 coverage.coverage_percent 时整行拒写（fail-closed + 原因），不再把缺席 0 回填进 append-only 的不可变行。
+- [chore] 移除 personal-edge `rule_compliance.daily_budget` 区块（V2-D 额度读数，本周新增的 additive 字段）：Journal 永远不含「今天」，该读数的 as-of 恒落在过去、恒为过期，且已无任何前端消费方；当日额度由前端手动计数（useIntradayManualBudgetStore）承载。
+- [修复] styleMatch S2/S3 的 not_matched 原因只陈述观测到的失败，标缺输入如实写「标缺」，不再断言未观测的事实；当日 <6 根 5m K 线且无上一时段可回退时，哑火形态按标缺（median_basis_insufficient）处理，不再基于退化中位数硬算。
+- [修复] 开仓前车道检查的 ET 时钟增加 5 分钟过时界：过时脉搏不再给出「符合」（「已过 12:00 截止线」这类单调事实保留为不符合），角落时钟标注「约 N 分钟前的服务端时点，已过时」；/rules 页刷新失败仍显示旧表时新增「显示的是上次成功读取（时间）」标注。
+- [文档] docs/CHANGELOG.md [Unreleased] 段的分类标题（### 发布亮点/新功能/改进/修复/测试）整理为扁平 `- [类型]` 行，符合 AGENTS.md 硬规则。
+- [新功能] 盘中默认扫描的服务端预热循环（`INTRADAY_REFRESH_SCHEDULER_ENABLED`，默认关闭）：工作日 04:00–20:00 ET 内每 `INTRADAY_REFRESH_INTERVAL_SECONDS`（默认 45，地板 30）秒预热页面默认轮询命中的同一扫描 key，走与用户请求相同的 single-flight 路径（join-not-duplicate，绝不并发第二个工厂）；断路器打开时安静折叠保持节奏，预热结果与请求驱动结果同缓存同 TTL 不可区分。
+- [改进] `/opportunities/intraday-top` 响应新增 additive 延迟诊断字段 `generated_in_seconds`（工厂墙钟耗时；缓存命中报告原始生成耗时）与 `served_from`（fresh/cache/warm_cache）；实时扫描表脚注渲染「本轮扫描耗时 Xs · 缓存命中」一行小字。
+- [测试] 预热调度器 tick 时窗闸门（假时钟）、失败折叠与状态迁移日志、间隔地板钳制、lifespan 开/关接线、预热加入用户 leader 的单飞（慢工厂确定性）、延迟字段 additive 合同与前端脚注渲染。
+- [新功能] 盘中机会提示器（`INTRADAY_ALERTS_ENABLED`，默认关闭，依赖 `INTRADAY_REFRESH_SCHEDULER_ENABLED`）：挂在预热循环的扫描载荷上（零新增取数），把五类事实推送到 Telegram——盘前 |pre_change_percent|≥2% 异动、放量爆发（量比 ≥2 且爆发分 ≥2.5）、新强波段入账、近 30 分位移达 ±0.5 ATR（美元换算沿用前端扫描表同一口径，仅日线 ATR14 标尺）、当日 0DTE 日型；黑名单标的（PLTR/AMD/QQQ/SMCI，后端单一出处 src/opportunities/blacklist.py）不压制只附「⚠️ 你的历史亏钱标的」标注；每条消息末尾固定「事实描述，非买卖信号」，全文无概率、建议或买卖措辞。
+- [新功能] 提示防骚扰：（标的×规则）ET 日去重（进程内，中途重启后最坏重复提示）、单 tick 多条合并为一条消息、全局日上限 `INTRADAY_ALERTS_MAX_PER_DAY`（默认 20，最小 1）触顶补「今日提示已达上限 N 条」后当日停发；发送在独立线程消化有界队列，Telegram 失败/恢复仅状态变化时各记一行日志，绝不阻塞或拖垮预热节奏。
+- [测试] 提示器五规则触发/不触发与文案、盘前时段闸门、黑名单标注、日内去重与 ET 翻转清零、全局上限与终止通知、批量合并单消息（单页脚）、发送失败安静降级与异常吞噬、有界队列不阻塞、warm 入口 observer 接线、lifespan 三态接线（开/缺预热/默认关）、配置解析与最小值钳制（夹具载荷 + mock 发送器，全部确定性）。
+- [改进] 实时扫描表「你的战绩」列按用户要求移到最后一列（详情按钮之后）：它是上下文标注、不是盘中交易关键读数，语义与列头 tooltip 不变。
+- [新功能] 盘前涨跌可见：`IntradayTopCandidate` 声明 additive 字段 `pre_change_percent`（仅盘前时段有值，非盘前服务端置 None——快照 pre_* 列开盘后残留早间读数属陈旧值）；扫描表「涨跌%」列盘前时段主行改示「盘前 +x.x%」（标缺显式「盘前标缺」）、副行如实标「昨日 +x.x%」（G-12：session_change_percent 此刻仍指向上一常规时段），列头排序同口径；常规时段渲染不变。
+- [改进] `/intraday` 的期权异动 feed 移入 Journal 仓位复盘页签（新包装组件 JournalOptionEventReview，进页签只读一次不轮询）：用户定位「期权异动是复盘证据，不是盘中决策输入」；feed 组件本体与「分类不证明开平仓方向」脚注原样保留。
+- [新功能] `/intraday` 侧栏新增「盘前期权异常 · 昨日事实」面板：深度层名单（≤8 檔）的上一时段 call/put 成交量比与 OI 比（既有 option-walls G-24 比例，0–45 DTE）+ 最近一页异动最大单笔（既有 option-events，每批 ≤3 檔、每檔 ≤10 条）；偏斜章（比值 ≥3 或 ≤0.33）与大单章（单笔 ≥$1M）均为 v1 启发式圆整阈值、未经验证；盘前 + 开盘 30 分钟自动展开、其后收起，收起态零请求，逐檔 fail-closed 标缺；footer 固定携带「OI＝上一清算时段、成交量/大单＝上一时段累计」「分类来自供应商，不构成方向证明；比例异常≠会涨会跌——该假说在你的数据上尚未检验」。
+- [新功能] 盘中机会提示器新增规则 6「盘前期权大单」：盘前时段候选 option_activity.max_single_turnover ≥ $1M（与面板同值阈值）→「{T} 期权大单 $x.xM（上一时段异动页最大单笔）」，每标的每日一次；预热载荷不含 call/put 比例（在 option-walls 端点上），偏斜提示有意跳过、不为它新增取数路径。
+- [测试] 扫描表列序（你的战绩收尾+列数不变）、盘前涨跌主行/昨日副行/盘前标缺与盘前口径排序、候选 pre_change_percent 盘前携带与非盘前置 None 的序列化契约、期权异动 feed 迁移（/intraday 不再渲染 + Journal 复盘页签渲染 + 包装组件加载/失败诚实态）、盘前期权异常面板（事实渲染、偏斜/大单阈值含边界值、批量请求上界、逐檔标缺、收起零请求、盘段展开节奏、空态）、提示器规则 6 触发/阈值/时段闸门/日内去重。
+- [文档] New-docs/phase1/06 更新 §2.8 默认列序与盘前涨跌口径、§14 提示器第六条规则，新增 §15 盘前期权异常面板（数据路径、阈值、展示节奏与诚实边界）；README 未改（页面板块级交互细节按仓库分层惯例落在 phase1 专题文档）。
+- [新功能] 实时扫描表新增「期权墙」列（形态后、详情前）：深度层每檔上一清算时段 OI 分布事实——紧凑两行「C 210 · P 195」+「γ205 · 中心202.4」（两侧最大 OI 墙 / gross gamma 集中行权价 / OI 加权中心），tooltip 逐位给 OI 张数、占该侧%、距现价%、主力到期与 as-of；不渲染任何「最可能收在」预测，「价格会向墙位靠拢」未验证的边界（逐日快照 2026-08-04 起积累）逐字挂列头与单元格 tooltip；深度层外/读取失败显式标缺。
+- [改进] 期权墙读取抽出共享 hook useDeepLaneOptionWalls：扫描表「期权墙」列与盘前期权异常面板共用同一次 option-walls 批量请求与 sessionCache（名单派生/≤5 檔分批/在途去重只发生一次），零新增取数路径。
+- [改进] 盘前期权异常面板版式整理：大单章把方向写进标题（「大单 Call $7.9M」）；每檔一行一个事实、标签对齐；「最大单」一行给全明细，去掉重复的「大单明细」行；比例无定义时可见行收敛为紧凑短语（如「近月窗口无合约」），服务端原因逐字连同成因解释（大单落在 0–45 DTE 窗口外的远月 LEAP）挂 ⓘ tooltip。
+- [改进] 界面披露策略落地（用户反馈「不要急着撇清关系」）：常驻披露整句（「不是买卖建议」「机械核对」「事实描述，非信号」、RulesPage 警示横幅、规则遵守度 limitations 常驻列表、扫描表 footer「不是信号/非预测」措辞）从可见界面移除，原文一字不删地收进各面板标题行的共享 ⓘ（新组件 InfoHint）tooltip 或「完整口径」切换；as-of 时点、标缺原因与逐读数口径标注保留可见；后端 Telegram 尾行未动。
+- [测试] 扫描表期权墙列（渲染/批量共享读取/逐檔标缺/列头 tooltip 未验证边界）、11 列列序、footer 披露句迁移；盘前期权异常面板（大单方向章面、事实行版式、紧凑比例原因 + ⓘ 原文、诚实口径迁入 ⓘ）；车道清单/盘中计划/RulesPage 横幅/规则遵守度 limitations 的 tooltip-only 断言迁移。
+- [文档] New-docs/phase1/06 更新 §2.8 默认 11 列与期权墙口径、§15 面板文案与共享读取，新增 §16 界面披露策略；README 未改（板块级交互细节按仓库分层惯例落在 phase1 专题文档）。
+- [修复] OpenD 网关崩溃致行情通道静默降级 6 天（2026-08-14 22:25 起熔断器打开、页面大片标缺无人知晓）：清理僵尸进程重启 OpenD 后自愈；根因为外部进程崩溃，系统侧按设计降级但缺少告警。
+- [新功能] 行情通道看门狗（G-31）：预热调度器逐 tick 观测 Moomoo 熔断器 `is_tripped`（探针成功前恒为断开，与 `is_open()` 的冷却语义区分以防恢复/断开刷屏），状态翻转时经提示器 `notify_system` 向 Telegram 各推一次「通道断开/已恢复」；系统通知不占每日提示上限。
+- [测试] 看门狗状态机（断开一次/持续不重复/恢复一次/watch 与 notifier 异常吞噬/未接线零行为）+ `is_tripped` 生命周期 + `notify_system` 不占上限；lifespan 假对象同步新签名。
+- [文档] 新增 `New-docs/phase1/16_EDGE_FORENSICS_AND_REGIME_GATE.md`：2026 年 1–7 月真实交易取证（月度盈亏、DTE 期望翻转、费用拖累、频率升级、集中度）、文献基础（Coval-Shumway/Goyal-Saretto/Barbon-Buraschi/Moreira-Muir/Lo-MacKinlay 等）、规则 R1–R5 与实施计划 E-1..E-5；阈值校准阻塞于 2026-08 CSV 导入。
+- [新功能] Journal 新增 `src/journal/edge_stats.py` 纯函数统计模块：expectancy bootstrap 置信区间、距统计显著所需样本、0-1/2-7 DTE 分桶期望、费用拖累比、交易频率、Kelly 估计（n<30 fail closed）与月度分解；只读、不接存储层。
+- [新功能] Regime 新增 `src/regime/varratio.py`：Lo-MacKinlay 方差比 VR(q)（含异方差稳健 z）、趋势/均值回归形态分类、Moreira-Muir 逆方差仓位缩放与 0-1DTE 准入门（缺输入一律 fail closed）；纯函数，不改变现有评分链路。
+- [测试] 新增 `src/journal/tests/test_edge_stats.py` 与 `src/regime/tests/test_varratio.py`：已知答案用例、bootstrap 确定性、AR(1) 合成序列方向性、边界与 fail-closed 回归。
+- [新功能] Journal 导入 2026-08 Moomoo CSV（folder_watcher 正式链路，+3,600 事件、去重 681，全账本 2,671 笔）；`New-docs/phase1/16` 增补 §1.7 全账本终版口径（2-7DTE 连续 5 个月为正 +$195,292，0-1DTE 6–8 月 −$131,034，累计 7/31 达峰 +$208,366）。
+- [新功能] Regime 新增 `tsmom_mm_gate`（QQQ/SOXX 20 日时序动量 + Moreira-Muir 逆方差 scale 的 0-1DTE 准入门）：训练 4–6 月保留全部利润、样本外 7–8 月屏蔽 80% 亏损、五个最差日全红灯；校准协议与诚实限制记录于 doc 16 §5.1。
+- [测试] `test_varratio.py` 新增 tsmom_mm_gate 真值表与 2026-08-03 真实特征重放判决测试（28 passed）。
+- [文档] doc 16 增补 §5.2（E-4 第 2 部分）：日内 VR 判别（VR≥1 动量态 16 天 0-1DTE 合计 −$162k，与 gamma-fragility 文献一致，记为 H4 待实时验证）；R6 熔断真实序列模拟（$5k 救 +$72k 但非单调）；叠加测试证明 gate 为主防线、R6 仅灾备不叠加。
+- [文档] doc 16 增补 §5.3 投产级验收：PBO 62.9%（CSCV）、DSR 49%、H1 t=1.79（HLZ 门槛 3.0）三道关均未过；裁定 gate 仅作防御部署（禁止绿灯加仓）、H1 记 promising/证据不足（估需再 ~247 交易日）、上线即逐日记录并预注册季度重验与升格/废除判据。
+- [新功能] 新增 `GET /api/v1/journal/edge-panel`（`src/journal/edge_panel.py` 服务层）：tsmom_mm_gate 实时档位（QQQ/SOXX 20 日动量 + MM scale，yfinance 30 分钟缓存，行情失败一律 fail closed 红灯）、DTE 分桶期望、H1 日度 t 值 vs HLZ 3.0 门槛、当日频率与本月费率纪律指标。
+- [新功能] Web `/journal` 新增「今日武器档位」卡片（EdgePanelCard）：gate 红绿灯与中文拦截原因、特征行、0-1/2-7 分桶表、H1 证据状态行（含距显著剩余样本）、纪律行（今日 x/8 笔、本月费率超 30% 标红）；行情不可用渲染红色 fail-closed 横幅，不空白。
+- [测试] 新增 edge_panel 服务与端点测试（含行情失败 fail-closed、空账本路径）及 EdgePanelCard 渲染测试；api 全套 280 passed、journal 全套 527 passed、web lint 0 errors、build 通过（Node 22）。
+- [文档] `New-docs/phase1/17_PRO_PRACTICE_BLUEPRINT.md`：基于 5 份深度研究简报（日内动量/期权流文献、机构扫描与复盘实践、工具基准，含引用与证据强度）的设计蓝图——贴合度评审、推送四级分级（P0≤1/日可打断休息）、深度复盘界面规格（盲评式日终流 S0-S4/单笔深潜含 MAE-MFE 诚实用法与机械 what-if/过程与结果物理分离）与 Phase A-C 实施计划；研究结论与用户自身已证明负结果冲突处均以用户数据为准并明示。
+- [新功能] 引导式日终复盘流（蓝图 17 Phase A）：新路由 `/journal/review/daily` 的 S0 检票（休息日一键确认＝过程指标）→S1 违规扫描（classify_rule_lane 机械判定，逐条违规强制一句话确认）→S2 七项过程打分（自动优先/手填兜底/缺席标缺）→S3 持仓出场预登记（写既有 append-only 复盘链）→S4 封卷步进器；盲评为核心机制——密封并自愿点击「揭示当日结果」前，页面与 API 载荷均不含任何盈亏字段，揭示顺序本身入库。
+- [新功能] 新增 `GET/POST /api/v1/journal/review-flow/daily`（`api/v1/endpoints/journal_review_flow.py` + `src/journal/review_flow.py`）：服务端计算车道判定、Duke 四象限（违规∧盈利＝「侥幸」标红）与可自动化过程指标，密封要求违规全确认、揭示要求已密封；会话落 `journal_v2_daily_review_sessions` append-only 修订链（deny trigger 拒绝 UPDATE/DELETE，按 account+ET 日幂等，含 sha256）。
+- [新功能] MAE/MFE 标的 5m 近似口径（蓝图 17 §三(b)诚实用法）：纯函数 `src/journal/excursions.py`（exposure 判定表、U0/逐 bar 公式、ATR14 标尺、fail-closed status），append-only `journal_v2_episode_excursions`（(build,episode,code_version) 唯一幂等）＋本地 `market_5m_bars` 持久层（只写已完结 RTH bar，覆盖率随时间趋近 100%）；`scripts/backfill_excursions.py` 回填近 ~60 天并兼任每日增量任务（`--daily`，挂既有调度，不新增守护进程），超窗回合写永久标缺、绝不以 0 或日线冒充。
+- [新功能] 单笔复盘页改造为蓝图强制顺序：区① 决策时快照（车道判定/在册出场计划/regime 与推送标缺徽章）→区② 折叠揭示（揭示前无 Net、无 K 线请求、保存按钮禁用）→区③ 四象限＋双轨标签（新增蓝图 mistake 词表 chips）→区④ 机械反事实（仅「仅合规车道」与「gate 执行」两个、永不叠加；gate 逐日记录未回填前标缺）；新增只读 MAE/MFE 偏移诊断（单笔读数＋按持有结构分层的 |MAE|×R 散点，永久免责「不用于设置止损；持仓分组存在内生性」由测试逐字锁定）。
+- [新功能] 新增 `GET /api/v1/journal/episodes/{id}/excursion` 与 `GET /api/v1/journal/review-flow/excursions`（单笔记录或标缺原因＋机械判定；聚合散点数据），Journal 首页新增「今日复盘」入口卡（未开始/进行中/已密封/休息日）。
+- [测试] 新增 excursions 纯函数 18 例（深 MAE 后大 MFE/short put/跨日跳空/无 bar 标缺/组合腿不适用/partial 覆盖/ATR 标尺）、daily_review 修订链与密封-揭示顺序及 deny-trigger、review_flow 四象限与七项指标、端点 TestClient 全流程走查（载荷级盲评断言：密封揭示前 JSON 不含 pnl）；前端新增日终流步进器、ExcursionDiagnostics 免责逐字锁定与禁用指标（SQN/Zella 类合成分、hold-time 最优、MAE 止损）负断言测试。backend offline 全绿、web vitest 91 文件 839 用例全过、lint 0 errors、tsc 干净（Node 22）。
+- [chore] 对真实账本执行回填：build 1 的 1,437 笔已平仓回合全部落 excursion 行（ready 355 / partial 9 / missing_bars 1,051（多为超出 60 天保留窗口的永久标缺）/ not_applicable 22），30 个 underlying 共持久化 94,020 根 5m bar（2026-06-29→08-25，各 41 个交易日）。
+- [文档] 新增 `New-docs/phase1/18_DEEP_REVIEW_PHASE_A.md`（Phase A 实现注记：表 DDL、端点契约、七项指标 Phase A 可得性、5m 持久化调度方式、与蓝图的偏差清单）；README 未改动——本次为 `/journal` 子页面新增能力，入门/部署面无变化，专题细节按 §1 归档于 New-docs/phase1。
+- [修复] 日终复盘「揭示」改为服务端逐字重放已密封修订（最小请求：日期＋可选 expected_revision 链位校验，内容字段一律忽略）：页面重载丢手填分、封卷后注解写入、指标 3 因会话行出现翻面等客户端漂移不再把揭示卡死为 422；保持揭示须晚于密封、不可与密封同修订、不可撤销，前端揭示按钮同步改走最小请求。
+- [修复] MAE/MFE exposure 判定接受账本真实资产词汇 `equity`（保留 `stock` 别名）：22 笔正股回合不再被假 `not_applicable`；excursion 行所有时间戳统一 UTC 入库、按 UTC 读出（旧 ET wall-clock 行保留在 1.0 版本下）；短于一根 5m bar 的持有改判 `not_applicable`（原因 `sub_bar_hold_below_5m_granularity`，粒度限制不再谎称缺数据）；u0_flag 区分「盘外开仓」（时钟）与「入场日无 bar」（数据缺口）并更新前端文案。
+- [修复] excursion 回填不再永久冻结瞬时抓取失败：唯一键扩为 (build, episode, code_version, attempt)（SQLite 重建表迁移，旧行 attempt=1 原样保留、append-only 触发器重装），保留窗口内 missing_bars/partial 行在 bars 后到且结果严格更好时以 attempt+1 追加，无新 bar 重跑零写，读取取最优/最新 attempt。
+- [修复] 日终复盘流的 ET 换算改用真实 America/New_York（DST 感知）：EST 时段 11:30 的 0DTE 入场不再被 UTC−4 近似误判为 late_0dte；personal_edge 自身的文档化近似口径不变。
+- [修复] 日终复盘 POST 重排为「先校验后落笔」：被拒请求（无效 ack、密封冻结、超长内容等）不再留下出场预登记写入；过程指标 6（决策日志完整率）只认 thesis/trigger/rationale 至少一项非空，S3 出场预登记（附 exit_plan_registration tag 留痕）不再抬高该指标。
+- [改进] EXCURSION_LIMITATIONS 与前端偏移诊断如实声明「出场 bar 溢出」（平仓所在整根 5m bar 计入，平仓后至多约 5 分钟行情被计入）；excursion 口径版本递增至 underlying-5m/1.1。
+- [chore] 对真实账本以 underlying-5m/1.1 重跑回填：1,437 笔已平仓回合全部追加新版本行——ready 356 / partial 9 / missing_bars 1,039 / not_applicable 33（22 笔正股按 bar 可得性落 1 ready + 21 missing_bars；33 笔亚 bar 持有拿到诚实标注；episode 1064 改判入场日数据缺口）；5m 持久层增至 94,860 根 / 30 underlying。
+- [chore] 新增 launchd 模板 `scripts/launchagents/com.dailystock.excursion-daily.plist`（每日收盘后 5m 持久化＋增量回填；仓库不代为加载，加载命令由 `--daily` 运行结束打印，是否调度为用户动作）。
+- [测试] 新增揭示三场景回归（重载丢手填分/注解漂移/一步封卷后揭示）、被拒 POST 零写、UTC round-trip、attempt 重试严格更好才写、SQLite attempt 迁移重建、EST 车道判定、亚 bar 粒度与入场日缺口 flag、指标 6 排除规则、前端 S2 禁用词负断言扩展；后端新增跨语言免责常量守卫测试（读取前端 reviewHardLines.ts 断言逐字节一致）。
+- [新功能] 历史 Phase B 曾将盘中提示重构为四级协议：旧 P0 行动级（七条件全过，Telegram 响铃，≤1/日 ≤3/周）、P1 预备级、P2 页面观察级与 P3 台账级；该旧 P0 合同现已被本段顶部的 `p0_2m_signal_v1` 四条件、2/日与7/周预算覆盖。
+- [新功能] 新增 append-only 推送台账 `journal_v2_push_events`（deny trigger，同 journal_v2 全家）：每条分级决定 dispatch 前落库（含七条件评估 JSON、去重键、gate 状态、被抑制原因——无静默丢弃），Telegram 发送结果以 delivery 行追加记 ok/fail；提示器重启后当日去重键与 P0/P1 预算从台账重建，修复原「中途重启最坏重复提示」注明缺陷（台账不可读时如实回退进程内去重）。
+- [新功能] 新增 `GET /api/v1/journal/push-ledger/daily` 与 /intraday「今日提示流」卡：当日台账逐条可见（tier 徽标/通道/被抑制原因/发送失败）、四级硬预算用量、P0 passed 率（滚动 20 条机械代理，>70% 应收紧的阈值披露；自动收紧闸在代码常量 `P0_AUTO_TIGHTEN_ENABLED=False` 后，绝不静默自改）。
+- [新功能] 日终复盘过程指标 1「推送依从率」由标缺转为推送台账机械关联自动值：今日新开回合中开仓前同日同标的存在已投递 P0/P1 推送的比例；台账当日无记录或今日无新开回合仍标缺；reason 原样携带诚实限度（机械关联只证明行动相关、不证明因果）。
+- [新功能] 财报前长权利金拦截（蓝图改进 #3）：盘中计划面板对命中财报回避窗的标的渲染硬性警示红框（de Silva, Smith & So 2026, Rev. Finance：均亏 5-9%，高预期波动事件 10-14%；只警示不禁止），推送侧同一命中把 P0/P1 降级 P2 并附同一红字，日历不可得时 P0 降 P1（未知≠安全）。
+- [新功能] 跨周末持仓提示（蓝图改进 #4）：周五 ET ≥14:00 以 P1 静默罗列未平仓回合事实，框架为「跨周末持仓：隐波周末衰减证据（Jones-Shemesh）」；持仓快照不可得时落 P3 台账行带原因（不静默跳过）；周四/五的 P0/P1 行文自动附跨周末标注。
+- [改进] `TelegramSender.send_to_telegram` 新增 additive `disable_notification` 参数（Telegram 官方静默投递，P1 预备级使用；纯文本回退保留该旗标），默认行为逐字节不变。
+- [改进] R6 灾备保险丝接入推送（蓝图改进 #9）：当日已实现亏损触 $12k 宽线后当日 P0/P1 全部降级为页面提示并发一条静默触线通告，明日复位；盈亏数据缺失＝维持现状（不触发也不冒充未触线）。
+- [改进] 推送与面板系统文案执行「聪明钱/主力/大资金」措辞禁令（蓝图改进 #5）：盘前大单文案改为中性来源声明（可能是对冲/库存流，不构成方向），期权墙 tooltip「主力到期」改「首要到期」；前后端各有负向断言测试锁定不回潜。
+- [文档] 新增 `New-docs/phase1/19_PUSH_TIERING_PHASE_B.md`：四级协议实现映射、P0 七条件逐条可评估性（含标缺→降级的诚实声明）、台账 DDL 与重启重建、指标 1 公式与已知限度、对照蓝图的偏差清单；根 README 未重复专题细节。
+- [测试] 新增 P0 七条件真值表（逐条翻转必降级）、双窗确认状态性（连续两窗/断档重来/方向翻转）、静默投递参数、台账 append-only 与重启重建、指标 1 机械关联与诚实限度文案、财报拦截三态、跨周末提示时间闸门、尾盘助手资格标缺降级、P1 预算耗尽原因、措辞禁令负断言（Python + vitest）、推送台账日 feed 端点契约回归。
+- [修复] R6 保险丝触线日的跨周末持仓提示不再被无痕跳过：落一条被抑制的 P3 台账行（weekend_notice_suppressed_by_fuse）并登记当日去重键，丢弃可见且不重复评估（无静默丢弃红线）。
+- [修复] R6 保险丝改为按 ET 日锁存（当日不可上调）：触线后盈亏回升或盈亏数据断供都不再当日解锁，重启后从台账触线通告行 re-latch；缺失语义精确化——未锁存＋缺失对 P1 按未触线处理（缺数据绝不触发），P0 行动级要求正面确证未触线、缺失时按不确定规则降 P1。
+- [修复] journal_v2_push_events 的 append-only deny trigger 随建表就位：push_models 注册表级与 metadata 级 after_create 钩子（模式同持仓快照表），Base.metadata.create_all 建表路径不再留下「建表后、首次仓库调用前」的无保护窗口，对既有无触发器数据库幂等补装；线上库已执行补装并验证两只触发器在位。
+- [修复] 财报拦截回避窗按车道取宽：4-7DTE 隔夜车道（引擎默认与计划面板过夜/车道未知模式）按 intraday_top 的前向 5 天财报窗口拦截，0DTE 日内语境保留 ≤3 天口径；不另设平行数字。
+- [改进] 推送队列拥塞日志逐次记录（成功入队重置指纹，不再整个进程只记第一次）；系统通知被队列满丢弃时留一行显式日志（系统通知无台账行，日志为文档化的唯一痕迹）。
+- [改进] 过程指标 1「已投递」按层收严：P0/P1 须有 telegram_ok=true 的 delivery 行才计（decision 行只证明「决定发」）；跟随计数按回合侧去重（一笔回合至多满足一条推送）；P0 passed 率滚动窗口改为有界分批回扫并如实报告实际窗口；R6 盈亏 provider 增加 SQL 侧日期预过滤，不再全量扫描 build。
+- [修复] earnings_veto 对 within_blackout 增加布尔契约防御：非布尔（生产方契约漂移）一律判 unknown（未知≠安全），不当命中也不当清白。
+- [文档] .env.example 盘中提示器说明与 New-docs/phase1/06 §14 更新为四级推送协议现实（P2 页面化、台账重启重建，指向 phase1/19）；phase1/19 补记 R6 锁存与缺失语义、财报车道窗口、条件④恒真声明、指标 1 送达口径与 gate 红灯端到端测试名。
+- [测试] 新增 R6 锁存（盈亏回升/断供/重启 re-latch/缺失降档 P0）、触线日跨周末 P3 行、gate 红灯日型抑制与 red_lanes 钩子端到端、p0_candidate_eval P3 写入与差额签名去重、条件⑦ as_of 不可解析标缺、财报车道窗口（Python + vitest）、指标 1 送达确证与回合侧去重、passed 率窗口回扫、队列拥塞逐次日志与系统通知丢弃留痕回归。
 
 ## [3.11.0] - 2026-03-27
 

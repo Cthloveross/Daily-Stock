@@ -25,10 +25,10 @@ const STATE_COLOR: Record<RegimeState, string> = {
   no_trade: 'text-down-strong',
 };
 const STATE_LABEL: Record<RegimeState, string> = {
-  aggressive: 'AGGRESSIVE',
-  standard: 'STANDARD',
-  cautious: 'CAUTIOUS',
-  no_trade: 'NO TRADE',
+  aggressive: 'SUPPORTIVE',
+  standard: 'MIXED',
+  cautious: 'HIGH RISK',
+  no_trade: 'ADVERSE',
 };
 
 function formatScore(n: number): string {
@@ -93,6 +93,7 @@ export const RegimeScore: React.FC<RegimeScoreProps> = ({
     </div>
 
     {note && <div className="text-caption text-text-3">{note}</div>}
+    <div className="text-caption text-text-4">仅作市场风险背景，不决定 DTE 或标的异动是否成立。</div>
     <div className="text-caption text-text-4">
       {version && <span className="font-mono">{version}</span>}
       {version && updatedAt && <span> · </span>}

@@ -53,14 +53,36 @@ class RegimeResult:
 
 
 def classify(score: int, *, aggressive: int = 75, standard: int = 55, cautious: int = 35) -> tuple[str, str]:
-    """Map a numeric score onto the four action labels."""
+    """Map a numeric score onto four descriptive risk-context labels.
+
+    The label is not a DTE permission gate.  ``INTRA-0-7`` candidates always
+    keep their own same-ET-day exit and contract-liquidity requirements.
+    """
     if score >= aggressive:
-        return "aggressive", "Full size within plan; breakouts > retests."
+        return (
+            "aggressive",
+            "Supportive Regime context only. INTRA-0-7 still requires a "
+            "same-ET-day exit and verified contract liquidity.",
+        )
     if score >= standard:
-        return "standard", "Standard risk; wait for retests, skip chases."
+        return (
+            "standard",
+            "Mixed-to-supportive Regime context only. INTRA-0-7 still "
+            "requires a same-ET-day exit and verified contract liquidity.",
+        )
     if score >= cautious:
-        return "cautious", "Half size; retests only; no 0DTE."
-    return "no_trade", "Stand aside today; paper-trade instead."
+        return (
+            "cautious",
+            "Higher-risk Regime context; this does not prohibit 0DTE. Apply "
+            "the strictest spread and quote-freshness checks and exit the "
+            "position on the same-ET-day basis.",
+        )
+    return (
+        "no_trade",
+        "Adverse Regime context; treat it as counter-evidence, not a blanket "
+        "DTE prohibition. Any INTRA-0-7 candidate still requires verified "
+        "liquidity and a same-ET-day exit.",
+    )
 
 
 def current_market_date(now: Optional[datetime] = None) -> date:
@@ -172,7 +194,7 @@ def compute_regime_score(
         d5_prev_day=d5,
         d6_premarket=d6,
         snapshot=snapshot,
-        version="v2",
+        version="v3",
         generated_at=datetime.now(timezone.utc),
     )
 

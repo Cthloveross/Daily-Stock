@@ -12,7 +12,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from dotenv import dotenv_values
 from fastapi.responses import Response
-from starlette.requests import Request
 
 # Keep this test runnable when optional LLM runtime deps are not installed.
 try:
@@ -32,6 +31,28 @@ def _reset_auth_globals() -> None:
     auth._password_hash_salt = None
     auth._password_hash_stored = None
     auth._rate_limit = {}
+
+
+async def _invoke_asgi(middleware, scope):
+    """Run one HTTP request through an ASGI middleware and capture messages."""
+    messages = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        messages.append(message)
+
+    await middleware(scope, receive, send)
+    return messages
+
+
+def _response_status(messages) -> int:
+    return next(message["status"] for message in messages if message["type"] == "http.response.start")
+
+
+async def _status_response_app(scope, receive, send, *, status_code: int = 200) -> None:
+    await Response(status_code=status_code)(scope, receive, send)
 
 
 class AuthApiTestCase(unittest.TestCase):
@@ -219,13 +240,54 @@ class AuthApiTestCase(unittest.TestCase):
             "server": ("testserver", 80),
             "root_path": "",
         }
-        request = Request(scope)
-        middleware = AuthMiddleware(app=MagicMock())
+        downstream = AsyncMock()
+        middleware = AuthMiddleware(app=downstream)
 
         with patch("api.middlewares.auth.is_auth_enabled", return_value=True):
-            response = asyncio.run(middleware.dispatch(request, AsyncMock(return_value=Response(status_code=200))))
+            messages = asyncio.run(_invoke_asgi(middleware, scope))
 
-        self.assertEqual(response.status_code, 401)
+        self.assertEqual(_response_status(messages), 401)
+        downstream.assert_not_awaited()
+
+    def test_auth_middleware_forwards_streaming_messages_unchanged(self) -> None:
+        """Auth must not repackage downstream file/stream response bodies."""
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/assets/example.woff2",
+            "headers": [],
+            "query_string": b"",
+            "scheme": "http",
+            "client": ("127.0.0.1", 1234),
+            "server": ("testserver", 80),
+            "root_path": "",
+        }
+        expected_messages = [
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-length", b"6")],
+            },
+            {"type": "http.response.body", "body": b"abc", "more_body": True},
+            {"type": "http.response.body", "body": b"def", "more_body": False},
+        ]
+        sent_messages = []
+
+        async def downstream(_scope, _receive, send):
+            for message in expected_messages:
+                await send(message)
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            sent_messages.append(message)
+
+        middleware = AuthMiddleware(app=downstream)
+        with patch("api.middlewares.auth.is_auth_enabled", return_value=True):
+            asyncio.run(middleware(scope, receive, send))
+
+        self.assertEqual(sent_messages, expected_messages)
 
     def test_logout_requires_session_when_auth_enabled(self) -> None:
         scope = {
@@ -239,15 +301,14 @@ class AuthApiTestCase(unittest.TestCase):
             "server": ("testserver", 80),
             "root_path": "",
         }
-        request = Request(scope)
-        middleware = AuthMiddleware(app=MagicMock())
-        call_next = AsyncMock(return_value=Response(status_code=204))
+        downstream = AsyncMock()
+        middleware = AuthMiddleware(app=downstream)
 
         with patch("api.middlewares.auth.is_auth_enabled", return_value=True):
-            response = asyncio.run(middleware.dispatch(request, call_next))
+            messages = asyncio.run(_invoke_asgi(middleware, scope))
 
-        self.assertEqual(response.status_code, 401)
-        call_next.assert_not_awaited()
+        self.assertEqual(_response_status(messages), 401)
+        downstream.assert_not_awaited()
 
     def test_protected_api_accessible_with_session(self) -> None:
         scope = {
@@ -261,17 +322,15 @@ class AuthApiTestCase(unittest.TestCase):
             "server": ("testserver", 80),
             "root_path": "",
         }
-        request = Request(scope)
-        middleware = AuthMiddleware(app=MagicMock())
-        next_response = Response(status_code=200)
-        call_next = AsyncMock(return_value=next_response)
+        downstream = AsyncMock(side_effect=_status_response_app)
+        middleware = AuthMiddleware(app=downstream)
 
         with patch("api.middlewares.auth.is_auth_enabled", return_value=True):
             with patch("api.middlewares.auth.verify_session", return_value=True):
-                response = asyncio.run(middleware.dispatch(request, call_next))
+                messages = asyncio.run(_invoke_asgi(middleware, scope))
 
-        self.assertEqual(response.status_code, 200)
-        call_next.assert_awaited_once()
+        self.assertEqual(_response_status(messages), 200)
+        downstream.assert_awaited_once()
 
     def test_auth_settings_requires_session_when_auth_enabled(self) -> None:
         scope = {
@@ -285,13 +344,14 @@ class AuthApiTestCase(unittest.TestCase):
             "server": ("testserver", 80),
             "root_path": "",
         }
-        request = Request(scope)
-        middleware = AuthMiddleware(app=MagicMock())
+        downstream = AsyncMock()
+        middleware = AuthMiddleware(app=downstream)
 
         with patch("api.middlewares.auth.is_auth_enabled", return_value=True):
-            response = asyncio.run(middleware.dispatch(request, AsyncMock(return_value=Response(status_code=200))))
+            messages = asyncio.run(_invoke_asgi(middleware, scope))
 
-        self.assertEqual(response.status_code, 401)
+        self.assertEqual(_response_status(messages), 401)
+        downstream.assert_not_awaited()
 
     def test_auth_settings_is_reachable_when_auth_disabled(self) -> None:
         scope = {
@@ -305,16 +365,14 @@ class AuthApiTestCase(unittest.TestCase):
             "server": ("testserver", 80),
             "root_path": "",
         }
-        request = Request(scope)
-        middleware = AuthMiddleware(app=MagicMock())
-        next_response = Response(status_code=200)
-        call_next = AsyncMock(return_value=next_response)
+        downstream = AsyncMock(side_effect=_status_response_app)
+        middleware = AuthMiddleware(app=downstream)
 
         with patch("api.middlewares.auth.is_auth_enabled", return_value=False):
-            response = asyncio.run(middleware.dispatch(request, call_next))
+            messages = asyncio.run(_invoke_asgi(middleware, scope))
 
-        self.assertEqual(response.status_code, 200)
-        call_next.assert_awaited_once()
+        self.assertEqual(_response_status(messages), 200)
+        downstream.assert_awaited_once()
 
     def test_auth_settings_enable_sets_initial_password_and_logs_in(self) -> None:
         self.env_path.write_text(

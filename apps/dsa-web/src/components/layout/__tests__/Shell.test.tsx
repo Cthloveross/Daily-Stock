@@ -44,4 +44,22 @@ describe('Shell', () => {
     );
     expect(container).toBeTruthy();
   });
+
+  it('puts the intraday workstation first in the primary navigation', () => {
+    const { container } = render(
+      <MemoryRouter initialEntries={['/regime']}>
+        <Routes>
+          <Route element={<Shell />}>
+            <Route path="/regime" element={<div>page content</div>} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+    const nav = container.querySelector('nav[aria-label="Primary navigation"]');
+    expect(nav).toBeTruthy();
+    const links = nav ? Array.from(nav.querySelectorAll('a')) : [];
+    expect(links[0]?.getAttribute('href')).toBe('/intraday');
+    expect(links[0]?.textContent).toContain('日内');
+    expect(links.some((link) => link.getAttribute('href') === '/regime')).toBe(true);
+  });
 });

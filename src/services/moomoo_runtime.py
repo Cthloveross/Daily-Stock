@@ -266,13 +266,184 @@ def ensure_opend_ready(
         _close_context(ctx)
 
 
+# ---------------------------------------------------------------------------
+# Consecutive-failure circuit breaker shared by the Moomoo adapters
+# ---------------------------------------------------------------------------
+# 一台“卡死”的 OpenD（TCP 可连、RPC 悬挂）会让每一次同步查询都烧满 SDK 内部
+# 12–20 秒的超时上限；批量端点（快照 / 异动 / 到期日 / K 线）串起来就是分钟级
+# 悬挂。断路器只统计**传输类失败**（RPC 抛异常、连接/握手失败、ret 错误详情
+# 含超时/断连标记）：连续 N 次后打开，冷却期内快速失败（调用方既有的
+# unavailable + reason fail-closed 语义原样保留），冷却结束放行一次探针，
+# 成功即闭合。``ret != RET_OK`` 的业务型拒绝（如未知代码）是供应商在正常
+# 应答，**不**计入失败。阈值与冷却为内部常量（不新增环境变量）。
+
+DEFAULT_BREAKER_FAILURE_THRESHOLD = 3
+DEFAULT_BREAKER_COOLDOWN_SECONDS = 60.0
+# 半开探针自身的租约：探针路径若在 record_* 之前就返回（lane 正忙、SDK
+# 缺失等），到期自动让下一位调用方成为探针，绝不把断路器卡死在半开态。
+DEFAULT_BREAKER_PROBE_TTL_SECONDS = 30.0
+
+_TRANSPORT_FAILURE_MARKERS = (
+    "timeout",
+    "time out",
+    "timed out",
+    "超时",
+    "disconnect",
+    "断开",
+    "connection",
+    "连接",
+)
+
+
+def is_transport_failure_detail(detail: Any) -> bool:
+    """Classify a provider error detail as transport-shaped (timeout/link).
+
+    Business rejections (unknown code, permission, empty result) must never
+    trip the breaker — the daemon answered, it is not wedged.
+    """
+    # 注意不要对 detail 做真值判断：pandas DataFrame 的 __bool__ 会抛错。
+    text = "" if detail is None else str(detail)
+    text = text.lower()
+    return any(marker in text for marker in _TRANSPORT_FAILURE_MARKERS)
+
+
+class MoomooCircuitOpenError(MoomooRuntimeError):
+    """Raised (or reported) when the shared Moomoo breaker fails fast."""
+
+
+class MoomooCircuitBreaker:
+    """Small consecutive-failure breaker with a single half-open probe.
+
+    States: closed（正常计数）→ open（连续失败达到阈值，冷却期内一律快速
+    失败）→ half-open（冷却结束后恰好放行一次探针；探针成功闭合、失败重新
+    进入整段冷却）。时钟可注入，测试用假时钟即可确定性覆盖全部转移。
+    """
+
+    def __init__(
+        self,
+        *,
+        failure_threshold: int = DEFAULT_BREAKER_FAILURE_THRESHOLD,
+        cooldown_seconds: float = DEFAULT_BREAKER_COOLDOWN_SECONDS,
+        probe_ttl_seconds: float = DEFAULT_BREAKER_PROBE_TTL_SECONDS,
+        clock=time.monotonic,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._failure_threshold = max(1, int(failure_threshold))
+        self._cooldown_seconds = max(0.0, float(cooldown_seconds))
+        self._probe_ttl_seconds = max(0.0, float(probe_ttl_seconds))
+        self._clock = clock
+        self._consecutive_failures = 0
+        self._opened_at: Optional[float] = None
+        self._probe_started_at: Optional[float] = None
+        self._last_failure_reason: Optional[str] = None
+
+    @property
+    def is_tripped(self) -> bool:
+        """自打开以来是否仍未被成功探针闭合——通道看门狗专用观测。
+
+        与 :meth:`is_open` 不同：``is_open()`` 在冷却到期、可放行探针时
+        返回 False（「此刻会不会快速失败」），而通道若仍然死着，探针失败
+        会立刻重开——按它做看门狗会每个冷却周期刷一对「恢复/断开」。
+        本属性回答「通道自断开后恢复了吗」：只有 record_success（探针
+        成功）才翻回 False。不改变任何状态，不消耗探针名额。
+        """
+        with self._lock:
+            return self._opened_at is not None
+
+    def _open_message(self) -> str:
+        reason = self._last_failure_reason or "unknown transport failure"
+        return (
+            "moomoo circuit open after "
+            f"{self._failure_threshold} consecutive transport failures "
+            f"(cooldown {self._cooldown_seconds:.0f}s): {reason}"
+        )
+
+    def check(self) -> None:
+        """Raise :class:`MoomooCircuitOpenError` while open; admit one probe.
+
+        冷却期内直接抛出；冷却结束后第一位调用方成为探针（放行），其余调用
+        方在探针结束前仍快速失败。
+        """
+        with self._lock:
+            if self._opened_at is None:
+                return
+            now = self._clock()
+            if now - self._opened_at < self._cooldown_seconds:
+                raise MoomooCircuitOpenError(self._open_message())
+            if (
+                self._probe_started_at is not None
+                and now - self._probe_started_at < self._probe_ttl_seconds
+            ):
+                raise MoomooCircuitOpenError(
+                    f"{self._open_message()} [probe in flight]"
+                )
+            # 探针租约：到期未回报（record_*）则让下一位调用方接棒。
+            self._probe_started_at = now
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._consecutive_failures = 0
+            self._opened_at = None
+            self._probe_started_at = None
+            self._last_failure_reason = None
+
+    def record_failure(self, reason: Any) -> None:
+        with self._lock:
+            self._last_failure_reason = str(reason)[:200]
+            if self._opened_at is not None:
+                # Failed probe（或打开期间迟到的失败）：重新计整段冷却。
+                self._opened_at = self._clock()
+                self._probe_started_at = None
+                return
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._failure_threshold:
+                self._opened_at = self._clock()
+                self._probe_started_at = None
+                logger.warning(
+                    "[moomoo_runtime] circuit opened after %s consecutive "
+                    "transport failures; failing fast for %.0fs (last: %s)",
+                    self._consecutive_failures,
+                    self._cooldown_seconds,
+                    self._last_failure_reason,
+                )
+
+    def is_open(self) -> bool:
+        """Read-only view for health surfaces; never mutates probe state."""
+        with self._lock:
+            if self._opened_at is None:
+                return False
+            now = self._clock()
+            return now - self._opened_at < self._cooldown_seconds or (
+                self._probe_started_at is not None
+                and now - self._probe_started_at < self._probe_ttl_seconds
+            )
+
+    def reset_for_tests(self) -> None:
+        """Return to the closed state between deterministic tests."""
+        self.record_success()
+
+
+#: Process-wide breaker shared by every Moomoo adapter hot path
+#: (batch snapshot, option events, expiry availability, wall-context
+#: acquisition, history kline). One wedged OpenD affects them all equally,
+#: so they share one failure budget.
+MOOMOO_RPC_BREAKER = MoomooCircuitBreaker()
+
+
 __all__ = [
+    "DEFAULT_BREAKER_COOLDOWN_SECONDS",
+    "DEFAULT_BREAKER_FAILURE_THRESHOLD",
+    "DEFAULT_BREAKER_PROBE_TTL_SECONDS",
     "DEFAULT_READY_TIMEOUT_SECONDS",
     "DEFAULT_TCP_TIMEOUT_SECONDS",
+    "MOOMOO_RPC_BREAKER",
+    "MoomooCircuitBreaker",
+    "MoomooCircuitOpenError",
     "MoomooRuntimeError",
     "configure_moomoo_sdk_runtime",
     "create_ready_quote_context",
     "ensure_opend_ready",
+    "is_transport_failure_detail",
     "probe_opend_tcp",
     "quote_context_is_ready",
     "suppress_moomoo_sdk_console",

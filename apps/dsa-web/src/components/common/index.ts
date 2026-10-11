@@ -22,6 +22,7 @@ export * from './Select';
 export * from './Badge';
 export * from './StatusDot';
 export * from './Tooltip';
+export { InfoHint } from './InfoHint';
 export * from './Pagination';
 export * from './ConfirmDialog';
 export * from '../layout/Shell';

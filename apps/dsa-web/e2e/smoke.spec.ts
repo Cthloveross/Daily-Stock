@@ -101,26 +101,67 @@ test.describe('web smoke (isolated empty-DB backend)', () => {
     await expect(dialog.locator('li', { hasText: '结果回填维护' })).toContainText('未启用');
   });
 
-  test('journal positions and import tabs render empty states without unexpected errors', async ({ page }) => {
+  test('journal review workspace and data tab render empty states without unexpected errors', async ({ page }) => {
     const captured = captureErrors(page);
 
     await page.goto('/journal?tab=positions');
     await expect(page.getByText('期权交易复盘')).toBeVisible({ timeout: 15_000 });
     await expect(page.getByRole('button', { name: '仓位复盘' })).toBeVisible();
-    await expect(page.getByRole('button', { name: '交易证据' })).toBeVisible();
-    // 当前仓位快照能力未启用时必须 fail-closed，而不是伪装成空仓。
-    await expect(page.getByText('当前仓位快照功能未启用')).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByRole('button', { name: '数据与构建', exact: true })).toBeVisible();
+    // G-3 IA：仓位复盘只保留复盘工作台；数据管线全部移到「数据与构建」。
+    await expect(page.getByRole('heading', { name: '复盘工作台' })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByRole('button', { name: '继续复盘下一笔' })).toBeVisible();
+    await expect(page.getByText('当前仓位快照功能未启用')).toHaveCount(0);
 
     await page.goto('/journal?tab=import');
+    await expect(page.getByRole('heading', { name: '每日刷新' })).toBeVisible({ timeout: 15_000 });
     await expect(page.getByText('OpenD 只读刷新', { exact: true }).first()).toBeVisible({ timeout: 15_000 });
     // MOOMOO_JOURNAL_REFRESH_ENABLED=false 的诚实降级文案 + 手动导入兜底仍在。
     await expect(
       page.getByText('服务器尚未启用 Journal 只读刷新；仍可在下方使用手动文件导入。'),
     ).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByRole('heading', { name: '历史导入' })).toBeVisible();
     await expect(page.getByText('高级 / 首次导入：CSV 账单或只读 JSON')).toBeVisible();
+    // 快照/未来构建与构建管理已迁入本 tab，且快照能力未启用时仍 fail-closed。
+    await expect(page.getByRole('heading', { name: '当前持仓快照与未来构建' })).toBeVisible();
+    await expect(page.getByText('当前仓位快照功能未启用')).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByRole('heading', { name: '构建与默认视图管理' })).toBeVisible();
 
     expect(captured.pageErrors).toEqual([]);
     expect(unexpectedConsoleErrors(captured)).toEqual([]);
+  });
+
+  test('intraday workstation renders honest empty/closed shell', async ({ page }) => {
+    await page.goto('/intraday');
+
+    // 页头 + 诚实边界：盘中滚动研究，不是信号，不进入统计。
+    await expect(page.getByRole('heading', { name: '日内工作台' })).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByText('盘中滚动研究 · 不是信号 · 不进入统计')).toBeVisible();
+
+    // 三个区块 shell：市场脉搏、今日计划、日内扫描、期权异动。
+    await expect(page.locator('section[aria-label="市场脉搏"]')).toBeVisible();
+    await expect(page.getByText('今日计划 · 盘前冻结对照')).toBeVisible();
+    await expect(page.locator('section[aria-label="日内扫描"]')).toBeVisible({ timeout: 30_000 });
+    await expect(page.locator('section[aria-label="期权异动"]')).toBeVisible();
+    await expect(
+      page.getByText(/偏多 \/ 偏空 \/ 中性为 Moomoo 供应商分类/),
+    ).toBeVisible();
+
+    // Moomoo 关闭的隔离后端：脉搏必须显式未配置/标缺，不伪造读数。
+    await expect(
+      page.locator('section[aria-label="市场脉搏"]').getByText('未配置').first(),
+    ).toBeVisible({ timeout: 20_000 });
+
+    // v3 时段上下文与 Moomoo 无关（纯 ET 时钟）：标签必须始终在场且非空。
+    // 具体时段随运行时刻变化，只断言存在与文案属于已知集合。
+    await expect(
+      page.locator('section[aria-label="市场脉搏"]').getByLabel('时段上下文'),
+    ).toHaveText(/盘前|开盘试错|主战场|午前过渡|午间震荡|午后酝酿|尾盘趋势|盘后|休市/, {
+      timeout: 20_000,
+    });
+
+    // 空库无冻结盘前计划：今日计划区必须给诚实空态而不是空白。
+    await expect(page.getByText(/今日尚无已发布的冻结盘前计划|盘前计划状态读取失败|今日官方盘前版本没有可对照的候选/)).toBeVisible({ timeout: 30_000 });
   });
 
   test('opportunity deep link renders the live-scan shell without an official snapshot', async ({ page }) => {

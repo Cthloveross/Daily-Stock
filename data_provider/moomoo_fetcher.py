@@ -35,6 +35,7 @@ import logging
 import math
 import os
 import threading
+import time
 from datetime import (
     date,
     datetime,
@@ -42,14 +43,17 @@ from datetime import (
     timedelta,
     timezone,
 )
-from typing import Optional
+from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from src.services.moomoo_runtime import (
+    MOOMOO_RPC_BREAKER,
+    MoomooCircuitOpenError,
     MoomooRuntimeError,
     create_ready_quote_context,
+    is_transport_failure_detail,
     probe_opend_tcp,
     quote_context_is_ready,
 )
@@ -59,6 +63,15 @@ from .realtime_types import RealtimeSource, UnifiedRealtimeQuote
 from .us_index_mapping import is_us_stock_code, get_us_index_yf_symbol
 
 logger = logging.getLogger(__name__)
+
+
+class MoomooHistoryEmptyError(DataFetchError):
+    """The provider completed a successful history request with no rows.
+
+    This is deliberately narrower than an unavailable market, permission
+    error, broken page sequence, or transport failure. Callers collecting a
+    fixed historical universe may record the gap without inventing bars.
+    """
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -150,6 +163,62 @@ _INTRADAY_KTYPE: dict[str, str] = {
 # per page this still permits up to 128,000 intraday bars in one response.
 _INTRADAY_MAX_PAGES = 128
 
+# ``request_history_kline`` is process-wide load on the one local OpenD, even
+# when callers happen to own different SDK contexts.  Moomoo permits at most
+# 60 *first-page* history requests per rolling 30 seconds.  Keep a conservative
+# 0.6s gap (50/30s) between first pages, and also yield briefly between exempt
+# continuation pages: a 60-day extended-hours 1m pull can otherwise issue tens
+# of local RPCs back-to-back for each symbol.  These are internal safety limits,
+# not user-tunable strategy settings.
+_HISTORY_FIRST_PAGE_MIN_INTERVAL_SECONDS = 0.6
+_HISTORY_CONTINUATION_MIN_INTERVAL_SECONDS = 0.05
+_HISTORY_RPC_LOCK = threading.Lock()
+_history_last_request_started: Optional[float] = None
+_history_last_first_page_started: Optional[float] = None
+
+
+def _pace_history_kline_request(*, first_page: bool) -> None:
+    """Wait until one history RPC is inside both local pacing limits.
+
+    The caller must hold ``_HISTORY_RPC_LOCK`` for the wait, RPC, and breaker
+    outcome update.  That makes history reads single-concurrency across every
+    ``MoomooFetcher`` instance and prevents already-queued callers from racing
+    past a breaker opened by the preceding request.
+    """
+
+    global _history_last_request_started, _history_last_first_page_started
+
+    now = time.monotonic()
+    wait_seconds = 0.0
+    if _history_last_request_started is not None:
+        wait_seconds = max(
+            wait_seconds,
+            _HISTORY_CONTINUATION_MIN_INTERVAL_SECONDS
+            - (now - _history_last_request_started),
+        )
+    if first_page and _history_last_first_page_started is not None:
+        wait_seconds = max(
+            wait_seconds,
+            _HISTORY_FIRST_PAGE_MIN_INTERVAL_SECONDS
+            - (now - _history_last_first_page_started),
+        )
+    if wait_seconds > 0:
+        time.sleep(wait_seconds)
+    started_at = time.monotonic()
+    _history_last_request_started = started_at
+    if first_page:
+        _history_last_first_page_started = started_at
+
+
+def _reset_history_kline_pacer_for_tests() -> None:
+    """Clear process pacing timestamps between deterministic unit tests."""
+
+    global _history_last_request_started, _history_last_first_page_started
+    with _HISTORY_RPC_LOCK:
+        _history_last_request_started = None
+        _history_last_first_page_started = None
+
+
 # Moomoo's ``time_key`` is expressed in the exchange's local wall-clock time
 # and does not carry an offset. Preserve that market-time meaning before the
 # value crosses the API boundary so browser clients can compare it to UTC
@@ -233,6 +302,28 @@ class MoomooFetcher(BaseFetcher):
         """Inspect connection state without issuing a blocking SDK query."""
         return quote_context_is_ready(self._ctx)
 
+    def _lifecycle_lock(self) -> threading.RLock:
+        """Return the ctx lifecycle lock, tolerating test scaffolds via __new__.
+
+        每一次 SDK RPC 都必须与健康检查的 ``close()`` 持同一把锁：否则
+        `_get_ctx` 判定旧连接已死并 close 时，另一个线程可能正拿着同一个
+        ctx 在做 RPC（实测表现为随机的 SDK 内部异常/悬挂）。RLock 允许
+        `_get_ctx` 在已持锁的 RPC 包装内重入。
+        """
+        lock = getattr(self, "_ctx_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._ctx_lock = lock
+        return lock
+
+    @staticmethod
+    def _record_rpc_outcome(ok: bool, detail: object = None) -> None:
+        """Feed the shared breaker; business rejections are not failures."""
+        if ok or not is_transport_failure_detail(detail):
+            MOOMOO_RPC_BREAKER.record_success()
+        else:
+            MOOMOO_RPC_BREAKER.record_failure(str(detail)[:200])
+
     def _get_ctx(self):
         """Lazy-create + cache the OpenQuoteContext.
 
@@ -241,7 +332,7 @@ class MoomooFetcher(BaseFetcher):
         """
         if not self.enabled or not self._sdk_ok:
             raise DataFetchError("MoomooFetcher 未启用或 SDK 未安装")
-        with self._ctx_lock:
+        with self._lifecycle_lock():
             if self._ctx is not None and (
                 not probe_opend_tcp(self.host, self.port)
                 or not self._is_ctx_alive()
@@ -259,20 +350,98 @@ class MoomooFetcher(BaseFetcher):
                         port=self.port,
                     )
                 except MoomooRuntimeError as exc:
+                    MOOMOO_RPC_BREAKER.record_failure(str(exc))
                     raise DataFetchError(
                         f"无法连接 OpenD ({self.host}:{self.port})：{exc}"
                     ) from exc
             return self._ctx
 
+    def _history_kline_page(self, request: dict):
+        """Run one ``request_history_kline`` RPC under the lifecycle lock.
+
+        Acquiring ctx and issuing the RPC under one lock section closes the
+        close()-vs-RPC race（G-7e）；断路器把「卡死的 OpenD」限制在连续三次
+        传输失败内，冷却期内直接以 DataFetchError 快速失败并交给下游数据源
+        fallback（诚实降级，不静默）。所有 history RPC 还经过进程级单并发
+        节流；这既满足首分页限频，也避免大段 1m 续页连续占满 OpenD。
+        """
+        from moomoo import RET_OK
+
+        with _HISTORY_RPC_LOCK:
+            # Check only after this caller reaches the front of the queue.  A
+            # preceding request may have opened the breaker while we waited.
+            try:
+                MOOMOO_RPC_BREAKER.check()
+            except MoomooCircuitOpenError as exc:
+                raise DataFetchError(f"Moomoo 断路器打开：{exc}") from exc
+            _pace_history_kline_request(
+                first_page=request.get("page_req_key") is None
+            )
+            with self._lifecycle_lock():
+                ctx = self._get_ctx()
+                try:
+                    ret, data, next_page_key = ctx.request_history_kline(
+                        **request
+                    )
+                except Exception as exc:
+                    MOOMOO_RPC_BREAKER.record_failure(str(exc))
+                    raise
+            self._record_rpc_outcome(
+                ret == RET_OK,
+                data if ret != RET_OK else None,
+            )
+            return ret, data, next_page_key
+
     def close(self) -> None:
         """Tear down the OpenD connection. Safe to call repeatedly."""
-        with self._ctx_lock:
+        with self._lifecycle_lock():
             if self._ctx is not None:
                 try:
                     self._ctx.close()
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("[MoomooFetcher] close error (ignored): %s", exc)
                 self._ctx = None
+
+    def get_history_quota(self) -> dict:
+        """Read the provider's per-symbol history quota without consuming it."""
+        from moomoo import RET_OK
+
+        with self._lifecycle_lock():
+            MOOMOO_RPC_BREAKER.check()
+            ret, payload = self._get_ctx().get_history_kl_quota(get_detail=True)
+        self._record_rpc_outcome(ret == RET_OK, payload if ret != RET_OK else None)
+        if ret != RET_OK:
+            raise DataFetchError(f"Moomoo history quota failed: {payload}")
+        used, remaining, details = payload
+        if int(used) < 0 or int(remaining) < 0:
+            raise DataFetchError("Moomoo history quota returned negative values")
+        return {
+            "used_quota": int(used),
+            "remain_quota": int(remaining),
+            "downloaded_codes": sorted({
+                str(row.get("code") or "").strip().upper()
+                for row in details
+                if isinstance(row, dict) and row.get("code")
+            }),
+        }
+
+    def get_adjustment_events(self, stock_code: str) -> list[dict]:
+        """Keep provider corporate-action evidence beside a history snapshot."""
+        from moomoo import RET_OK
+
+        with self._lifecycle_lock():
+            MOOMOO_RPC_BREAKER.check()
+            ret, payload = self._get_ctx().get_rehab(self._to_moomoo_code(stock_code))
+        self._record_rpc_outcome(ret == RET_OK, payload if ret != RET_OK else None)
+        if ret != RET_OK:
+            raise DataFetchError(f"Moomoo adjustment events failed: {payload}")
+        if not isinstance(payload, pd.DataFrame):
+            raise DataFetchError("Moomoo adjustment events were not a table")
+        # JSON round-trip normalizes NumPy scalars and missing values without
+        # discarding the provider's adjustment factors.
+        import json
+
+        return json.loads(payload.to_json(orient="records", date_format="iso"))
 
     # ------------------------------------------------------------------
     # Code conversion
@@ -334,7 +503,6 @@ class MoomooFetcher(BaseFetcher):
     ) -> pd.DataFrame:
         from moomoo import KLType, AuType, KL_FIELD, RET_OK
 
-        ctx = self._get_ctx()
         mcode = self._to_moomoo_code(stock_code)
         logger.info(
             "[Moomoo] history_kline daily code=%s start=%s end=%s",
@@ -343,22 +511,28 @@ class MoomooFetcher(BaseFetcher):
             end_date,
         )
         try:
-            ret, data, _page_key = ctx.request_history_kline(
-                code=mcode,
-                start=start_date,
-                end=end_date,
-                ktype=KLType.K_DAY,
-                autype=AuType.QFQ,
-                fields=[KL_FIELD.ALL],
-                max_count=1000,
+            ret, data, _page_key = self._history_kline_page(
+                {
+                    "code": mcode,
+                    "start": start_date,
+                    "end": end_date,
+                    "ktype": KLType.K_DAY,
+                    "autype": AuType.QFQ,
+                    "fields": [KL_FIELD.ALL],
+                    "max_count": 1000,
+                }
             )
+        except DataFetchError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise DataFetchError(f"Moomoo daily request raised: {exc}") from exc
 
         if ret != RET_OK:
             raise DataFetchError(f"Moomoo history_kline failed: {data}")
+        if _page_key is not None:
+            raise DataFetchError("Moomoo daily history was truncated; use a shorter explicit range")
         if data is None or data.empty:
-            raise DataFetchError(f"Moomoo returned empty for {mcode}")
+            raise MoomooHistoryEmptyError(f"Moomoo returned empty for {mcode}")
         return data
 
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
@@ -446,7 +620,6 @@ class MoomooFetcher(BaseFetcher):
 
         from moomoo import AuType, KLType, KL_FIELD, RET_OK
 
-        ctx = self._get_ctx()
         common_request = {
             "code": mcode,
             "start": session_date.isoformat(),
@@ -466,7 +639,9 @@ class MoomooFetcher(BaseFetcher):
             if page_req_key is not None:
                 request["page_req_key"] = page_req_key
             try:
-                ret, data, next_page_key = ctx.request_history_kline(**request)
+                ret, data, next_page_key = self._history_kline_page(request)
+            except DataFetchError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 raise DataFetchError(
                     f"Moomoo premarket page {page_number} request raised: {exc}"
@@ -595,7 +770,11 @@ class MoomooFetcher(BaseFetcher):
     # ------------------------------------------------------------------
     # Intraday K-line (mirrors YfinanceFetcher.fetch_intraday signature)
     # ------------------------------------------------------------------
-    def fetch_intraday(self, stock_code: str, interval: str, days: int = 30) -> pd.DataFrame:
+    def fetch_intraday(
+        self, stock_code: str, interval: str, days: int = 30, *,
+        start: Optional[str] = None, end: Optional[str] = None,
+        before_request: Optional[Callable[[], None]] = None,
+    ) -> pd.DataFrame:
         ktype_attr = _INTRADAY_KTYPE.get(interval)
         if ktype_attr is None:
             raise ValueError(
@@ -605,23 +784,28 @@ class MoomooFetcher(BaseFetcher):
         from moomoo import KLType, AuType, KL_FIELD, RET_OK
 
         ktype = getattr(KLType, ktype_attr)
-        ctx = self._get_ctx()
         mcode = self._to_moomoo_code(stock_code)
-        end = datetime.now().date()
-        start = end - timedelta(days=max(1, days))
+        market = mcode.split(".", 1)[0]
+        market_tz = ZoneInfo(_MARKET_TIMEZONES.get(market, "UTC"))
+        if (start is None) != (end is None):
+            raise ValueError("Moomoo explicit intraday range requires both start and end")
+        end_day = date.fromisoformat(end) if end is not None else datetime.now(market_tz).date()
+        start_day = date.fromisoformat(start) if start is not None else end_day - timedelta(days=max(1, days))
+        if start_day > end_day:
+            raise ValueError("Moomoo intraday start must not follow end")
         is_us = mcode.startswith("US.")
         logger.info(
             "[Moomoo] history_kline intraday code=%s interval=%s start=%s end=%s ext=%s",
             mcode,
             interval,
-            start.isoformat(),
-            end.isoformat(),
+            start_day.isoformat(),
+            end_day.isoformat(),
             is_us,
         )
         common_request = {
             "code": mcode,
-            "start": start.isoformat(),
-            "end": end.isoformat(),
+            "start": start_day.isoformat(),
+            "end": end_day.isoformat(),
             "ktype": ktype,
             "autype": AuType.QFQ,
             "fields": [KL_FIELD.ALL],
@@ -634,11 +818,15 @@ class MoomooFetcher(BaseFetcher):
         page_count = 0
 
         for page_number in range(1, _INTRADAY_MAX_PAGES + 1):
+            if before_request is not None:
+                before_request()
             request = dict(common_request)
             if page_req_key is not None:
                 request["page_req_key"] = page_req_key
             try:
-                ret, data, next_page_key = ctx.request_history_kline(**request)
+                ret, data, next_page_key = self._history_kline_page(request)
+            except DataFetchError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 raise DataFetchError(
                     f"Moomoo intraday page {page_number} request raised: {exc}"
@@ -674,12 +862,26 @@ class MoomooFetcher(BaseFetcher):
             )
 
         if not frames:
-            raise DataFetchError(
+            raise MoomooHistoryEmptyError(
                 f"Moomoo returned empty intraday for {mcode} interval={interval}"
             )
         combined = pd.concat(frames, ignore_index=True)
         if "time_key" not in combined.columns:
             raise DataFetchError("Moomoo intraday response is missing time_key")
+        # Pagination overlap and provider revisions must remain visible to the
+        # strict downstream 2m contract.  Keep the established single row per
+        # timestamp for existing native-interval callers, but attach the raw
+        # multiplicity before deduplication.  ``aggregate_exact_2m_ohlcv`` then
+        # invalidates any bucket containing a source minute with count != 1;
+        # silently keeping the last revision would otherwise make duplicate
+        # input look complete.
+        source_time_key_count = combined.groupby(
+            "time_key", dropna=False
+        )["time_key"].transform("size")
+        combined["_source_time_key_count"] = source_time_key_count
+        duplicate_timestamp_count = int(
+            (combined.groupby("time_key", dropna=False).size() > 1).sum()
+        )
         combined = (
             combined.drop_duplicates(subset=["time_key"], keep="last")
             .sort_values("time_key", kind="stable")
@@ -687,13 +889,21 @@ class MoomooFetcher(BaseFetcher):
         )
         logger.info(
             "[Moomoo] history_kline intraday complete code=%s interval=%s "
-            "pages=%d rows=%d",
+            "pages=%d rows=%d duplicate_timestamps=%d",
             mcode,
             interval,
             page_count,
             len(combined),
+            duplicate_timestamp_count,
         )
-        return self._normalize_intraday(combined, stock_code)
+        normalized = self._normalize_intraday(combined, stock_code)
+        normalized.attrs.update({
+            "page_count": page_count,
+            "requested_start": start_day.isoformat(),
+            "requested_end": end_day.isoformat(),
+            "adjustment": "QFQ",
+        })
+        return normalized
 
     def _normalize_intraday(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
         """For intraday we keep ISO 8601 datetime in `date` column (matches yfinance fetcher)."""
@@ -710,20 +920,43 @@ class MoomooFetcher(BaseFetcher):
             market_tz = ZoneInfo(_MARKET_TIMEZONES.get(market, "UTC"))
 
             def _market_iso(value: object) -> Optional[str]:
-                timestamp = pd.to_datetime(value, errors="coerce")
+                # Moomoo returns ISO-like exchange-local wall-clock strings.
+                # Scalar ``pd.to_datetime`` takes several seconds over a
+                # 60-session 1m response and monopolizes the API process.  Use
+                # the stdlib parser for that normal path, retaining pandas for
+                # uncommon compatible inputs and exact DST localization.
+                if isinstance(value, datetime):
+                    timestamp = value
+                elif isinstance(value, str):
+                    text = value.strip()
+                    if not text:
+                        return None
+                    try:
+                        timestamp = datetime.fromisoformat(
+                            f"{text[:-1]}+00:00"
+                            if text[-1:] in {"Z", "z"}
+                            else text
+                        )
+                    except ValueError:
+                        timestamp = pd.to_datetime(value, errors="coerce")
+                else:
+                    timestamp = pd.to_datetime(value, errors="coerce")
                 if pd.isna(timestamp):
                     return None
                 if timestamp.tzinfo is None:
-                    timestamp = timestamp.tz_localize(market_tz)
+                    timestamp = pd.Timestamp(timestamp).tz_localize(market_tz)
                 else:
-                    timestamp = timestamp.tz_convert(market_tz)
+                    timestamp = timestamp.astimezone(market_tz)
                 return timestamp.isoformat()
 
             df["date"] = df["date"].apply(_market_iso)
         if "pct_chg" not in df.columns and "close" in df.columns:
             df["pct_chg"] = (df["close"].pct_change() * 100).fillna(0).round(2)
         df["code"] = stock_code
-        keep = ["code"] + STANDARD_COLUMNS
+        # Private provenance column is intentionally preserved until the
+        # strict 2m aggregator consumes it.  Public K-line serialization drops
+        # it after aggregation.
+        keep = ["code"] + STANDARD_COLUMNS + ["_source_time_key_count"]
         df = df[[c for c in keep if c in df.columns]]
         return df.dropna(subset=["date", "close"]).reset_index(drop=True)
 
@@ -741,9 +974,24 @@ class MoomooFetcher(BaseFetcher):
         try:
             from moomoo import RET_OK
 
-            ctx = self._get_ctx()
+            try:
+                MOOMOO_RPC_BREAKER.check()
+            except MoomooCircuitOpenError as exc:
+                if log_final_failure:
+                    logger.info("[Moomoo] snapshot skipped: %s", exc)
+                return None
             mcode = self._to_moomoo_code(stock_code)
-            ret, data = ctx.get_market_snapshot([mcode])
+            # RPC 与健康检查 close() 持同一把生命周期锁（G-7e）。
+            with self._lifecycle_lock():
+                ctx = self._get_ctx()
+                try:
+                    ret, data = ctx.get_market_snapshot([mcode])
+                except Exception as exc:
+                    MOOMOO_RPC_BREAKER.record_failure(str(exc))
+                    raise
+            self._record_rpc_outcome(
+                ret == RET_OK, data if ret != RET_OK else None
+            )
             if ret != RET_OK or data is None or data.empty:
                 if log_final_failure:
                     logger.info("[Moomoo] snapshot %s empty: %s", mcode, data)

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   evaluateOpportunitySnapshot,
   fetchDailyOpportunities,
+  fetchNearExpiryContracts,
   fetchPremarketCycleStatus,
   fetchPremarketUniverse,
   fetchOpportunityLearningSummary,
@@ -155,6 +156,33 @@ describe('daily opportunity API', () => {
       { symbols: ['NVDA'], dte_min: 0, dte_max: 45 },
       { timeout: 45_000 },
     );
+  });
+});
+
+describe('near-expiry contract API', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessionCache.clearAll();
+  });
+
+  it('defaults the active contract browser request to the full 0–7DTE window', async () => {
+    apiMocks.post.mockResolvedValue({
+      data: {
+        schema_version: 'near-expiry-contracts/1.0',
+        generated_at: '2026-08-04T14:30:06+00:00',
+        market_date_et: '2026-08-04',
+        item: { ticker: 'NVDA', max_dte: 7 },
+      },
+    });
+
+    const result = await fetchNearExpiryContracts(' us.nvda ');
+
+    expect(apiMocks.post).toHaveBeenCalledWith(
+      '/api/v1/opportunities/near-expiry-contracts',
+      { symbol: 'NVDA', max_dte: 7, refresh: false },
+      { timeout: 30_000 },
+    );
+    expect(result.item.maxDte).toBe(7);
   });
 });
 

@@ -22,10 +22,10 @@ export interface RegimeGaugeProps {
 // Bands are drawn as arcs in the SVG, matching the design-system semantic
 // colors (muted green/red/amber, accent violet for Standard).
 const BANDS: Array<{ from: number; to: number; fill: string; label: string; state: RegimeState }> = [
-  { from: -100, to: 35,  fill: 'var(--down-strong)', label: 'NO TRADE', state: 'no_trade' },
-  { from: 35,   to: 55,  fill: 'var(--warn-strong)', label: 'CAUTIOUS', state: 'cautious' },
-  { from: 55,   to: 75,  fill: 'var(--accent)',      label: 'STANDARD', state: 'standard' },
-  { from: 75,   to: 100, fill: 'var(--up-strong)',   label: 'AGGRESSIVE', state: 'aggressive' },
+  { from: -100, to: 35,  fill: 'var(--down-strong)', label: 'ADVERSE', state: 'no_trade' },
+  { from: 35,   to: 55,  fill: 'var(--warn-strong)', label: 'HIGH RISK', state: 'cautious' },
+  { from: 55,   to: 75,  fill: 'var(--accent)',      label: 'MIXED', state: 'standard' },
+  { from: 75,   to: 100, fill: 'var(--up-strong)',   label: 'SUPPORTIVE', state: 'aggressive' },
 ];
 
 const STATE_COLOR: Record<RegimeState, string> = {
@@ -35,10 +35,10 @@ const STATE_COLOR: Record<RegimeState, string> = {
   no_trade: 'text-down-strong',
 };
 const STATE_LABEL: Record<RegimeState, string> = {
-  aggressive: 'AGGRESSIVE',
-  standard: 'STANDARD',
-  cautious: 'CAUTIOUS',
-  no_trade: 'NO TRADE',
+  aggressive: 'SUPPORTIVE',
+  standard: 'MIXED',
+  cautious: 'HIGH RISK',
+  no_trade: 'ADVERSE',
 };
 
 const W = 300;
@@ -250,7 +250,7 @@ export const RegimeGauge: React.FC<RegimeGaugeProps> = ({
       </svg>
 
       <div className="text-center font-mono text-mono-xs text-text-4">
-        默认阈值 · 35 谨慎 · 55 标准 · 75 激进
+        默认阈值 · 35 偏险 · 55 混合 · 75 有利
       </div>
 
       <div className="flex items-center justify-between">
@@ -274,6 +274,7 @@ export const RegimeGauge: React.FC<RegimeGaugeProps> = ({
       </div>
 
       {note && <div className="text-caption text-text-3">{note}</div>}
+      <div className="text-caption text-text-4">仅作市场风险背景，不决定 DTE 或标的异动是否成立。</div>
       {qualityState !== 'ready' && incompleteDomains.length > 0 && (
         <div className="rounded-ds-sm border border-warn-strong/30 bg-warn-strong/5 px-2.5 py-2 text-caption text-text-2">
           缺失或不完整：{incompleteDomains.join('、')}。当前结果

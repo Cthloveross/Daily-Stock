@@ -33,6 +33,8 @@ import type {
   PremarketCycleState,
 } from '../../types/opportunities';
 import { Button, EmptyState } from '../ui';
+import { IntradayTrackingPanel } from './IntradayTrackingPanel';
+import { OptionWallRatioPanel } from './OptionWallRatioPanel';
 import { WallLevelExpiryBreakdown } from './WallLevelExpiryBreakdown';
 import { parseApiTimestamp } from '../../utils/marketTime';
 
@@ -886,6 +888,8 @@ function OptionWallSnapshot({ context }: { context: CandidateOptionWallContext }
           {item.coverage.validContracts}/{item.coverage.requestedContracts} · {item.coverage.coveragePercent.toFixed(1)}%
         </div>
       </div>
+
+      <OptionWallRatioPanel item={item} />
 
       <WallLevelList
         title="Call OI 墙（集中位）"
@@ -2779,9 +2783,16 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
               管理 / 导入自选
             </button>
             <span className="text-caption text-text-3">只读研究，不是交易指令</span>
+            <button
+              type="button"
+              onClick={() => navigate('/intraday')}
+              className="text-caption text-text-2 underline-offset-2 hover:text-text-1 hover:underline"
+            >
+              进入日内工作台 →
+            </button>
           </div>
           <p className="mt-1 max-w-4xl text-body-sm text-text-3">
-            Top 5 规则匹配候选由上一完整交易日的 EMA8/13、20 日位置与量能确定性计算；计算可复现，策略有效性另行验证。
+            基于上一完整交易日日线结构 · 数日至数周研究周期。Top 5 规则匹配候选由 EMA8/13、20 日位置与量能确定性计算；计算可复现，策略有效性另行验证。
           </p>
         </div>
         <Button
@@ -3019,6 +3030,8 @@ export function DailyOpportunityList({ symbols }: { symbols: string[] }) {
               />
             )}
           </div>
+
+          <IntradayTrackingPanel candidates={primaryCandidates} />
         </div>
       )}
     </section>

@@ -386,6 +386,7 @@ def get_stock_history(
             last_bar_at=result.get("last_bar_at"),
             derived_from_period=result.get("derived_from_period"),
             aggregation_method=result.get("aggregation_method"),
+            aggregation_contract=result.get("aggregation_contract"),
             data=data
         )
     

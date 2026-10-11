@@ -83,7 +83,9 @@ const CandidateRow: React.FC<{
           </button>
         )}
       </div>
-      <p className="text-caption text-text-2">{candidate.ruleText}</p>
+      {/* rule_text 是 append-only 冻结文本，分段靠换行；不保留换行会让 R5–R8
+          这类多段取证记录塌成一坨。只改渲染，不动数据。 */}
+      <p className="whitespace-pre-line text-caption text-text-2">{candidate.ruleText}</p>
       <div className="flex flex-wrap items-center gap-2 text-caption text-text-3">
         <span>{snapshotSummary(candidate.evidenceSnapshot) ?? '证据快照已冻结'}</span>
         <span>创建于 {fmtDate(candidate.createdAt)}</span>
@@ -150,7 +152,7 @@ const RuleRow: React.FC<{
           )
         )}
       </div>
-      <p className="text-caption text-text-2">{rule.ruleText}</p>
+      <p className="whitespace-pre-line text-caption text-text-2">{rule.ruleText}</p>
       <div className="flex flex-wrap items-center gap-2 text-caption text-text-3">
         <span>{snapshotSummary(rule.evidenceSnapshot) ?? '证据快照已冻结'}</span>
         <span>记录于 {fmtDate(rule.createdAt)}</span>

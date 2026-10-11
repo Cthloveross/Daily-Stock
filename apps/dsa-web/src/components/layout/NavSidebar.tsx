@@ -2,9 +2,11 @@ import type React from 'react';
 import { useState } from 'react';
 import { NavLink } from 'react-router-dom';
 import {
+  Activity,
   Gauge,
   CandlestickChart,
   NotebookPen,
+  ScrollText,
   Rewind,
   Settings,
   LogOut,
@@ -21,9 +23,13 @@ interface NavItem {
 }
 
 const ITEMS: NavItem[] = [
+  // 日内工作台是盘中主界面，置于导航首位。
+  { to: '/intraday', label: '日内', icon: Activity },
   { to: '/regime', label: 'Regime', icon: Gauge },
   { to: '/watchlist', label: 'Watchlist', icon: CandlestickChart },
   { to: '/journal', label: 'Journal', icon: NotebookPen },
+  // 交易纪律：规则原文 + 支撑它的证据表，只读。
+  { to: '/rules', label: '纪律', icon: ScrollText },
   { to: '/backtest', label: 'Backtest', icon: Rewind },
   { to: '/settings', label: 'Settings', icon: Settings },
 ];

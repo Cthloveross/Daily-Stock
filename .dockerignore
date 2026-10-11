@@ -8,7 +8,20 @@ __pycache__/
 venv/
 .venv/
 env/
-.env.local
+
+# 运行时配置与密钥绝不能进入远端 Docker build context。
+# `.env.example` 仅是无凭据模板，可以保留给仓库文档/审计使用。
+.env
+.playwright-cli/
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+*.pem
+*.key
+OpenD.xml
+.com.moomoo.OpenD/
 
 # 忽略 IDE
 .idea/
@@ -16,10 +29,10 @@ env/
 *.swp
 *.swo
 
-# 忽略数据文件（可选，如果想持久化就注释掉）
-# data/
-# logs/
-# reports/
+# 运行时数据库、日志和报告通过 volume 持久化，不参与镜像构建。
+data/
+logs/
+reports/
 
 # 忽略测试文件
 test_*.py

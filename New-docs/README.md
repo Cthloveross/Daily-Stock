@@ -2,7 +2,7 @@
 
 > **定位**：这是整个仓库的文档入口。所有 `.md`（除 `docs/CHANGELOG.md` 和仓库根的 `README.md` / `AGENTS.md` / `SKILL.md`）都在这里。
 > **维护者**：[@Cthloveross](https://github.com/Cthloveross)
-> **最后更新**：2026-07-31
+> **最后更新**：2026-09-10
 
 ---
 
@@ -31,6 +31,10 @@
 | 配置 Moomoo、Alpaca、Finnhub、OpenAI 并判断哪些付费 API 暂不需要 | [`integrations/options-research-data-setup.md`](./integrations/options-research-data-setup.md) |
 | 看 5D/20D 结果如何在收盘后自动成熟及其统计门槛 | [`phase1/09_AUTOMATIC_OUTCOME_MAINTENANCE.md`](./phase1/09_AUTOMATIC_OUTCOME_MAINTENANCE.md) |
 | 看 Moomoo 当前期权持仓如何只读双采样、显式确认并作为未来边界锚点 | [`phase1/11_CURRENT_POSITION_SNAPSHOTS.md`](./phase1/11_CURRENT_POSITION_SNAPSHOTS.md) |
+| 看每条交易纪律和它的证据、call/put 比例的诚实边界与期权墙逐日快照 | [`phase1/15_TRADING_DISCIPLINE_EVIDENCE.md`](./phase1/15_TRADING_DISCIPLINE_EVIDENCE.md) |
+| 看现行盘中推送分级、0–7DTE、逐分钟开盘提醒与 strict-2m P0 合同 | [`phase1/19_PUSH_TIERING_PHASE_B.md`](./phase1/19_PUSH_TIERING_PHASE_B.md) → [`phase1/20_INTRADAY_0_7DTE_RULE_MIGRATION.md`](./phase1/20_INTRADAY_0_7DTE_RULE_MIGRATION.md) → [`phase1/21_OPENING_5M_ALERT_RESEARCH.md`](./phase1/21_OPENING_5M_ALERT_RESEARCH.md) → [`phase1/22_P0_2M_SIGNAL_AND_CALIBRATION.md`](./phase1/22_P0_2M_SIGNAL_AND_CALIBRATION.md) |
+| 准备 strict-2m 原始历史导出并合并真实 20 日 shadow | [`phase1/23_P0_2M_OFFLINE_EXPORT_FORMAT.md`](./phase1/23_P0_2M_OFFLINE_EXPORT_FORMAT.md) |
+| 本机关闭后仍接收盘中 Telegram 提示 | [`deployment/intraday-cloud.md`](./deployment/intraday-cloud.md) |
 | 查看旧版本文档 | [`archive/`](./archive/) |
 
 > **变更日志** 不在这里 —— 在 [`docs/CHANGELOG.md`](../docs/CHANGELOG.md)（自动化与 AGENTS.md 硬规则依赖该路径）。
@@ -81,6 +85,7 @@ New-docs/
 │   ├── DEPLOY_EN.md                同上（英文）
 │   ├── deploy-webui-cloud.md       云服务器 Web 界面访问指南
 │   ├── desktop-package.md          Electron 桌面端打包
+│   ├── intraday-cloud.md            盘中 Telegram 的 Linux VPS 单机常驻部署
 │   └── zeabur-deployment.md        Zeabur 一键部署
 │
 ├── contributing/                   贡献指南
@@ -130,7 +135,19 @@ New-docs/
 │   ├── 08_SERVER_OWNED_PREMARKET_ORCHESTRATION.md 服务端研究池、租约与 09:12/09:17 调度
 │   ├── 09_AUTOMATIC_OUTCOME_MAINTENANCE.md 收盘后 5D/20D 结果自动成熟与统计护栏
 │   ├── 10_JOURNAL_READONLY_REFRESH.md Journal 每日只读刷新、证据发布与构建激活
-│   └── 11_CURRENT_POSITION_SNAPSHOTS.md Moomoo 当前期权持仓双采样与未来边界锚点
+│   ├── 11_CURRENT_POSITION_SNAPSHOTS.md Moomoo 当前期权持仓双采样与未来边界锚点
+│   ├── 12_FORMAL_FUTURE_BUILD_CONTRACT.md 正式未来构建合同
+│   ├── 13_PLAYBOOK_PROMOTION_CONTRACT.md Playbook 升格合同
+│   ├── 14_ARTIFACT_GC_CONTRACT.md 短期 artifact 回收合同
+│   ├── 15_TRADING_DISCIPLINE_EVIDENCE.md 交易纪律证据
+│   ├── 16_EDGE_FORENSICS_AND_REGIME_GATE.md Edge 取证与 Regime gate
+│   ├── 17_PRO_PRACTICE_BLUEPRINT.md 专业实践蓝图
+│   ├── 18_DEEP_REVIEW_PHASE_A.md 深度审计 Phase A
+│   ├── 19_PUSH_TIERING_PHASE_B.md 推送分级与持久台账
+│   ├── 20_INTRADAY_0_7DTE_RULE_MIGRATION.md 0–7DTE 纯日内迁移
+│   ├── 21_OPENING_5M_ALERT_RESEARCH.md 09:31–09:35 顺序开盘提醒
+│   ├── 22_P0_2M_SIGNAL_AND_CALIBRATION.md strict-2m P0/P0-X 与上线门禁
+│   └── 23_P0_2M_OFFLINE_EXPORT_FORMAT.md 离线原始导出与 live-shadow 合并格式
 │
 └── archive/                        归档（旧版本 / 一次性盘点）
     ├── PROJECT_VISION_v1-3.md      旧愿景（已被 architecture/01 取代）

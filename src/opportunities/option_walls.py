@@ -33,6 +33,32 @@ METRIC_BASIS_MODEL_GAMMA = "model_from_settled_oi_and_snapshot_greeks"
 # being zero-filled.
 _QUOTE_FIELD_COUNT = 4  # iv_percent, bid, ask, mark
 
+# --- call/put 比例：事实描述，不是方向信号 ----------------------------------
+#
+# 这段文案是本仓库对「高 call 比例＝会涨」「价格会向最大痛点靠拢」两个说法的
+# 唯一立场，前端逐字渲染。**当前仓库没有任何历史 OI 序列**，因此这两个假设
+# 在用户自己的数据上都还没有被检验过——把比例当信号用等于用未经检验的假设
+# 下注。逐日快照（``option_wall_daily_snapshots``）正在积累样本。
+CALL_PUT_RATIO_CAVEAT = (
+    "call/put 比例与墙位是当前持仓与成交的事实描述；本仓库尚无历史 OI 序列，"
+    "因此「高 call 比例＝会涨」「价格会向最大痛点靠拢」这两个说法在你的数据上都"
+    "**尚未被检验**。系统正在逐日记录，样本足够后会给出回溯频率。"
+)
+
+#: 未平仓分布的加权中心。刻意**不叫** max pain，也不作预测使用：它只是
+#: ``Σ(strike × OI) / Σ(OI)``，一个描述性的重心，是否对价格有引力**未验证**。
+OI_WEIGHTED_CENTER_LABEL = "未平仓分布的加权中心（描述，未验证是否有引力）"
+OI_WEIGHTED_CENTER_METHOD = "open_interest_weighted_mean_strike"
+
+_RATIO_QUANTUM = 6
+
+# Fail-closed reasons — a zero or missing denominator is reported, never
+# silently rendered as 0, 1, or infinity.
+RATIO_REASON_ZERO_DENOMINATOR = (
+    "分母为 0（该窗口内无对应 put 持仓/成交），比例无定义"
+)
+RATIO_REASON_NO_DATA = "该窗口内无有效合约，无法计算比例"
+
 
 def _finite_number(value: Any) -> Optional[float]:
     try:
@@ -308,6 +334,86 @@ def _atm_call_iv_context(
     }
 
 
+def _ratio(
+    numerator_total: float,
+    denominator_total: float,
+    *,
+    metric_basis: str,
+    numerator_side: str,
+    denominator_side: str,
+) -> dict[str, Any]:
+    """One aggregate call/put ratio with its basis and explicit null+reason.
+
+    A zero denominator is *not* an error and *not* infinity — it is an
+    undefined ratio, reported as ``value=None`` plus the reason, with both
+    observed totals still surfaced so the reader can see why.
+    """
+
+    has_any = numerator_total > 0 or denominator_total > 0
+    if not has_any:
+        value: Optional[float] = None
+        reason: Optional[str] = RATIO_REASON_NO_DATA
+    elif denominator_total <= 0:
+        value = None
+        reason = RATIO_REASON_ZERO_DENOMINATOR
+    else:
+        value = round(numerator_total / denominator_total, _RATIO_QUANTUM)
+        reason = None
+    return {
+        "value": value,
+        "numerator_total": round(numerator_total, _RATIO_QUANTUM),
+        "denominator_total": round(denominator_total, _RATIO_QUANTUM),
+        "numerator_side": numerator_side,
+        "denominator_side": denominator_side,
+        "metric_basis": metric_basis,
+        "reason": reason,
+    }
+
+
+def _oi_weighted_center(
+    call_oi: dict[float, float],
+    put_oi: dict[float, float],
+) -> dict[str, Any]:
+    """``Σ(strike × OI) / Σ(OI)`` over both sides — a description, not a target.
+
+    Deliberately not named "max pain" and never presented as a prediction:
+    whether price is attracted to this level is an untested hypothesis on this
+    account's data (there is no stored OI history yet to test it against).
+    """
+
+    weighted = 0.0
+    total = 0.0
+    for values in (call_oi, put_oi):
+        for strike, open_interest in values.items():
+            if (
+                math.isfinite(strike)
+                and math.isfinite(open_interest)
+                and open_interest > 0
+            ):
+                weighted += strike * open_interest
+                total += open_interest
+    if total <= 0:
+        return {
+            "strike": None,
+            "total_open_interest": 0.0,
+            "label": OI_WEIGHTED_CENTER_LABEL,
+            "method": OI_WEIGHTED_CENTER_METHOD,
+            "metric_basis": METRIC_BASIS_SETTLED_OI,
+            "validated_as_price_magnet": False,
+            "reason": RATIO_REASON_NO_DATA,
+        }
+    return {
+        "strike": round(weighted / total, _RATIO_QUANTUM),
+        "total_open_interest": round(total, _RATIO_QUANTUM),
+        "label": OI_WEIGHTED_CENTER_LABEL,
+        "method": OI_WEIGHTED_CENTER_METHOD,
+        "metric_basis": METRIC_BASIS_SETTLED_OI,
+        # 明确的机器可读标记：本仓库从未验证过它对价格有引力。
+        "validated_as_price_magnet": False,
+        "reason": None,
+    }
+
+
 def build_option_wall_payload(
     snapshot: Any,
     *,
@@ -459,11 +565,52 @@ def build_option_wall_payload(
         for key, (unit, method, side, metric_basis) in metric_specs.items()
     }
 
+    def _total(metric_key: str) -> float:
+        return sum(
+            value
+            for value in metrics[metric_key].values()
+            if math.isfinite(value) and value > 0
+        )
+
+    call_oi_total = _total("call_oi")
+    put_oi_total = _total("put_oi")
+    call_volume_total = _total("call_volume")
+    put_volume_total = _total("put_volume")
+
     return {
         "formula_version": FORMULA_VERSION,
         "spot": round(spot, 6),
         "quote_as_of": max(quote_times) if quote_times else None,
         "atm_call_iv": _atm_call_iv_context(snapshot, spot=spot),
+        # additive (option-wall/1.3): aggregate call/put ratios.  Facts about
+        # what is currently held and traded — never a direction signal.
+        "totals": {
+            "call_oi": round(call_oi_total, _RATIO_QUANTUM),
+            "put_oi": round(put_oi_total, _RATIO_QUANTUM),
+            "call_volume": round(call_volume_total, _RATIO_QUANTUM),
+            "put_volume": round(put_volume_total, _RATIO_QUANTUM),
+        },
+        "ratios": {
+            "call_put_oi_ratio": _ratio(
+                call_oi_total,
+                put_oi_total,
+                metric_basis=METRIC_BASIS_SETTLED_OI,
+                numerator_side="call",
+                denominator_side="put",
+            ),
+            "call_put_volume_ratio": _ratio(
+                call_volume_total,
+                put_volume_total,
+                metric_basis=METRIC_BASIS_SESSION_VOLUME,
+                numerator_side="call",
+                denominator_side="put",
+            ),
+            "caveat": CALL_PUT_RATIO_CAVEAT,
+        },
+        "oi_weighted_center": _oi_weighted_center(
+            metrics["call_oi"],
+            metrics["put_oi"],
+        ),
         "scope": {
             "dte_min": dte_min,
             "dte_max": dte_max,
@@ -505,5 +652,6 @@ def build_option_wall_payload(
             "Open interest is a cleared-position total and does not reveal buyer/seller or opening/closing direction.",
             "Session volume is cumulative and does not reveal whether positions remain open.",
             "A concentration level is context, not guaranteed support, resistance, pinning, or breakout.",
+            CALL_PUT_RATIO_CAVEAT,
         ],
     }

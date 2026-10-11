@@ -9,6 +9,17 @@ import pandas as pd
 import pytest
 
 from data_provider import moomoo_options
+from src.services.moomoo_runtime import MOOMOO_RPC_BREAKER
+
+
+@pytest.fixture(autouse=True)
+def _reset_moomoo_breaker():
+    """共享断路器状态不得跨用例泄漏（含用桩故意制造的失败）。"""
+
+    MOOMOO_RPC_BREAKER.reset_for_tests()
+    yield
+    MOOMOO_RPC_BREAKER.reset_for_tests()
+
 
 
 class _OptionEventFilter:

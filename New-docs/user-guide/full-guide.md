@@ -241,6 +241,55 @@ daily_stock_analysis/
 
 > 说明：默认 `daily_analysis` GitHub Actions workflow 只映射固定变量名，不会自动导入任意编号的 `STOCK_GROUP_N` / `EMAIL_GROUP_N`。因此分组邮箱目前仅在本地 `.env`、Docker 或其他已显式注入这些环境变量的运行环境中生效；若你要在自己的 GitHub Actions 中使用，需在 workflow 的 job `env:` 中逐组显式映射。
 
+### 盘中提醒与严格 2m P0
+
+| 变量名 | 说明 | 默认值 | 必填 |
+|--------|------|--------|:----:|
+| `INTRADAY_REFRESH_SCHEDULER_ENABLED` | 启动 FastAPI 托管的盘中调度器；P1-O 与 strict-2m monitor 都依赖它 | `false` | 盘中提醒必需 |
+| `INTRADAY_REFRESH_INTERVAL_SECONDS` | 慢页面/期权预热间隔；独立快信号时钟仍每分钟结束后约 5 秒读取，只评估新完整 `window_end` | `60`（最小 30） | 可选 |
+| `INTRADAY_WATCHLIST` | 盘中自选列表；为空时 strict-2m monitor 不启动。正式 action 必须与冻结 69 只清单完全一致 | 空 | strict-2m 必需 |
+| `INTRADAY_ALERTS_ENABLED` | 启用 P1-O 和旧 P1/P2 提示流；它不是 strict-2m 的研究或 action 开关 | `false` | P1-O 必需 |
+| `INTRADAY_ALERTS_MAX_PER_DAY` | P0/P1 Telegram 行数的最外层每日护栏 | `20` | 可选 |
+| `INTRADAY_P0_2M_ENABLED` | strict-2m 研究子开关；仍需 scheduler 开启、自选非空和可用 OpenD 才会实际扫描 | `true` | 可选 |
+| `INTRADAY_P0_2M_ACTION_ENABLED` | strict-2m RTH P0 手机出口；完整校准通过前必须保持关闭，盘外仅研究提醒 | `false` | 可选 |
+| `INTRADAY_P0_2M_SHADOW_MOBILE_ENABLED` | 校准前可选的真实四条件研究提醒；记 P2、不表示已验证收益、不占正式 P0 指标 | `false` | 可选 |
+| `INTRADAY_P0_2M_ACTIVATION_ARTIFACT` | 已通过校准的 activation artifact 路径；运行时还会在同一持久 `DATABASE_PATH` 验证 exact artifact/export attestation | 空 | action 必需 |
+
+P1-O 手机提醒要求 scheduler、`INTRADAY_ALERTS_ENABLED=true`、Moomoo 精确 20 日
+同进度 1m 基线、OpenD 可用以及 Telegram Bot Token/Chat ID。strict-2m shadow 不依赖
+`INTRADAY_ALERTS_ENABLED` 或 Telegram，但要求 scheduler、自选列表和 Moomoo 1m/日线数据。
+strict-2m 正式手机出口还必须同时满足 action 开关、固定 69 只的通过 artifact、同一持久
+SQLite 中的双 attestation、标的 mobile eligibility 和 Telegram 凭据；单独打开 action
+不会绕过门禁。完整信号与校准合同见
+[`22_P0_2M_SIGNAL_AND_CALIBRATION.md`](../phase1/22_P0_2M_SIGNAL_AND_CALIBRATION.md)，
+本机关闭后的单机常驻部署见 [`intraday-cloud.md`](../deployment/intraday-cloud.md)。
+
+20 日 shadow 必须覆盖冻结交易日的完整现场窗口且全部门禁达标，不是等待 20 天自动开启。
+`history_loaded_count` 仅证明历史下载；`ready_count` 要求当前盘段/同钟点有固定前 60 日完整
+基线，半日市没有下午 RTH 样本时不能借第 61 日补足。非扫描时段（周末、休市、04:00 前
+或 20:00 后）`ready_count=0` 不表示当前槽故障；盘段开始后不足 18 分钟仍在形成期，
+应看首个合法 18m endpoint。快信号不等待慢 Top/期权预热，
+开盘启用时后台慢预热在 09:30–09:36 让路。研究 RTH 独立限 2/日、7/周，盘外每盘段
+1/日、合计 5/周；「今日提示流」分开显示研究/正式预算，并按消息键关联既有回执。
+“已受理”或“Telegram 已接收”不等于手机已响/已读，无确定回执只标结果未确认。
+
+开盘 1m 与全天 2m 使用同一份启动时冻结的完整自选，不再受前 20 只或页面排名限制。
+开盘前预热基线，开盘关键窗只读缓存；关闭共享行情 monitor 或缺数据时明确显示不可用。
+健康面板区分历史载入、当前时槽就绪与开盘基线；活动窗超过 120 秒无完成扫描报异常，
+首次扫描宽限也是 120 秒。前瞻显示起止日及待开始/采集中/已结束/未知，记录失败可见，
+旧轮结束不会自动重开或回填。电脑必须保持运行、联网且 OpenD 可用；本地版不能在休眠或
+关机时扫描。校准凭证仅支持正常交易时段的检测与投递，不证明盈利，盘外仍是研究提醒。
+历史复权核验失败的股票会列出原因并保留在覆盖率分母中，不参与正式事件及对照统计，
+不通过删票或补造分钟提高通过率。
+
+P95 表示相对该票同钟历史的异常分位，不是未来方向胜率。当前系统只发现日内异常，
+没有经过验证的完整交易或期权净收益模型。报价合格候选与执行许可分开：后端使用真实
+XNYS 收盘给出 09:45 开始、普通候选收盘前 45 分钟截止、0DTE 前 90 分钟截止、退出参考
+前 15 分钟；前端不自行按固定时钟判断，状态过期即标缺。R6 未知或触发时只保留行情事实。
+历史审核分别报告尾盘正常截尾、真正缺行情和待成熟结果；单票基线失败不会直接否决
+整个资产类别。新前瞻收益仅用同轮、同票、同日的准确 t+20m 价格，不补造旧记录。
+旧版自定义交易框架和聊天保留为只读历史，不自动继续作为 AI 分析前提；可复核后复制保存。
+
 #### 飞书云文档配置（可选，解决消息截断问题）
 
 | 变量名 | 说明 | 必填 |
@@ -624,6 +673,14 @@ FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/your_hook_token
 3. 获取 Chat ID（可通过 @userinfobot）
 4. 设置 `TELEGRAM_BOT_TOKEN` 和 `TELEGRAM_CHAT_ID`
 5. (可选) 如需发送到 Topic，设置 `TELEGRAM_MESSAGE_THREAD_ID` (从 Topic 链接末尾获取)
+
+盘中真实消息遇到短时 DNS/连接故障时，会使用启动时缓存的 Telegram IPv4 做带证书主机名
+校验的回退。strict-2m 在确认 accepted 前原子提交 decision 与可恢复 outbox；数据库不可读
+或写失败时拒绝并重检，不回退到内存去重。非 opening 消息在首次发送前持久化，最多
+6 分钟内重试，窗口内重启可恢复，过期终止。延迟补发明确标注；opening 不跨 checkpoint
+补发，09:35 最终提醒截止 09:36。read-timeout 等可能已送达的结果不会自动重发。该机制不能覆盖
+电脑休眠、关机或整机断网；这些场景需要持续在线的部署环境，见
+`New-docs/deployment/intraday-cloud.md`。提供部署配置不等于云端已经上线。
 
 ### 邮件
 

@@ -81,6 +81,19 @@ stdout 只包含汇总，不包含路径、文件名、order/deal ID 或逐笔�
 
 旧 `/api/v1/journal/import` 对 Moomoo CSV 固定返回 410，避免任何旧客户端绕过可信账本、静默丢失 aggregate-only 订单后重建 FIFO。Web `/journal?tab=import` 已改为预览优先，并明确显示“数据库写入：否”；只有用户点击保存按钮才追加可信证据。
 
+### 4.3 组合单（多腿价差）父单行 · parser v3
+
+`moomoo-statement-v3` 起，History CSV 中的组合单父单行（例如 `MU260731P745/760`、数量 `2unit(s)`、成交摘要 `2unit(s)@7.00`）不再导致整个文件解析失败，也**永不**被伪装成普通单腿订单：
+
+- 父单行被分类为 `order_kind=combo_parent`（evidence level `combo_parent`）；数量与成交摘要按**组合 unit** 语义保留（`combo_unit_quantity`），不推导合约乘数，也不推导腿级数量；
+- 价差符号不做 OCC 单行权价解码：保留原始符号，另外在无歧义时解析 underlying / 到期日 / C-P 方向与原样的行权价文本（如 `745/760`）；
+- 费用尾列是券商的**组级**费用总额，只保留在 execution-group scope，不向腿或成交分摊；
+- 父单行后跟随的腿展示行（有 Side/Symbol、无 Status/Order Time）与其成交续行作为腿证据原样保留在父单上，不生成独立订单；
+- preview 响应新增 `combo_parent_orders` / `combo_parent_leg_rows` / `combo_parent_fee_total` 计数，并附 `combo_parent_orders_are_audit_only_evidence` 警示；含组合父单的 CSV 至少为 `partial`，导入需显式 `allow_partial=true`；
+- 账本写入时父单存为 CSV 来源的 `BrokerExecutionGroupObservation`（`parent_quantity_semantics=csv_combo_package_units_audit_only`）+ 组级 `BrokerExecutionGroupFeeObservation`，不写腿观测、不写成交观测；
+- canonical 选择 fail closed：CSV 组合父单没有 broker group 身份和被声明的腿定义，`load_canonical_observation_inputs` 明确排除（provenance `canonical_scope=excluded_csv_combo_parent`，排除计数见 `excluded_csv_execution_group_observations`）；腿级事实唯一来源仍是 OpenAPI execution group；
+- 旧版 CSV↔readonly-export 对账将窗口内组合父单显式排除并输出 `csv_combo_parent_orders_excluded_from_reconciliation=N` 警示，不再尝试把它当单腿订单去匹配。
+
 Data Health 会分别显示整个 batch 的覆盖范围和 API reconciliation 的覆盖窗口。当前正确 CSV 共 3,542 个订单，只有稳定窗口内 1,089 个订单经过 OpenAPI 逐单核对，因此 UI 显示“部分窗口已通过”，不会再误报整批已通过。
 
 Episode API 的边界假设、条件性 P&L、费用守恒和当前构建结果见 [Phase 1.2 专题](./02_POSITION_EPISODES.md)。

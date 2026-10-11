@@ -10,12 +10,37 @@
 """
 
 import logging
+import threading
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 
 from src.repositories.stock_repo import StockRepository
 
 logger = logging.getLogger(__name__)
+
+# 进程级共享 DataFetcherManager（盘中波段爆发车道修复）：
+# 历史实现每次请求（波段爆发甚至每标的、每 60 秒轮询）都新建 manager →
+# 新建 MoomooFetcher → 新的 OpenD 连接握手，把轮询变成连接放大器。
+# DataFetcherManager 自身线程安全（逐 fetcher 调用锁），MoomooFetcher 的
+# ctx 每次调用都做健康检查并自愈重连，因此进程级单例无需显式 close。
+# 按类身份缓存：测试 monkeypatch ``data_provider.base.DataFetcherManager``
+# 时自动重建，互不串味。
+_shared_manager_lock = threading.Lock()
+_shared_manager: Optional[Any] = None
+_shared_manager_cls: Optional[Any] = None
+
+
+def _get_shared_fetcher_manager():
+    """Return the process-wide DataFetcherManager, rebuilding on class swap."""
+
+    global _shared_manager, _shared_manager_cls
+    from data_provider.base import DataFetcherManager
+
+    with _shared_manager_lock:
+        if _shared_manager is None or _shared_manager_cls is not DataFetcherManager:
+            _shared_manager = DataFetcherManager()
+            _shared_manager_cls = DataFetcherManager
+        return _shared_manager
 
 
 class StockService:
@@ -40,10 +65,8 @@ class StockService:
             实时行情数据字典
         """
         try:
-            # 调用数据获取器获取实时行情
-            from data_provider.base import DataFetcherManager
-            
-            manager = DataFetcherManager()
+            # 调用数据获取器获取实时行情（进程级共享 manager，见模块注释）
+            manager = _get_shared_fetcher_manager()
             quote = manager.get_realtime_quote(stock_code)
             
             if quote is None:
@@ -118,7 +141,7 @@ class StockService:
                 - daily: 日线
                 - weekly / monthly: 基于日线 resample 聚合
                 - 1m / 2m / 5m / 15m / 30m / 60m / 90m / 1h: 分钟级
-                  （2m 基于带时区的 1m K 线聚合）
+                  （2m 基于带时区的 1m K 线做严格、分时段聚合）
             days: 获取天数（周/月会按聚合因子放大，intraday 受 yfinance 上限约束）
             include_stock_name: 是否额外查询证券名称。只需要 OHLCV 的内部调用可关闭，
                 避免一次与行情复盘无关的实时报价请求。
@@ -161,9 +184,7 @@ class StockService:
     ) -> Dict[str, Any]:
         """日线 / 周线（W-FRI 聚合）/ 月线（ME 聚合）"""
         try:
-            from data_provider.base import DataFetcherManager
-
-            manager = DataFetcherManager()
+            manager = _get_shared_fetcher_manager()
 
             # 周/月需要更多日线作为聚合原料
             if period == "weekly":
@@ -217,11 +238,20 @@ class StockService:
     ) -> Dict[str, Any]:
         """分钟级 K 线（仅美股）。"""
         derived_from_period = "1m" if interval == "2m" else None
+        # Preserve the established value for existing API clients; the
+        # additive contract field identifies the stricter implementation.
         aggregation_method = (
             "time_bucket_2m_ohlcv" if interval == "2m" else None
         )
+        aggregation_contract = None
+        if interval == "2m":
+            from src.opportunities.exact_2m import (
+                EXACT_2M_AGGREGATION_CONTRACT,
+            )
+
+            aggregation_contract = EXACT_2M_AGGREGATION_CONTRACT
         try:
-            from data_provider.base import DataFetcherManager, DataFetchError
+            from data_provider.base import DataFetchError
         except ImportError:
             logger.warning("DataFetcherManager 未找到，返回空数据")
             return self._history_result(
@@ -230,9 +260,10 @@ class StockService:
                 [],
                 derived_from_period=derived_from_period,
                 aggregation_method=aggregation_method,
+                aggregation_contract=aggregation_contract,
             )
 
-        manager = DataFetcherManager()
+        manager = _get_shared_fetcher_manager()
         source_interval = "1m" if interval == "2m" else interval
         try:
             df, source = manager.get_intraday_data(
@@ -254,10 +285,13 @@ class StockService:
                 [],
                 derived_from_period=derived_from_period,
                 aggregation_method=aggregation_method,
+                aggregation_contract=aggregation_contract,
             )
 
         if interval == "2m":
-            df = self._resample_intraday_ohlcv(df, "2min")
+            from src.opportunities.exact_2m import aggregate_exact_2m_ohlcv
+
+            df = aggregate_exact_2m_ohlcv(df, source=source)
             if df.empty:
                 return self._history_result(
                     stock_code,
@@ -265,6 +299,7 @@ class StockService:
                     [],
                     derived_from_period=derived_from_period,
                     aggregation_method=aggregation_method,
+                    aggregation_contract=aggregation_contract,
                 )
 
         stock_name = (
@@ -282,6 +317,7 @@ class StockService:
             source=source,
             derived_from_period=derived_from_period,
             aggregation_method=aggregation_method,
+            aggregation_contract=aggregation_contract,
         )
 
     @staticmethod
@@ -294,6 +330,7 @@ class StockService:
         source: Optional[str] = None,
         derived_from_period: Optional[str] = None,
         aggregation_method: Optional[str] = None,
+        aggregation_contract: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Build history output and derive provenance from returned bars only."""
         result: Dict[str, Any] = {
@@ -307,6 +344,7 @@ class StockService:
             "last_bar_at": None,
             "derived_from_period": derived_from_period,
             "aggregation_method": aggregation_method,
+            "aggregation_contract": aggregation_contract,
         }
         timestamps = [
             str(item.get("date")).strip()
@@ -323,78 +361,8 @@ class StockService:
             last_bar_at=max(timestamps),
             derived_from_period=derived_from_period,
             aggregation_method=aggregation_method,
+            aggregation_contract=aggregation_contract,
         )
-        return result
-
-    @staticmethod
-    def _resample_intraday_ohlcv(df, rule: str):
-        """Aggregate timezone-aware intraday bars without crossing local dates.
-
-        Each market-local trading date is resampled independently. Empty time
-        buckets are discarded, so overnight and midday session gaps cannot be
-        combined into one derived candle.
-        """
-        import pandas as pd
-
-        work = df.copy()
-
-        def _aware_timestamp(value):
-            timestamp = pd.to_datetime(value, errors="coerce")
-            if pd.isna(timestamp) or timestamp.tzinfo is None:
-                return pd.NaT
-            return timestamp
-
-        work["_ts"] = work["date"].map(_aware_timestamp)
-        work = work.dropna(subset=["_ts", "close"])
-        if work.empty:
-            return work.drop(columns=["_ts"], errors="ignore")
-
-        work["_local_date"] = work["_ts"].map(
-            lambda value: value.strftime("%Y-%m-%d")
-        )
-        aggregation = {
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-        }
-
-        def _sum_with_missing(series):
-            return series.sum(min_count=1)
-
-        if "volume" in work.columns:
-            aggregation["volume"] = _sum_with_missing
-        if "amount" in work.columns:
-            aggregation["amount"] = _sum_with_missing
-
-        chunks = []
-        for _, daily in work.groupby("_local_date", sort=True):
-            daily = daily.sort_values("_ts").copy()
-            timestamps = pd.DatetimeIndex(daily.pop("_ts").tolist())
-            daily.index = timestamps
-            daily.index.name = "_ts"
-            resampled = daily.resample(
-                rule,
-                origin="start_day",
-                closed="left",
-                label="left",
-            ).agg(aggregation)
-            resampled = resampled.dropna(subset=["close"])
-            if resampled.empty:
-                continue
-            resampled["date"] = [value.isoformat() for value in resampled.index]
-            chunks.append(resampled.reset_index(drop=True))
-
-        if not chunks:
-            return work.iloc[0:0].drop(
-                columns=["_ts", "_local_date"],
-                errors="ignore",
-            )
-
-        result = pd.concat(chunks, ignore_index=True)
-        result["pct_chg"] = (
-            result["close"].pct_change() * 100
-        ).fillna(0).round(2)
         return result
 
     @staticmethod

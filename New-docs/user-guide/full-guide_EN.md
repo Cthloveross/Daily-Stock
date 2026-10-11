@@ -214,6 +214,70 @@ Default schedule: Every weekday at **18:00 (Beijing Time)** automatic execution.
 
 > Note: the default `daily_analysis` GitHub Actions workflow only maps fixed variable names. It does not automatically import arbitrary numbered variables such as `STOCK_GROUP_N` / `EMAIL_GROUP_N`. This feature therefore works in local `.env`, Docker, or any runtime where you explicitly inject those variables.
 
+### Intraday Alerts and Strict 2m P0
+
+| Variable | Description | Default | Required |
+|--------|------|--------|:----:|
+| `INTRADAY_REFRESH_SCHEDULER_ENABLED` | Starts the FastAPI-owned intraday scheduler; both P1-O and the strict-2m monitor depend on it | `false` | Required for intraday alerts |
+| `INTRADAY_REFRESH_INTERVAL_SECONDS` | Slow page/option-warming interval; an independent fast clock still reads about 5 seconds after each minute close and evaluates only new completed `window_end` values | `60` (minimum 30) | Optional |
+| `INTRADAY_WATCHLIST` | Intraday symbol list; the strict-2m monitor does not start when it is empty. Production action requires the exact frozen 69-symbol universe | Empty | Required for strict-2m |
+| `INTRADAY_ALERTS_ENABLED` | Enables P1-O and the legacy P1/P2 feed; this is not the strict-2m research or action switch | `false` | Required for P1-O |
+| `INTRADAY_ALERTS_MAX_PER_DAY` | Outer daily cap for P0/P1 Telegram lines | `20` | Optional |
+| `INTRADAY_P0_2M_ENABLED` | Strict-2m research sub-switch; actual scanning still requires the scheduler, a non-empty watchlist, and working OpenD data | `true` | Optional |
+| `INTRADAY_P0_2M_ACTION_ENABLED` | Formal RTH P0 delivery; keep disabled until calibration passes; extended hours remain research-only | `false` | Optional |
+| `INTRADAY_P0_2M_SHADOW_MOBILE_ENABLED` | Optional real four-condition research alerts before calibration; recorded as P2, without validated profitability or formal P0 metrics | `false` | Optional |
+| `INTRADAY_P0_2M_ACTIVATION_ARTIFACT` | Path to a passed activation artifact; runtime also verifies the exact artifact/export attestations in the same persistent `DATABASE_PATH` | Empty | Required for action |
+
+P1-O phone alerts require the scheduler, `INTRADAY_ALERTS_ENABLED=true`, Moomoo's exact
+20-session same-progress 1m baseline, working OpenD, and Telegram Bot Token/Chat ID. Strict-2m
+shadow does not require `INTRADAY_ALERTS_ENABLED` or Telegram, but it does require the scheduler,
+the watchlist, and Moomoo 1m/daily data. Formal P0 phone delivery additionally requires the action switch,
+a passed artifact for the frozen 69-symbol universe, both attestations in the same persistent
+SQLite database, per-symbol mobile eligibility, and Telegram credentials. Enabling the action
+switch alone cannot bypass these gates. See
+[`22_P0_2M_SIGNAL_AND_CALIBRATION.md`](../phase1/22_P0_2M_SIGNAL_AND_CALIBRATION.md)
+for the signal/calibration contract and [`intraday-cloud.md`](../deployment/intraday-cloud.md)
+for always-on deployment when the local computer is off.
+
+The frozen 20-session shadow must contain complete live observations and pass every gate;
+elapsed time alone never enables production P0. `history_loaded_count` means history was
+downloaded, not that the current session/clock slot has 60 complete prior-session baselines.
+A half-day without an afternoon RTH slot cannot be replaced by the 61st session. Outside
+scanning hours (weekends, holidays, before 04:00 or after 20:00 ET), `ready_count=0` does not
+mean a current-slot baseline failure. The first 18 minutes of each session are a formation
+period; assess readiness from its first legal 18m endpoint. Fast signals do not wait for
+slow Top/option warming; when opening alerts are enabled, background page
+warming yields from 09:30 to 09:36 ET. Research alerts have separate caps: RTH 2/day and
+7/week, extended hours 1/day per session and 5/week combined. The feed shows research and
+formal budgets separately and joins existing receipts by message key. Acceptance or
+“Telegram received” does not establish a phone ring or read; unresolved results stay unconfirmed.
+
+Opening 1m and all-day 2m use the same full watchlist frozen at startup, without the old
+20-symbol or UI-ranking limit. References warm before the opening; the critical path reads
+cached history and subscribed minutes only. A missing shared monitor or incomplete data fails
+closed. Health separates loaded history, current-slot readiness and opening readiness, and
+flags scans older than 120 seconds during active hours (also the initial-scan grace period).
+Forward runs expose their dates and waiting/collecting/completed/unknown state and write errors;
+an ended run is never silently restarted or backfilled. The local computer must remain awake,
+online and connected to OpenD. A passed artifact covers RTH detection/delivery, not profitability
+or extended-session validation; previously selected historical examples are not untouched data.
+Symbols that fail historical adjustment checks retain their coverage denominator and explicit
+reasons, but contribute neither formal events nor comparator events; no dropped symbols or
+synthetic minutes are used to improve the pass rate.
+
+P95 is a historical anomaly percentile, not a 95% probability of continued movement.
+This is an intraday anomaly detector with manual option review, not a validated entry,
+exit, sizing or net option-return model. Quote-qualified candidates are not execution
+permission. The backend XNYS calendar supplies the 09:45 start, regular cutoff 45 minutes
+before the actual close, 0DTE cutoff 90 minutes before close and exit reference 15 minutes
+before close. The UI treats missing or expired decisions as unknown rather than deriving
+its own fixed-clock permission. Unknown or triggered R6 allows facts, not contract advice.
+Historical diagnostics separate closing-session censoring, missing prices and pending
+outcomes; one symbol's baseline failure does not disqualify an entire asset class.
+New forward outcomes use exact same-run, same-symbol, same-day t+20m prices, without
+backfilling old observations. Legacy custom frameworks and chats remain in a read-only
+archive and are no longer automatically supplied to AI; review and copy before saving.
+
 #### Feishu Cloud Document Configuration (Optional, solves message truncation issues)
 
 | Variable | Description | Required |
@@ -517,6 +581,18 @@ For a full illustrated troubleshooting guide, see [New-docs/integrations/bots/fe
 3. Get Chat ID (via @userinfobot)
 4. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`
 5. (Optional) To send to Topic, set `TELEGRAM_MESSAGE_THREAD_ID` (get from Topic link)
+
+Strict-2m decisions and recoverable messages are committed atomically before accepted
+is returned. Database read/write failures reject the observation for retry instead of
+falling back to memory-only dedupe. Non-opening messages enter the durable outbox before
+the first network send; definite transport failures retry for at most six minutes and
+survive a restart within that window. Expired jobs stop, and late retries are labeled.
+Opening alerts never cross checkpoints; the final 09:35 alert expires at 09:36 ET.
+Indeterminate read timeouts are not retried to avoid duplicate
+phone rings. This cannot scan while the computer is asleep, powered off, or
+fully offline; use the always-on deployment described in
+`New-docs/deployment/intraday-cloud.md` for that requirement. Deployment configuration
+in the repository is not proof of a running cloud service.
 
 ### Email
 

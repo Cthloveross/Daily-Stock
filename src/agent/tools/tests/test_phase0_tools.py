@@ -99,7 +99,7 @@ class TestGetJournalSnapshotTool:
         assert out["current_phase"] == 0
         assert out["reality_test"]["total_trades"] == 0
 
-    def test_counts_zero_dte_this_week(self):
+    def test_reports_recent_dte_distribution_without_weekly_quota(self):
         from src.agent.tools.get_journal_snapshot_tool import get_journal_snapshot_tool
         from src.journal.models import JournalTrade
         from src.journal.storage import init_journal_schema
@@ -126,7 +126,8 @@ class TestGetJournalSnapshotTool:
                 )
             )
         out = get_journal_snapshot_tool(days=30)
-        assert out["zero_dte_trades_last_week"] == 1
+        assert out["dte_counts"] == {"0DTE": 1}
+        assert "zero_dte_trades_last_week" not in out
 
 
 class TestGetOptionChainTool:

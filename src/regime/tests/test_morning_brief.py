@@ -16,7 +16,7 @@ def _mk_result(label="standard", score=60, events=None):
         date=date(2026, 4, 17),
         score=score,
         label=label,
-        action_hint="Standard risk; wait for retests.",
+        action_hint="Regime context only; not a DTE or underlying-signal gate.",
         d1_direction=20,
         d2_volatility=10,
         d3_macro_penalty=0,
@@ -36,7 +36,7 @@ class TestFormatBrief:
         body = format_brief(_mk_result())
         assert "Regime Brief" in body
         assert "2026-04-17" in body
-        assert "standard" in body
+        assert "mixed" in body
         assert "+60" in body
         assert "SPY" in body
         assert "520.12" in body
@@ -49,9 +49,23 @@ class TestFormatBrief:
 
     def test_no_trade_has_warning(self):
         body = format_brief(_mk_result(label="no_trade", score=20))
-        assert "no_trade" in body
+        assert "adverse" in body
         assert "Warnings" in body
-        assert "stand aside" in body.lower()
+        assert "not a DTE or underlying-signal gate" in body
+        assert "stand aside" not in body.lower()
+        assert "no new risk" not in body.lower()
+
+    def test_event_and_crisis_warnings_are_facts_not_trade_instructions(self):
+        result = _mk_result(label="cautious", score=40)
+        result.d3_macro_penalty = -30
+        result.d2_volatility = -15
+        body = format_brief(result)
+        assert "higher_risk" in body
+        assert "event and jump risk is elevated" in body
+        assert "volatility and liquidity risk is elevated" in body
+        assert "avoid held" not in body
+        assert "size down" not in body
+        assert "widen stops" not in body
 
     def test_handles_missing_vix(self):
         r = _mk_result()

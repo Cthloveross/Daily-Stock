@@ -525,3 +525,141 @@ def test_trade_context_is_not_created_when_preflight_fails(monkeypatch) -> None:
         moomoo_live._ctx_open("127.0.0.1", 11111, "US")
 
     trade_constructor.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Shared consecutive-failure circuit breaker (fake clock, fully deterministic)
+# ---------------------------------------------------------------------------
+
+
+class _FakeClock:
+    def __init__(self, start: float = 1_000.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _breaker(clock: _FakeClock) -> moomoo_runtime.MoomooCircuitBreaker:
+    return moomoo_runtime.MoomooCircuitBreaker(
+        failure_threshold=3,
+        cooldown_seconds=60.0,
+        probe_ttl_seconds=30.0,
+        clock=clock,
+    )
+
+
+def test_breaker_opens_after_three_consecutive_failures_and_fails_fast() -> None:
+    clock = _FakeClock()
+    breaker = _breaker(clock)
+
+    breaker.record_failure("timeout #1")
+    breaker.check()  # two failures: still closed
+    breaker.record_failure("timeout #2")
+    breaker.check()
+    breaker.record_failure("timeout #3")
+
+    assert breaker.is_open() is True
+    with pytest.raises(moomoo_runtime.MoomooCircuitOpenError):
+        breaker.check()
+    # Fail fast for the whole cooldown window.
+    clock.advance(59.9)
+    with pytest.raises(moomoo_runtime.MoomooCircuitOpenError):
+        breaker.check()
+
+
+def test_breaker_success_resets_the_consecutive_counter() -> None:
+    clock = _FakeClock()
+    breaker = _breaker(clock)
+
+    breaker.record_failure("timeout")
+    breaker.record_failure("timeout")
+    breaker.record_success()
+    breaker.record_failure("timeout")
+    breaker.record_failure("timeout")
+
+    # Never three in a row: still closed.
+    breaker.check()
+    assert breaker.is_open() is False
+
+
+def test_breaker_admits_exactly_one_probe_after_cooldown() -> None:
+    clock = _FakeClock()
+    breaker = _breaker(clock)
+    for _ in range(3):
+        breaker.record_failure("timeout")
+
+    clock.advance(60.0)
+    breaker.check()  # first caller becomes the half-open probe
+    with pytest.raises(moomoo_runtime.MoomooCircuitOpenError, match="probe"):
+        breaker.check()  # concurrent caller still fails fast
+
+    breaker.record_success()  # probe succeeded: breaker closes
+    breaker.check()
+    assert breaker.is_open() is False
+
+
+def test_breaker_failed_probe_restarts_the_full_cooldown() -> None:
+    clock = _FakeClock()
+    breaker = _breaker(clock)
+    for _ in range(3):
+        breaker.record_failure("timeout")
+
+    clock.advance(60.0)
+    breaker.check()  # probe admitted
+    breaker.record_failure("still wedged")
+
+    with pytest.raises(moomoo_runtime.MoomooCircuitOpenError):
+        breaker.check()
+    clock.advance(59.9)
+    with pytest.raises(moomoo_runtime.MoomooCircuitOpenError):
+        breaker.check()
+    clock.advance(0.2)
+    breaker.check()  # next probe admitted after the fresh cooldown
+
+
+def test_breaker_dangling_probe_expires_and_hands_off() -> None:
+    """探针路径提前返回（未 record_*）时靠探针租约自愈，绝不卡死半开态。"""
+
+    clock = _FakeClock()
+    breaker = _breaker(clock)
+    for _ in range(3):
+        breaker.record_failure("timeout")
+
+    clock.advance(60.0)
+    breaker.check()  # probe admitted but never reports back
+    clock.advance(30.0)  # probe TTL expires
+    breaker.check()  # a new caller takes over the probe slot
+
+
+def test_transport_detail_classification_ignores_business_rejections() -> None:
+    assert moomoo_runtime.is_transport_failure_detail("request timeout") is True
+    assert moomoo_runtime.is_transport_failure_detail("连接超时") is True
+    assert moomoo_runtime.is_transport_failure_detail("disconnected") is True
+    assert moomoo_runtime.is_transport_failure_detail("Unknown stock") is False
+    assert moomoo_runtime.is_transport_failure_detail("rate limited") is False
+    assert moomoo_runtime.is_transport_failure_detail(None) is False
+
+
+def test_breaker_is_tripped_reflects_outage_lifecycle():
+    """G-31 看门狗观测 is_tripped：closed→False，连续失败达阈值→True，
+    冷却到期仍 True（与 is_open() 的区别所在），仅探针成功闭合→False。"""
+
+    clock = {"t": 0.0}
+    breaker = moomoo_runtime.MoomooCircuitBreaker(
+        failure_threshold=2, cooldown_seconds=10.0, clock=lambda: clock["t"]
+    )
+    assert breaker.is_tripped is False
+    breaker.record_failure("connection lost")
+    assert breaker.is_tripped is False
+    breaker.record_failure("connection lost")
+    assert breaker.is_tripped is True
+    # 观测多次不改变状态、不占探针。
+    assert breaker.is_tripped is True
+    clock["t"] = 11.0
+    breaker.check()  # 冷却结束：本调用成为探针（放行）
+    breaker.record_success()
+    assert breaker.is_tripped is False

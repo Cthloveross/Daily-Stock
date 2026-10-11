@@ -86,6 +86,60 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "validation": {"min_items": 1},
         "display_order": 10,
     },
+    "INTRADAY_WATCHLIST": {
+        "title": "Intraday Watchlist (two-tier scan)",
+        "description": (
+            "日内 Top 扫描的宽层清单（逗号分隔美股代码）。留空＝保持现状"
+            "（STOCK_LIST 回退，单层扫描）；配置后启用两层模式：全清单每轮一次"
+            "批量快照，按 |涨跌幅|→成交额 晋升 Top K 进入深度层。"
+        ),
+        "category": "base",
+        "data_type": "array",
+        "ui_control": "textarea",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "",
+        "options": [],
+        "validation": {},
+        "display_order": 11,
+    },
+    "INTRADAY_DEEP_LANE_MAX": {
+        "title": "Intraday Deep Lane Max (K)",
+        "description": (
+            "两层模式下异动闸门每轮晋升到深度层的标的数上限（1..20，默认 12）。"
+            "仅约束按异动排名晋升的名额；当日冻结盘前计划标的始终占深度位。"
+        ),
+        "category": "base",
+        "data_type": "number",
+        "ui_control": "number",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "12",
+        "options": [],
+        "validation": {"min": 1, "max": 20},
+        "display_order": 12,
+    },
+    "INTRADAY_PINNED_TICKERS": {
+        "title": "Intraday Pinned Tickers (always deep-scanned)",
+        "description": (
+            "两层模式下的用户钉选清单（逗号分隔美股代码）。钉选标的保证每轮"
+            "进入深度层（与当日冻结盘前计划同权：不占 K 名额、并入同一批快照"
+            "、按当日额度去重）。留空＝无钉选；仅在 INTRADAY_WATCHLIST 已配置"
+            "时生效。"
+        ),
+        "category": "base",
+        "data_type": "array",
+        "ui_control": "textarea",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "",
+        "options": [],
+        "validation": {},
+        "display_order": 13,
+    },
     # ------------------------------------------------------------------
     # AI Model – LiteLLM unified config
     # ------------------------------------------------------------------
@@ -1522,6 +1576,156 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "options": [],
         "validation": {},
         "display_order": 11,
+    },
+    "INTRADAY_REFRESH_SCHEDULER_ENABLED": {
+        "title": "Intraday Warm Cache Scheduler",
+        "description": (
+            "Keep the default intraday-top scan cache warm on weekdays "
+            "09:00-16:15 ET warm window so the page default poll never hits the "
+            "10-45s cold path. Goes through the same single-flight scan "
+            "path as user requests; read-only, never places orders. "
+            "Requires a process restart."
+        ),
+        "category": "system",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "false",
+        "options": [],
+        "validation": {},
+        "display_order": 12,
+    },
+    "INTRADAY_REFRESH_INTERVAL_SECONDS": {
+        "title": "Intraday Warm Cache Interval (seconds)",
+        "description": (
+            "Maximum ordinary warm-loop cadence in seconds (default 60). "
+            "The loop aligns to each completed minute plus five seconds; "
+            "2-minute P0 evaluation still consumes only newly completed exact bars. Values "
+            "below 30 are clamped to 30."
+        ),
+        "category": "system",
+        "data_type": "number",
+        "ui_control": "number",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "60",
+        "options": [],
+        "validation": {"min": 30},
+        "display_order": 13,
+    },
+    "INTRADAY_ALERTS_ENABLED": {
+        "title": "Opening / Legacy Intraday Alert Flow",
+        "description": (
+            "Enable P1-O opening alerts plus the legacy P1/P2/system "
+            "alert flow observed from the warm-scan payload. This is not "
+            "the strict 2-minute P0 research or mobile-action switch. "
+            "Requires INTRADAY_REFRESH_SCHEDULER_ENABLED; phone delivery "
+            "also requires Telegram credentials and a process restart."
+        ),
+        "category": "system",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "false",
+        "options": [],
+        "validation": {},
+        "display_order": 14,
+    },
+    "INTRADAY_P0_2M_ENABLED": {
+        "title": "Exact 2-minute P0 Research Lane",
+        "description": (
+            "Evaluate the full INTRADAY_WATCHLIST with strict completed "
+            "2-minute bars. Symbols without their own 60-session same-clock "
+            "baseline remain baseline_warming/shadow. Never places orders."
+        ),
+        "category": "system",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "true",
+        "options": [],
+        "validation": {},
+        "display_order": 15,
+    },
+    "INTRADAY_P0_2M_ACTION_ENABLED": {
+        "title": "Exact 2-minute P0/P0-X Mobile Delivery",
+        "description": (
+            "Explicit mobile-delivery switch. A passed activation artifact "
+            "whose universe_hash matches the current watchlist is also "
+            "mandatory; this switch alone cannot bypass calibration gates."
+        ),
+        "category": "system",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "false",
+        "options": [],
+        "validation": {},
+        "display_order": 16,
+    },
+    "INTRADAY_P0_2M_ACTIVATION_ARTIFACT": {
+        "title": "Exact 2-minute P0 Activation Artifact",
+        "description": (
+            "Optional absolute path to the locked calibration JSON. Mobile "
+            "delivery remains disabled when it is absent, invalid, stale, or "
+            "for a different universe hash."
+        ),
+        "category": "system",
+        "data_type": "string",
+        "ui_control": "text",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": None,
+        "options": [],
+        "validation": {},
+        "display_order": 17,
+    },
+    "INTRADAY_P0_2M_SHADOW_MOBILE_ENABLED": {
+        "title": "Strict 2-minute Research Notifications",
+        "description": (
+            "Send real four-condition crossings as uncalibrated research "
+            "notifications, with independent budgets and no option supplement. "
+            "Requires Telegram credentials; does not enable formal P0 or "
+            "claim a verified return advantage. Restart to apply."
+        ),
+        "category": "system",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "false",
+        "options": [],
+        "validation": {},
+        "display_order": 18,
+    },
+    "INTRADAY_ALERTS_MAX_PER_DAY": {
+        "title": "Intraday Alerts Daily Cap",
+        "description": (
+            "Maximum alerts per ET day (default 20, minimum 1). When the "
+            "cap is reached one final notice is sent and alerting stops "
+            "for the rest of the day."
+        ),
+        "category": "system",
+        "data_type": "number",
+        "ui_control": "number",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "20",
+        "options": [],
+        "validation": {"min": 1},
+        "display_order": 18,
     },
     "SCHEDULE_RUN_IMMEDIATELY": {
         "title": "Schedule Run Immediately",
