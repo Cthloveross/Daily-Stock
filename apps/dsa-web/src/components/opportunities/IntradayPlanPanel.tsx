@@ -14,7 +14,7 @@ import {
 } from '../../stores/intradayPlanStore';
 import { InfoHint } from '../common/InfoHint';
 import { Tooltip } from '../common/Tooltip';
-import { LANE_SAMPLE_CAVEAT } from './LaneChecklistPanel';
+import { INTRADAY_POLICY_CAVEAT } from './LaneChecklistPanel';
 import { SPREAD_ILLIQUID_THRESHOLD_PERCENT } from './NearExpiryContractPanel';
 import { quoteTimeLabel } from './intradayFormat';
 import {
@@ -26,11 +26,8 @@ import {
 import {
   evaluatePlanTicker,
   type PlanCheckRow,
-  type PlanTickerView,
 } from './intradayPlanChecks';
 import {
-  OVERNIGHT_MAX_DTE,
-  OVERNIGHT_MIN_DTE,
   type CheckStatus,
 } from './laneChecklist';
 
@@ -68,7 +65,7 @@ export const PLAN_FRAMING_LINE = '按你自己的规则机械核对，不是买�
 /** 标题行 ⓘ 的完整诚实边界：定位句 + 样本口径 caveat（逐字）。 */
 export const PLAN_HONESTY_NOTE = [
   `${PLAN_FRAMING_LINE}。`,
-  LANE_SAMPLE_CAVEAT,
+  INTRADAY_POLICY_CAVEAT,
 ].join('\n');
 
 export const INVALIDATION_PROMPT =
@@ -121,21 +118,17 @@ function CheckRow({ check }: { check: PlanCheckRow }) {
 }
 
 /**
- * 合约候选区：按今日车道推出的 DTE 区间读一次临期合约，按**用户自己的**
+ * 合约候选区：固定读取唯一活动车道的 0..7DTE，按**用户自己的**
  * 价格分档标注，并把标准仓位换成张数与手续费。不排序偏好、不推荐任何一张。
  */
 function PlanContracts({
   ticker,
-  minDte,
   maxDte,
-  windowMode,
   dteLabel,
   standardSizeUsd,
 }: {
   ticker: string;
-  minDte: number;
   maxDte: number;
-  windowMode: PlanTickerView['contractWindowMode'];
   dteLabel: string;
   standardSizeUsd: number;
 }) {
@@ -160,14 +153,9 @@ function PlanContracts({
     void load(false);
   }, [load]);
 
-  // 车道未知时同时显示两个合规窗口（0DTE 与 4-7DTE），1-3DTE 与车道无关地
-  // 绝不显示（V2-C①）——「车道读不到」绝不静默降级成「默认日内」。
-  const groups = (item?.expiries ?? []).filter((group) => (
-    windowMode === 'unknown'
-      ? group.dte === 0
-        || (group.dte >= OVERNIGHT_MIN_DTE && group.dte <= OVERNIGHT_MAX_DTE)
-      : group.dte >= minDte
-  ));
+  const groups = (item?.expiries ?? []).filter(
+    (group) => group.dte >= 0 && group.dte <= maxDte,
+  );
 
   return (
     <div className="mt-2 rounded-ds-sm border border-subtle bg-bg-0 p-2">
@@ -183,7 +171,7 @@ function PlanContracts({
               '$2-8 甜蜜区（你自己的历史）：$2-4 净 +3.12%（n=544）、$4-8 净 +3.44%（n=208）。\n'
               + '<$1 净 −14.25%（n=72），费用吃掉权利金的 5.56%——同样金额买便宜合约＝张数多＝手续费按张收。\n'
               + '$1-2 净 −1.28%（n=365，毛 +0.93%，被 2.20% 费用翻负）；>$8 净 −0.96%（n=218）。\n'
-              + LANE_SAMPLE_CAVEAT
+              + INTRADAY_POLICY_CAVEAT
             }
           >
             <span className="text-caption text-text-3 underline decoration-dotted underline-offset-2">
@@ -215,11 +203,7 @@ function PlanContracts({
         <p className="mt-1 text-caption text-text-3">{item.message}</p>
       ) : groups.length === 0 ? (
         <p className="mt-1 text-caption text-text-3">
-          {windowMode === 'unknown'
-            ? `链内 0–${maxDte}DTE 中没有 0DTE 或 ${OVERNIGHT_MIN_DTE}-${OVERNIGHT_MAX_DTE}DTE 的到期日（今日车道未知，仅显示这两个合规窗口）。`
-            : minDte > 0
-              ? `链内 0–${maxDte}DTE 中没有 ${minDte}DTE 及以上的到期日（今日车道要求 ${dteLabel}）。`
-              : '链内没有符合今日车道的到期日。'}
+          {`链内没有 0–${maxDte}DTE 到期日。`}
         </p>
       ) : (
         <div className="mt-1.5 overflow-x-auto">
@@ -334,9 +318,9 @@ function PlanContracts({
  * 盘中计划：用户从下方实时扫描手动提升上来的标的，逐个做**机械核对**。
  *
  * 每张卡片给四件事，全部是核对而非建议：
- * 1. 今日车道（V2-E，来自服务端 `laneAvailability`）；
+ * 1. 今日 INTRA-0-7 可用性（来自服务端 `laneAvailability`）；
  * 2. 逐条规则状态（复用 `laneChecklist.ts` 的判定 + 扫描已有读数）；
- * 3. 今日车道对应 DTE 区间的合约候选，按**你自己的**价格分档标注
+ * 3. 0–7DTE、同日退出范围内的合约候选，按**你自己的**价格分档标注
  *    （$2-8 甜蜜区高亮、<$1 灰显警示）并把标准仓位换成张数与手续费；
  * 4. 失效位提示（中性一行，不给任何进出场价位）。
  *
@@ -347,10 +331,12 @@ export function IntradayPlanPanel({
   pulse,
   top,
   loading = false,
+  nowMs,
 }: {
   pulse: IntradayPulseResponse | null;
   top: IntradayTopResponse | null;
   loading?: boolean;
+  nowMs?: number;
 }) {
   const tickers = useIntradayPlanStore(selectPlanTickers);
   const demote = useIntradayPlanStore((state) => state.demote);
@@ -367,8 +353,10 @@ export function IntradayPlanPanel({
     candidates: top?.candidates ?? [],
     laneAvailability: top?.laneAvailability ?? null,
     pulseGeneratedAt: pulse?.generatedAt ?? null,
+    executionPolicy: top?.executionPolicy,
+    nowMs,
     loading: loading && !top,
-  })), [tickers, top, pulse, loading]);
+  })), [tickers, top, pulse, loading, nowMs]);
 
   return (
     <section
@@ -431,17 +419,19 @@ export function IntradayPlanPanel({
                     <span
                       data-plan-day-type={view.dayType.state}
                       className={`text-caption ${
-                        view.lane === 'overnight' ? 'text-warn-strong' : 'text-text-2'
+                        view.dayType.state === 'unavailable'
+                          ? 'text-warn-strong'
+                          : 'text-text-2'
                       }`}
                     >
-                      今日车道：
-                      {view.lane === 'intraday'
-                        ? '日内可用（V2-E）'
-                        : view.lane === 'overnight'
-                          ? '过夜日 · 日内关闭（V2-E）'
+                      活动规则：
+                      {view.lane === 'intra_0_7'
+                        ? 'INTRA-0-7 可用'
+                        : view.dayType.state === 'unavailable'
+                          ? 'INTRA-0-7 暂停'
                           : view.dayType.state === 'loading'
-                            ? '读取中…'
-                            : '标缺（V2-E）'}
+                            ? 'INTRA-0-7 读取中…'
+                            : 'INTRA-0-7 标缺'}
                     </span>
                   </Tooltip>
                   {!view.inDeepLane && (
@@ -461,6 +451,18 @@ export function IntradayPlanPanel({
                 </button>
               </div>
 
+              {/* 仅今日财报的长权利金硬性警示（de Silva 证据引用；
+                  只警示不禁止——系统只读，不隐藏任何内容）。 */}
+              {view.earningsHardBlock && (
+                <p
+                  data-testid={`earnings-hard-block-${view.ticker}`}
+                  role="alert"
+                  className="mt-2 rounded-ds-sm border border-warn-strong bg-bg-0 px-2 py-1.5 text-caption font-medium text-warn-strong"
+                >
+                  {view.earningsHardBlock}
+                </p>
+              )}
+
               <ul className="mt-2 space-y-1" aria-label={`${view.ticker} 逐条核对`}>
                 {view.checks.map((check) => (
                   <CheckRow key={check.id} check={check} />
@@ -469,7 +471,7 @@ export function IntradayPlanPanel({
 
               {view.legs.length > 0 && (
                 <div className="mt-1.5 flex flex-wrap items-baseline gap-1">
-                  <span className="text-caption text-text-3">今日波段</span>
+                  <span className="text-caption text-text-3">旧 5m 兼容波段（研究）</span>
                   {view.legs.map((leg) => (
                     <span
                       key={`${leg.startEt}-${leg.endEt}`}
@@ -477,7 +479,7 @@ export function IntradayPlanPanel({
                     >
                       {leg.startEt}
                       {leg.direction === 'up' ? '↑' : leg.direction === 'down' ? '↓' : '→'}
-                      {leg.grade === 'strong' ? ' 暴动' : leg.grade === 'medium' ? ' 推升' : ''}
+                      {leg.grade === 'strong' ? ' strong' : leg.grade === 'medium' ? ' medium' : ''}
                     </span>
                   ))}
                 </div>
@@ -485,9 +487,7 @@ export function IntradayPlanPanel({
 
               <PlanContracts
                 ticker={view.ticker}
-                minDte={view.contractMinDte}
                 maxDte={view.contractMaxDte}
-                windowMode={view.contractWindowMode}
                 dteLabel={view.contractDteLabel}
                 standardSizeUsd={standardSizeUsd}
               />

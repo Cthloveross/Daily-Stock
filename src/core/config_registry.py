@@ -1600,8 +1600,10 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     "INTRADAY_REFRESH_INTERVAL_SECONDS": {
         "title": "Intraday Warm Cache Interval (seconds)",
         "description": (
-            "Warm-loop cadence in seconds (default 45). Values below 30 "
-            "(the base single-flight lease) are clamped to 30."
+            "Maximum ordinary warm-loop cadence in seconds (default 60). "
+            "The loop aligns to each completed minute plus five seconds; "
+            "2-minute P0 evaluation still consumes only newly completed exact bars. Values "
+            "below 30 are clamped to 30."
         ),
         "category": "system",
         "data_type": "number",
@@ -1609,20 +1611,19 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "is_sensitive": False,
         "is_required": False,
         "is_editable": True,
-        "default_value": "45",
+        "default_value": "60",
         "options": [],
         "validation": {"min": 30},
         "display_order": 13,
     },
     "INTRADAY_ALERTS_ENABLED": {
-        "title": "Intraday Opportunity Alerts (Telegram)",
+        "title": "Opening / Legacy Intraday Alert Flow",
         "description": (
-            "Push factual intraday alerts (premarket movers, volume "
-            "bursts, strong legs, 30-min displacement, 0DTE day type) "
-            "to Telegram, detected on the warm-scan payload with zero "
-            "extra provider fetches. Facts only, never trade advice. "
-            "Requires INTRADAY_REFRESH_SCHEDULER_ENABLED plus Telegram "
-            "credentials, and a process restart."
+            "Enable P1-O opening alerts plus the legacy P1/P2/system "
+            "alert flow observed from the warm-scan payload. This is not "
+            "the strict 2-minute P0 research or mobile-action switch. "
+            "Requires INTRADAY_REFRESH_SCHEDULER_ENABLED; phone delivery "
+            "also requires Telegram credentials and a process restart."
         ),
         "category": "system",
         "data_type": "boolean",
@@ -1634,6 +1635,79 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "options": [],
         "validation": {},
         "display_order": 14,
+    },
+    "INTRADAY_P0_2M_ENABLED": {
+        "title": "Exact 2-minute P0 Research Lane",
+        "description": (
+            "Evaluate the full INTRADAY_WATCHLIST with strict completed "
+            "2-minute bars. Symbols without their own 60-session same-clock "
+            "baseline remain baseline_warming/shadow. Never places orders."
+        ),
+        "category": "system",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "true",
+        "options": [],
+        "validation": {},
+        "display_order": 15,
+    },
+    "INTRADAY_P0_2M_ACTION_ENABLED": {
+        "title": "Exact 2-minute P0/P0-X Mobile Delivery",
+        "description": (
+            "Explicit mobile-delivery switch. A passed activation artifact "
+            "whose universe_hash matches the current watchlist is also "
+            "mandatory; this switch alone cannot bypass calibration gates."
+        ),
+        "category": "system",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "false",
+        "options": [],
+        "validation": {},
+        "display_order": 16,
+    },
+    "INTRADAY_P0_2M_ACTIVATION_ARTIFACT": {
+        "title": "Exact 2-minute P0 Activation Artifact",
+        "description": (
+            "Optional absolute path to the locked calibration JSON. Mobile "
+            "delivery remains disabled when it is absent, invalid, stale, or "
+            "for a different universe hash."
+        ),
+        "category": "system",
+        "data_type": "string",
+        "ui_control": "text",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": None,
+        "options": [],
+        "validation": {},
+        "display_order": 17,
+    },
+    "INTRADAY_P0_2M_SHADOW_MOBILE_ENABLED": {
+        "title": "Strict 2-minute Research Notifications",
+        "description": (
+            "Send real four-condition crossings as uncalibrated research "
+            "notifications, with independent budgets and no option supplement. "
+            "Requires Telegram credentials; does not enable formal P0 or "
+            "claim a verified return advantage. Restart to apply."
+        ),
+        "category": "system",
+        "data_type": "boolean",
+        "ui_control": "switch",
+        "is_sensitive": False,
+        "is_required": False,
+        "is_editable": True,
+        "default_value": "false",
+        "options": [],
+        "validation": {},
+        "display_order": 18,
     },
     "INTRADAY_ALERTS_MAX_PER_DAY": {
         "title": "Intraday Alerts Daily Cap",
@@ -1651,7 +1725,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "default_value": "20",
         "options": [],
         "validation": {"min": 1},
-        "display_order": 15,
+        "display_order": 18,
     },
     "SCHEDULE_RUN_IMMEDIATELY": {
         "title": "Schedule Run Immediately",

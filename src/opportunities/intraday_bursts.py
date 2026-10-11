@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Pure rolling 15-minute momentum-burst (波段爆发) detection on 5m bars.
+"""Legacy rolling 15-minute momentum-burst display on 5m bars.
+
+This heuristic is retained only for API compatibility and retrospective
+research display.  It is not an active P0/P0-X condition and must not affect
+alerting, tiering, supporting-evidence counts, or candidate ranking.
 
 This module never fetches data.  Callers inject a symbol's raw 5m bars (the
 same rows the ``/stocks/{code}/history?period=5m`` loader returns, ``date`` as
@@ -190,8 +194,8 @@ LEG_MIN_SCORE = 8.0
 # 5.03、持续段 2.5-3.1，而同日无波时段窗口 <1.1 —— 2.5 收录该波全程且
 # 不触及静默期。中波段只是记录与展示分级，不改变 supports 口径。
 LEG_MEDIUM_MIN_SCORE = 2.5
-# 当前窗口记为 supports 的最低 burst_score（比 LEG_MIN_SCORE 低一档，
-# 让正在发展中的爆发提前一根 K 线亮起）。
+# Historical supports threshold.  v9 retains the value only to decode/replay
+# old artifacts; current evidence is always neutral/unknown and never ranks.
 BURST_SUPPORT_MIN = 6.0
 # 两个独立波段的窗口起点至少相隔 30 分钟，否则视为同一波并合并。
 LEG_MIN_GAP_MINUTES = 30
@@ -202,10 +206,9 @@ BURST_BASIS = "rolling_15m_thrust_over_median_range_times_volume_ratio"
 MEDIAN_BASIS_CURRENT = "current_session_bars_so_far"
 MEDIAN_BASIS_PRIOR = "prior_session_fallback"
 
-# v3 速度分级：相邻两个滚动 15 分钟窗口的爆发分之差。用户纪律（Playbook
-# 候选 R1）是「日内只交易加速；2 分钟级速度的波在 1 分钟速度熄火时离场」——
-# 本仓库的 K 线是 5 分钟粒度，诚实 v1 只能给出 5m 窗口级的加速/减速近似，
-# 不是 1m/2m 秒级速度；减速标签是用户自己的离场提示，不是系统信号。
+# v3 速度分级：相邻两个滚动 15 分钟窗口的爆发分之差。本仓库的 K 线是
+# 5 分钟粒度，只能给出窗口级的加速/减速近似。INTRA-0-7/v1 下它是纯观察性
+# 上下文，不映射旧 Playbook R1，也不产生进场、持有或离场指令。
 SPEED_BASIS = "consecutive_rolling_15m_window_burst_score_delta_5m_bars"
 
 # ---------------------------------------------------------------------------
@@ -361,7 +364,7 @@ BURST_LIMITATIONS = (
     "成交事件，不代表尾盘更值得交易；与既有「开盘段占多数」一样，本版只如实声明、不改阈值。",
     "开盘前 30 分钟（当日不足 6 根 K 线）中位数基准回退上一交易时段并显式标注。",
     "速度分级＝相邻两个 15 分钟窗口爆发分之差（5m K 线近似，非 1m/2m 秒级速度）；"
-    "「减速」对应用户自身纪律 R1 的离场提示，不是系统买卖信号。",
+    "它只描述已发生的波动变化，不映射旧 R1，也不产生进场、持有或离场指令。",
     # v7 起速回放研究（9,173 次爆发起点）实测的两条口径性质，如实声明，不改阈值。
     f"阈值口径的已知性质：中波段阈值（≥{LEG_MEDIUM_MIN_SCORE}）平均每个「有爆发的标的-交易日」"
     "触发 3.74 个窗口，其中 62.8% 落在开盘 stratum（当日不足 6 根 K 线、中位数基准回退上一"
@@ -487,6 +490,8 @@ def unavailable_fizzle_flag(
     """标缺的哑火读数：缺席不是结论，前端据此**什么都不渲染**。"""
 
     return {
+        "legacy": True,
+        "legacy_usage": "api_compatibility_and_research_display_only",
         "state": "unavailable",
         "efficiency": efficiency,
         "vol_norm": vol_norm,
@@ -663,6 +668,32 @@ def normalize_bar_label_convention(
     return rows
 
 
+def filter_completed_bars_as_of(
+    bars: Sequence[Mapping[str, Any]],
+    *,
+    as_of: Any,
+    bar_minutes: int = BURST_BAR_MINUTES,
+) -> list[dict[str, Any]]:
+    """只保留在 ``as_of`` 时已经完整收盘的 start-labelled K 线。
+
+    供应商可能在一个 5 分钟周期尚未结束时就返回正在形成的那根。盘中 warm
+    每 30--45 秒运行，若不裁剪，15 分钟 burst 与 30 分钟 displacement 会
+    偷看部分 K 线并把它缓存。无法解析时间或 ``as_of`` 无时区时 fail closed。
+    """
+
+    observed = _parse_bar_start_et(as_of)
+    if observed is None:
+        return []
+    duration = timedelta(minutes=max(1, int(bar_minutes)))
+    completed: list[dict[str, Any]] = []
+    for bar in bars or ():
+        start = _parse_bar_start_et(bar.get("date"))
+        if start is None or start + duration > observed:
+            continue
+        completed.append(dict(bar))
+    return completed
+
+
 def filter_regular_session_bars(
     bars: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -686,7 +717,11 @@ def filter_regular_session_bars(
         close = _finite(bar.get("close"))
         if open_ is None or high is None or low is None or close is None:
             continue
-        if open_ <= 0 or high < low:
+        if (
+            min(open_, high, low, close) <= 0
+            or high < low
+            or not (low <= open_ <= high and low <= close <= high)
+        ):
             continue
         volume = _finite(bar.get("volume"))
         rows.append(

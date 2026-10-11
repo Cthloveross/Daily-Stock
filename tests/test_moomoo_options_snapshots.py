@@ -1237,3 +1237,35 @@ def test_expiry_availability_short_wait_raises_busy_instead_of_failure(
         is None
     )
     assert waits == [2.5, None]
+
+
+def test_near_expiry_chain_short_wait_raises_busy_instead_of_failure(
+    monkeypatch,
+):
+    """P0 warm read can defer a busy shared wall lane without negative caching."""
+
+    _install_fake_moomoo(monkeypatch)
+    monkeypatch.setattr(moomoo_options, "_enabled", lambda: True)
+    waits: list[float] = []
+
+    def busy_claim(wait_seconds=None):
+        waits.append(wait_seconds)
+        return None
+
+    monkeypatch.setattr(
+        moomoo_options, "_claim_wall_context_lane", busy_claim
+    )
+
+    with pytest.raises(moomoo_options.MoomooWallLaneBusyError):
+        moomoo_options.fetch_near_expiry_chain_moomoo(
+            "NVDA", max_dte=7, ref_date=date(2026, 8, 4), lane_wait_seconds=2.5
+        )
+    assert waits == [2.5]
+
+    assert (
+        moomoo_options.fetch_near_expiry_chain_moomoo(
+            "NVDA", max_dte=7, ref_date=date(2026, 8, 4)
+        )
+        is None
+    )
+    assert waits == [2.5, None]

@@ -35,7 +35,6 @@ from src.opportunities.intraday_bursts import (
     ATR_SCALE_LIMITATION_LINE,
     BURST_BASIS,
     BURST_LIMITATIONS,
-    BURST_SUPPORT_MIN,
     DISPLACEMENT_LIMITATION_LINE,
     FIZZLE_CAVEAT,
     FIZZLE_EFFICIENCY_MIN,
@@ -51,7 +50,7 @@ from src.opportunities.intraday_setups import (
     compute_setup_match_profile,
 )
 
-# v2: 波段爆发（15 分钟推力×量比）成为盘中主排序信号；聚合证据退居次序。
+# historical v2: 波段爆发（15 分钟推力×量比）曾成为盘中主排序信号。
 # v3: 新增四类「上下文信号」——时段上下文（用户历史纪律提示）、财报临近标记、
 # 大盘对齐（候选爆发方向 vs SPY VWAP 位置）、速度分级（相邻窗口爆发分之差）。
 # 全部是标注（labels），不参与排序、不隐藏行、不阻断任何操作：系统标注，
@@ -86,7 +85,9 @@ from src.opportunities.intraday_setups import (
 #      循环性是构造性的；改成只用 15 分钟检查点**向前**计分后，速度未死与
 #      速度已死的 P(>0) 差异只剩 ~0.1pp。该列因此只描述过去 30 分钟，
 #      不承载任何前向信息（文案随之去掉「活下来」的存活框架）。
-INTRADAY_TOP_SIGNAL_VERSION = "intraday_session_evidence_v8"
+# v9: 旧 5m burst_score 降为 API/复盘兼容字段，不再计 supports 或参与排序；
+# P0/P0-X 已迁移到独立严格 2m 信号。列表改按其余研究证据计数排序。
+INTRADAY_TOP_SIGNAL_VERSION = "intraday_session_evidence_v9"
 INTRADAY_TOP_SCHEMA_VERSION = "intraday-top/1.0"
 
 # ---------------------------------------------------------------------------
@@ -106,10 +107,7 @@ MARKET_ALIGNMENT_BASIS = (
 MARKET_CONTEXT_TICKER = "SPY"
 _NEW_YORK_TZ = ZoneInfo("America/New_York")
 
-# 盘中（盘前/盘中/盘后，quote_session_scope=current_session）：按当前爆发分
-# 优先排序；休市（closed）：v2 起按「最近交易时段的最强波段分」排序（复盘视角：
-# 今天谁走出过最强的波），缺波段读数的行退回证据计数序，并仍附带最近一个交易
-# 时段的波段列表（晚间复盘可见「今日走了几波」）。
+# 旧排序枚举只为历史载荷兼容保留；生产响应从 v9 起只生成证据计数排序。
 RANKING_METHOD_BURST_FIRST = "burst_score_first_then_evidence_count"
 RANKING_METHOD_EVIDENCE_COUNT = "rule_based_evidence_count"
 
@@ -164,19 +162,18 @@ INTRADAY_TOP_LIMITATIONS = (
     "盘中滚动研究：结果随行情持续变化，不冻结任何版本，也不能事后重建。",
     "不写入机会快照、qualification 或 5D/20D 结果统计（statistics_track=none_intraday_v1_unscored）。",
     "期权异动为 Moomoo 分类计数：不推断开平仓，不证明真实主动买卖方向。",
-    "盘中排序以 15 分钟波段爆发分（推力×量比，v2 启发式阈值按 2026-07-31 标注样本校准）优先，"
-    "证据计数次之；休市按最近交易时段的最强波段分排序（缺波段读数的行退回证据计数序）。"
-    "两者都不是胜率或预期收益模型，不是买卖信号。",
+    "旧 5m burst_score 是未验证启发式，仅为 API/复盘兼容展示；不再进入支持项计数、排序、"
+    "提醒或 P0 分级。当前列表统一按其余独立研究证据计数排序；这也不是胜率或预期收益模型。",
     "量能节奏对比 20 个交易日全日中位数，未按盘中时点折算；VWAP 为累计额/量近似。",
     "v3 上下文信号（时段/财报/大盘/速度）只是标注，不参与排序、不隐藏行、不阻断操作：系统标注，用户过滤。",
-    "时段提示为用户自身 1,653 笔已平仓交易统计的硬编码 v1 文案（Playbook 候选 R1/R3），不是市场统计或买卖信号；"
-    "时段由 America/New_York 时钟判定，未接入交易所假日日历。",
+    "时段标签只陈述 America/New_York 墙钟对应的流动性/波动环境；不包含轻仓、进场、观望、持有或离场建议，"
+    "且未接入交易所假日日历。",
     f"财报临近＝Finnhub 财报日历前向 {EARNINGS_WINDOW_DAYS} 天窗口；≤{EARNINGS_BLACKOUT_DAYS} 天标注"
     "「期权贵」是用户自身回避规则的 v1 启发式；日历不可得时显式标缺，绝不以「无财报」冒充。",
     "大盘对齐＝候选当前爆发方向 vs SPY 会话 VWAP 位置；SPY VWAP 为累计成交额 ÷ 累计成交量近似，"
     "非逐笔官方 VWAP，任一侧缺失即标缺。",
     "速度分级＝相邻两个 15 分钟窗口爆发分之差（5m K 线近似，非 1m/2m 秒级速度）；"
-    "「减速」对应用户纪律 R1 的离场提示，不是系统信号。",
+    "它只描述已发生的波动变化，不映射任何离场规则。",
     "v4 形态相似度（styleMatch v1）＝当前时段几何形状 vs 你自己的三个 Playbook "
     "setup（S1 低点抬高突破 / S2 跳空托举 / S3 高开遇阻）的纯形状对比：5m K 线"
     "聚合到 15m 近似 + 会话快照派生字段，非 2m/1m 确认帧，不含 8/13 EMA 托举与"
@@ -711,7 +708,7 @@ def build_intraday_top_candidate(
             (last_price / snapshot_prev_close - 1.0) * 100.0, 6
         )
 
-    # -- 2. momentum burst（波段爆发，v2 主信号） ------------------------------
+    # -- 2. legacy momentum burst（仅兼容展示） -------------------------------
     # 5m K 线来自共享历史加载器，与 Moomoo 快照互相独立：任何一侧失败都只让
     # 自己显式标缺，绝不拖垮另一侧的证据。
     bursts = dict(
@@ -719,12 +716,13 @@ def build_intraday_top_candidate(
         if burst_profile is not None
         else unavailable_burst_profile("burst_input_missing")
     )
+    bursts["legacy"] = True
+    bursts["legacy_usage"] = "api_compatibility_and_research_display_only"
     burst_current = bursts.get("current") or None
     burst_score = _finite(
         burst_current.get("score") if isinstance(burst_current, Mapping) else None
     )
     burst_observed = bursts.get("state") == "ready" and burst_score is not None
-    burst_supports = burst_observed and burst_score >= BURST_SUPPORT_MIN
     evidence.append(
         _evidence(
             ticker=ticker,
@@ -743,13 +741,17 @@ def build_intraday_top_candidate(
                 else None
             ),
             unit="ratio",
-            status="supports" if burst_supports else ("neutral" if burst_observed else "unknown"),
+            status="neutral" if burst_observed else "unknown",
             source=bursts.get("source") or "history_5m_loader",
             observed_at=bursts.get("session_date_et"),
             fetched_at=bursts.get("fetched_at") or as_of_text,
             observation_window=BURST_BASIS,
             quality_state="derived" if burst_observed else "missing",
-            limitations=list(BURST_LIMITATIONS),
+            actionability="legacy_context",
+            limitations=[
+                "legacy：5m burst_score 只为 API/复盘兼容保留，不参与支持项计数、排序、提醒或 P0 分级。",
+                *BURST_LIMITATIONS,
+            ],
         )
     )
 
@@ -1173,80 +1175,12 @@ def build_intraday_top_candidate(
     }
 
 
-def _candidate_current_burst_score(candidate: Mapping[str, Any]) -> Optional[float]:
-    bursts = candidate.get("session_bursts")
-    if not isinstance(bursts, Mapping) or bursts.get("state") != "ready":
-        return None
-    current = bursts.get("current")
-    if not isinstance(current, Mapping):
-        return None
-    return _finite(current.get("score"))
-
-
-def _candidate_best_burst_score(candidate: Mapping[str, Any]) -> Optional[float]:
-    """会话内最强波段分：取当前窗口与全部已识别波段的最大值。
-
-    休市复盘视角下「今天谁走出过最强的波」比收盘时点的末窗口分更有意义；
-    盘中该值与当前窗口分共同决定排序上限。缺失时返回 None，不以 0 冒充。
-    """
-
-    bursts = candidate.get("session_bursts")
-    if not isinstance(bursts, Mapping) or bursts.get("state") != "ready":
-        return None
-    scores: list[float] = []
-    current = bursts.get("current")
-    if isinstance(current, Mapping):
-        value = _finite(current.get("score"))
-        if value is not None:
-            scores.append(value)
-    legs = bursts.get("legs")
-    if isinstance(legs, Sequence):
-        for leg in legs:
-            if isinstance(leg, Mapping):
-                value = _finite(leg.get("score"))
-                if value is not None:
-                    scores.append(value)
-    return max(scores) if scores else None
-
-
 def _candidate_sort_key(candidate: Mapping[str, Any]) -> tuple[Any, ...]:
-    """v1 ordering: research state, then supports count, then ticker."""
+    """v9 ordering: non-legacy research state/evidence, then ticker."""
 
     return (
         _STATE_ORDER.get(str(candidate.get("research_state")), 99),
         -int(candidate.get("supporting_evidence_count") or 0),
-        str(candidate.get("ticker") or ""),
-    )
-
-
-def _candidate_burst_sort_key(candidate: Mapping[str, Any]) -> tuple[Any, ...]:
-    """v2 in-session ordering: current burst score first, then supports/state.
-
-    A missing/unavailable burst never fabricates a score of 0 — those rows
-    simply fall back behind every scored row, ordered by the v1 key.
-    """
-
-    score = _candidate_current_burst_score(candidate)
-    return (
-        0 if score is not None else 1,
-        -(score if score is not None else 0.0),
-        -int(candidate.get("supporting_evidence_count") or 0),
-        _STATE_ORDER.get(str(candidate.get("research_state")), 99),
-        str(candidate.get("ticker") or ""),
-    )
-
-
-def _candidate_session_best_burst_sort_key(
-    candidate: Mapping[str, Any],
-) -> tuple[Any, ...]:
-    """休市排序：最近交易时段的最强波段分优先，缺失退回 v1 序。"""
-
-    score = _candidate_best_burst_score(candidate)
-    return (
-        0 if score is not None else 1,
-        -(score if score is not None else 0.0),
-        -int(candidate.get("supporting_evidence_count") or 0),
-        _STATE_ORDER.get(str(candidate.get("research_state")), 99),
         str(candidate.get("ticker") or ""),
     )
 
@@ -1313,17 +1247,9 @@ def build_intraday_top_run(
         )
         for ticker in symbols
     ]
-    # 盘前/盘中/盘后按当前爆发分优先；休市按「最近交易时段的最强波段分」
-    # 排序（复盘视角：今天谁走出过最强的波），两种口径都不冻结、不入统计。
-    burst_ranked = quote_session_scope == QUOTE_SCOPE_CURRENT
-    candidates.sort(
-        key=(
-            _candidate_burst_sort_key
-            if burst_ranked
-            else _candidate_session_best_burst_sort_key
-        )
-    )
-    ranking_method = RANKING_METHOD_BURST_FIRST
+    # v9 起旧 5m burst_score 仅作兼容/复盘展示，任何时段都不得影响排序。
+    candidates.sort(key=_candidate_sort_key)
+    ranking_method = RANKING_METHOD_EVIDENCE_COUNT
 
     as_of_text = _iso(as_of)
     fingerprint = "|".join(

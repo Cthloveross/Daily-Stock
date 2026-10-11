@@ -235,7 +235,7 @@ export function IntradayTrackingPanel({ candidates }: { candidates: OpportunityC
               onChange={(event) => setAutoRefresh(event.target.checked)}
               aria-label="自动刷新今日计划跟踪"
             />
-            自动刷新（60 秒 · 仅盘前/盘中且页面可见）
+            自动刷新（1 分钟 · 仅盘前/盘中且页面可见）
           </label>
           <Button
             variant="secondary"

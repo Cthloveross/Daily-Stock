@@ -929,11 +929,8 @@ def _run_two_tier(monkeypatch, watchlist: list[str], prices: dict[str, float]):
     return response.json()
 
 
-def test_lane_availability_overnight_only_on_a_no_zero_dte_day(monkeypatch):
-    """2026-08-04（周二）真实形状：NVDA 1/3/6DTE、AAOI 仅 3DTE → 过夜日。
-
-    这正是 V2-E 描述的场景：日内车道关闭，不得退而买 1-3DTE。
-    """
+def test_lane_availability_no_zero_dte_still_has_intraday_zero_to_seven_pool(monkeypatch):
+    """没有0DTE但有1/3/6DTE时，legacy事实保留，活动日内池必须可用。"""
 
     calls = _stub_expiry_availability(
         monkeypatch,
@@ -948,6 +945,11 @@ def test_lane_availability_overnight_only_on_a_no_zero_dte_day(monkeypatch):
 
     lane = body["lane_availability"]
     assert lane["day_type"] == "overnight_only"
+    assert lane["policy_version"] == "INTRA-0-7/v1"
+    assert lane["holding_policy"] == "same_et_day_only"
+    assert lane["policy_state"] == "available"
+    assert lane["eligible_tickers"] == ["NVDA", "AAOI"]
+    assert (lane["eligible_dte_min"], lane["eligible_dte_max"]) == (0, 7)
     assert lane["basis"] == "per_ticker_option_expiry_metadata_within_0_7_dte_v1"
     assert lane["checked_scope"] == "intraday_deep_lane_tickers"
     assert lane["zero_dte_tickers"] == []
@@ -957,6 +959,7 @@ def test_lane_availability_overnight_only_on_a_no_zero_dte_day(monkeypatch):
     by_ticker = {item["ticker"]: item for item in lane["tickers"]}
     assert by_ticker["NVDA"]["available_dte_list"] == [1, 3, 6]
     assert by_ticker["NVDA"]["has_zero_dte"] is False
+    assert by_ticker["NVDA"]["has_eligible_0_7"] is True
     assert by_ticker["AAOI"]["available_dte_list"] == [3]
     # 只对深度层标的读取，不向宽层扇出。
     assert sorted(calls) == ["AAOI", "NVDA"]
@@ -976,6 +979,7 @@ def test_lane_availability_intraday_available_lists_zero_dte_tickers(monkeypatch
 
     lane = body["lane_availability"]
     assert lane["day_type"] == "intraday_available"
+    assert lane["policy_state"] == "available"
     assert lane["zero_dte_tickers"] == ["NVDA"]
 
 
@@ -992,6 +996,7 @@ def test_lane_availability_unknown_when_any_chain_unreadable(monkeypatch):
 
     lane = body["lane_availability"]
     assert lane["day_type"] == "unknown"
+    assert lane["policy_state"] == "available"  # NVDA 的 1DTE 正向证据已足够
     assert lane["unavailable_count"] == 1
     by_ticker = {item["ticker"]: item for item in lane["tickers"]}
     assert by_ticker["AAOI"]["has_zero_dte"] is None

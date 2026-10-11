@@ -181,7 +181,7 @@ class TestMarketSessionState:
 
 
 class TestMarketSessionPhase:
-    """v3 时段上下文：ET 时钟边界（含开盘/主战场/噪音/尾盘四个纪律时段）。"""
+    """中性时段上下文：ET 时钟边界不携带交易建议。"""
 
     @pytest.mark.parametrize(
         ("hour", "minute", "expected"),
@@ -224,14 +224,25 @@ class TestMarketSessionPhase:
         with pytest.raises(ValueError):
             market_session_phase(datetime(2026, 7, 28, 10, 0))
 
-    def test_discipline_hint_copy_is_present_for_every_phase(self):
-        # 硬编码 v1 文案：四个纪律时段的关键提示词必须在位。
-        assert "仅轻仓 S2" in session_phase_label("opening_probe")
-        assert "主战场" in session_phase_label("prime")
-        assert "默认观望" in session_phase_label("noise")
-        assert "最高单笔均值" in session_phase_label("power_hour")
+    def test_phase_copy_is_neutral_environment_context(self):
+        assert session_phase_label("opening_probe").startswith("09:30–10:00")
+        assert session_phase_label("prime").startswith("10:00–11:00")
+        assert session_phase_label("noise").startswith("13:00–14:00")
+        assert session_phase_label("power_hour").startswith("15:00–16:00")
+        joined = " ".join(SESSION_PHASE_LABELS.values())
+        for normative_copy in (
+            "仅轻仓",
+            "主战场",
+            "默认观望",
+            "等待尾盘方向确认",
+            "最高单笔均值",
+        ):
+            assert normative_copy not in joined
+        assert "流动性与波动环境" in session_phase_label("noise")
         # 每个 phase 都有非空标签；未知 phase 落到诚实的休市文案。
         for phase, label in SESSION_PHASE_LABELS.items():
             assert label and session_phase_label(phase) == label
         assert session_phase_label("unexpected") == SESSION_PHASE_LABELS["closed"]
-        assert SESSION_PHASE_HINT_BASIS == "user_trading_history_hardcoded_v1"
+        assert SESSION_PHASE_HINT_BASIS == (
+            "america_new_york_liquidity_context_neutral_v2"
+        )

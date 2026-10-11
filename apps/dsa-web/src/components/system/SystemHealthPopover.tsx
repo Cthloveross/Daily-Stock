@@ -1,5 +1,5 @@
 import type React from 'react';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Activity } from 'lucide-react';
 import apiClient from '../../api';
 import { cn } from '../../utils/cn';
@@ -23,6 +23,9 @@ const LAYER_LABELS: Record<string, string> = {
   opend_tcp: 'OpenD 端口',
   moomoo_sdk: 'Moomoo SDK',
   journal_refresh_config: 'Journal 刷新配置',
+  opening_v2_1m_provider: '开盘 v2 分钟数据',
+  intraday_p0_2m: '严格 2m P0',
+  intraday_p0_2m_shadow: '20 日前瞻验证',
   premarket_publication: '盘前官方发布',
   outcome_maintenance: '结果回填维护',
   economic_schedule_coverage: '经济日程覆盖',
@@ -55,6 +58,7 @@ export const SystemHealthPopover: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const aliveRef = useRef(true);
+  const requestRef = useRef(0);
 
   useEffect(() => {
     aliveRef.current = true;
@@ -72,16 +76,35 @@ export const SystemHealthPopover: React.FC = () => {
     return () => document.removeEventListener('pointerdown', onPointerDown);
   }, [open]);
 
-  const toggle = () => {
-    const next = !open;
-    setOpen(next);
-    if (!next) return;
+  const refresh = useCallback(() => {
+    const requestId = ++requestRef.current;
+    const current = () => aliveRef.current && requestId === requestRef.current;
     setLoading(true);
     setError(null);
     apiClient.get<HealthLayersResponse>('/api/v1/system/health-layers', { timeout: 10_000 })
-      .then((response) => { if (aliveRef.current) setData(response.data); })
-      .catch(() => { if (aliveRef.current) setError('健康状态读取失败'); })
-      .finally(() => { if (aliveRef.current) setLoading(false); });
+      .then((response) => { if (current()) setData(response.data); })
+      .catch(() => {
+        if (current()) {
+          setData(null);
+          setError('健康状态读取失败，当前状态未知');
+        }
+      })
+      .finally(() => { if (current()) setLoading(false); });
+  }, []);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const timer = window.setInterval(refresh, 30_000);
+    return () => {
+      window.clearInterval(timer);
+      requestRef.current += 1;
+    };
+  }, [open, refresh]);
+
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    if (next) refresh();
   };
 
   return (
@@ -104,6 +127,12 @@ export const SystemHealthPopover: React.FC = () => {
         >
           {loading && <p className="text-caption text-text-3">读取中…</p>}
           {error && <p className="text-caption text-warn-strong">{error}</p>}
+          {data && (
+            <p className="mb-2 text-caption text-text-3">
+              检查于 {new Date(data.generated_at).toLocaleTimeString('zh-CN', { timeZone: 'America/New_York' })} ET
+              · 展开时每 30 秒更新
+            </p>
+          )}
           {data && (
             <ul className="space-y-2">
               {data.layers.map((layer) => (

@@ -325,7 +325,7 @@ export async function fetchOpportunityOptionEvents(
  */
 export async function fetchNearExpiryContracts(
   symbol: string,
-  maxDte = 3,
+  maxDte = 7,
   options: { refresh?: boolean } = {},
 ): Promise<NearExpiryContractResponse> {
   const normalized = normalizeSupportedUsOptionUnderlying(symbol);

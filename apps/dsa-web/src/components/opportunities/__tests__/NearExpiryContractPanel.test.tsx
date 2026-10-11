@@ -138,7 +138,7 @@ function panelItem(overrides: Partial<NearExpiryContractItem> = {}): NearExpiryC
     source: 'moomoo_openapi',
     fetchedAt: '2026-08-04T20:00:00+00:00',
     formulaVersion: 'near-expiry-contracts/v1',
-    maxDte: 3,
+    maxDte: 7,
     spot: 100,
     spotAsOf: '2026-08-04 15:59:59',
     openInterestAsOf: '2026-07-31',
@@ -212,6 +212,8 @@ describe('NearExpiryContractPanel', () => {
     await waitFor(() => {
       expect(screen.getByText(/2 DTE · 2026-08-04/)).toBeInTheDocument();
     });
+    expect(screen.getByText('临期合约 · MU（0–7 DTE）')).toBeInTheDocument();
+    expect(fetchNearExpiryContracts).toHaveBeenCalledWith('MU', 7, { refresh: false });
     expect(
       screen.getByText('合约选择参考 · 不构成推荐 · 以券商实时盘口为准'),
     ).toBeInTheDocument();
@@ -318,14 +320,14 @@ describe('NearExpiryContractPanel', () => {
     vi.mocked(fetchNearExpiryContracts).mockResolvedValue(response(panelItem({
       state: 'empty',
       expiries: [],
-      message: '3 天内没有该标的的期权到期日；这是诚实空态，不是数据失败。',
+      message: '7 天内没有该标的的期权到期日；这是诚实空态，不是数据失败。',
     })));
 
     render(<NearExpiryContractPanel symbol="MU" />);
 
     await waitFor(() => {
       expect(
-        screen.getByText('3 天内没有该标的的期权到期日；这是诚实空态，不是数据失败。'),
+        screen.getByText('7 天内没有该标的的期权到期日；这是诚实空态，不是数据失败。'),
       ).toBeInTheDocument();
     });
     expect(screen.queryByRole('table')).not.toBeInTheDocument();
@@ -342,7 +344,7 @@ describe('NearExpiryContractPanel', () => {
     expect(screen.queryByRole('table')).not.toBeInTheDocument();
   });
 
-  it('shows a prominent header badge when earnings fall inside the blackout window', async () => {
+  it('shows future earnings as neutral context even when the legacy blackout flag is true', async () => {
     vi.mocked(fetchNearExpiryContracts).mockResolvedValue(response(panelItem({
       earningsProximity: earningsProximity({
         daysToEarnings: 2,
@@ -355,13 +357,15 @@ describe('NearExpiryContractPanel', () => {
 
     await waitFor(() => {
       expect(
-        screen.getByText('财报 2 天内 · 期权贵 · 你的回避规则'),
+        screen.getByText('距财报 2 天 · 当日平仓，不跨事件'),
       ).toBeInTheDocument();
     });
+    expect(screen.getByText('距财报 2 天 · 当日平仓，不跨事件')).not.toHaveClass('text-warning');
+    expect(screen.queryByText(/期权贵|硬拦截/)).not.toBeInTheDocument();
     expect(screen.queryByText('财报日历标缺 · 未知≠安全')).not.toBeInTheDocument();
   });
 
-  it('labels a same-day earnings blackout as 今日财报', async () => {
+  it('labels only same-day earnings as a hard block', async () => {
     vi.mocked(fetchNearExpiryContracts).mockResolvedValue(response(panelItem({
       earningsProximity: earningsProximity({
         daysToEarnings: 0,
@@ -374,9 +378,10 @@ describe('NearExpiryContractPanel', () => {
 
     await waitFor(() => {
       expect(
-        screen.getByText('今日财报 · 期权贵 · 你的回避规则'),
+        screen.getByText('今日财报 · INTRA-0-7 硬拦截'),
       ).toBeInTheDocument();
     });
+    expect(screen.getByText('今日财报 · INTRA-0-7 硬拦截')).toHaveClass('text-warning');
   });
 
   it('renders no earnings marker when ready and outside the blackout window', async () => {

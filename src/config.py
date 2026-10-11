@@ -760,13 +760,24 @@ class Config:
     # 盘中默认扫描的服务端预热循环：工作日 04:00–20:00 ET 内按固定节奏刷新
     # 页面默认轮询命中的两层扫描缓存；默认关闭，不配置＝行为零变化。
     intraday_refresh_scheduler_enabled: bool = False
-    # 预热间隔（秒）：默认 45；低于 30（基础单飞租约）会被钳制到 30。
-    intraday_refresh_interval_seconds: int = 45
-    # 盘中机会提示器（Telegram）：把预热扫描载荷里已有的事实（盘前异动/
-    # 放量/强波段/位移/日型）推送到手机；挂在预热循环上，零新增取数，
-    # 需要 INTRADAY_REFRESH_SCHEDULER_ENABLED=true 才有载荷可观察。
-    # 默认关闭＝行为零变化。
+    # 常规预热最长间隔（秒）：默认 60；服务端在每个
+    # 已完成分钟后 +5s 唤醒，2m P0 仅在新的完整 2m 框出现时评估。
+    # 低于 30（基础单飞租约）会被钳制到 30。
+    intraday_refresh_interval_seconds: int = 60
+    # 旧盘中提示流开关：控制 P1-O、P2/旧 P1 与系统通知；挂在预热循环上。
+    # 严格 2m P0 的研究与手机出口分别由下面两个独立开关控制。
+    # 默认关闭＝不启用这条旧提示流。
     intraday_alerts_enabled: bool = False
+    # 新 2m P0 研究车道。启用时全量读取 INTRADAY_WATCHLIST，新票以
+    # baseline_warming/shadow 进入，不借用其他标的基线。
+    intraday_p0_2m_enabled: bool = True
+    # 手机 P0/P0X 的显式总开关。即使开启，仍必须有与当前
+    # universe_hash 一致且全部上线门槛通过的校准 artifact；否则只入网页/台账。
+    intraday_p0_2m_action_enabled: bool = False
+    intraday_p0_2m_activation_artifact: Optional[str] = None
+    # 未通过 action 校准期间的独立研究提醒。只发送明确标注为「尚未校准、
+    # 不可据此行动」的严格四条件事实；不计入正式 P0/P0X 预算或 passed 率。
+    intraday_p0_2m_shadow_mobile_enabled: bool = False
     # 每日提示上限（条，最小 1）：触顶后补发一条「今日提示已达上限」并当日停发。
     intraday_alerts_max_per_day: int = 20
     schedule_time: str = "18:00"              # 每日推送时间（HH:MM 格式）
@@ -1502,12 +1513,35 @@ class Config:
             ).lower() == 'true',
             intraday_refresh_interval_seconds=parse_env_int(
                 os.getenv('INTRADAY_REFRESH_INTERVAL_SECONDS'),
-                45,
+                60,
                 field_name='INTRADAY_REFRESH_INTERVAL_SECONDS',
                 minimum=30,
             ),
             intraday_alerts_enabled=cls._resolve_env_value(
                 'INTRADAY_ALERTS_ENABLED',
+                default='false',
+                prefer_env_file=True,
+            ).lower() == 'true',
+            intraday_p0_2m_enabled=cls._resolve_env_value(
+                'INTRADAY_P0_2M_ENABLED',
+                default='true',
+                prefer_env_file=True,
+            ).lower() == 'true',
+            intraday_p0_2m_action_enabled=cls._resolve_env_value(
+                'INTRADAY_P0_2M_ACTION_ENABLED',
+                default='false',
+                prefer_env_file=True,
+            ).lower() == 'true',
+            intraday_p0_2m_activation_artifact=(
+                cls._resolve_env_value(
+                    'INTRADAY_P0_2M_ACTIVATION_ARTIFACT',
+                    default='',
+                    prefer_env_file=True,
+                ).strip()
+                or None
+            ),
+            intraday_p0_2m_shadow_mobile_enabled=cls._resolve_env_value(
+                'INTRADAY_P0_2M_SHADOW_MOBILE_ENABLED',
                 default='false',
                 prefer_env_file=True,
             ).lower() == 'true',

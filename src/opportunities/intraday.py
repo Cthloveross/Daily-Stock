@@ -46,16 +46,14 @@ _REGULAR_END = time(16, 0)
 _AFTERHOURS_END = time(20, 0)
 
 # ---------------------------------------------------------------------------
-# v3 时段上下文（session phase）。
+# v4 时段上下文（session phase）。
 #
-# 常规时段按用户自身交易纪律再切分为六个阶段；提示文案是用户 1,653 笔已平仓
-# 交易统计（Playbook 候选 R1/R3，2026-07 数据核验）的硬编码 v1 文案：
-# 09:30–10:00 试错时段（历史净亏）、10:00–11:00 主战场（历史最大净盈利）、
-# 13:00–14:00 噪音时段（历史净亏损，默认观望）、15:00–16:00 尾盘趋势时段
-# （历史最高单笔均值）。这些标签只是研究上下文：系统标注，用户过滤——
-# 永远不隐藏行、不阻断任何操作，也不是市场统计或买卖信号。
+# 常规时段仍按 ET 墙钟切分，供页面解释所处的流动性/波动环境。旧 v3 曾把
+# 用户历史盈亏和「轻仓 / 主战场 / 默认观望 / 等待确认」写进标签，容易被当成
+# 当前交易规则；v4 删除所有规范性措辞。时段只描述环境，不授权、阻断或建议
+# 任何仓位。当前 INTRA-0-7 的实际时间闸门由独立规则层负责。
 # ---------------------------------------------------------------------------
-SESSION_PHASE_HINT_BASIS = "user_trading_history_hardcoded_v1"
+SESSION_PHASE_HINT_BASIS = "america_new_york_liquidity_context_neutral_v2"
 _OPENING_PROBE_END = time(10, 0)
 _PRIME_END = time(11, 0)
 _MIDDAY_END = time(13, 0)
@@ -63,15 +61,15 @@ _NOISE_END = time(14, 0)
 _AFTERNOON_END = time(15, 0)
 
 SESSION_PHASE_LABELS: dict[str, str] = {
-    "premarket": "盘前 · 计划与观察 · 常规时段未开始",
-    "opening_probe": "开盘试错 · 仅轻仓 S2 · 你的历史此时段净亏",
-    "prime": "主战场 · 你的历史最大净盈利时段",
-    "midday": "午前过渡 · 你的历史无显著优势时段",
-    "noise": "午间震荡 · 你的历史净亏损时段 · 默认观望",
-    "afternoon": "午后酝酿 · 等待尾盘方向确认",
-    "power_hour": "尾盘趋势 · 你的历史最高单笔均值时段",
+    "premarket": "盘前 · 常规时段未开始",
+    "opening_probe": "09:30–10:00 · 开盘流动性与波动环境",
+    "prime": "10:00–11:00 · 上午流动性与波动环境",
+    "midday": "11:00–13:00 · 午间流动性与波动环境",
+    "noise": "13:00–14:00 · 午间流动性与波动环境",
+    "afternoon": "14:00–15:00 · 午后流动性与波动环境",
+    "power_hour": "15:00–16:00 · 尾盘流动性与波动环境",
     "afterhours": "盘后 · 常规时段已结束",
-    "closed": "休市 · 复盘时段",
+    "closed": "休市 · 历史行情查看",
 }
 
 
@@ -112,7 +110,7 @@ def market_session_phase(now: datetime) -> str:
 
 
 def session_phase_label(phase: str) -> str:
-    """Chinese phase label + hardcoded v1 discipline hint for one phase."""
+    """Return a neutral ET-session environment label for one phase."""
 
     return SESSION_PHASE_LABELS.get(phase, SESSION_PHASE_LABELS["closed"])
 

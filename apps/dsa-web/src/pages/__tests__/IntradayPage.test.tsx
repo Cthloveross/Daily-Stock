@@ -98,9 +98,9 @@ function pulse(sessionState: IntradaySessionState = 'regular'): IntradayPulseRes
     sessionStateBasis: 'america_new_york_clock_v1',
     sessionPhase: closed ? 'closed' : 'prime',
     sessionPhaseLabel: closed
-      ? '休市 · 复盘时段'
-      : '主战场 · 你的历史最大净盈利时段',
-    sessionPhaseHintBasis: 'user_trading_history_hardcoded_v1',
+      ? '休市 · 历史行情查看'
+      : '10:00–11:00 · 上午流动性与波动环境',
+    sessionPhaseHintBasis: 'america_new_york_liquidity_context_neutral_v2',
     items: [
       {
         ticker: 'SPY',
@@ -440,8 +440,10 @@ function topResponse(
     sessionStateBasis: 'america_new_york_clock_v1',
     sessionPhase: sessionState === 'closed' ? 'closed' : 'prime',
     sessionPhaseLabel:
-      sessionState === 'closed' ? '休市 · 复盘时段' : '主战场 · 你的历史最大净盈利时段',
-    sessionPhaseHintBasis: 'user_trading_history_hardcoded_v1',
+      sessionState === 'closed'
+        ? '休市 · 历史行情查看'
+        : '10:00–11:00 · 上午流动性与波动环境',
+    sessionPhaseHintBasis: 'america_new_york_liquidity_context_neutral_v2',
     quoteSessionScope: sessionState === 'closed' ? 'latest_prior_session' : 'current_session',
     quoteSessionLabel: sessionState === 'closed' ? '最近一个交易时段' : '当前交易时段',
     marketContext: {
@@ -456,11 +458,8 @@ function topResponse(
       source: 'moomoo_openapi',
       unavailableReason: null,
     },
-    signalVersion: 'intraday_session_evidence_v8',
-    rankingMethod:
-      sessionState === 'closed'
-        ? 'rule_based_evidence_count'
-        : 'burst_score_first_then_evidence_count',
+    signalVersion: 'intraday_session_evidence_v9',
+    rankingMethod: 'rule_based_evidence_count',
     statisticsTrack: 'none_intraday_v1_unscored',
     moomooEnabled: true,
     universe: candidates.map((item) => item.ticker),
@@ -536,7 +535,9 @@ describe('IntradayPage', () => {
     renderPage();
 
     expect(screen.getByText('日内工作台')).toBeInTheDocument();
-    expect(screen.getByText('盘中滚动研究 · 不是信号 · 不进入统计')).toBeInTheDocument();
+    expect(
+      screen.getByText('P0/P0-X＝异动事实 · 旧 5m/合约上下文＝研究 · 非买卖建议'),
+    ).toBeInTheDocument();
     expect(screen.getByRole('link', { name: '周内研究 →' })).toHaveAttribute('href', '/regime');
 
     // 市场脉搏：SPY 读数 + VIX 显式标缺（不伪造 0）。
@@ -544,9 +545,9 @@ describe('IntradayPage', () => {
     expect(within(pulseSection).getByText('SPY')).toBeInTheDocument();
     expect(within(pulseSection).getByText('VIX')).toBeInTheDocument();
     expect(within(pulseSection).getByText('标缺')).toBeInTheDocument();
-    // v3 时段上下文醒目展示：用户历史纪律提示（硬编码 v1 文案）。
+    // 时段上下文只描述中性流动性/波动环境，不提供交易动作建议。
     expect(within(pulseSection).getByLabelText('时段上下文')).toHaveTextContent(
-      '主战场 · 你的历史最大净盈利时段',
+      '10:00–11:00 · 上午流动性与波动环境',
     );
     // SPY 会话 VWAP 位置（累计额/量近似）。
     expect(within(pulseSection).getByText('VWAP 上方')).toBeInTheDocument();
@@ -564,7 +565,7 @@ describe('IntradayPage', () => {
     // 2026-08-15 形态后加「期权墙」）。
     expect(screen.getByText('实时扫描 · 现在谁在动')).toBeInTheDocument();
     const table = await screen.findByRole('table', { name: '实时扫描表' });
-    const headers = ['排名', '标的', '涨跌%', '当前爆发', '今日波段', '速度', '近30分位移', '形态', '期权墙', '详情', '你的战绩'];
+    const headers = ['排名', '标的', '涨跌%', '旧5m爆发', '旧5m波段', '速度', '近30分位移', '形态', '期权墙', '详情', '你的战绩'];
     for (const header of headers) {
       expect(within(table).getByText(header)).toBeInTheDocument();
     }
@@ -576,12 +577,12 @@ describe('IntradayPage', () => {
     // （0.72 ATR × ATR14 1.5 = $1.08），ATR 刻度退到副行。
     expect(within(table).getByText('+$1.08')).toBeInTheDocument();
     expect(within(table).getByText(/\+0\.72 ATR/)).toBeInTheDocument();
-    // v3 上下文（财报回避窗 badge；速度加速↑）。
-    expect(within(table).getByText('财报 2 天内 · 期权贵')).toBeInTheDocument();
+    // 事件距离只作为同日平仓语境；速度标签只描述已观测变化。
+    expect(within(table).getByText('距财报 2 天')).toBeInTheDocument();
     expect(within(table).getByText('加速↑')).toBeInTheDocument();
     expect(within(table).getAllByText(/10:30:04 ET/).length).toBeGreaterThan(0);
 
-    // 当前爆发：分数 + 15 分钟推力%；今日波段 chips；标缺行诚实。
+    // 旧5m爆发：分数 + 15 分钟推力%；旧5m波段 chips；标缺行诚实。
     expect(within(table).getByText('8.6')).toBeInTheDocument();
     // 副行同时给出量比（暴不暴量的直读），文本被拆成多节点故用匹配函数。
     expect(
@@ -595,9 +596,9 @@ describe('IntradayPage', () => {
     const tslaRow = within(table).getByLabelText('打开 TSLA 即时扫描详情');
     expect(within(tslaRow).getAllByText('标缺').length).toBeGreaterThan(0);
 
-    // 页头副标题：爆发分优先排名 + 版本号。
-    expect(screen.getByText(/波段爆发优先排名/)).toBeInTheDocument();
-    expect(screen.getByText(/intraday_session_evidence_v8/)).toBeInTheDocument();
+    // 页头副标题：非 legacy 研究证据计数排名 + 版本号。
+    expect(screen.getByText(/按非 legacy 研究证据计数排名/)).toBeInTheDocument();
+    expect(screen.getByText(/intraday_session_evidence_v9/)).toBeInTheDocument();
 
     // 主次顺序：脉搏 → 纪律条 → 车道清单 → 盘中计划 → 实时扫描（滚动）
     // → 今日计划跟踪 → 盘前期权异常（侧栏）。
@@ -656,12 +657,8 @@ describe('IntradayPage', () => {
     fireEvent.click(changeHeader); // 第三次点击回到服务端证据排名
     expect(tickerOrder()[0]).toContain('NVDA');
 
-    // 当前爆发列可排序；TSLA 爆发标缺永远排最后（升降序均如此）。
-    const burstHeader = within(table).getByRole('button', { name: '按当前爆发排序' });
-    fireEvent.click(burstHeader); // desc
-    expect(tickerOrder()[0]).toContain('NVDA');
-    fireEvent.click(burstHeader); // asc：标缺仍最后
-    expect(tickerOrder()[0]).toContain('NVDA');
+    // 旧5m爆发只兼容展示，不再提供客户端排序。
+    expect(within(table).queryByRole('button', { name: /爆发排序/ })).not.toBeInTheDocument();
   });
 
   it('navigates to the live-scan detail page on row click', async () => {
@@ -674,7 +671,7 @@ describe('IntradayPage', () => {
     expect(row).toBeInTheDocument();
   });
 
-  it('polls every 60s only while visible and in premarket/regular session', async () => {
+  it('polls every minute only while visible and in premarket/regular session', async () => {
     vi.useFakeTimers();
     renderPage();
     await act(async () => {
@@ -691,7 +688,7 @@ describe('IntradayPage', () => {
       setDocumentVisibility('hidden');
     });
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(180_000);
+      await vi.advanceTimersByTimeAsync(60_000);
     });
     expect(fetchIntradayTop).toHaveBeenCalledTimes(2);
 
@@ -720,10 +717,35 @@ describe('IntradayPage', () => {
     expect(fetchIntradayTop).toHaveBeenCalledTimes(1);
     expect(screen.getAllByText(/最近一个交易时段/).length).toBeGreaterThan(0);
     // 休市时段上下文如实标注，不冒充任何盘中时段。
-    expect(screen.getByLabelText('时段上下文')).toHaveTextContent('休市 · 复盘时段');
+    expect(screen.getByLabelText('时段上下文')).toHaveTextContent('休市 · 历史行情查看');
     expect(
       screen.getByText('自动刷新暂停（仅页面可见且盘前/盘中）'),
     ).toBeInTheDocument();
+  });
+
+  it('expires a server execution decision even when page polling is paused', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-28T14:30:05Z'));
+    vi.mocked(fetchIntradayTop).mockResolvedValue({
+      ...topResponse(),
+      executionPolicy: {
+        policyVersion: 'intraday_execution_policy_v1', state: 'ready',
+        asOf: '2026-07-28T14:30:05Z', expiresAt: '2026-07-28T14:32:05Z',
+        marketDateEt: '2026-07-28', reason: 'regular', entryStartEt: '09:45',
+        ordinaryEntryCutoffEt: '15:15', zeroDteEntryCutoffEt: '14:30',
+        exitDeadlineEt: '15:45', closeEt: '16:00',
+        ordinaryEntryAllowed: true, zeroDteEntryAllowed: true,
+      },
+    });
+    renderPage();
+    await act(async () => { await Promise.resolve(); });
+    fireEvent.change(screen.getByLabelText('进场 DTE'), { target: { value: '1' } });
+    const clock = () => document.querySelector('[data-check-id="clock"]');
+    expect(clock()?.getAttribute('data-check-status')).toBe('pass');
+    act(() => { setDocumentVisibility('hidden'); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(120_001); });
+    expect(fetchIntradayTop).toHaveBeenCalledTimes(1);
+    expect(clock()?.getAttribute('data-check-status')).toBe('missing');
   });
 
   it('manual refresh bypasses the server TTL with refresh=true', async () => {

@@ -19,9 +19,11 @@ import { IntradayDisciplineStrip } from '../components/opportunities/IntradayDis
 import { LaneChecklistPanel } from '../components/opportunities/LaneChecklistPanel';
 import { IntradayPlanPanel } from '../components/opportunities/IntradayPlanPanel';
 import { IntradayScanTable } from '../components/opportunities/IntradayScanTable';
+import { IntradayAlertFeedCard } from '../components/opportunities/IntradayAlertFeedCard';
 import { PremarketOptionAnomalyPanel } from '../components/opportunities/PremarketOptionAnomalyPanel';
 import { IntradayTrackingPanel } from '../components/opportunities/IntradayTrackingPanel';
 import { Button } from '../components/ui';
+import { parseApiTimestamp } from '../utils/marketTime';
 
 /** 自动刷新间隔：仅在页面可见且盘段为盘前/盘中时轮询（与今日计划跟踪面板一致）。 */
 export const INTRADAY_PAGE_POLL_INTERVAL_MS = 60_000;
@@ -35,8 +37,8 @@ export const INTRADAY_PAGE_POLL_INTERVAL_MS = 60_000;
  * + 合约候选 + 张数/手续费 + 失效位提示）→ **实时扫描（滚动）**（现在谁在动，
  * 提升来源；盘中滚动证据排名 + 今日曾深扫账本）→ 今日计划跟踪（盘前冻结
  * 计划走到哪了）→ **盘前期权异常**（侧栏：深度层标的上一时段的 call/put
- * 偏斜与大单事实，盘前 + 开盘 30 分钟醒目、其后收起）。全部内容是盘中滚动
- * 研究：不是信号、不冻结、不进入统计；期权分类是 Moomoo 标签，不证明方向。
+ * 偏斜与大单事实，盘前 + 开盘 30 分钟醒目、其后收起）。旧 5m 扫描、合约墙与
+ * 期权分类只作研究上下文；严格 P0/P0-X 是版本化异动事实，但也不是买卖建议。
  * 周内研究仍在 /regime。2026-08-14 起盘中期权异动 feed 移入 Journal 仓位
  * 复盘面（用户定位：异动是复盘证据，不是盘中决策输入）。
  *
@@ -55,6 +57,7 @@ const IntradayPage: React.FC = () => {
   const [pulse, setPulse] = useState<IntradayPulseResponse | null>(null);
   const [pulseError, setPulseError] = useState<string | null>(null);
   const [top, setTop] = useState<IntradayTopResponse | null>(null);
+  const [executionNowMs, setExecutionNowMs] = useState(() => Date.now());
   const [topError, setTopError] = useState<string | null>(null);
   // 初始即为加载中：挂载 effect 内不做同步 setState（react-hooks 规则），
   // 手动刷新在事件回调里显式置回 loading。
@@ -86,6 +89,7 @@ const IntradayPage: React.FC = () => {
       }
       if (topResult.status === 'fulfilled') {
         setTop(topResult.value);
+        setExecutionNowMs(Date.now());
         setTopError(null);
       } else {
         setTopError(
@@ -135,10 +139,20 @@ const IntradayPage: React.FC = () => {
   useEffect(() => {
     const onVisibilityChange = () => {
       setPageVisible(document.visibilityState === 'visible');
+      setExecutionNowMs(Date.now());
     };
     document.addEventListener('visibilitychange', onVisibilityChange);
     return () => document.removeEventListener('visibilitychange', onVisibilityChange);
   }, []);
+
+  useEffect(() => {
+    const expiresAt = parseApiTimestamp(top?.executionPolicy?.expiresAt)?.getTime();
+    if (expiresAt === undefined) return undefined;
+    // 只让已有服务端许可过期；不在浏览器推算交易日或自行续期。
+    const timer = window.setTimeout(() => setExecutionNowMs(Date.now()),
+      Math.max(0, Math.min(expiresAt - Date.now() + 1, 120_001)));
+    return () => window.clearTimeout(timer);
+  }, [top?.executionPolicy?.expiresAt]);
 
   const sessionState = top?.sessionState ?? pulse?.sessionState ?? null;
   // 只在页面可见且盘段为盘前/盘中时轮询；其他情况彻底停表，不做后台请求。
@@ -161,11 +175,13 @@ const IntradayPage: React.FC = () => {
           <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
             <h1 className="text-h2 font-semibold text-text-1">日内工作台</h1>
             <span className="text-caption text-text-3">
-              盘中滚动研究 · 不是信号 · 不进入统计
+              P0/P0-X＝异动事实 · 旧 5m/合约上下文＝研究 · 非买卖建议
             </span>
           </div>
           <p className="mt-1 max-w-4xl text-body-sm text-text-3">
-            当日交易的单屏视图：市场脉搏、冻结盘前计划对照、日内滚动扫描与盘前期权异常。
+            当日交易的单屏视图：严格 2 分钟 P0/P0-X 提示台账、市场脉搏、冻结盘前计划
+            对照、旧 5 分钟兼容扫描与盘前期权异常。只有版本化 P0/P0-X 属于异动事实；
+            旧 5 分钟分数、期权墙和合约上下文不参与 P0 分级。
             期权异动 feed 已移至 Journal 仓位复盘（复盘证据，不是盘中输入）。
             周内（盘前冻结 · 数日至数周）研究在
             {' '}
@@ -182,7 +198,7 @@ const IntradayPage: React.FC = () => {
               onChange={(event) => setAutoRefresh(event.target.checked)}
               aria-label="自动刷新日内工作台"
             />
-            自动刷新（60 秒 · 仅盘前/盘中且页面可见）
+            自动刷新（1 分钟 · 仅盘前/盘中且页面可见）
           </label>
           <Button
             variant="secondary"
@@ -210,9 +226,9 @@ const IntradayPage: React.FC = () => {
       {/* 规模与频率：紧随脉搏的一行镜子读数（每美元回报才是真账），不是警报。 */}
       <IntradayDisciplineStrip />
 
-      {/* 开仓前车道检查：对照用户自己那套规则（V2-A…V2-E）的清单——今日无
-          0DTE 时整块警示并把日内车道置灰；ET 时钟复用脉搏时点。 */}
-      <LaneChecklistPanel pulse={pulse} top={top} loading={loading} />
+      {/* 开仓前纯日内检查：按 INTRA-0-7/v1 核对 0–7DTE 与同日退出；没有
+          0DTE 不等于日内关闭。ET 时钟复用脉搏时点。 */}
+      <LaneChecklistPanel pulse={pulse} top={top} loading={loading} nowMs={executionNowMs} />
 
       {/* 主次顺序：盘中计划（真正干活的地方）在最上，实时扫描（滚动，谁现在
           在动）在其下作为提升来源，今日计划跟踪其后；侧栏为盘前期权异常
@@ -220,7 +236,7 @@ const IntradayPage: React.FC = () => {
           盘中期权异动 feed 已移入 Journal 仓位复盘）。 */}
       <div className="grid gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(340px,1fr)]">
         <div className="min-w-0 space-y-4">
-          <IntradayPlanPanel pulse={pulse} top={top} loading={loading} />
+          <IntradayPlanPanel pulse={pulse} top={top} loading={loading} nowMs={executionNowMs} />
           <IntradayScanTable data={top} loading={loading} error={topError} />
           <section aria-label="今日计划" className="overflow-hidden rounded-ds-md border border-subtle bg-bg-1">
             {planCandidates !== null && planCandidates.length > 0 ? (
@@ -243,7 +259,12 @@ const IntradayPage: React.FC = () => {
             )}
           </section>
         </div>
-        <PremarketOptionAnomalyPanel top={top} />
+        <div className="min-w-0 space-y-4">
+          <PremarketOptionAnomalyPanel top={top} />
+          {/* 今日提示流（Phase B）：推送台账持久化读端——P2 观察级只在
+              这里出现（不推 Telegram），被抑制/降级决定逐条带原因可见。 */}
+          <IntradayAlertFeedCard />
+        </div>
       </div>
     </div>
   );

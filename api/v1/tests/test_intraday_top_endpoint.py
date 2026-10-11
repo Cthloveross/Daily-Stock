@@ -242,16 +242,16 @@ def test_contract_regular_session_full_row(monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert body["schema_version"] == "intraday-top/1.0"
-    assert body["signal_version"] == "intraday_session_evidence_v8"
+    assert body["signal_version"] == "intraday_session_evidence_v9"
     # 盘中主排序 = 波段爆发分优先。
-    assert body["ranking_method"] == "burst_score_first_then_evidence_count"
+    assert body["ranking_method"] == "rule_based_evidence_count"
     # 不冻结、不入统计的显式标记。
     assert body["statistics_track"] == "none_intraday_v1_unscored"
     assert body["session_state"] == "regular"
-    # v3 时段上下文：10:30 ET = 主战场（用户历史纪律提示，硬编码 v1 文案）。
+    # 10:30 ET 只映射为中性的上午流动性/波动环境。
     assert body["session_phase"] == "prime"
-    assert "主战场" in body["session_phase_label"]
-    assert body["session_phase_hint_basis"] == "user_trading_history_hardcoded_v1"
+    assert body["session_phase_label"] == "10:00–11:00 · 上午流动性与波动环境"
+    assert body["session_phase_hint_basis"] == "america_new_york_liquidity_context_neutral_v2"
     assert body["quote_session_scope"] == "current_session"
     assert body["quote_session_label"] == "当前交易时段"
     assert body["universe"] == ["NVDA"]
@@ -411,7 +411,12 @@ def test_contract_regular_session_full_row(monkeypatch):
         for entry in item["evidence"]
         if entry["metric"] == "session_momentum_burst"
     )
-    assert burst_evidence["status"] == "supports"
+    assert burst_evidence["status"] == "neutral"
+    assert burst_evidence["actionability"] == "legacy_context"
+    assert item["session_bursts"]["legacy"] is True
+    assert item["session_bursts"]["legacy_usage"] == (
+        "api_compatibility_and_research_display_only"
+    )
     # 证据合同：每条证据带来源 / as-of / 口径 / limitations。
     for evidence in item["evidence"]:
         assert evidence["source"]
@@ -494,7 +499,7 @@ def test_closed_session_labels_last_session_and_snapshot_gap_basis(monkeypatch):
     assert body["quote_session_scope"] == "latest_prior_session"
     assert body["quote_session_label"] == "最近一个交易时段"
     # 休市：排序退回 v1 证据计数。
-    assert body["ranking_method"] == "burst_score_first_then_evidence_count"
+    assert body["ranking_method"] == "rule_based_evidence_count"
     item = body["candidates"][0]
     # 休市：缺口分母切换为快照自带前收并显式标注，不用日线前收伪装。
     assert item["gap_basis"] == "session_open_vs_moomoo_snapshot_prev_close"
@@ -519,6 +524,35 @@ def test_closed_session_labels_last_session_and_snapshot_gap_basis(monkeypatch):
     setup_match = item["setup_match"]
     assert setup_match["quote_session_scope"] == "latest_prior_session"
     assert setup_match["session_date_et"] == "2026-07-24"
+
+
+def test_execution_policy_updates_even_while_research_payload_is_cached(monkeypatch):
+    monkeypatch.delenv("MOOMOO_OPEND_ENABLED", raising=False)
+    _stub_daily_loader(monkeypatch)
+    now = {"value": datetime.fromisoformat("2026-07-28T14:29:30-04:00")}
+    monkeypatch.setattr(opportunities, "_intraday_now", lambda: now["value"])
+    client = _client()
+    first = client.post("/api/v1/opportunities/intraday-top", json={"symbols": ["NVDA"]})
+    assert first.status_code == 200
+    first_policy = first.json()["execution_policy"]
+    assert first_policy["zero_dte_entry_allowed"] is True
+    assert first_policy["expires_at"] == "2026-07-28T14:30:00-04:00"
+    now["value"] += timedelta(seconds=31)
+    second = client.post("/api/v1/opportunities/intraday-top", json={"symbols": ["NVDA"]})
+    assert second.status_code == 200
+    assert second.json()["generated_at"] == first.json()["generated_at"]
+    assert second.json()["execution_policy"]["zero_dte_entry_allowed"] is False
+
+
+def test_execution_policy_half_day_api_does_not_reuse_normal_close(monkeypatch):
+    monkeypatch.delenv("MOOMOO_OPEND_ENABLED", raising=False)
+    _stub_daily_loader(monkeypatch, now=datetime.fromisoformat("2026-11-27T12:50:00-05:00"))
+    response = _client().post("/api/v1/opportunities/intraday-top", json={"symbols": ["NVDA"]})
+    assert response.status_code == 200
+    policy = response.json()["execution_policy"]
+    assert policy["ordinary_entry_allowed"] is False
+    assert policy["close_et"] == "13:00"
+    assert policy["exit_deadline_et"] == "12:45"
 
 
 def test_ttl_cache_shares_and_refresh_bypasses(monkeypatch):
@@ -749,6 +783,977 @@ def test_burst_bars_cached_per_symbol_across_refresh(monkeypatch):
     assert fetch_calls == ["NVDA"]
 
 
+def test_opening_same_slot_reference_is_loaded_once_and_exposed(monkeypatch):
+    monkeypatch.setenv("MOOMOO_OPEND_ENABLED", "true")
+    _stub_daily_loader(monkeypatch)
+    monkeypatch.setattr(
+        opportunities,
+        "_fetch_underlying_session_quotes",
+        lambda symbols: {"NVDA": _quote()},
+    )
+    _stub_events(monkeypatch, {"NVDA": []})
+    calls: list[tuple[str, int]] = []
+
+    reference_rows = []
+    exact_days = opportunities._exact_prior_xnys_session_labels("2026-07-28")
+    assert len(exact_days) == 20
+    for day in exact_days:
+        reference_rows.append(
+            {
+                "date": f"{day}T09:30:00-04:00",
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.5,
+                "close": 100.6,
+                "volume": 1_000_000.0,
+            }
+        )
+
+    def fetch(symbol: str, *, days: int = 4):
+        calls.append((symbol, days))
+        if days == opportunities._INTRADAY_OPENING_REFERENCE_FETCH_DAYS:
+            return reference_rows, "fixture_5m"
+        return _five_minute_session("2026-07-28", bar_count=12), "fixture_5m"
+
+    monkeypatch.setattr(opportunities, "_fetch_intraday_5m_bars", fetch)
+    client = _client()
+    payload = {"symbols": ["NVDA"]}
+    first = client.post("/api/v1/opportunities/intraday-top", json=payload)
+    refreshed = client.post(
+        "/api/v1/opportunities/intraday-top", json={**payload, "refresh": True}
+    )
+    assert first.status_code == refreshed.status_code == 200
+    opening = first.json()["candidates"][0]["session_bursts"]["opening_impulse"]
+    assert opening["state"] == "not_qualified"
+    assert opening["reference_session_count"] == 20
+    assert opening["bar_start_et"] == "09:30"
+    assert calls == [
+        ("NVDA", opportunities._INTRADAY_OPENING_REFERENCE_FETCH_DAYS),
+        ("NVDA", opportunities._INTRADAY_BURST_FETCH_DAYS),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("second", "retryable_pending_count"),
+    [(5, 2), (15, 0)],
+)
+def test_opening_fast_path_observes_plan_and_pinned_before_full_scan(
+    monkeypatch,
+    second,
+    retryable_pending_count,
+):
+    now = datetime(2026, 8, 31, 13, 35, second, tzinfo=timezone.utc)
+    monkeypatch.setattr(opportunities, "_intraday_now", lambda: now)
+    monkeypatch.setattr(opportunities, "_todays_plan_tickers", lambda day: ["TSLA"])
+    monkeypatch.setattr(
+        opportunities, "_configured_intraday_pinned_tickers", lambda: ["NVDA"]
+    )
+    monkeypatch.setattr(opportunities, "_configured_symbols", lambda: [])
+    monkeypatch.setattr(
+        opportunities,
+        "_intraday_daily_inputs",
+        lambda symbols, **kwargs: {
+            symbol: {"atr14": 10.0, "prior_close": 100.0}
+            for symbol in symbols
+        },
+    )
+
+    def profiles(symbols, **kwargs):
+        return {
+            symbol: {
+                "state": "pending",
+                "alert_qualified": False,
+                "rule_version": "opening_impulse_v2",
+                "checkpoint": 5,
+                "checkpoint_label": "09:35",
+                "retryable_pending": retryable_pending_count > 0,
+            }
+            for symbol in symbols
+        }
+
+    monkeypatch.setattr(
+        opportunities, "_load_intraday_opening_progressive_profiles", profiles
+    )
+    observed = []
+    summary = opportunities.warm_opening_impulse_scan(
+        observed.append, target_symbols=("TSLA", "NVDA"),
+    )
+
+    assert summary == {
+        "action": "observed",
+        "candidate_count": 2,
+        "pending_count": 2,
+        "retryable_pending_count": retryable_pending_count,
+        "qualified_count": 0,
+        "opening_critical_window": True,
+    }
+    assert len(observed) == 1
+    assert [row["ticker"] for row in observed[0]["candidates"]] == [
+        "TSLA",
+        "NVDA",
+    ]
+    assert observed[0]["opening_fast_path"] is True
+    assert observed[0]["as_of"] == now.isoformat()
+    assert observed[0]["alert_observed_at"] == now.isoformat()
+
+
+def test_opening_fast_path_prewarms_only_1m_history_before_0935(monkeypatch):
+    now = datetime(2026, 8, 31, 13, 15, 5, tzinfo=timezone.utc)
+    monkeypatch.setattr(opportunities, "_intraday_now", lambda: now)
+    monkeypatch.setattr(opportunities, "_todays_plan_tickers", lambda day: [])
+    monkeypatch.setattr(
+        opportunities, "_configured_intraday_pinned_tickers", lambda: []
+    )
+    monkeypatch.setattr(
+        opportunities, "_configured_symbols", lambda: ["TSLA", "NVDA"]
+    )
+    daily_calls = []
+    reference_calls = []
+    reference_1m_calls = []
+    monkeypatch.setattr(
+        opportunities,
+        "_intraday_daily_inputs",
+        lambda symbols, **kwargs: daily_calls.append(list(symbols)) or {},
+    )
+    monkeypatch.setattr(
+        opportunities,
+        "_load_intraday_opening_reference_history",
+        lambda symbols, **kwargs: reference_calls.append(list(symbols)) or {},
+    )
+    monkeypatch.setattr(
+        opportunities,
+        "_load_intraday_opening_1m_reference_history",
+        lambda symbols, **kwargs: reference_1m_calls.append(list(symbols)) or {},
+    )
+    observed = []
+
+    summary = opportunities.warm_opening_impulse_scan(
+        observed.append, target_symbols=("TSLA", "NVDA"), prewarm_only=True,
+    )
+
+    assert summary == {
+        "action": "prewarmed",
+        "candidate_count": 2,
+        "opening_critical_window": False,
+    }
+    assert daily_calls == [["TSLA", "NVDA"]]
+    assert reference_calls == []  # retired native-5m lane must not delay opening
+    assert reference_1m_calls == [["TSLA", "NVDA"]]
+    assert observed == []
+
+
+def test_progressive_opening_provider_lag_is_retryable_and_observed(monkeypatch):
+    now = datetime(2026, 8, 31, 13, 32, 5, tzinfo=timezone.utc)
+    monkeypatch.setattr(opportunities, "_intraday_now", lambda: now)
+    monkeypatch.setattr(opportunities, "_todays_plan_tickers", lambda day: ["TSLA"])
+    monkeypatch.setattr(
+        opportunities, "_configured_intraday_pinned_tickers", lambda: []
+    )
+    monkeypatch.setattr(opportunities, "_configured_symbols", lambda: [])
+    monkeypatch.setattr(
+        opportunities,
+        "_intraday_daily_inputs",
+        lambda symbols, **kwargs: {
+            "TSLA": {"atr14": 10.0, "prior_close": 100.0}
+        },
+    )
+    monkeypatch.setattr(
+        opportunities,
+        "_load_intraday_opening_1m_reference_history",
+        lambda symbols, **kwargs: {
+            "TSLA": {
+                "bars": [],
+                "source": "fixture_1m",
+                "reference_session_count": 20,
+                "unavailable_reason": None,
+            }
+        },
+    )
+
+    def provider_lag(*args, **kwargs):
+        raise TimeoutError("1m bar has not settled")
+
+    monkeypatch.setattr(opportunities, "_fetch_intraday_1m_bars", provider_lag)
+    observed = []
+
+    summary = opportunities.warm_opening_impulse_scan(
+        observed.append, target_symbols=("TSLA",), current_1m_reader=provider_lag,
+    )
+
+    assert summary == {
+        "action": "observed",
+        "candidate_count": 1,
+        "pending_count": 1,
+        "retryable_pending_count": 1,
+        "qualified_count": 0,
+        "opening_critical_window": True,
+    }
+    profile = observed[0]["candidates"][0]["session_bursts"][
+        "opening_progressive"
+    ]
+    assert profile["state"] == "pending"
+    assert profile["checkpoint"] == 1
+    assert profile["retryable_pending"] is True
+    assert profile["unavailable_reason"] == "history_1m_unavailable:TimeoutError"
+
+
+def test_fetch_intraday_1m_normalizes_moomoo_end_labels_by_one_minute(
+    monkeypatch,
+):
+    calls = []
+
+    def history(_self, symbol, *, period, days, include_stock_name):
+        calls.append((symbol, period, days, include_stock_name))
+        return {
+            "source": "MoomooFetcher",
+            "data": [
+                {
+                    "date": "2026-08-31T09:31:00-04:00",
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.5,
+                    "close": 100.8,
+                    "volume": 1_000,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(
+        "src.services.stock_service.StockService.get_history_data",
+        history,
+    )
+
+    bars, source = opportunities._fetch_intraday_1m_bars("TSLA", days=3)
+
+    assert source == "MoomooFetcher"
+    assert calls == [("TSLA", "1m", 3, False)]
+    assert bars[0]["date"] == "2026-08-31T09:30:00-04:00"
+
+
+def _opening_one_minute_session(day: str) -> list[dict]:
+    return [
+        {
+            "date": f"{day}T09:{minute:02d}:00-04:00",
+            "open": 100.0,
+            "high": 100.5,
+            "low": 99.8,
+            "close": 100.3,
+            "volume": 1_000,
+        }
+        for minute in range(30, 35)
+    ]
+
+
+def test_opening_1m_reference_count_never_backfills_an_older_session():
+    exact_days = list(
+        opportunities._exact_prior_xnys_session_labels("2026-08-31")
+    )
+    assert len(exact_days) == 20
+    complete = [
+        bar
+        for day in exact_days
+        for bar in _opening_one_minute_session(day)
+    ]
+    assert opportunities._opening_1m_reference_session_count(
+        complete,
+        market_date_et="2026-08-31",
+    ) == 20
+
+    missing_day = exact_days[-3]
+    with_gap = [
+        bar for bar in complete if not bar["date"].startswith(missing_day)
+    ]
+    older_day = opportunities._exact_prior_xnys_session_labels(exact_days[0])[-1]
+    with_gap.extend(_opening_one_minute_session(older_day))
+
+    assert opportunities._opening_1m_reference_session_count(
+        with_gap,
+        market_date_et="2026-08-31",
+    ) == 19
+
+
+def test_opening_1m_reference_cache_keeps_only_exact_opening_minutes(
+    monkeypatch,
+):
+    exact_days = list(
+        opportunities._exact_prior_xnys_session_labels("2026-08-31")
+    )
+    bars = [
+        bar
+        for day in exact_days
+        for bar in _opening_one_minute_session(day)
+    ]
+    # Provider responses may contain every regular/extended minute.  Neither
+    # an irrelevant regular-session row nor an older complete session belongs
+    # in the day cache used by the sequential detector.
+    bars.append(
+        {
+            "date": f"{exact_days[-1]}T12:00:00-04:00",
+            "open": 100.0,
+            "high": 100.5,
+            "low": 99.8,
+            "close": 100.3,
+            "volume": 1_000,
+        }
+    )
+    older_day = opportunities._exact_prior_xnys_session_labels(exact_days[0])[-1]
+    bars.extend(_opening_one_minute_session(older_day))
+    monkeypatch.setattr(opportunities, "_cache_now", lambda: 100.0)
+    monkeypatch.setattr(
+        opportunities,
+        "_fetch_intraday_1m_bars",
+        lambda symbol, **kwargs: (bars, "MoomooFetcher"),
+    )
+
+    result = opportunities._load_intraday_opening_1m_reference_history(
+        ["TSLA"],
+        market_date_et="2026-08-31",
+    )
+
+    cached = result["TSLA"]
+    assert cached["reference_session_count"] == 20
+    assert len(cached["bars"]) == 100
+    assert {row["date"][:10] for row in cached["bars"]} == set(exact_days)
+    assert all("T09:3" in row["date"] for row in cached["bars"])
+
+
+def _put_opening_v2_readiness_cache(
+    symbol: str,
+    *,
+    source: str,
+    reference_session_count: int,
+    expires_at: float = 200.0,
+) -> None:
+    with opportunities._scan_cache_lock:
+        opportunities._intraday_opening_1m_reference_cache[
+            (symbol, "2026-08-31")
+        ] = opportunities._ScanCacheEntry(
+            expires_at=expires_at,
+            result={
+                "bars": [],
+                "source": source,
+                "reference_session_count": reference_session_count,
+                "unavailable_reason": None,
+            },
+        )
+
+
+def test_opening_v2_readiness_is_unknown_without_current_day_cache(monkeypatch):
+    monkeypatch.setattr(opportunities, "_cache_now", lambda: 100.0)
+    monkeypatch.setattr(
+        opportunities,
+        "_fetch_intraday_1m_bars",
+        lambda *args, **kwargs: pytest.fail(
+            "readiness inspection must never perform provider I/O"
+        ),
+    )
+
+    readiness = opportunities.get_opening_v2_provider_readiness(
+        market_date_et="2026-08-31",
+        target_symbols=["TSLA"],
+    )
+
+    assert readiness["target_count"] == 1
+    assert readiness["cached_count"] == 0
+    assert readiness["ready_count"] == 0
+    assert readiness["provider_counts"] == {}
+    assert readiness["reason_code"] == "not_observed_today"
+
+
+def test_opening_v2_readiness_requires_moomoo_with_all_20_sessions(monkeypatch):
+    monkeypatch.setattr(opportunities, "_cache_now", lambda: 100.0)
+    _put_opening_v2_readiness_cache(
+        "TSLA",
+        source="MoomooFetcher",
+        reference_session_count=20,
+    )
+
+    readiness = opportunities.get_opening_v2_provider_readiness(
+        market_date_et="2026-08-31",
+        target_symbols=["TSLA"],
+    )
+
+    assert readiness["required_interval"] == "1m"
+    assert readiness["required_reference_sessions"] == 20
+    assert readiness["target_count"] == 1
+    assert readiness["cached_count"] == 1
+    assert readiness["ready_count"] == 1
+    assert readiness["provider_counts"] == {"MoomooFetcher": 1}
+    assert readiness["reason_code"] == "ready"
+
+
+def test_opening_v2_readiness_rejects_yfinance_even_if_count_claims_20(
+    monkeypatch,
+):
+    monkeypatch.setattr(opportunities, "_cache_now", lambda: 100.0)
+    # Lock the provider contract independently of row count: Yahoo's 1m
+    # retention is seven calendar days and can never be the v2 baseline.
+    _put_opening_v2_readiness_cache(
+        "TSLA",
+        source="YfinanceFetcher",
+        reference_session_count=20,
+    )
+
+    readiness = opportunities.get_opening_v2_provider_readiness(
+        market_date_et="2026-08-31",
+        target_symbols=["TSLA"],
+    )
+
+    assert readiness["cached_count"] == 1
+    assert readiness["ready_count"] == 0
+    assert readiness["provider_counts"] == {"YfinanceFetcher": 1}
+    assert readiness["reason_code"] == "yfinance_1m_depth_insufficient"
+
+
+def test_opening_v2_readiness_is_partial_when_only_some_targets_are_ready(
+    monkeypatch,
+):
+    monkeypatch.setattr(opportunities, "_cache_now", lambda: 100.0)
+    _put_opening_v2_readiness_cache(
+        "TSLA",
+        source="MoomooFetcher",
+        reference_session_count=20,
+    )
+    _put_opening_v2_readiness_cache(
+        "META",
+        source="MoomooFetcher",
+        reference_session_count=19,
+    )
+
+    readiness = opportunities.get_opening_v2_provider_readiness(
+        market_date_et="2026-08-31",
+        target_symbols=["TSLA", "META"],
+    )
+
+    assert readiness["target_count"] == 2
+    assert readiness["cached_count"] == 2
+    assert readiness["ready_count"] == 1
+    assert readiness["provider_counts"] == {"MoomooFetcher": 2}
+    assert readiness["reason_code"] == "partial_or_incomplete_reference"
+
+
+def test_progressive_opening_rejects_reference_current_source_mismatch(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        opportunities,
+        "_load_intraday_opening_1m_reference_history",
+        lambda symbols, **kwargs: {
+            "TSLA": {
+                "bars": [],
+                "source": "MoomooFetcher",
+                "reference_session_count": 20,
+                "unavailable_reason": None,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        opportunities,
+        "_fetch_intraday_1m_bars",
+        lambda symbol, **kwargs: ([], "YFinanceFetcher"),
+    )
+    monkeypatch.setattr(
+        opportunities,
+        "compute_sequential_opening_impulse_profile",
+        lambda *args, **kwargs: {
+            "state": "qualified",
+            "alert_qualified": True,
+            "direction": "up",
+            "rule_version": "opening_impulse_v2",
+            "checkpoint": 2,
+            "checkpoint_label": "09:32",
+        },
+    )
+
+    profiles = opportunities._load_intraday_opening_progressive_profiles(
+        ["TSLA"],
+        market_date_et="2026-08-31",
+        quote_session_scope="current_session",
+        as_of=datetime(2026, 8, 31, 13, 32, 5, tzinfo=timezone.utc),
+        atr14_by_symbol={"TSLA": 10.0},
+        prior_close_by_symbol={"TSLA": 100.0},
+    )
+
+    profile = profiles["TSLA"]
+    assert profile["state"] == "unavailable"
+    assert profile["alert_qualified"] is False
+    reason = str(profile.get("unavailable_reason") or "")
+    assert "source" in reason and "mismatch" in reason
+
+
+def test_opening_fast_path_uses_0935_completed_1m_v2(monkeypatch):
+    now = datetime(2026, 8, 31, 13, 35, 5, tzinfo=timezone.utc)
+    progressive_profile = {
+        "state": "qualified",
+        "alert_qualified": True,
+        "rule_version": "opening_impulse_v2",
+        "bar_start_et": "09:30",
+        "bar_end_et": "09:35",
+        "completed_as_of": "2026-08-31T09:35:02-04:00",
+        "reference_session_count": 20,
+        "direction": "up",
+        "quality_score": 4.2,
+        "checkpoint": 5,
+        "checkpoint_label": "09:35",
+        "confirmation_points": [5],
+        "confirmation_mode": "completed_1m_cumulative",
+        "retryable_pending": False,
+    }
+    monkeypatch.setattr(opportunities, "_intraday_now", lambda: now)
+    monkeypatch.setattr(opportunities, "_todays_plan_tickers", lambda day: ["TSLA"])
+    monkeypatch.setattr(
+        opportunities, "_configured_intraday_pinned_tickers", lambda: []
+    )
+    monkeypatch.setattr(opportunities, "_configured_symbols", lambda: [])
+    monkeypatch.setattr(
+        opportunities,
+        "_intraday_daily_inputs",
+        lambda symbols, **kwargs: {
+            "TSLA": {"atr14": 10.0, "prior_close": 100.0}
+        },
+    )
+    monkeypatch.setattr(
+        opportunities,
+        "_load_intraday_opening_progressive_profiles",
+        lambda symbols, **kwargs: {"TSLA": progressive_profile},
+    )
+    observed = []
+
+    summary = opportunities.warm_opening_impulse_scan(
+        observed.append, target_symbols=("TSLA",),
+    )
+
+    progressive = observed[0]["candidates"][0]["session_bursts"][
+        "opening_progressive"
+    ]
+    assert "opening_impulse" not in observed[0]["candidates"][0]["session_bursts"]
+    assert progressive["state"] == "qualified"
+    assert progressive["alert_qualified"] is True
+    assert progressive["rule_version"] == "opening_impulse_v2"
+    assert progressive["checkpoint"] == 5
+    assert progressive["checkpoint_label"] == "09:35"
+    assert progressive["confirmation_points"] == [5]
+    assert progressive["confirmation_mode"] == "completed_1m_cumulative"
+    assert summary["qualified_count"] == 1
+
+
+@pytest.mark.parametrize("minute", [32, 33, 35])
+def test_opening_full_69_uses_subscribed_1m_without_history_rpc(monkeypatch, minute):
+    from src.opportunities.p0_2m_calibration import DEFAULT_P0_UNIVERSE_69
+
+    symbols = DEFAULT_P0_UNIVERSE_69
+    now = datetime(2026, 8, 31, 13, minute, 5, tzinfo=timezone.utc)
+    monkeypatch.setattr(opportunities, "_intraday_now", lambda: now)
+    monkeypatch.setattr(opportunities, "_cache_now", lambda: 100.0)
+    monkeypatch.setattr(opportunities, "_todays_plan_tickers", lambda day: [])
+    monkeypatch.setattr(opportunities, "_configured_intraday_pinned_tickers", lambda: [])
+    for name in ("_fetch_intraday_1m_bars", "_intraday_daily_inputs"):
+        monkeypatch.setattr(
+            opportunities, name,
+            lambda *args, **kwargs: pytest.fail("critical opening must use caches only"),
+        )
+    references = [
+        row for day in opportunities._exact_prior_xnys_session_labels("2026-08-31")
+        for row in _opening_one_minute_session(day)
+    ]
+    for symbol in symbols:
+        _put_opening_v2_readiness_cache(
+            symbol, source="MoomooFetcher", reference_session_count=20,
+        )
+        opportunities._intraday_opening_1m_reference_cache[
+            (symbol, "2026-08-31")
+        ].result["bars"] = references
+        opportunities._intraday_daily_cache[(symbol, "2026-08-31")] = (
+            opportunities._ScanCacheEntry(
+                expires_at=200.0, result={"atr14": 2.0, "prior_close": 99.5},
+            )
+        )
+    raw_current = [
+        {
+            "date": f"2026-08-31T09:{31 + offset:02d}:00-04:00",
+            "open": 100.0 + offset * 0.9,
+            "high": 101.0 + offset * 0.9,
+            "low": 99.95 + offset * 0.9,
+            "close": 100.9 + offset * 0.9,
+            "volume": 2_500,
+        }
+        for offset in range(5)
+    ]
+    reads = []
+
+    def subscribed(symbol, *, as_of):
+        assert as_of == now
+        reads.append(symbol)
+        # Includes future minutes deliberately: normalization + the strict
+        # completed-bar filter must still restrict the active checkpoint.
+        return raw_current, "MoomooFetcher"
+
+    opportunities.set_opening_signal_universe(
+        symbols, current_1m_reader=subscribed,
+        stream_health_reader=lambda: {"stream_ready": True},
+    )
+    observed = []
+    summary = opportunities.warm_opening_impulse_scan(observed.append)
+    readiness = opportunities.get_opening_v2_provider_readiness(
+        market_date_et="2026-08-31",
+    )
+    assert summary["candidate_count"] == summary["qualified_count"] == 69
+    assert set(reads) == set(symbols) and len(reads) == 69
+    assert [row["ticker"] for row in observed[0]["candidates"]] == list(symbols)
+    assert all(
+        row["session_bursts"]["opening_progressive"]["checkpoint"] == minute - 30
+        for row in observed[0]["candidates"]
+    )
+    assert readiness["target_count"] == readiness["ready_count"] == 69
+    assert readiness["current_stream_ready"] is True
+    assert readiness["current_stream_reason"] == "ready"
+
+
+def test_opening_prewarms_full_69_before_0900_and_cache_survives_rollover(monkeypatch):
+    from src.opportunities.p0_2m_calibration import DEFAULT_P0_UNIVERSE_69
+
+    symbols = DEFAULT_P0_UNIVERSE_69
+    now = datetime(2026, 8, 31, 8, 10, tzinfo=timezone.utc)
+    monkeypatch.setattr(opportunities, "_intraday_now", lambda: now)
+    monkeypatch.setattr(opportunities, "_cache_now", lambda: 100.0)
+    days = set(opportunities._exact_prior_xnys_session_labels("2026-08-31"))
+    days.update(opportunities._exact_prior_xnys_session_labels("2026-09-01"))
+    bars = [row for day in sorted(days) for row in _opening_one_minute_session(day)]
+    reads = []
+    monkeypatch.setattr(
+        opportunities, "_fetch_intraday_1m_bars",
+        lambda symbol, **kwargs: reads.append(symbol) or (bars, "MoomooFetcher"),
+    )
+    daily_calls = []
+    monkeypatch.setattr(
+        opportunities, "_intraday_daily_inputs",
+        lambda targets, **kwargs: daily_calls.append(tuple(targets)) or {},
+    )
+    summary = opportunities.warm_opening_impulse_scan(
+        target_symbols=symbols, prewarm_only=True,
+    )
+    assert summary["action"] == "prewarmed"
+    assert summary["candidate_count"] == 69
+    assert daily_calls == [symbols]
+    opportunities._load_intraday_opening_1m_reference_history(
+        list(symbols), market_date_et="2026-09-01",
+    )
+    assert len(reads) == 138
+    for day in ("2026-08-31", "2026-09-01"):
+        cached = opportunities._load_intraday_opening_1m_reference_history(
+            list(symbols), market_date_et=day, cache_only=True,
+        )
+        assert len(cached) == 69
+        assert all(row["reference_session_count"] == 20 for row in cached.values())
+    opportunities.warm_opening_impulse_scan(target_symbols=symbols, prewarm_only=True)
+    assert len(reads) == 138  # repeated prewarm does not refetch intact prefixes
+
+
+def test_opening_daily_cache_retains_69_current_and_next_session_entries(monkeypatch):
+    from src.opportunities.p0_2m_calibration import DEFAULT_P0_UNIVERSE_69
+
+    monkeypatch.setattr(opportunities, "_cache_now", lambda: 100.0)
+    for day in ("2026-08-31", "2026-09-01"):
+        for symbol in DEFAULT_P0_UNIVERSE_69:
+            opportunities._prune_intraday_daily_cache(100.0)
+            opportunities._intraday_daily_cache[(symbol, day)] = (
+                opportunities._ScanCacheEntry(expires_at=200.0, result={"atr14": 2.0})
+            )
+    for day in ("2026-08-31", "2026-09-01"):
+        assert len(opportunities._cached_opening_daily_inputs(
+            list(DEFAULT_P0_UNIVERSE_69), market_date_et=day,
+        )) == 69
+
+
+def test_opening_missing_subscription_or_baseline_fails_closed_without_rpc(monkeypatch):
+    now = datetime(2026, 8, 31, 13, 33, 5, tzinfo=timezone.utc)
+    monkeypatch.setattr(opportunities, "_intraday_now", lambda: now)
+    monkeypatch.setattr(opportunities, "_todays_plan_tickers", lambda day: [])
+    monkeypatch.setattr(opportunities, "_configured_intraday_pinned_tickers", lambda: [])
+    monkeypatch.setattr(
+        opportunities, "_fetch_intraday_1m_bars",
+        lambda *args, **kwargs: pytest.fail("cache misses must never trigger opening RPC"),
+    )
+    opportunities.set_opening_signal_universe(("TSLA",))
+    observed = []
+    summary = opportunities.warm_opening_impulse_scan(observed.append)
+    assert summary["qualified_count"] == 0
+    assert observed[0]["candidates"][0]["session_bursts"]["opening_progressive"][
+        "alert_qualified"
+    ] is False
+    readiness = opportunities.get_opening_v2_provider_readiness(
+        market_date_et="2026-08-31",
+    )
+    assert readiness["current_stream_ready"] is False
+    assert readiness["current_stream_reason"] == "opening_subscription_cache_unavailable"
+
+
+@pytest.mark.parametrize("count", [1, 69])
+def test_opening_calculation_failure_isolated_to_one_symbol(monkeypatch, count):
+    from src.opportunities.p0_2m_calibration import DEFAULT_P0_UNIVERSE_69
+
+    symbols = DEFAULT_P0_UNIVERSE_69 if count == 69 else ("TSLA",)
+    failed_symbol = symbols[0]
+    monkeypatch.setattr(opportunities, "_cache_now", lambda: 100.0)
+    for symbol in symbols:
+        _put_opening_v2_readiness_cache(
+            symbol, source="MoomooFetcher", reference_session_count=20,
+        )
+
+    def calculate(*args, **kwargs):
+        if kwargs["atr14"] == 2.0:
+            raise ValueError("one symbol computation failed")
+        return {"state": "qualified", "alert_qualified": True, "direction": "up"}
+
+    monkeypatch.setattr(opportunities, "compute_sequential_opening_impulse_profile", calculate)
+    profiles = opportunities._load_intraday_opening_progressive_profiles(
+        list(symbols), market_date_et="2026-08-31", quote_session_scope="current_session",
+        as_of=datetime(2026, 8, 31, 13, 33, 5, tzinfo=timezone.utc),
+        atr14_by_symbol={symbol: 2.0 if symbol == failed_symbol else 3.0 for symbol in symbols},
+        current_1m_reader=lambda *args, **kwargs: ([], "MoomooFetcher"), cache_only=True,
+    )
+    assert set(profiles) == set(symbols)
+    failed = profiles[failed_symbol]
+    assert failed["state"] == "unavailable"
+    assert failed["alert_qualified"] is False
+    assert failed["unavailable_reason"] == "opening_1m_profile_compute_failed:ValueError"
+    assert failed["checkpoint"] == 3
+    assert sum(profile["alert_qualified"] for profile in profiles.values()) == count - 1
+
+
+@pytest.mark.parametrize("minute", [30, 32, 35])
+def test_page_opening_window_reads_legacy_cache_without_cold_history(monkeypatch, minute):
+    now = datetime(2026, 8, 31, 13, minute, 5, tzinfo=timezone.utc)
+    monkeypatch.setattr(opportunities, "_intraday_now", lambda: now)
+    monkeypatch.setattr(opportunities, "_cache_now", lambda: 100.0)
+    for name in ("_load_intraday_opening_reference_history", "_fetch_intraday_5m_bars"):
+        monkeypatch.setattr(
+            opportunities, name,
+            lambda *args, **kwargs: pytest.fail("critical page must not fetch 5m history"),
+        )
+    opportunities._intraday_burst_cache[("TSLA", "2026-08-31", "current_session")] = (
+        opportunities._ScanCacheEntry(
+            expires_at=200.0,
+            result={"profile": {"state": "ready", "legacy": True}, "bars": [{"cached": True}]},
+        )
+    )
+    profiles, bars = opportunities._load_intraday_burst_profiles(
+        ["TSLA", "NVDA"], market_date_et="2026-08-31",
+        quote_session_scope="current_session", as_of=now,
+    )
+    assert profiles["TSLA"] == {"state": "ready", "legacy": True}
+    assert bars["TSLA"] == [{"cached": True}]
+    assert profiles["NVDA"]["state"] == "unavailable"
+    assert profiles["NVDA"]["unavailable_reason"] == "opening_critical_window_cache_not_ready"
+    assert bars["NVDA"] == []
+
+
+def test_page_history_resumes_at_0936_and_when_request_predates_window(monkeypatch):
+    now = datetime(2026, 8, 31, 13, 36, tzinfo=timezone.utc)
+    monkeypatch.setattr(opportunities, "_intraday_now", lambda: now)
+    calls = []
+    monkeypatch.setattr(
+        opportunities, "_load_intraday_opening_reference_history",
+        lambda *args, **kwargs: calls.append("reference") or {},
+    )
+    monkeypatch.setattr(
+        opportunities, "_fetch_intraday_5m_bars",
+        lambda *args, **kwargs: calls.append("current") or ([], "MoomooFetcher"),
+    )
+    opportunities._load_intraday_burst_profiles(
+        ["TSLA"], market_date_et="2026-08-31", quote_session_scope="current_session", as_of=now,
+    )
+    assert calls == ["reference", "current"]
+    assert opportunities._opening_critical_window_active(
+        now.replace(minute=29),
+    ) is False
+    monkeypatch.setattr(opportunities, "_intraday_now", lambda: now.replace(minute=32))
+    assert opportunities._opening_critical_window_active(now.replace(minute=29)) is True
+
+
+def test_page_daily_history_missing_in_opening_window_is_explicit_not_fetched(monkeypatch):
+    now = datetime(2026, 8, 31, 13, 32, tzinfo=timezone.utc)
+    monkeypatch.setattr(opportunities, "_intraday_now", lambda: now)
+    monkeypatch.setattr(opportunities, "_cache_now", lambda: 100.0)
+    monkeypatch.setattr(
+        opportunities, "_create_data_fetcher_manager",
+        lambda: pytest.fail("critical page must not create a cold daily provider"),
+    )
+    opportunities._intraday_daily_cache[("TSLA", "2026-08-31")] = opportunities._ScanCacheEntry(
+        expires_at=200.0, result={"atr14": 2.0, "source": "MoomooFetcher"},
+    )
+    daily = opportunities._intraday_daily_inputs(
+        ["TSLA", "NVDA"], as_of=now, market_date_et="2026-08-31",
+    )
+    assert daily["TSLA"]["atr14"] == 2.0
+    assert daily["NVDA"]["atr14"] is None
+    assert daily["NVDA"]["atr14_unavailable_reason"] == "opening_critical_window_cache_not_ready"
+    monkeypatch.setattr(opportunities, "_fetch_intraday_1m_bars", lambda *args, **kwargs: pytest.fail(
+        "prewarm that crosses into opening must not start a cold prefix request"
+    ))
+    assert opportunities._load_intraday_opening_1m_reference_history(
+        ["NVDA"], market_date_et="2026-08-31",
+    ) == {}
+
+
+@pytest.mark.parametrize(
+    ("session_count", "expected_ttl"),
+    [
+        (19, opportunities._INTRADAY_OPENING_REFERENCE_FAILURE_TTL_SECONDS),
+        (20, opportunities._INTRADAY_OPENING_REFERENCE_CACHE_TTL_SECONDS),
+    ],
+)
+def test_opening_reference_cache_uses_short_ttl_until_20_valid_slots(
+    monkeypatch,
+    session_count,
+    expected_ttl,
+):
+    days = []
+    cursor = date(2026, 8, 28)
+    while len(days) < session_count:
+        if cursor.weekday() < 5:
+            days.append(cursor.isoformat())
+        cursor -= timedelta(days=1)
+    bars = []
+    for day in days:
+        bars.extend(_five_minute_session(day))
+
+    monkeypatch.setattr(opportunities, "_cache_now", lambda: 100.0)
+    monkeypatch.setattr(
+        opportunities,
+        "_fetch_intraday_5m_bars",
+        lambda symbol, **kwargs: (bars, "fixture_5m"),
+    )
+
+    result = opportunities._load_intraday_opening_reference_history(
+        ["TSLA"],
+        market_date_et="2026-08-31",
+    )
+
+    assert result["TSLA"]["reference_session_count"] == session_count
+    entry = opportunities._intraday_opening_reference_cache[
+        ("TSLA", "2026-08-31")
+    ]
+    assert entry.expires_at == 100.0 + expected_ttl
+
+
+def test_legacy_burst_profile_does_not_synthesize_progressive_after_opening(
+    monkeypatch,
+):
+    now = datetime(2026, 8, 31, 13, 36, 5, tzinfo=timezone.utc)
+    monkeypatch.setattr(opportunities, "_intraday_now", lambda: now)
+    key = ("TSLA", "2026-08-31", "current_session")
+    with opportunities._scan_cache_lock:
+        opportunities._intraday_burst_cache[key] = opportunities._ScanCacheEntry(
+            expires_at=999.0,
+            result={
+                "profile": {
+                    "state": "ready",
+                    "opening_impulse": {"state": "pending"},
+                },
+                "bars": [{"cached": True}],
+            },
+        )
+    monkeypatch.setattr(opportunities, "_cache_now", lambda: 100.0)
+    monkeypatch.setattr(
+        opportunities,
+        "_load_intraday_opening_reference_history",
+        lambda symbols, **kwargs: {"TSLA": {"bars": [], "source": "fixture"}},
+    )
+    fetch_calls = []
+    monkeypatch.setattr(
+        opportunities,
+        "_fetch_intraday_5m_bars",
+        lambda symbol, **kwargs: fetch_calls.append(symbol) or ([], "fixture"),
+    )
+    monkeypatch.setattr(
+        opportunities,
+        "compute_session_burst_profile",
+        lambda *args, **kwargs: {"state": "insufficient_bars"},
+    )
+    monkeypatch.setattr(
+        opportunities,
+        "compute_opening_impulse_profile",
+        lambda *args, **kwargs: {
+            "state": "qualified",
+            "alert_qualified": True,
+            "rule_version": "opening_impulse_v1",
+            "bar_start_et": "09:30",
+            "bar_end_et": "09:35",
+            "completed_as_of": "2026-08-31T09:35:02-04:00",
+            "reference_session_count": 20,
+            "direction": "up",
+        },
+    )
+
+    profiles, bars = opportunities._load_intraday_burst_profiles(
+        ["TSLA"],
+        market_date_et="2026-08-31",
+        quote_session_scope="current_session",
+        as_of=now,
+        atr14_by_symbol={"TSLA": 10.0},
+        prior_close_by_symbol={"TSLA": 100.0},
+    )
+
+    assert fetch_calls == ["TSLA"]
+    assert profiles["TSLA"]["opening_impulse"]["state"] == "qualified"
+    assert "opening_progressive" not in profiles["TSLA"]
+    assert bars["TSLA"] == []
+
+
+def test_burst_profile_cache_refreshes_on_new_completed_5m_boundary(monkeypatch):
+    key = ("TSLA", "2026-08-31", "current_session")
+    with opportunities._scan_cache_lock:
+        opportunities._intraday_burst_cache[key] = opportunities._ScanCacheEntry(
+            expires_at=999.0,
+            result={
+                "profile": {
+                    "state": "ready",
+                    "current": {"end_et": "10:00"},
+                    "opening_impulse": {"state": "not_qualified"},
+                },
+                "bars": [{"cached": True}],
+            },
+        )
+    monkeypatch.setattr(opportunities, "_cache_now", lambda: 100.0)
+    monkeypatch.setattr(
+        opportunities,
+        "_load_intraday_opening_reference_history",
+        lambda symbols, **kwargs: {"TSLA": {"bars": [], "source": "fixture"}},
+    )
+    fetch_calls = []
+    monkeypatch.setattr(
+        opportunities,
+        "_fetch_intraday_5m_bars",
+        lambda symbol, **kwargs: fetch_calls.append(symbol) or ([], "fixture"),
+    )
+    monkeypatch.setattr(
+        opportunities,
+        "compute_session_burst_profile",
+        lambda *args, **kwargs: {
+            "state": "ready",
+            "current": {"end_et": "10:05"},
+        },
+    )
+    monkeypatch.setattr(
+        opportunities,
+        "compute_opening_impulse_profile",
+        lambda *args, **kwargs: {"state": "not_qualified"},
+    )
+
+    profiles, _bars = opportunities._load_intraday_burst_profiles(
+        ["TSLA"],
+        market_date_et="2026-08-31",
+        quote_session_scope="current_session",
+        as_of=datetime(2026, 8, 31, 14, 5, 5, tzinfo=timezone.utc),
+        atr14_by_symbol={"TSLA": 10.0},
+        prior_close_by_symbol={"TSLA": 100.0},
+    )
+
+    assert fetch_calls == ["TSLA"]
+    assert profiles["TSLA"]["current"]["end_et"] == "10:05"
+
+
 def test_earnings_calendar_single_range_call_cached_for_the_day(monkeypatch):
     monkeypatch.setenv("MOOMOO_OPEND_ENABLED", "true")
     _stub_daily_loader(monkeypatch)
@@ -861,10 +1866,10 @@ def test_intraday_pulse_disabled_and_degraded_vix(monkeypatch):
     assert disabled.status_code == 200
     body = disabled.json()
     assert body["schema_version"] == "intraday-pulse/1.0"
-    # v3 时段上下文与 Moomoo 无关（纯 ET 时钟）：未配置时同样如实标注。
+    # 中性时段上下文与 Moomoo 无关（纯 ET 时钟）：未配置时同样如实标注。
     assert body["session_phase"] == "prime"
-    assert "主战场" in body["session_phase_label"]
-    assert body["session_phase_hint_basis"] == "user_trading_history_hardcoded_v1"
+    assert body["session_phase_label"] == "10:00–11:00 · 上午流动性与波动环境"
+    assert body["session_phase_hint_basis"] == "america_new_york_liquidity_context_neutral_v2"
     assert [item["ticker"] for item in body["items"]] == ["SPY", "QQQ", "VIX"]
     assert all(item["state"] == "not_configured" for item in body["items"])
     assert all(item["last_price"] is None for item in body["items"])
@@ -903,7 +1908,7 @@ def test_intraday_pulse_disabled_and_degraded_vix(monkeypatch):
 
 
 def test_intraday_pulse_session_phase_noise_window(monkeypatch):
-    # 2026-07-28 17:30 UTC = 13:30 ET → 噪音时段（用户历史净亏损，默认观望）。
+    # 2026-07-28 17:30 UTC = 13:30 ET → 中性的午间环境标签。
     monkeypatch.delenv("MOOMOO_OPEND_ENABLED", raising=False)
     monkeypatch.setattr(
         opportunities,
@@ -914,7 +1919,8 @@ def test_intraday_pulse_session_phase_noise_window(monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert body["session_phase"] == "noise"
-    assert "默认观望" in body["session_phase_label"]
+    assert body["session_phase_label"] == "13:00–14:00 · 午间流动性与波动环境"
+    assert "默认观望" not in body["session_phase_label"]
     assert any("系统标注，用户过滤" in text for text in body["limitations"])
 
 

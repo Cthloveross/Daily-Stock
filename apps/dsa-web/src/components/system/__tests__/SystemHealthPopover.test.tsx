@@ -1,5 +1,5 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SystemHealthPopover } from '../SystemHealthPopover';
 
 const apiMocks = vi.hoisted(() => ({ get: vi.fn() }));
@@ -26,6 +26,7 @@ describe('SystemHealthPopover', () => {
   beforeEach(() => {
     apiMocks.get.mockReset().mockResolvedValue(healthResponse());
   });
+  afterEach(() => { vi.useRealTimers(); });
 
   it('fetches layers only when opened and renders each state', async () => {
     render(<SystemHealthPopover />);
@@ -51,7 +52,7 @@ describe('SystemHealthPopover', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '系统健康分层' }));
 
-    expect(await screen.findByText('健康状态读取失败')).toBeInTheDocument();
+    expect(await screen.findByText('健康状态读取失败，当前状态未知')).toBeInTheDocument();
   });
 
   it('closes when clicking outside', async () => {
@@ -64,5 +65,38 @@ describe('SystemHealthPopover', () => {
     await waitFor(() => {
       expect(screen.queryByText('API 进程')).not.toBeInTheDocument();
     });
+  });
+
+  it('refreshes only while open and removes stale health after a failed refresh', async () => {
+    vi.useFakeTimers();
+    render(<SystemHealthPopover />);
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '系统健康分层' }));
+    });
+    expect(screen.getByText('API 进程')).toBeInTheDocument();
+    expect(screen.getByText(/检查于/)).toBeInTheDocument();
+    apiMocks.get.mockRejectedValueOnce(new Error('offline'));
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+
+    expect(apiMocks.get).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('健康状态读取失败，当前状态未知')).toBeInTheDocument();
+    expect(screen.queryByText('API 进程')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '系统健康分层' }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(apiMocks.get).toHaveBeenCalledTimes(2);
+  });
+
+  it('shows an ended shadow window without calling it a calibration pass', async () => {
+    const response = healthResponse();
+    response.data.layers.push({
+      layer: 'intraday_p0_2m_shadow', state: 'ok',
+      detail: '本轮观察窗口已结束；结束不表示已通过校准',
+    });
+    apiMocks.get.mockResolvedValue(response);
+    render(<SystemHealthPopover />);
+    fireEvent.click(screen.getByRole('button', { name: '系统健康分层' }));
+    expect(await screen.findByText('20 日前瞻验证')).toBeInTheDocument();
+    expect(screen.getByText('本轮观察窗口已结束；结束不表示已通过校准')).toBeInTheDocument();
   });
 });

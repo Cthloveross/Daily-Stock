@@ -13,6 +13,16 @@ from src.core.config_registry import (
 )
 
 
+def test_strict_2m_research_mobile_switch_is_explicit_and_off_by_default():
+    field = get_field_definition("INTRADAY_P0_2M_SHADOW_MOBILE_ENABLED")
+    assert field["category"] == "system"
+    assert field["data_type"] == "boolean" and field["ui_control"] == "switch"
+    assert field["default_value"] == "false"
+    assert field["is_editable"] is True and field["is_sensitive"] is False
+    assert field["display_order"] != 9000
+    assert "does not enable formal P0" in field["description"]
+
+
 class TestSlackFieldsRegistered(unittest.TestCase):
     """Slack config keys must be present in the registry."""
 

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Pure near-expiry (0–3 DTE) contract-panel assembly.
+"""Pure near-expiry (0–``max_dte``, provider-bounded to 7) assembly.
 
 「临期合约面板」是合约选择支持，不是推荐引擎：本模块只做确定性的
 近价内外行权价窗口选择、逐合约点差计算与按到期日分组，不产生任何

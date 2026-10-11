@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Deterministic tests for the 今日车道可用性（day-type / V2-E）pure module.
+"""Deterministic tests for the 今日 0–7DTE 车道可用性 pure module.
 
 锁定三件事：
 1. 逐标的可用性对「有 0DTE / 没有 0DTE / 链读不到」三种输入的三态输出；
-2. 聚合 day_type 的优先级（正向证据 > 全可读无 0DTE > 未知），特别是
-   **绝不**把「读不到」聚合成 overnight_only；
+2. 兼容字段 day_type 的优先级（正向证据 > 全可读无 0DTE > 未知），特别是
+   **绝不**把「读不到」聚合成 overnight_only，也不把 legacy 名称当作活动建议；
 3. 不含任何星期规则——同一批到期日在任何日期下给出同一结论。
 """
 from __future__ import annotations
@@ -133,8 +133,8 @@ def test_day_type_intraday_available_survives_partial_unknowns():
     assert zero == ["QQQ"]
 
 
-def test_day_type_overnight_only_when_all_readable_and_no_zero_dte():
-    """2026-08-04（周二）真实形状：全部可读、全部无 0DTE → 过夜日。"""
+def test_legacy_day_type_records_no_zero_dte_without_recommending_overnight():
+    """全部可读且无 0DTE：保留 wire 枚举，但明确不能据此关闭日内。"""
 
     day_type, reason, zero = derive_day_type(
         [
@@ -146,7 +146,8 @@ def test_day_type_overnight_only_when_all_readable_and_no_zero_dte():
     )
     assert day_type == "overnight_only"
     assert zero == []
-    assert "V2-E" in reason
+    assert "legacy 0DTE" in reason
+    assert "不代表日内关闭" in reason
 
 
 def test_day_type_unknown_when_no_zero_dte_and_any_chain_unreadable():

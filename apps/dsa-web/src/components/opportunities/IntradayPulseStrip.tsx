@@ -31,9 +31,8 @@ function formatPrice(value: number | null): string {
  * 市场脉搏（SPY / QQQ / VIX 快照读数 + 时段上下文 + 盘段 + ET 时钟 + 刷新指示）。
  * 缺失代码显式标缺（如 VIX 快照不可得），绝不以 0 或旧值冒充。
  *
- * v3 时段上下文醒目置于条首：标签文案是用户自身历史交易统计的硬编码 v1
- * 纪律提示（如「午间震荡 · 你的历史净亏损时段 · 默认观望」）——系统标注，
- * 用户过滤：它不隐藏任何数据、不阻断任何操作，也不是买卖信号。
+ * 时段上下文醒目置于条首，但只描述 ET 墙钟对应的流动性/波动环境；不再
+ * 携带「轻仓 / 主战场 / 默认观望 / 等待确认」等规范性旧建议。
  * SPY/QQQ 附会话 VWAP 位置（累计额/量近似），作大盘情绪参照。
  */
 export function IntradayPulseStrip({
@@ -56,7 +55,7 @@ export function IntradayPulseStrip({
       <div className="flex flex-wrap items-center gap-x-6 gap-y-2 px-4 py-2.5">
         {data?.sessionPhaseLabel && (
           <Tooltip
-            content="你的历史交易统计提示（硬编码 v1 文案）· 系统标注，用户过滤 · 不是信号"
+            content="ET 时段环境标签 · 只描述流动性/波动背景 · 不提供进场、观望、持有或离场建议"
             focusable
           >
             <div

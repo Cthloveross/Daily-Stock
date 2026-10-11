@@ -618,6 +618,7 @@ describe('OpportunityDetailPage', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '期权墙' }));
     expect(screen.getByText('查看当日成交量集中位')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '查看临期合约（0–7 DTE） ▾' })).toBeInTheDocument();
     expect(screen.queryByText('查看各期限历史波动率')).not.toBeInTheDocument();
     expect(screen.queryByText('概率区间怎么算')).not.toBeInTheDocument();
     expect(screen.queryByText(/BUY \/ SELL、情绪与订单类型/)).not.toBeInTheDocument();

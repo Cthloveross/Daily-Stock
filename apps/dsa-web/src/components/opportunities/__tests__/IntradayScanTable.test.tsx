@@ -300,7 +300,7 @@ function topResponse(): IntradayTopResponse {
     sessionStateBasis: 'america_new_york_clock_v1',
     sessionPhase: 'prime',
     sessionPhaseLabel: '主战场 · 你的历史最大净盈利时段',
-    sessionPhaseHintBasis: 'user_trading_history_hardcoded_v1',
+    sessionPhaseHintBasis: 'america_new_york_liquidity_context_neutral_v2',
     quoteSessionScope: 'current_session',
     quoteSessionLabel: '当前交易时段',
     marketContext: {
@@ -315,8 +315,8 @@ function topResponse(): IntradayTopResponse {
       source: 'moomoo_openapi',
       unavailableReason: 'spy_quote_unavailable',
     },
-    signalVersion: 'intraday_session_evidence_v8',
-    rankingMethod: 'burst_score_first_then_evidence_count',
+    signalVersion: 'intraday_session_evidence_v9',
+    rankingMethod: 'rule_based_evidence_count',
     statisticsTrack: 'none_intraday_v1_unscored',
     moomooEnabled: true,
     universe: ['NVDA', 'MU'],
@@ -340,7 +340,7 @@ function nearExpiryEmpty(ticker: string): NearExpiryContractResponse {
       source: 'moomoo_openapi',
       fetchedAt: '2026-08-04T14:30:06+00:00',
       formulaVersion: 'near-expiry-contracts/v1',
-      maxDte: 3,
+      maxDte: 7,
       spot: 100,
       spotAsOf: '2026-08-04 10:30:04',
       openInterestAsOf: '2026-08-01',
@@ -356,7 +356,7 @@ function nearExpiryEmpty(ticker: string): NearExpiryContractResponse {
         excludedUnknownStandardTypeContracts: 0,
       },
       expiries: [],
-      message: '3 天内没有该标的的期权到期日；这是诚实空态，不是数据失败。',
+      message: '7 天内没有该标的的期权到期日；这是诚实空态，不是数据失败。',
       limitations: [],
     },
   };
@@ -438,7 +438,7 @@ describe('IntradayScanTable 默认 10 列网格（v3 上下文并入）', () => 
     // 默认网格恰好 11 列交易关键读数（v6 起含「近30分位移」，「波段vs大盘」
     // 下沉；2026-08-14 按用户要求「你的战绩」收尾——上下文标注放最后；
     // 2026-08-15 形态后加「期权墙」）。
-    const headers = ['排名', '标的', '涨跌%', '当前爆发', '今日波段', '速度', '近30分位移', '形态', '期权墙', '详情', '你的战绩'];
+    const headers = ['排名', '标的', '涨跌%', '旧5m爆发', '旧5m波段', '速度', '近30分位移', '形态', '期权墙', '详情', '你的战绩'];
     for (const header of headers) {
       expect(within(table).getByText(header)).toBeInTheDocument();
     }
@@ -456,12 +456,37 @@ describe('IntradayScanTable 默认 10 列网格（v3 上下文并入）', () => 
     }
     // 排名列显示服务端排名。
     expect(within(table).getByText('#1')).toBeInTheDocument();
-    // 财报回避窗内：警示徽标并入标的格次行，回避规则口径随 aria-label 附带。
-    const blackoutBadge = within(table).getByText('财报 2 天内 · 期权贵');
-    expect(blackoutBadge.getAttribute('aria-label')).toContain('你的回避规则（≤3 天）');
+    // 未来财报只作中性上下文；legacy withinBlackout=true 不得再触发硬警示。
+    const futureBadge = within(table).getByText('距财报 2 天');
+    expect(futureBadge.getAttribute('aria-label')).toContain('当日平仓，不跨事件');
+    expect(futureBadge).not.toHaveClass('text-warning');
     // 速度：加速↑ + Δ 值。
     expect(within(table).getByText('加速↑')).toBeInTheDocument();
     expect(within(table).getByText('Δ +4.3')).toBeInTheDocument();
+  });
+
+  it('uses the hard-block treatment only for same-day earnings', () => {
+    const today = v3Candidate();
+    const response = {
+      ...topResponse(),
+      candidates: [{
+        ...today,
+        earningsProximity: {
+          ...today.earningsProximity,
+          daysToEarnings: 0,
+          earningsDate: '2026-08-04',
+          withinBlackout: true,
+        },
+      }],
+      universe: ['NVDA'],
+    };
+
+    render(<IntradayScanTable data={response} loading={false} error={null} />);
+
+    const badge = within(screen.getByRole('table', { name: '实时扫描表' }))
+      .getByText('今日财报 · 硬拦截');
+    expect(badge).toHaveClass('text-warning');
+    expect(badge.getAttribute('aria-label')).toContain('INTRA-0-7 当日交易会跨财报事件');
   });
 
   it('moves 波段vs大盘 into the expanded 研究读数 grid without losing its 口径', async () => {
@@ -495,7 +520,7 @@ describe('IntradayScanTable 默认 10 列网格（v3 上下文并入）', () => 
     expect(within(table).getByLabelText('打开 MU 即时扫描详情')).toBeInTheDocument();
   });
 
-  it('sorts by current burst with unavailable rows always last and server rank unchanged', () => {
+  it('keeps legacy 5m burst visible but removes it from client sorting', () => {
     const ready = v3Candidate();
     const response = {
       ...topResponse(),
@@ -504,16 +529,13 @@ describe('IntradayScanTable 默认 10 列网格（v3 上下文并入）', () => 
     };
     render(<IntradayScanTable data={response} loading={false} error={null} />);
     const table = screen.getByRole('table', { name: '实时扫描表' });
-    fireEvent.click(within(table).getByRole('button', { name: '按当前爆发排序' }));
     const bodyRows = () => within(table).getAllByRole('row').slice(1);
     const tickerOrder = () =>
       bodyRows().map((row) => within(row).getAllByRole('cell')[1]?.textContent ?? '');
-    // desc：有爆发分的 NVDA 在前，标缺的 MU 永远最后。
-    expect(tickerOrder()[0]).toContain('NVDA');
-    // 客户端排序不改写服务端排名：NVDA 仍是 #2。
-    expect(within(bodyRows()[0]).getAllByRole('cell')[0]?.textContent).toBe('#2');
-    fireEvent.click(within(table).getByRole('button', { name: '按当前爆发排序' }));
-    expect(tickerOrder()[0]).toContain('NVDA');
+    // 服务端顺序保持 MU -> NVDA；旧分数再高也不能在客户端重排。
+    expect(tickerOrder()[0]).toContain('MU');
+    expect(within(table).queryByRole('button', { name: /爆发排序/ })).not.toBeInTheDocument();
+    expect(within(table).getByText('旧5m爆发')).toBeInTheDocument();
   });
 });
 
@@ -1276,7 +1298,7 @@ describe('IntradayScanTable 展开行（研究读数 + 临期合约）', () => {
       expect(screen.getByLabelText('NVDA 临期合约')).toBeInTheDocument();
     });
     expect(navigateMock).not.toHaveBeenCalled();
-    expect(fetchNearExpiryContracts).toHaveBeenCalledWith('NVDA', 3, { refresh: false });
+    expect(fetchNearExpiryContracts).toHaveBeenCalledWith('NVDA', 7, { refresh: false });
 
     // 再次点击收起。
     fireEvent.click(screen.getByLabelText('展开 NVDA 研究读数与临期合约'));
@@ -1574,7 +1596,7 @@ describe('IntradayScanTable 近30分位移列（v6 recent displacement）', () =
     render(<IntradayScanTable data={response} loading={false} error={null} />);
     expect(document.body.textContent).toContain('版本未声明');
     // 绝不把硬编码版本冒充成载荷声明的版本。
-    expect(document.body.textContent).not.toContain('intraday_session_evidence_v8');
+    expect(document.body.textContent).not.toContain('intraday_session_evidence_v9');
   });
 
   it('annotates a gapped displacement window instead of claiming a clean 30 minutes', () => {
@@ -1668,8 +1690,8 @@ describe('IntradayScanTable footer 口径两级展示', () => {
     render(<IntradayScanTable data={topResponse()} loading={false} error={null} />);
 
     // 默认只有一行简短口径说明（含 v5 波段分级图例），公式墙收起。
-    expect(screen.getByText(/排序与口径说明：盘中排序＝爆发分优先/)).toBeInTheDocument();
-    expect(screen.getByText(/强＝爆发分 ≥8 暴动 \/ 中＝≥2.5 持续推升/)).toBeInTheDocument();
+    expect(screen.getByText(/服务端按非 legacy 独立证据计数/)).toBeInTheDocument();
+    expect(screen.getByText(/旧 5m 爆发\/波段仅兼容与复盘展示/)).toBeInTheDocument();
     // v8：位移一行仍在默认简短口径里，但存活框架已换成循环性更正。
     expect(
       screen.getByText(/0.5 ATR 只是参考刻度（原分层按持仓时长定义、循环性已被量化推翻/),
@@ -1677,12 +1699,12 @@ describe('IntradayScanTable footer 口径两级展示', () => {
     expect(
       screen.queryByText(/0.5 ATR 是你自己 766 笔样本的经验「活下来」线/),
     ).not.toBeInTheDocument();
-    expect(screen.queryByText(/当前爆发＝最近 15 分钟（3 根 5m K 线）/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/旧5m爆发＝最近 15 分钟（3 根 5m K 线）/)).not.toBeInTheDocument();
     // 期权墙口径进入可见行（数据口径，不是披露句）。
     expect(screen.getByText(/期权墙＝上一清算时段 OI 分布（C\/P\/γ\/中心/)).toBeInTheDocument();
     // 界面披露策略（2026-08-15）：常驻可见行不再有「不是信号/非预测」类
     // 披露句——它们逐字收进「完整口径」切换（见下）。
-    const visibleFooterLine = screen.getByText(/排序与口径说明：盘中排序＝爆发分优先/);
+    const visibleFooterLine = screen.getByText(/服务端按非 legacy 独立证据计数/);
     expect(visibleFooterLine.textContent).not.toContain('不是信号');
     expect(visibleFooterLine.textContent).not.toContain('非预测');
     expect(screen.queryByText(/披露：近30分位移不含前向信息/)).not.toBeInTheDocument();
@@ -1703,8 +1725,13 @@ describe('IntradayScanTable footer 口径两级展示', () => {
     expect(
       screen.getByText(/『价格会向墙位靠拢』在你的数据上尚未验证——逐日快照 2026-08-04 起积累/),
     ).toBeInTheDocument();
-    expect(screen.getByText(/当前爆发＝最近 15 分钟（3 根 5m K 线）/)).toBeInTheDocument();
-    expect(screen.getByText(/减速=你的离场信号，R1/)).toBeInTheDocument();
+    expect(screen.getByText(/旧5m爆发＝最近 15 分钟（3 根 5m K 线）/)).toBeInTheDocument();
+    expect(screen.getByText(/不参与支持计数、排名、提醒或 P0/)).toBeInTheDocument();
+    expect(screen.getByText(/不映射旧 R1，也不产生进场、持有或离场指令/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/财报仅作警告上下文，不改变严格 2m P0 信号事实/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/≤3 天标「期权贵」/)).not.toBeInTheDocument();
     expect(screen.getByText(/系统标注，用户过滤：不隐藏行、不阻断操作、不参与排序/)).toBeInTheDocument();
     expect(screen.getByText(/期权异动＝最近一页 Moomoo 分类计数，不推断开平仓/)).toBeInTheDocument();
     // 完整口径逐字携带取证数字与全部 caveat。
@@ -1724,7 +1751,7 @@ describe('IntradayScanTable footer 口径两级展示', () => {
 
     // 再次点击收起。
     fireEvent.click(toggle);
-    expect(screen.queryByText(/当前爆发＝最近 15 分钟（3 根 5m K 线）/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/旧5m爆发＝最近 15 分钟（3 根 5m K 线）/)).not.toBeInTheDocument();
   });
 });
 
@@ -1945,14 +1972,14 @@ describe('IntradayScanTable 哑火形态标记（v7，命中才渲染）', () =>
     return screen.getByRole('table', { name: '实时扫描表' });
   }
 
-  it('renders a warning-muted chip inside the existing 当前爆发 cell, adding no column', () => {
+  it('renders a warning-muted chip inside the legacy 5m burst cell, adding no column', () => {
     const table = renderWith(fizzleFlag());
     // 不新增列：默认网格仍是 11 列（2026-08-15 起含「期权墙」）。
     expect(within(table).getAllByRole('columnheader').length).toBe(11);
     const chip = within(table).getByText('哑火形态');
     expect(chip).toBeInTheDocument();
     expect(chip.className).toContain('text-warning');
-    // 徽标落在「当前爆发」格里（与该窗口的分数同一单元格）。
+    // 徽标落在「旧5m爆发」格里（与该窗口的分数同一单元格）。
     const cell = chip.closest('td');
     expect(cell).not.toBeNull();
     expect(within(cell as HTMLElement).getByText('3.6')).toBeInTheDocument();
@@ -2181,13 +2208,13 @@ describe('IntradayScanTable 「期权墙」列（上一清算时段 OI 分布事
     expect(await within(table).findByText('C 210 · P 195')).toBeInTheDocument();
     expect(within(table).getByText('γ205 · 中心202.4')).toBeInTheDocument();
 
-    // tooltip（aria-label 同文）逐位给 OI/占比/距现价/主力到期 + as-of。
+    // tooltip（aria-label 同文）逐位给 OI/占比/距现价/首要到期 + as-of。
     const label = within(table)
       .getByText('C 210 · P 195')
       .closest('span[aria-label]')
       ?.getAttribute('aria-label') ?? '';
     expect(label).toContain('看涨墙 C 210：OI 12,345 张 · 占看涨侧 OI 18.2% · 距现价 +5.00%');
-    expect(label).toContain('主力到期 2026-08-08（占该位 62%）');
+    expect(label).toContain('首要到期 2026-08-08（占该位 62%）');
     expect(label).toContain('看跌墙 P 195：OI 9,876 张 · 占看跌侧 OI 15.0% · 距现价 −2.50%');
     expect(label).toContain('γ 集中 205：距现价 +2.50%');
     expect(label).toContain('OI 加权中心 202.4：距现价 +1.20%');

@@ -290,7 +290,7 @@ const OpportunityDetailPage: React.FC = () => {
   const [wall, setWall] = useState<OpportunityOptionWallItem | null>(null);
   const [wallLoading, setWallLoading] = useState(true);
   const [wallError, setWallError] = useState<string | null>(null);
-  // 临期合约面板按需展开：只有用户显式点击才发起 0–3 DTE 合约读取。
+  // 临期合约面板按需展开：只有用户显式点击才发起 0–7 DTE 合约读取。
   const [nearExpiryOpen, setNearExpiryOpen] = useState(false);
   const [eventItem, setEventItem] = useState<OpportunityOptionEventItem | null>(null);
   const [eventsLoading, setEventsLoading] = useState(true);
@@ -970,7 +970,7 @@ const OpportunityDetailPage: React.FC = () => {
                       className="rounded-ds-sm border border-subtle px-2 py-1 text-caption text-text-2 hover:bg-bg-2 hover:text-text-1"
                       aria-expanded={nearExpiryOpen}
                     >
-                      查看临期合约（0–3 DTE）{nearExpiryOpen ? ' ▴' : ' ▾'}
+                      查看临期合约（0–7 DTE）{nearExpiryOpen ? ' ▴' : ' ▾'}
                     </button>
                     {nearExpiryOpen && (
                       <div className="mt-3">

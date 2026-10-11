@@ -789,11 +789,12 @@ class OptionWallSnapshotResponse(BaseModel):
 
 
 class IntradayEarningsProximity(BaseModel):
-    """v3 财报临近标记：前向 5 天窗口内最近财报日；不可得时显式标缺。
+    """财报临近上下文：前向窗口内最近财报日；不可得时显式标缺。
 
     within_blackout=None 表示日历不可得（诚实未知），不是「安全」。
-    ≤3 天的「期权贵」阈值是用户自身回避规则的 v1 启发式。
-    日内扫描表候选与临期合约面板（G-8）共用同一形状与同一份日历缓存。
+    ``within_blackout``/``blackout_days`` 仅为旧载荷兼容；当前 INTRA-0-7
+    规则只对 days_to_earnings=0 硬拦，未来财报仅作中性上下文，并要求
+    同一 ET 交易日平仓、不跨事件。扫描表与临期合约面板共用同一形状与缓存。
     """
 
     state: Literal["ready", "unavailable"]
@@ -815,10 +816,10 @@ class NearExpiryContractRequest(BaseModel):
         description="单个美股期权 underlying；US. 前缀会被规范化移除。",
     )
     max_dte: int = Field(
-        3,
+        7,
         ge=0,
         le=7,
-        description="纳入的最大 DTE（含 0DTE）；默认 3，上限 7。",
+        description="纳入的最大 DTE（含 0DTE）；默认 7，即 0-7DTE。",
     )
     refresh: bool = Field(
         False,
@@ -908,9 +909,9 @@ class NearExpiryContractItem(BaseModel):
     strike_window: NearExpiryStrikeWindow
     coverage: NearExpiryCoverage
     expiries: list[NearExpiryExpiryGroup] = Field(default_factory=list)
-    # 今日车道可用性（V2-E，additive）：链已读到即由已在手的到期日分组推导，
-    # 零额外抓取。has_zero_dte=None 表示链读不到（未知），**不是**「没有
-    # 0DTE」；state="empty"（链可读、窗口内无到期日）时为 False。
+    # 0-7DTE 可用性证据（additive）：链已读到即由已在手的到期日分组推导，
+    # 零额外抓取。has_zero_dte 是兼容保留的 0DTE 事实；None 表示链读不到
+    # （未知），**不是**「没有 0DTE」。当前策略读取 available_dte_list。
     has_zero_dte: Optional[bool] = None
     available_dte_list: list[int] = Field(default_factory=list)
     availability_unavailable_reason: Optional[str] = None
@@ -1184,8 +1185,8 @@ class IntradayBurstWindow(BaseModel):
 class IntradayBurstSpeed(BaseModel):
     """v3 速度分级：相邻两个滚动 15 分钟窗口爆发分之差（5m K 线近似）。
 
-    「减速」对应用户纪律 R1 的离场提示，不是系统信号；窗口不足或缺分数时
-    显式 unknown + reason，绝不以「持平」冒充观测值。
+    这是纯观察性上下文，不映射旧 R1，也不产生进场、持有或离场指令；
+    窗口不足或缺分数时显式 unknown + reason，绝不以「持平」冒充观测值。
     """
 
     state: Literal["accelerating", "decelerating", "flat", "unknown"]
@@ -1257,12 +1258,82 @@ class IntradayFizzleFlag(BaseModel):
     reference: IntradayFizzleReference
 
 
+class IntradayOpeningImpulse(BaseModel):
+    """首根完整 5m 开盘异动画像；候选探测，不是入场信号。"""
+
+    state: Literal["qualified", "not_qualified", "pending", "unavailable"]
+    alert_qualified: bool = False
+    rule_version: Literal["opening_impulse_v1"]
+    bar_start_et: Literal["09:30"]
+    bar_end_et: Literal["09:35"]
+    completed_as_of: Optional[str] = None
+    open: Optional[float] = Field(default=None, gt=0)
+    high: Optional[float] = Field(default=None, gt=0)
+    low: Optional[float] = Field(default=None, gt=0)
+    close: Optional[float] = Field(default=None, gt=0)
+    volume: Optional[float] = Field(default=None, ge=0)
+    dollar_volume: Optional[float] = Field(default=None, ge=0)
+    direction: Optional[Literal["up", "down", "flat"]] = None
+    body_percent: Optional[float] = None
+    body_atr: Optional[float] = Field(default=None, ge=0)
+    range_atr: Optional[float] = Field(default=None, ge=0)
+    body_efficiency: Optional[float] = Field(default=None, ge=0, le=1)
+    directional_close_location: Optional[float] = Field(
+        default=None, ge=0, le=1
+    )
+    opening_volume_rvol_20d: Optional[float] = Field(default=None, ge=0)
+    opening_range_ratio_20d: Optional[float] = Field(default=None, ge=0)
+    opening_body_ratio_20d: Optional[float] = Field(default=None, ge=0)
+    volume_percentile_20d: Optional[float] = Field(default=None, ge=0, le=1)
+    range_percentile_20d: Optional[float] = Field(default=None, ge=0, le=1)
+    body_percentile_20d: Optional[float] = Field(default=None, ge=0, le=1)
+    reference_session_count: int = Field(0, ge=0)
+    reference_median_volume: Optional[float] = Field(default=None, ge=0)
+    reference_median_range: Optional[float] = Field(default=None, ge=0)
+    reference_median_abs_body: Optional[float] = Field(default=None, ge=0)
+    prior_close: Optional[float] = Field(default=None, gt=0)
+    gap_percent: Optional[float] = None
+    closed_vs_prior_percent: Optional[float] = None
+    reclaimed_prior_close: Optional[bool] = None
+    opening_mid: Optional[float] = Field(default=None, gt=0)
+    quality_score: Optional[float] = Field(default=None, ge=0)
+    failed_checks: list[str] = Field(default_factory=list)
+    thresholds: dict[str, float] = Field(default_factory=dict)
+    unavailable_reason: Optional[str] = None
+    source: Optional[str] = None
+    reference_source: Optional[str] = None
+    current_source: Optional[str] = None
+    basis: str
+    limitations: list[str] = Field(default_factory=list)
+
+
+class IntradaySequentialOpeningImpulse(IntradayOpeningImpulse):
+    """09:31--09:35 顺序开盘画像；早期双确认，最终累计完整 1m。"""
+
+    rule_version: Literal["opening_impulse_v2"]
+    bar_end_et: str
+    checkpoint: Optional[int] = Field(default=None, ge=0, le=5)
+    checkpoint_label: Optional[str] = None
+    completed_checkpoints: list[dict] = Field(default_factory=list)
+    confirmation_points: list[int] = Field(default_factory=list)
+    confirmation_labels: list[str] = Field(default_factory=list)
+    confirmation_mode: Optional[
+        Literal["consecutive_1m", "completed_1m_cumulative"]
+    ] = None
+    current_checkpoint_pass: Optional[bool] = None
+    retryable_pending: bool = False
+
+
 class IntradaySessionBursts(BaseModel):
-    """波段爆发（v2 主信号）：当前窗口 + 当日（或最近一个交易时段）波段列表。
+    """Legacy 5m 波段读数：只供兼容展示和复盘研究。
 
     K 线不可得或不足时显式标 state + reason，绝不以 0 分冒充平静。
     """
 
+    legacy: Literal[True] = True
+    legacy_usage: Literal["api_compatibility_and_research_display_only"] = (
+        "api_compatibility_and_research_display_only"
+    )
     state: Literal["ready", "insufficient_bars", "unavailable"]
     session_date_et: Optional[str] = None
     bar_count: int = Field(0, ge=0)
@@ -1277,6 +1348,12 @@ class IntradaySessionBursts(BaseModel):
     speed: IntradayBurstSpeed
     # v7 哑火形态（additive）：描述 current 窗口；旧载荷可省略。
     fizzle_flag: Optional[IntradayFizzleFlag] = None
+    # P1-O 兼容字段：当前 09:35 final 也只使用 09:30 起五根完整 1m
+    # 累计画像；顺序细节见 opening_progressive，不改变旧 15m burst state。
+    opening_impulse: Optional[IntradayOpeningImpulse] = None
+    # opening_impulse_v2：09:31--09:34 的顺序双确认或 09:35 五根完整 1m
+    # 累计确认。保留 v1 字段以兼容旧客户端。
+    opening_progressive: Optional[IntradaySequentialOpeningImpulse] = None
     unavailable_reason: Optional[str] = None
     source: Optional[str] = None
     fetched_at: Optional[str] = None
@@ -1520,19 +1597,21 @@ class IntradayTickerLaneAvailability(BaseModel):
     ticker: str
     state: Literal["ready", "unavailable"]
     has_zero_dte: Optional[bool] = None
+    has_eligible_0_7: Optional[bool] = None
     available_dte_list: list[int] = Field(default_factory=list)
     expiries: list[NearExpiryAvailabilityExpiry] = Field(default_factory=list)
     unavailable_reason: Optional[str] = None
 
 
 class IntradayLaneAvailability(BaseModel):
-    """今日车道可用性（V2-E）：深度层标的今天有没有 0DTE 可用。
+    """今日 0-7DTE 日内策略可用性，兼容保留 legacy 0DTE day_type。
 
     ``day_type`` 三态：``intraday_available``（≥1 个标的确证有 0DTE）/
-    ``overnight_only``（全部标的都读到了链且都没有 0DTE → 日内车道关闭）/
+    ``overnight_only``（legacy：全部标的都读到了链且都没有 0DTE）/
     ``unknown``（一个都没查，或没查到 0DTE 但存在读不到的标的）。
-    判定输入是当日真实期权到期日元数据，**不含任何星期规则**——假日与
-    特殊到期会让星期规则失效。只描述可用性，不打分、不推荐。
+    新消费者读取 ``policy_state``：有任一 0-7DTE 到期为 available；全部
+    可读且窗口为空为 unavailable；其余 unknown。``day_type`` 只保留为旧版
+    0DTE 事实，``overnight_only`` 不再代表当前策略允许隔夜。
     """
 
     formula_version: str
@@ -1540,6 +1619,13 @@ class IntradayLaneAvailability(BaseModel):
     max_dte: int = Field(ge=0, le=7)
     day_type: Literal["intraday_available", "overnight_only", "unknown"]
     day_type_reason: str
+    policy_version: Literal["INTRA-0-7/v1"]
+    holding_policy: Literal["same_et_day_only"]
+    eligible_dte_min: Literal[0]
+    eligible_dte_max: Literal[7]
+    policy_state: Literal["available", "unavailable", "unknown"]
+    policy_state_reason: str
+    eligible_tickers: list[str] = Field(default_factory=list)
     basis: Literal["per_ticker_option_expiry_metadata_within_0_7_dte_v1"]
     checked_scope: Literal["intraday_deep_lane_tickers"]
     checked_count: int = Field(ge=0)
@@ -1549,6 +1635,55 @@ class IntradayLaneAvailability(BaseModel):
     deferred_tickers: list[str] = Field(default_factory=list)
     tickers: list[IntradayTickerLaneAvailability] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
+
+
+class IntradayExecutionPolicy(BaseModel):
+    """Manual time checks only; neither a signal gate nor trade permission."""
+
+    policy_version: Literal["intraday_execution_policy_v1"]
+    state: Literal["ready", "closed", "unavailable"]
+    as_of: Optional[str] = None
+    expires_at: Optional[str] = None
+    market_date_et: Optional[str] = None
+    reason: str
+    entry_start_et: Optional[str] = None
+    ordinary_entry_cutoff_et: Optional[str] = None
+    zero_dte_entry_cutoff_et: Optional[str] = None
+    exit_deadline_et: Optional[str] = None
+    close_et: Optional[str] = None
+    ordinary_entry_allowed: Optional[bool] = None
+    zero_dte_entry_allowed: Optional[bool] = None
+
+
+class IntradayOptionContractFriction(BaseModel):
+    """P0 候选对应的确定性 0-7DTE 合约报价存证（additive）。"""
+
+    state: Literal["ready", "unavailable"]
+    source: str
+    selection_basis: str
+    ticker: Optional[str] = None
+    direction: Optional[Literal["up", "down"]] = None
+    contract_code: Optional[str] = None
+    right: Optional[Literal["C", "P"]] = None
+    strike: Optional[float] = Field(default=None, gt=0)
+    expiry: Optional[str] = None
+    dte: Optional[int] = Field(default=None, ge=0, le=7)
+    underlying_spot: Optional[float] = Field(default=None, gt=0)
+    bid: Optional[float] = Field(default=None, ge=0)
+    ask: Optional[float] = Field(default=None, ge=0)
+    mid: Optional[float] = Field(default=None, gt=0)
+    spread_percent: Optional[float] = Field(default=None, ge=0)
+    delta: Optional[float] = Field(default=None, ge=-1, le=1)
+    volume: Optional[int] = Field(default=None, ge=0)
+    open_interest: Optional[int] = Field(default=None, ge=0)
+    iv_percent: Optional[float] = Field(default=None, gt=0)
+    quote_as_of: Optional[str] = None
+    fetched_at: str
+    # 只有通过新鲜度硬门的合约才输出 age；被拒绝时保留明确 reason。
+    quote_age_seconds: Optional[float] = None
+    unavailable_reason: Optional[str] = None
+    execution_policy: Optional[IntradayExecutionPolicy] = None
+    execution_allowed: Optional[bool] = None
 
 
 class IntradayTopCandidate(BaseModel):
@@ -1609,6 +1744,9 @@ class IntradayTopCandidate(BaseModel):
     # 快照缺列同样是 None（标缺），绝不 0 回填；单层（显式 symbols）模式恒
     # 为 None（该字段由两层扫描的宽层快照带入）。
     pre_change_percent: Optional[float] = None
+    # 只在服务端 warm observer 的 near-P0 按需副本中点亮；普通页面响应可为
+    # null。报价失败/过期时保留 unavailable + reason，绝不以零值放行。
+    option_contract_friction: Optional[IntradayOptionContractFriction] = None
 
 
 class IntradayTopRecentOptionEvent(BaseModel):
@@ -1643,23 +1781,21 @@ class IntradayTopResponse(BaseModel):
     session_state_basis: Literal["america_new_york_clock_v1"]
     session_phase: IntradaySessionPhase
     session_phase_label: str
-    session_phase_hint_basis: Literal["user_trading_history_hardcoded_v1"]
+    session_phase_hint_basis: Literal["america_new_york_liquidity_context_neutral_v2"]
     quote_session_scope: Literal["current_session", "latest_prior_session"]
     quote_session_label: str
     market_context: IntradayMarketContext
-    signal_version: Literal["intraday_session_evidence_v8"]
-    ranking_method: Literal[
-        "burst_score_first_then_evidence_count",
-        "rule_based_evidence_count",
-    ]
+    signal_version: Literal["intraday_session_evidence_v9"]
+    ranking_method: Literal["rule_based_evidence_count"]
     statistics_track: Literal["none_intraday_v1_unscored"]
     moomoo_enabled: bool
     universe: list[str] = Field(default_factory=list)
     # watchlist 两层模式（additive）：单层（现状）模式恒为 null。
     universe_scan: Optional[IntradayUniverseScan] = None
-    # 今日车道可用性（V2-E，additive）：仅两层模式对深度层标的判定；
-    # 单层（现状）模式恒为 null。
+    # INTRA-0-7 策略可用性（additive）：仅两层模式对深度层标的判定；
+    # 单层（现状）模式恒为 null。legacy day_type 不再开关当前车道。
     lane_availability: Optional[IntradayLaneAvailability] = None
+    execution_policy: Optional[IntradayExecutionPolicy] = None
     unsupported_symbols: list[str] = Field(default_factory=list)
     requested_limit: int = Field(ge=1, le=10)
     candidate_count: int = Field(ge=0)
@@ -1707,6 +1843,6 @@ class IntradayPulseResponse(BaseModel):
     session_state_basis: Literal["america_new_york_clock_v1"]
     session_phase: IntradaySessionPhase
     session_phase_label: str
-    session_phase_hint_basis: Literal["user_trading_history_hardcoded_v1"]
+    session_phase_hint_basis: Literal["america_new_york_liquidity_context_neutral_v2"]
     items: list[IntradayPulseItem] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)

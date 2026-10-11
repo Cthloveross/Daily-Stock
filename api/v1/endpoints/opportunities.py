@@ -18,7 +18,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query
@@ -86,7 +86,17 @@ from src.opportunities.intraday import (
 )
 from src.opportunities.intraday_bursts import (
     compute_session_burst_profile,
+    filter_completed_bars_as_of,
+    filter_regular_session_bars,
     unavailable_burst_profile,
+)
+from src.opportunities.opening_impulse import (
+    OPENING_REFERENCE_SESSIONS,
+    compute_opening_impulse_profile,
+)
+from src.opportunities.opening_impulse_sequential import (
+    compute_sequential_opening_impulse_profile,
+    unavailable_sequential_opening_impulse_profile,
 )
 from src.opportunities.intraday_top import (
     EARNINGS_WINDOW_DAYS,
@@ -184,8 +194,8 @@ _OPTION_WALL_ASSUMPTIONS = (
 )
 _INTRADAY_TRACKING_SOURCE = "moomoo_openapi"
 _INTRADAY_TRACKING_SCHEMA = "intraday-tracking/1.0"
-# 日内 Top 榜是盘中滚动研究：60 秒 TTL 与前端 60 秒轮询对齐，一个轮询周期内
-# 的重复请求（多标签页/多组件）只触发一次完整装配。
+# 日内 Top 榜是盘中滚动研究：完成态保留 60 秒；默认 3 分钟自动轮询每次都会
+# 得到可刷新结果，同一分钟内的重复请求（多标签页/多组件）仍只装配一次。
 _INTRADAY_TOP_CACHE_TTL_SECONDS = 60.0
 # 服务端预热循环使用的默认 limit：与 IntradayTopRequest.limit 默认值及页面
 # 默认轮询（limit=5）一致，保证预热命中的正是默认轮询的缓存 key。
@@ -205,6 +215,25 @@ _INTRADAY_BURST_MAX_WORKERS = 4
 # bucket 内最多重取一次，且轮询周期（60s）内的重复请求全部命中缓存。
 _INTRADAY_BURST_CACHE_TTL_SECONDS = 60.0
 _INTRADAY_BURST_CACHE_MAX_ENTRIES = 64
+# 首根 5m 的基准必须是过去 20 个交易日**同一 09:30--09:35 时间槽**。
+# 长历史只在盘前/当日首次涉及该标的时读取一次；当前 K 线仍走上面的短窗口
+# 缓存，避免把 45 天历史每分钟重取。45 个自然日为节假日留出余量。
+_INTRADAY_OPENING_REFERENCE_FETCH_DAYS = 45
+_INTRADAY_OPENING_REFERENCE_CACHE_TTL_SECONDS = 12 * 60 * 60.0
+_INTRADAY_OPENING_REFERENCE_FAILURE_TTL_SECONDS = 5 * 60.0
+_INTRADAY_OPENING_REFERENCE_CACHE_MAX_ENTRIES = 64
+# 09:31--09:34 的顺序式探测必须把当前累计分钟与过去 20 日的同一累计
+# 进度比较。1m 长历史单独日缓存；09:35 同样只用五根完整 1m 累计证据。
+_INTRADAY_OPENING_1M_REFERENCE_FETCH_DAYS = 45
+_INTRADAY_OPENING_1M_CURRENT_FETCH_DAYS = 1
+_INTRADAY_OPENING_1M_REFERENCE_CACHE_TTL_SECONDS = 12 * 60 * 60.0
+_INTRADAY_OPENING_1M_REFERENCE_FAILURE_TTL_SECONDS = 5 * 60.0
+# Full 69-symbol current/next-session prefixes must coexist; UI Top limits
+# cannot evict the opening signal baseline during rollover.
+_INTRADAY_OPENING_1M_REFERENCE_CACHE_MAX_ENTRIES = 400
+# 09:35:05 首读后只给供应商约 10 秒完成定稿（05/07/09/11/13）。窗口
+# 结束后即使仍有个别 pending，也必须放行完整扫描，不能让一票拖住全池。
+_INTRADAY_OPENING_FAST_RETRY_END_SECONDS_ET = 9 * 3600 + 35 * 60 + 15
 _INTRADAY_PULSE_SCHEMA = "intraday-pulse/1.0"
 _INTRADAY_PULSE_CACHE_TTL_SECONDS = 60.0
 # SPY/QQQ 走美股 ETF 快照；VIX 指数在 Moomoo 美股快照中不保证可得，
@@ -220,17 +249,17 @@ _INTRADAY_PULSE_LIMITATIONS = (
     "仅作盘中背景，不是信号，不进入任何统计。",
 )
 # v3 财报日历：每个 ET 交易日一次 Finnhub 区间调用（当日 → +5 天），缓存
-# ≥1 小时供全 universe 复用；失败结果只短缓存 10 分钟（60 秒轮询不至于打爆
+# ≥1 小时供全 universe 复用；失败结果只短缓存 10 分钟（自动轮询不至于打爆
 # Finnhub，也不把一次失败冻结一整天）。日历不可得时逐候选显式标缺。
 _INTRADAY_EARNINGS_CACHE_TTL_SECONDS = 3600.0
 _INTRADAY_EARNINGS_FAILURE_TTL_SECONDS = 600.0
 _INTRADAY_EARNINGS_SOURCE = "finnhub_earnings_calendar"
 # Completed daily bars only change once per session; memoise the derived
-# ATR14 / 20-session median inputs so a 60s polling panel does not re-run the
+# ATR14 / 20-session median inputs so the polling panel does not re-run the
 # daily-history providers on every tick.  Live quote fields are never cached
 # here — they go through the shared 30s scan cache only.
 _INTRADAY_DAILY_CACHE_TTL_SECONDS = 900.0
-_INTRADAY_DAILY_CACHE_MAX_ENTRIES = 64
+_INTRADAY_DAILY_CACHE_MAX_ENTRIES = 400
 # --- 今日车道可用性（V2-E）------------------------------------------------
 # 「今天这些标的有没有 0DTE」只需要期权到期日元数据：复用临期合约链读取
 # 路径的第一步（fetch_expiry_availability_moomoo = 同一个独占 wall lane +
@@ -238,9 +267,9 @@ _INTRADAY_DAILY_CACHE_MAX_ENTRIES = 64
 # underlying 快照、不发 get_market_snapshot 批次——比整条链读取便宜一个量级。
 # 额度护栏（对齐 §2.1 记录的 10 次链查询 / 30 秒）：
 #   ① 逐标的按 ET 交易日缓存 1 小时——到期日一天最多变一次，同一交易日内
-#      的 60 秒轮询稳态命中缓存、零供应商请求；失败只短缓存 5 分钟，避免
+#      的常规轮询稳态命中缓存、零供应商请求；失败只短缓存 5 分钟，避免
 #      一次抖动把一整天钉死在 unknown；
-#   ② 单轮新增读取上限 8（60 秒轮询周期内 ≤8 次 < 10 次/30 秒），超出的标的
+#   ② 单轮新增读取上限 8（默认 3 分钟轮询周期内 ≤8 次），超出的标的
 #      本轮显式记为 unavailable（deferred）并在下一轮补齐——绝不为了凑齐
 #      结论而把「没查」说成「没有 0DTE」；
 #   ③ 单轮参与判定的标的上限 12（＝ INTRADAY_DEEP_LANE_MAX 默认值），
@@ -258,7 +287,7 @@ _LANE_AVAILABILITY_CHECKED_SCOPE = "intraday_deep_lane_tickers"
 # （deferred，不缓存失败），deferred_tickers 机制已如实呈现。
 _LANE_AVAILABILITY_LANE_WAIT_SECONDS = 2.5
 # --- watchlist v1 两层扫描（INTRADAY_WATCHLIST 配置后启用；未配置零改动）---
-# 宽层（tier-1）：整个清单每个 60 秒轮询周期只发 1 次 Moomoo
+# 宽层（tier-1）：整个清单每个扫描周期只发 1 次 Moomoo
 # ``get_market_snapshot`` 批量快照（官方单次上限 400 个代码）。清单上限 200
 # （含 SPY 与计划钉选后仍 << 400），因此永远单请求、无需分片；超出部分显式
 # 截断并在 universe_scan 中如实标注 watchlist_truncated，绝不无声丢弃。
@@ -424,6 +453,13 @@ _scan_flights: dict[tuple[Any, ...], _ScanFlight] = {}
 _scan_flight_generation = 0
 _intraday_daily_cache: dict[tuple[str, str], _ScanCacheEntry] = {}
 _intraday_burst_cache: dict[tuple[str, str, str], _ScanCacheEntry] = {}
+_intraday_opening_reference_cache: dict[tuple[str, str], _ScanCacheEntry] = {}
+_intraday_opening_1m_reference_cache: dict[
+    tuple[str, str], _ScanCacheEntry
+] = {}
+_opening_signal_symbols: Optional[tuple[str, ...]] = None
+_opening_current_1m_reader: Optional[Callable[..., Any]] = None
+_opening_stream_health_reader: Optional[Callable[[], Mapping[str, Any]]] = None
 _intraday_earnings_cache: dict[str, _ScanCacheEntry] = {}
 # 车道可用性：(symbol, ET 交易日) → 到期日读数（成功 1 小时 / 失败 5 分钟）。
 _lane_availability_cache: dict[tuple[str, str], _ScanCacheEntry] = {}
@@ -549,10 +585,13 @@ def _reset_scan_cache_for_tests() -> None:
     """
 
     global _intraday_momentum_history_date
+    set_opening_signal_universe(None)
     with _scan_cache_lock:
         _scan_cache.clear()
         _intraday_daily_cache.clear()
         _intraday_burst_cache.clear()
+        _intraday_opening_reference_cache.clear()
+        _intraday_opening_1m_reference_cache.clear()
         _intraday_earnings_cache.clear()
         _lane_availability_cache.clear()
         _intraday_playbook_cache.clear()
@@ -1946,6 +1985,27 @@ def _intraday_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _opening_critical_window_active(as_of: Optional[datetime] = None) -> bool:
+    """Avoid new page history RPCs during live opening checkpoints."""
+
+    from src.services.xnys_session_clock import resolve_xnys_session_clock
+
+    for observed in (as_of, _intraday_now()):
+        if observed is None:
+            continue
+        et = observed.astimezone(_NEW_YORK)
+        minute = et.hour * 60 + et.minute
+        if et.weekday() >= 5 or not (9 * 60 + 30 <= minute < 9 * 60 + 36):
+            continue
+        try:
+            session = resolve_xnys_session_clock(observed)
+        except Exception:  # noqa: BLE001 - unknown calendar must not start cold RPCs
+            return True
+        if session.state != "holiday":
+            return True
+    return False
+
+
 def _prune_intraday_daily_cache(now: float) -> None:
     expired = [
         key
@@ -1989,6 +2049,16 @@ def _intraday_daily_inputs(
             else:
                 missing.append(symbol)
     if not missing:
+        return results
+    if _opening_critical_window_active(as_of):
+        for symbol in missing:
+            results[symbol] = {
+                "atr14": None,
+                "atr14_unavailable_reason": "opening_critical_window_cache_not_ready",
+                "prior_20d_median_volume": None,
+                "median_unavailable_reason": "opening_critical_window_cache_not_ready",
+                "source": None,
+            }
         return results
 
     manager = None
@@ -2275,7 +2345,11 @@ def _load_intraday_option_event_items(
     return {symbol: load_one(symbol) for symbol in symbols}
 
 
-def _fetch_intraday_5m_bars(symbol: str) -> tuple[list[dict[str, Any]], Optional[str]]:
+def _fetch_intraday_5m_bars(
+    symbol: str,
+    *,
+    days: int = _INTRADAY_BURST_FETCH_DAYS,
+) -> tuple[list[dict[str, Any]], Optional[str]]:
     """Server-side 5m bars via the same loader as /stocks/{code}/history.
 
     Isolated so tests can stub it; never called when the symbol is cached.
@@ -2293,7 +2367,7 @@ def _fetch_intraday_5m_bars(symbol: str) -> tuple[list[dict[str, Any]], Optional
     result = StockService().get_history_data(
         symbol,
         period="5m",
-        days=_INTRADAY_BURST_FETCH_DAYS,
+        days=max(1, int(days)),
         include_stock_name=False,
     )
     source = result.get("source")
@@ -2301,6 +2375,686 @@ def _fetch_intraday_5m_bars(symbol: str) -> tuple[list[dict[str, Any]], Optional
         list(result.get("data") or []), source=source
     )
     return bars, source
+
+
+def _fetch_intraday_1m_bars(
+    symbol: str,
+    *,
+    days: int = _INTRADAY_OPENING_1M_CURRENT_FETCH_DAYS,
+) -> tuple[list[dict[str, Any]], Optional[str]]:
+    """Fetch start-labelled 1m bars for the progressive opening detector.
+
+    This is intentionally isolated from the rolling 5m burst cache.  Moomoo
+    labels history bars by their end time, so passing ``bar_minutes=1`` is a
+    correctness requirement; the helper then removes any still-forming bar.
+    """
+
+    from src.opportunities.intraday_bursts import normalize_bar_label_convention
+    from src.services.stock_service import StockService
+
+    result = StockService().get_history_data(
+        symbol,
+        period="1m",
+        days=max(1, int(days)),
+        include_stock_name=False,
+    )
+    source = result.get("source")
+    bars = normalize_bar_label_convention(
+        list(result.get("data") or []),
+        source=source,
+        bar_minutes=1,
+    )
+    return bars, source
+
+
+def _opening_1m_reference_session_count(
+    bars: list[dict[str, Any]], *, market_date_et: str
+) -> int:
+    """Count exact prior XNYS sessions with complete 09:30--09:34 minutes."""
+
+    return len(
+        _exact_opening_1m_reference_bars(
+            bars,
+            market_date_et=market_date_et,
+        )
+    ) // 5
+
+
+def _exact_opening_1m_reference_bars(
+    bars: list[dict[str, Any]], *, market_date_et: str
+) -> list[dict[str, Any]]:
+    """Keep only complete exact-20 opening minutes for the v2 day cache.
+
+    Providers may return roughly 30,000 one-minute rows for a 45-day request,
+    while the sequential detector needs at most 20 sessions x 5 minutes.  The
+    cache stores this compact, start-labelled evidence instead of repeatedly
+    deep-copying the entire response.  Incomplete or duplicate sessions are
+    omitted as a whole so downstream computation still fails closed.
+    """
+
+    expected_sessions = _exact_prior_xnys_session_labels(market_date_et)
+    if len(expected_sessions) != OPENING_REFERENCE_SESSIONS:
+        return []
+    expected_session_set = set(expected_sessions)
+
+    minutes_by_day: dict[str, dict[int, list[dict[str, Any]]]] = {}
+    for row in filter_regular_session_bars(bars):
+        day = str(row.get("session_date_et") or "")
+        start = row.get("start_et")
+        if day not in expected_session_set or not isinstance(start, datetime):
+            continue
+        minute = start.hour * 60 + start.minute
+        if not (9 * 60 + 30 <= minute <= 9 * 60 + 34):
+            continue
+        minutes_by_day.setdefault(day, {}).setdefault(minute, []).append(row)
+
+    selected: list[dict[str, Any]] = []
+    for day in expected_sessions:
+        by_minute = minutes_by_day.get(day) or {}
+        session_rows: list[dict[str, Any]] = []
+        for minute in range(9 * 60 + 30, 9 * 60 + 35):
+            matches = by_minute.get(minute) or []
+            if len(matches) != 1 or not _opening_bar_has_valid_ohlcv(matches[0]):
+                session_rows = []
+                break
+            row = matches[0]
+            session_rows.append(
+                {
+                    "date": row["start_et"].isoformat(),
+                    "open": row["open"],
+                    "high": row["high"],
+                    "low": row["low"],
+                    "close": row["close"],
+                    "volume": row["volume"],
+                }
+            )
+        selected.extend(session_rows)
+    return selected
+
+
+def _opening_bar_has_valid_ohlcv(row: Mapping[str, Any]) -> bool:
+    """Minimum cache-readiness contract shared by 1m and 5m baselines."""
+
+    try:
+        open_ = float(row.get("open"))
+        high = float(row.get("high"))
+        low = float(row.get("low"))
+        close = float(row.get("close"))
+        volume = float(row.get("volume"))
+    except (TypeError, ValueError):
+        return False
+    return (
+        all(math.isfinite(value) for value in (open_, high, low, close, volume))
+        and min(open_, high, low, close) > 0
+        and volume > 0
+        and high >= low
+        and high >= max(open_, close)
+        and low <= min(open_, close)
+    )
+
+
+def _exact_prior_xnys_session_labels(
+    market_date_et: str,
+) -> tuple[str, ...]:
+    """Return the exact preceding 20 XNYS sessions, oldest first."""
+
+    try:
+        import exchange_calendars as xcals
+
+        target = date.fromisoformat(market_date_et)
+        calendar = xcals.get_calendar("XNYS")
+        session = calendar.date_to_session(target, direction="none")
+        labels: list[str] = []
+        for _ in range(OPENING_REFERENCE_SESSIONS):
+            session = calendar.previous_session(session)
+            labels.append(session.date().isoformat())
+    except Exception as exc:  # noqa: BLE001 - exact calendar is mandatory
+        logger.debug(
+            "[opportunities] exact prior XNYS sessions unavailable: %s", exc
+        )
+        return ()
+    labels.reverse()
+    return tuple(labels)
+
+
+def _exact_opening_5m_reference_bars(
+    bars: list[dict[str, Any]], *, market_date_et: str
+) -> list[dict[str, Any]]:
+    """Select one valid 09:30 5m row for every exact prior XNYS session.
+
+    Duplicate or missing rows are omitted for that session so the v1 native
+    profile sees fewer than 20 rows and fails closed instead of silently
+    backfilling an older trading day.
+    """
+
+    expected_sessions = _exact_prior_xnys_session_labels(market_date_et)
+    expected_session_set = set(expected_sessions)
+    by_day: dict[str, list[dict[str, Any]]] = {}
+    for row in filter_regular_session_bars(bars):
+        day = str(row.get("session_date_et") or "")
+        start = row.get("start_et")
+        if (
+            day not in expected_session_set
+            or not isinstance(start, datetime)
+            or start.hour != 9
+            or start.minute != 30
+        ):
+            continue
+        by_day.setdefault(day, []).append(row)
+
+    selected: list[dict[str, Any]] = []
+    for day in expected_sessions:
+        matches = by_day.get(day) or []
+        if len(matches) != 1 or not _opening_bar_has_valid_ohlcv(matches[0]):
+            continue
+        row = matches[0]
+        selected.append(
+            {
+                "date": row["start_et"].isoformat(),
+                "open": row["open"],
+                "high": row["high"],
+                "low": row["low"],
+                "close": row["close"],
+                "volume": row.get("volume"),
+            }
+        )
+    return selected
+
+
+def _opening_sources_match(reference_source: Any, current_source: Any) -> bool:
+    """Require explicit, identical provenance for reference and live bars."""
+
+    reference = str(reference_source or "").strip().lower()
+    current = str(current_source or "").strip().lower()
+    return bool(reference and current and reference == current)
+
+
+def _opening_checkpoint_as_of(as_of: datetime, *, final: int = 4) -> int:
+    """Return the latest completed opening minute, bounded for early scans."""
+
+    et = as_of.astimezone(_NEW_YORK)
+    elapsed = et.hour * 60 + et.minute - (9 * 60 + 30)
+    return max(0, min(final, elapsed))
+
+
+def _prune_intraday_opening_1m_reference_cache(now: float) -> None:
+    expired = [
+        key
+        for key, entry in _intraday_opening_1m_reference_cache.items()
+        if entry.expires_at <= now
+    ]
+    for key in expired:
+        _intraday_opening_1m_reference_cache.pop(key, None)
+    while (
+        len(_intraday_opening_1m_reference_cache)
+        >= _INTRADAY_OPENING_1M_REFERENCE_CACHE_MAX_ENTRIES
+    ):
+        oldest = min(
+            _intraday_opening_1m_reference_cache,
+            key=lambda item: _intraday_opening_1m_reference_cache[item].expires_at,
+        )
+        _intraday_opening_1m_reference_cache.pop(oldest, None)
+
+
+def _load_intraday_opening_1m_reference_history(
+    symbols: list[str],
+    *,
+    market_date_et: str,
+    cache_only: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """Prewarm exact prior-session 1m prefixes once per ticker and ET day."""
+
+    now = _cache_now()
+    results: dict[str, dict[str, Any]] = {}
+    missing: list[str] = []
+    with _scan_cache_lock:
+        _prune_intraday_opening_1m_reference_cache(now)
+        for symbol in symbols:
+            entry = _intraday_opening_1m_reference_cache.get(
+                (symbol, market_date_et)
+            )
+            if entry is not None and entry.expires_at > now:
+                results[symbol] = copy.deepcopy(entry.result)
+            else:
+                missing.append(symbol)
+
+    if cache_only or _opening_critical_window_active():
+        return results
+
+    def load_one(symbol: str) -> dict[str, Any]:
+        try:
+            bars, source = _fetch_intraday_1m_bars(
+                symbol,
+                days=_INTRADAY_OPENING_1M_REFERENCE_FETCH_DAYS,
+            )
+            compact_bars = _exact_opening_1m_reference_bars(
+                bars, market_date_et=market_date_et
+            )
+            count = len(compact_bars) // 5
+            return {
+                "bars": compact_bars,
+                "source": source,
+                "reference_session_count": count,
+                "unavailable_reason": None,
+            }
+        except Exception as exc:  # noqa: BLE001 - isolate one ticker
+            logger.debug(
+                "[opportunities] opening 1m reference unavailable "
+                "symbol=%s error_type=%s",
+                symbol,
+                type(exc).__name__,
+            )
+            return {
+                "bars": [],
+                "source": None,
+                "reference_session_count": 0,
+                "unavailable_reason": (
+                    f"opening_1m_reference_history_unavailable:{type(exc).__name__}"
+                ),
+            }
+
+    loaded: dict[str, dict[str, Any]] = {}
+    if len(missing) > 1:
+        with ThreadPoolExecutor(
+            max_workers=min(_INTRADAY_BURST_MAX_WORKERS, len(missing)),
+            thread_name_prefix="intraday-opening-1m-reference",
+        ) as executor:
+            futures = {
+                executor.submit(load_one, symbol): symbol for symbol in missing
+            }
+            for future in as_completed(futures):
+                loaded[futures[future]] = future.result()
+    elif missing:
+        loaded = {missing[0]: load_one(missing[0])}
+
+    completion_time = _cache_now()
+    with _scan_cache_lock:
+        for symbol, payload in loaded.items():
+            ttl = (
+                _INTRADAY_OPENING_1M_REFERENCE_CACHE_TTL_SECONDS
+                if int(payload.get("reference_session_count") or 0)
+                >= OPENING_REFERENCE_SESSIONS
+                else _INTRADAY_OPENING_1M_REFERENCE_FAILURE_TTL_SECONDS
+            )
+            _prune_intraday_opening_1m_reference_cache(completion_time)
+            _intraday_opening_1m_reference_cache[
+                (symbol, market_date_et)
+            ] = _ScanCacheEntry(
+                expires_at=completion_time + ttl,
+                result=copy.deepcopy(payload),
+            )
+            results[symbol] = copy.deepcopy(payload)
+    return results
+
+
+def set_opening_signal_universe(
+    symbols: Optional[tuple[str, ...]],
+    *,
+    current_1m_reader: Optional[Callable[..., Any]] = None,
+    stream_health_reader: Optional[Callable[[], Mapping[str, Any]]] = None,
+) -> None:
+    """Bind the lifespan-frozen subscription universe, or release it at stop."""
+
+    global _opening_signal_symbols
+    global _opening_current_1m_reader, _opening_stream_health_reader
+    _opening_signal_symbols = symbols
+    _opening_current_1m_reader = current_1m_reader
+    _opening_stream_health_reader = stream_health_reader
+
+
+def _opening_target_symbols() -> list[str]:
+    from src.services.intraday_warm_cache_scheduler import (
+        resolve_intraday_signal_symbols,
+    )
+
+    return list(
+        _opening_signal_symbols
+        if _opening_signal_symbols is not None
+        else resolve_intraday_signal_symbols()
+    )
+
+
+def get_opening_v2_provider_readiness(
+    *,
+    market_date_et: Optional[str] = None,
+    target_symbols: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """Summarise cached 1m baseline readiness without provider I/O.
+
+    A green result is deliberately evidence based: every target must have an
+    unexpired, current-ET-day cache entry produced by ``MoomooFetcher`` with
+    all 20 exact prior XNYS opening prefixes.  TCP reachability alone is not
+    enough, while Yahoo's seven-day 1m retention cannot satisfy this rule.
+    """
+
+    observed_at = datetime.now(timezone.utc)
+    et_date = market_date_et or observed_at.astimezone(_NEW_YORK).date().isoformat()
+    if target_symbols is None:
+        try:
+            target_symbols = _opening_target_symbols()
+        except Exception as exc:  # noqa: BLE001 - health must remain bounded
+            logger.debug(
+                "[opportunities] opening readiness target load failed: %s",
+                type(exc).__name__,
+            )
+            target_symbols = []
+    targets = [
+        symbol
+        for symbol in normalize_symbols(target_symbols)
+        if is_supported_us_option_underlying(symbol)
+    ]
+
+    now = _cache_now()
+    cached_count = 0
+    ready_count = 0
+    provider_counts: dict[str, int] = {}
+    with _scan_cache_lock:
+        for symbol in targets:
+            entry = _intraday_opening_1m_reference_cache.get((symbol, et_date))
+            if entry is None or entry.expires_at <= now:
+                continue
+            cached_count += 1
+            payload = entry.result if isinstance(entry.result, Mapping) else {}
+            source = str(payload.get("source") or "unknown")
+            provider_counts[source] = provider_counts.get(source, 0) + 1
+            if (
+                source == "MoomooFetcher"
+                and int(payload.get("reference_session_count") or 0)
+                >= OPENING_REFERENCE_SESSIONS
+            ):
+                ready_count += 1
+
+    target_count = len(targets)
+    if target_count == 0:
+        reason_code = "no_target_symbols"
+    elif cached_count == 0:
+        reason_code = "not_observed_today"
+    elif ready_count == target_count:
+        reason_code = "ready"
+    elif ready_count == 0 and provider_counts.get("YfinanceFetcher", 0):
+        reason_code = "yfinance_1m_depth_insufficient"
+    else:
+        reason_code = "partial_or_incomplete_reference"
+    current_stream_ready = False
+    current_stream_reason = "opening_subscription_cache_unavailable"
+    if _opening_current_1m_reader is not None:
+        current_stream_reason = "opening_stream_health_unavailable"
+        if _opening_stream_health_reader is not None:
+            try:
+                current_stream_ready = (
+                    _opening_stream_health_reader().get("stream_ready") is True
+                )
+                current_stream_reason = (
+                    "ready" if current_stream_ready
+                    else "opening_subscription_stream_unavailable"
+                )
+            except Exception:  # noqa: BLE001 - health must never fetch/reconnect
+                pass
+    return {
+        "market_date_et": et_date,
+        "observed_at": observed_at.isoformat(),
+        "required_interval": "1m",
+        "required_reference_sessions": OPENING_REFERENCE_SESSIONS,
+        "requested_calendar_days": _INTRADAY_OPENING_1M_REFERENCE_FETCH_DAYS,
+        "target_count": target_count,
+        "cached_count": cached_count,
+        "ready_count": ready_count,
+        "provider_counts": provider_counts,
+        "reason_code": reason_code,
+        "current_stream_ready": current_stream_ready,
+        "current_stream_reason": current_stream_reason,
+    }
+
+
+def _load_intraday_opening_progressive_profiles(
+    symbols: list[str],
+    *,
+    market_date_et: str,
+    quote_session_scope: str,
+    as_of: datetime,
+    atr14_by_symbol: Optional[dict[str, Optional[float]]] = None,
+    prior_close_by_symbol: Optional[dict[str, Optional[float]]] = None,
+    current_1m_reader: Optional[
+        Callable[..., tuple[list[dict[str, Any]], Optional[str]]]
+    ] = None,
+    cache_only: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """Recompute the sequential opening profile from completed 1m evidence.
+
+    There is no minute-profile TTL.  The fast clock reads fresh subscribed 1m
+    rows and cached prior-20-session prefixes, with no provider RPC on misses.
+    The legacy request path may still explicitly fetch outside that clock.
+    """
+
+    references = _load_intraday_opening_1m_reference_history(
+        symbols,
+        market_date_et=market_date_et,
+        **({"cache_only": True} if cache_only else {}),
+    )
+    atr14_by_symbol = atr14_by_symbol or {}
+    prior_close_by_symbol = prior_close_by_symbol or {}
+
+    def load_one(symbol: str) -> dict[str, Any]:
+        fetched_at = datetime.now(timezone.utc).isoformat()
+        try:
+            if current_1m_reader is not None:
+                from src.opportunities.intraday_bursts import (
+                    normalize_bar_label_convention,
+                )
+
+                raw_bars, source = current_1m_reader(symbol, as_of=as_of)
+                bars = normalize_bar_label_convention(
+                    raw_bars, source=source, bar_minutes=1,
+                )
+            elif cache_only:
+                raise RuntimeError("opening_subscription_cache_unavailable")
+            else:
+                bars, source = _fetch_intraday_1m_bars(
+                    symbol,
+                    days=_INTRADAY_OPENING_1M_CURRENT_FETCH_DAYS,
+                )
+            bars = filter_completed_bars_as_of(
+                bars,
+                as_of=as_of,
+                bar_minutes=1,
+            )
+        except Exception as exc:  # noqa: BLE001 - isolate one ticker
+            logger.debug(
+                "[opportunities] opening current 1m unavailable "
+                "symbol=%s error_type=%s",
+                symbol,
+                type(exc).__name__,
+            )
+            profile = compute_sequential_opening_impulse_profile(
+                (),
+                reference_1m_bars=(),
+                market_date_et=market_date_et,
+                quote_session_scope=quote_session_scope,
+                as_of=as_of,
+                atr14=atr14_by_symbol.get(symbol),
+                prior_close=prior_close_by_symbol.get(symbol),
+            )
+            profile["unavailable_reason"] = (
+                f"history_1m_unavailable:{type(exc).__name__}"
+            )
+            profile["retryable_pending"] = True
+            profile["fetched_at"] = fetched_at
+            profile["source"] = None
+            profile["reference_source"] = (
+                (references.get(symbol) or {}).get("source")
+            )
+            profile["current_source"] = None
+            return profile
+
+        reference = references.get(symbol) or {}
+        reference_source = reference.get("source")
+        if not _opening_sources_match(reference_source, source):
+            profile = unavailable_sequential_opening_impulse_profile(
+                "opening_1m_reference_current_source_mismatch",
+                checkpoint=_opening_checkpoint_as_of(as_of),
+            )
+            profile["completed_as_of"] = as_of.astimezone(
+                _NEW_YORK
+            ).isoformat()
+        else:
+            profile = compute_sequential_opening_impulse_profile(
+                bars,
+                reference_1m_bars=list(reference.get("bars") or ()),
+                market_date_et=market_date_et,
+                quote_session_scope=quote_session_scope,
+                as_of=as_of,
+                atr14=atr14_by_symbol.get(symbol),
+                prior_close=prior_close_by_symbol.get(symbol),
+            )
+            if (
+                reference.get("unavailable_reason")
+                and profile.get("state") == "unavailable"
+            ):
+                profile["unavailable_reason"] = str(
+                    reference["unavailable_reason"]
+                )
+        profile["fetched_at"] = fetched_at
+        profile["source"] = source
+        profile["reference_source"] = reference_source
+        profile["current_source"] = source
+        return profile
+
+    def safe_load_one(symbol: str) -> dict[str, Any]:
+        try:
+            return load_one(symbol)
+        except Exception as exc:  # noqa: BLE001 - one calculation cannot lose the batch
+            profile = unavailable_sequential_opening_impulse_profile(
+                f"opening_1m_profile_compute_failed:{type(exc).__name__}",
+                checkpoint=_opening_checkpoint_as_of(as_of, final=5),
+            )
+            profile["completed_as_of"] = as_of.astimezone(_NEW_YORK).isoformat()
+            profile["fetched_at"] = datetime.now(timezone.utc).isoformat()
+            profile["reference_source"] = (references.get(symbol) or {}).get("source")
+            profile["source"] = profile["current_source"] = None
+            return profile
+
+    if len(symbols) > 1:
+        loaded: dict[str, dict[str, Any]] = {}
+        with ThreadPoolExecutor(
+            max_workers=min(_INTRADAY_BURST_MAX_WORKERS, len(symbols)),
+            thread_name_prefix="intraday-opening-1m-current",
+        ) as executor:
+            futures = {
+                executor.submit(safe_load_one, symbol): symbol for symbol in symbols
+            }
+            for future in as_completed(futures):
+                loaded[futures[future]] = future.result()
+        return loaded
+    return {symbols[0]: safe_load_one(symbols[0])} if symbols else {}
+
+
+def _prune_intraday_opening_reference_cache(now: float) -> None:
+    expired = [
+        key
+        for key, entry in _intraday_opening_reference_cache.items()
+        if entry.expires_at <= now
+    ]
+    for key in expired:
+        _intraday_opening_reference_cache.pop(key, None)
+    while (
+        len(_intraday_opening_reference_cache)
+        >= _INTRADAY_OPENING_REFERENCE_CACHE_MAX_ENTRIES
+    ):
+        oldest = min(
+            _intraday_opening_reference_cache,
+            key=lambda item: _intraday_opening_reference_cache[item].expires_at,
+        )
+        _intraday_opening_reference_cache.pop(oldest, None)
+
+
+def _load_intraday_opening_reference_history(
+    symbols: list[str],
+    *,
+    market_date_et: str,
+) -> dict[str, dict[str, Any]]:
+    """盘前预热每标的长历史，按 ``(ticker, ET date)`` 缓存整日。
+
+    返回值只有已归一化的 K 线、来源与显式错误；纯计算层仍会严格排除目标日，
+    所以盘中刷新长历史也不会把今天首根偷偷放进历史分母。
+    """
+
+    now = _cache_now()
+    results: dict[str, dict[str, Any]] = {}
+    missing: list[str] = []
+    with _scan_cache_lock:
+        _prune_intraday_opening_reference_cache(now)
+        for symbol in symbols:
+            entry = _intraday_opening_reference_cache.get(
+                (symbol, market_date_et)
+            )
+            if entry is not None and entry.expires_at > now:
+                results[symbol] = copy.deepcopy(entry.result)
+            else:
+                missing.append(symbol)
+
+    def load_one(symbol: str) -> dict[str, Any]:
+        try:
+            bars, source = _fetch_intraday_5m_bars(
+                symbol,
+                days=_INTRADAY_OPENING_REFERENCE_FETCH_DAYS,
+            )
+            exact_bars = _exact_opening_5m_reference_bars(
+                list(bars), market_date_et=market_date_et
+            )
+            return {
+                "bars": exact_bars,
+                "source": source,
+                "reference_session_count": len(exact_bars),
+                "unavailable_reason": None,
+            }
+        except Exception as exc:  # noqa: BLE001 - one baseline must not fail run
+            logger.debug(
+                "[opportunities] opening 5m reference unavailable "
+                "symbol=%s error_type=%s",
+                symbol,
+                type(exc).__name__,
+            )
+            return {
+                "bars": [],
+                "source": None,
+                "reference_session_count": 0,
+                "unavailable_reason": (
+                    f"opening_reference_history_unavailable:{type(exc).__name__}"
+                ),
+            }
+
+    loaded: dict[str, dict[str, Any]] = {}
+    if len(missing) > 1:
+        with ThreadPoolExecutor(
+            max_workers=min(_INTRADAY_BURST_MAX_WORKERS, len(missing)),
+            thread_name_prefix="intraday-opening-reference",
+        ) as executor:
+            futures = {
+                executor.submit(load_one, symbol): symbol for symbol in missing
+            }
+            for future in as_completed(futures):
+                loaded[futures[future]] = future.result()
+    elif missing:
+        loaded = {missing[0]: load_one(missing[0])}
+
+    completion_time = _cache_now()
+    with _scan_cache_lock:
+        for symbol, payload in loaded.items():
+            ttl = (
+                _INTRADAY_OPENING_REFERENCE_CACHE_TTL_SECONDS
+                if int(payload.get("reference_session_count") or 0)
+                >= OPENING_REFERENCE_SESSIONS
+                else _INTRADAY_OPENING_REFERENCE_FAILURE_TTL_SECONDS
+            )
+            _prune_intraday_opening_reference_cache(completion_time)
+            _intraday_opening_reference_cache[
+                (symbol, market_date_et)
+            ] = _ScanCacheEntry(
+                expires_at=completion_time + ttl,
+                result=copy.deepcopy(payload),
+            )
+            results[symbol] = copy.deepcopy(payload)
+    return results
 
 
 def _prune_intraday_burst_cache(now: float) -> None:
@@ -2324,6 +3078,9 @@ def _load_intraday_burst_profiles(
     *,
     market_date_et: str,
     quote_session_scope: str,
+    as_of: datetime,
+    atr14_by_symbol: Optional[dict[str, Optional[float]]] = None,
+    prior_close_by_symbol: Optional[dict[str, Optional[float]]] = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, list[dict[str, Any]]]]:
     """Per-symbol rolling-burst profiles from bounded 5m history reads.
 
@@ -2336,7 +3093,44 @@ def _load_intraday_burst_profiles(
     profile 一起缓存并返回，供 v4 styleMatch 形态检测复用（零新增请求）。
     """
 
+    if _opening_critical_window_active(as_of):
+        # Request-driven Top scans obey the same opening yield as background
+        # warming.  Legacy display must not start 45-day references/current
+        # 5m RPCs that compete with the subscription-backed signal clock.
+        now = _cache_now()
+        profiles: dict[str, dict[str, Any]] = {}
+        cached_bars: dict[str, list[dict[str, Any]]] = {}
+        with _scan_cache_lock:
+            for symbol in symbols:
+                entry = _intraday_burst_cache.get(
+                    (symbol, market_date_et, quote_session_scope)
+                )
+                if entry is not None and entry.expires_at > now:
+                    cached = copy.deepcopy(entry.result)
+                    profiles[symbol] = cached.get("profile") or {}
+                    cached_bars[symbol] = cached.get("bars") or []
+                else:
+                    profiles[symbol] = unavailable_burst_profile(
+                        "opening_critical_window_cache_not_ready",
+                        fetched_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                    cached_bars[symbol] = []
+        return profiles, cached_bars
+
+    opening_references = (
+        _load_intraday_opening_reference_history(
+            symbols,
+            market_date_et=market_date_et,
+        )
+        if quote_session_scope == "current_session"
+        else {}
+    )
+    atr14_by_symbol = atr14_by_symbol or {}
+    prior_close_by_symbol = prior_close_by_symbol or {}
     now = _cache_now()
+    as_of_et = as_of.astimezone(_NEW_YORK)
+    as_of_minutes = as_of_et.hour * 60 + as_of_et.minute
+    expected_completed_end_minutes = min((as_of_minutes // 5) * 5, 16 * 60)
     results: dict[str, dict[str, Any]] = {}
     bars_by_symbol: dict[str, list[dict[str, Any]]] = {}
     missing: list[str] = []
@@ -2348,6 +3142,56 @@ def _load_intraday_burst_profiles(
             )
             if entry is not None and entry.expires_at > now:
                 cached = copy.deepcopy(entry.result)
+                cached_profile = cached.get("profile") or {}
+                cached_opening = (
+                    cached_profile.get("opening_impulse")
+                    if isinstance(cached_profile, Mapping)
+                    else None
+                )
+                opening_bar_is_complete = (
+                    quote_session_scope == "current_session"
+                    and as_of_et.date().isoformat() == market_date_et
+                    and (as_of_et.hour * 60 + as_of_et.minute) >= 9 * 60 + 35
+                )
+                current = (
+                    cached_profile.get("current")
+                    if isinstance(cached_profile, Mapping)
+                    else None
+                )
+                cached_current_end_minutes = None
+                if isinstance(current, Mapping):
+                    try:
+                        hour_text, minute_text = str(
+                            current.get("end_et") or ""
+                        ).split(":", 1)
+                        cached_current_end_minutes = (
+                            int(hour_text) * 60 + int(minute_text)
+                        )
+                    except (TypeError, ValueError):
+                        cached_current_end_minutes = None
+                completed_bar_cache_is_stale = (
+                    quote_session_scope == "current_session"
+                    and as_of_et.date().isoformat() == market_date_et
+                    and expected_completed_end_minutes >= 9 * 60 + 45
+                    and (
+                        cached_current_end_minutes is None
+                        or cached_current_end_minutes
+                        < expected_completed_end_minutes
+                    )
+                )
+                # 09:34 的完整 warm 可能把「首根尚未完成」连同普通 burst
+                # profile 缓存 60 秒。09:35 快通道绝不能复用这份 pending：
+                # 强制补取短 K 线，供应商若仍未 finalise 则下一 tick 继续重试。
+                if (
+                    (
+                        opening_bar_is_complete
+                        and isinstance(cached_opening, Mapping)
+                        and cached_opening.get("state") == "pending"
+                    )
+                    or completed_bar_cache_is_stale
+                ):
+                    missing.append(symbol)
+                    continue
                 results[symbol] = cached.get("profile") or {}
                 bars_by_symbol[symbol] = cached.get("bars") or []
             else:
@@ -2359,6 +3203,7 @@ def _load_intraday_burst_profiles(
         fetched_at = datetime.now(timezone.utc).isoformat()
         try:
             bars, source = _fetch_intraday_5m_bars(symbol)
+            bars = filter_completed_bars_as_of(bars, as_of=as_of)
         except Exception as exc:  # noqa: BLE001 - one symbol must not fail the run
             logger.debug(
                 "[opportunities] intraday 5m bars unavailable symbol=%s error_type=%s",
@@ -2379,6 +3224,39 @@ def _load_intraday_burst_profiles(
             source=source,
             fetched_at=fetched_at,
         )
+        reference = opening_references.get(symbol) or {}
+        reference_reason = reference.get("unavailable_reason")
+        reference_source = reference.get("source")
+        sources_match = _opening_sources_match(reference_source, source)
+        if reference_reason or not sources_match:
+            opening_impulse = compute_opening_impulse_profile(
+                bars,
+                reference_bars=(),
+                market_date_et=market_date_et,
+                quote_session_scope=quote_session_scope,
+                as_of=as_of,
+                atr14=atr14_by_symbol.get(symbol),
+                prior_close=prior_close_by_symbol.get(symbol),
+            )
+            if opening_impulse.get("state") == "unavailable":
+                opening_impulse["unavailable_reason"] = str(
+                    reference_reason
+                    or "opening_5m_reference_current_source_mismatch"
+                )
+        else:
+            opening_impulse = compute_opening_impulse_profile(
+                bars,
+                reference_bars=list(reference.get("bars") or ()),
+                market_date_et=market_date_et,
+                quote_session_scope=quote_session_scope,
+                as_of=as_of,
+                atr14=atr14_by_symbol.get(symbol),
+                prior_close=prior_close_by_symbol.get(symbol),
+            )
+        opening_impulse["source"] = source
+        opening_impulse["reference_source"] = reference_source
+        opening_impulse["current_source"] = source
+        profile["opening_impulse"] = opening_impulse
         return profile, list(bars)
 
     loaded: dict[str, tuple[dict[str, Any], list[dict[str, Any]]]] = {}
@@ -2584,15 +3462,16 @@ def _load_lane_availability(
     enabled: bool,
     market_date_et: str,
 ) -> dict[str, Any]:
-    """今日车道可用性（V2-E）：深度层标的今天有没有 0DTE 可用。
+    """今日 0-7DTE 日内策略可用性，并兼容返回 legacy 0DTE day_type。
 
     额度护栏（逐条见 ``_LANE_AVAILABILITY_*`` 常量注释）：逐标的按 ET 交易日
     缓存、单轮新增读取有上限、参与判定的标的数有上限——**不向宽层全清单扇出**。
 
     fail closed 的三处：Moomoo 未启用、读取失败、本轮额度预算用尽（deferred）
-    一律记为该标的 ``unavailable`` + 原因；聚合层只有在「全部标的都读到了链
-    且都没有 0DTE」时才敢说 ``overnight_only``，否则一律 ``unknown``。
-    未知不等于「今天没有 0DTE」。
+    一律记为该标的 ``unavailable`` + 原因。当前消费者读取 ``policy_state``：
+    任一标的有 0-7DTE 到期即 ``available``，全部可读且窗口为空才是
+    ``unavailable``，否则 ``unknown``。旧 ``day_type`` 仅兼容表达 0DTE
+    可得性；其中 ``overnight_only`` 不再表示策略允许隔夜。
     """
 
     ordered = normalize_symbols(list(tickers))[:_LANE_AVAILABILITY_MAX_SYMBOLS]
@@ -2825,13 +3704,20 @@ def _execute_intraday_top(
         market_date_et=market_date_et,
     )
 
-    # 波段爆发（v2 主排序信号）：5m K 线与 Moomoo 开关无关，休市时段也读取
-    # （附最近一个交易时段的波段供晚间复盘）；单标的失败显式 unavailable。
+    # Legacy 5m burst 展示：与 Moomoo 开关无关，休市也可读取最近时段供复盘；
+    # v9 起不参与支持项、排序、提醒或 P0 分级。单标失败显式 unavailable。
     burst_scope = "latest_prior_session" if session_state == "closed" else "current_session"
     burst_profiles, setup_bars = _load_intraday_burst_profiles(
         supported,
         market_date_et=market_date_et,
         quote_session_scope=burst_scope,
+        as_of=requested_at,
+        atr14_by_symbol={
+            symbol: daily.atr14 for symbol, daily in dailies.items()
+        },
+        prior_close_by_symbol={
+            symbol: daily.prior_close for symbol, daily in dailies.items()
+        },
     )
 
     # v4 styleMatch：S1/S2/S3 Playbook 只读对应关系（本地读取 + 5 分钟缓存）；
@@ -3402,6 +4288,13 @@ def _execute_intraday_top_two_tier(
         deep_symbols,
         market_date_et=market_date_et,
         quote_session_scope=burst_scope,
+        as_of=requested_at,
+        atr14_by_symbol={
+            symbol: daily.atr14 for symbol, daily in dailies.items()
+        },
+        prior_close_by_symbol={
+            symbol: daily.prior_close for symbol, daily in dailies.items()
+        },
     )
     playbook_refs = _load_intraday_playbook_refs()
     earnings_calendar = _load_intraday_earnings_calendar(market_date_et)
@@ -4362,10 +5255,10 @@ def intraday_top(payload: IntradayTopRequest) -> IntradayTopResponse:
 
     与「周内 Top 5 · 盘前冻结」互不替代：本接口盘中滚动重排、不冻结版本、
     不写快照/qualification/5D/20D 结果（statistics_track=none_intraday_v1_unscored）。
-    v2 盘中主排序信号 = 15 分钟波段爆发（5m K 线滚动推力×量比，逐标的当前
-    + 上一交易时段有界读取）；聚合证据（缺口/量能节奏/VWAP/波幅扩张 + 有界
-    Moomoo 异动计数）退居次序。异动是供应商分类，不推断开平仓或真实主动
-    方向。休市时段仍可读取：排序退回证据计数，但附最近一个交易时段的波段。
+    v9 所有时段按非 legacy 聚合证据（缺口/量能节奏/VWAP/波幅扩张 + 有界
+    Moomoo 异动计数）排序。15 分钟 5m burst 只作 API/复盘兼容展示，永不进入
+    supports、排序、提醒或 P0/P0-X。异动是供应商分类，不推断开平仓或真实
+    主动方向；休市仍可查看最近交易时段的 legacy 波段。
 
     universe 解析：显式 ``symbols``（≤20）优先；空 symbols 时若配置了
     ``INTRADAY_WATCHLIST`` 走两层扫描（宽层批量快照 → 异动闸门 → 深度层，
@@ -4395,7 +5288,13 @@ def intraday_top(payload: IntradayTopRequest) -> IntradayTopResponse:
     except OpportunityScanTimeoutError as exc:
         raise _scan_timeout_response(exc) from exc
     _stamp_intraday_top_latency(result, meta)
-    return IntradayTopResponse.model_validate(result)
+    from src.services.alert_tiering import intraday_execution_policy
+
+    # Keep live manual time checks outside the cached research payload.
+    return IntradayTopResponse.model_validate({
+        **result,
+        "execution_policy": intraday_execution_policy(_intraday_now()),
+    })
 
 
 def _intraday_top_key_and_factory(
@@ -4510,8 +5409,193 @@ def _stamp_intraday_top_latency(
         result["served_from"] = "fresh"
 
 
+def _cached_opening_daily_inputs(
+    symbols: list[str], *, market_date_et: str,
+) -> dict[str, dict[str, Any]]:
+    """Read prewarmed daily context without a cold provider path."""
+
+    now = _cache_now()
+    with _scan_cache_lock:
+        return {
+            symbol: copy.deepcopy(entry.result)
+            for symbol in symbols
+            if (entry := _intraday_daily_cache.get((symbol, market_date_et)))
+            is not None and entry.expires_at > now
+        }
+
+
+def warm_opening_impulse_scan(
+    payload_observer: Optional[Callable[[dict[str, Any]], None]] = None,
+    *,
+    target_symbols: Optional[tuple[str, ...]] = None,
+    current_1m_reader: Optional[
+        Callable[..., tuple[list[dict[str, Any]], Optional[str]]]
+    ] = None,
+    prewarm_only: bool = False,
+) -> dict[str, Any]:
+    """盘前预热完整信号清单；09:31--09:35 只读严格 1m 缓存。
+
+    开盘与全天 2m 使用同一冻结清单，不受旧 20 票或 UI Top 截断。
+    04:00--09:30 慢实例预热日线和 1m 同进度基准；09:31--09:35 每个
+    完整分钟后重算累计画像并只走 opening observer。09:35 的
+    收口是 09:30--09:34 五根严格 1m，不等原生 5m。关键窗不等期权链、
+    异动页、财报日历或完整 Top 榜装配。
+
+    关键窗缺少预热或订阅证据就 fail closed，绝不逐票补拉历史。
+    """
+
+    requested_at = _intraday_now()
+    et = requested_at.astimezone(_NEW_YORK)
+    market_date_et = et.date().isoformat()
+    session_state = market_session_state(requested_at)
+    minute_et = et.hour * 60 + et.minute
+    if (
+        session_state not in {"premarket", "regular"}
+        or not (4 * 60 <= minute_et < 9 * 60 + 36)
+    ):
+        return {"action": "idle", "candidate_count": 0}
+
+    symbols = normalize_symbols(list(
+        target_symbols if target_symbols is not None else _opening_target_symbols()
+    ))
+    symbols = [
+        symbol for symbol in symbols if is_supported_us_option_underlying(symbol)
+    ]
+    if not symbols:
+        return {"action": "idle", "candidate_count": 0}
+
+    if minute_et < 9 * 60 + 30:
+        if prewarm_only:
+            _intraday_daily_inputs(
+                symbols, as_of=requested_at, market_date_et=market_date_et,
+            )
+            _load_intraday_opening_1m_reference_history(
+                symbols, market_date_et=market_date_et,
+            )
+        return {
+            "action": "prewarmed" if prewarm_only else "idle",
+            "candidate_count": len(symbols),
+            "opening_critical_window": False,
+        }
+
+    if prewarm_only:
+        return {"action": "idle", "candidate_count": 0}
+
+    if minute_et == 9 * 60 + 30:
+        # No completed regular-session minute exists yet.  Keep the warm host
+        # out of the slow full scan so the 09:31:05 checkpoint cannot be
+        # blocked by a 45-second Top lease.
+        return {
+            "action": "idle",
+            "candidate_count": len(symbols),
+            "opening_critical_window": True,
+            "pending_count": 0,
+            "retryable_pending_count": 0,
+            "qualified_count": 0,
+        }
+
+    if minute_et < 9 * 60 + 36:
+        daily_raw = _cached_opening_daily_inputs(
+            symbols, market_date_et=market_date_et,
+        )
+        progressive_profiles = _load_intraday_opening_progressive_profiles(
+            symbols,
+            market_date_et=market_date_et,
+            quote_session_scope="current_session",
+            as_of=requested_at,
+            atr14_by_symbol={
+                symbol: payload.get("atr14")
+                for symbol, payload in daily_raw.items()
+            },
+            prior_close_by_symbol={
+                symbol: payload.get("prior_close")
+                for symbol, payload in daily_raw.items()
+            },
+            current_1m_reader=current_1m_reader or _opening_current_1m_reader,
+            cache_only=True,
+        )
+        # Plans and pins add context only, never change the frozen universe.
+        plan = _todays_plan_tickers(market_date_et)
+        pinned = _configured_intraday_pinned_tickers()
+        plan_set = set(plan)
+        pinned_set = set(pinned)
+        candidates = []
+        for symbol in symbols:
+            daily = daily_raw.get(symbol) or {}
+            candidates.append(
+                {
+                    "ticker": symbol,
+                    "atr14": daily.get("atr14"),
+                    "prior_close": daily.get("prior_close"),
+                    "session_bursts": {
+                        "state": "opening_progressive",
+                        "opening_progressive": progressive_profiles.get(symbol)
+                        or {},
+                    },
+                    "opening_focus_source": (
+                        "plan"
+                        if symbol in plan_set
+                        else "pinned"
+                        if symbol in pinned_set
+                        else "configured_core"
+                    ),
+                }
+            )
+        payload = {
+            "as_of": requested_at.isoformat(),
+            "market_date_et": market_date_et,
+            "session_state": "regular",
+            "quote_session_scope": "current_session",
+            "candidates": candidates,
+            "universe_scan": {
+                "plan_always_include": list(plan),
+                "user_pinned": [
+                    symbol for symbol in pinned if symbol not in plan_set
+                ],
+                "user_focus": [],
+            },
+            "opening_fast_path": True,
+            "opening_progressive": True,
+        }
+        alert_observed_at = _intraday_now()
+        payload["alert_observed_at"] = alert_observed_at.isoformat()
+        if payload_observer is not None:
+            payload_observer(copy.deepcopy(payload))
+        profiles = [progressive_profiles.get(symbol) or {} for symbol in symbols]
+        pending_count = sum(
+            profile.get("state") == "pending" for profile in profiles
+        )
+        retryable_pending_count = sum(
+            bool(profile.get("retryable_pending")) for profile in profiles
+        )
+        return {
+            "action": "observed",
+            "candidate_count": len(candidates),
+            "pending_count": pending_count,
+            "retryable_pending_count": retryable_pending_count,
+            "qualified_count": sum(
+                profile.get("state") == "qualified" for profile in profiles
+            ),
+            "opening_critical_window": True,
+        }
+
+    # 09:36 后不补发开盘证据。原生 5m 画像仍保留在普通 API
+    # 响应中作 legacy 展示，但不再进入手机开盘分支。
+    return {
+        "action": "idle",
+        "candidate_count": 0,
+        "opening_critical_window": False,
+        "pending_count": 0,
+        "retryable_pending_count": 0,
+        "qualified_count": 0,
+    }
+
+
 def warm_default_intraday_top_scan(
     payload_observer: Optional[Callable[[dict[str, Any]], None]] = None,
+    payload_enricher: Optional[
+        Callable[[dict[str, Any]], dict[str, Any]]
+    ] = None,
 ) -> dict[str, Any]:
     """Warm the page's default intraday-top poll through the same single flight.
 
@@ -4522,9 +5606,11 @@ def warm_default_intraday_top_scan(
     在途请求（join-not-duplicate，绝不并发第二个工厂）。返回小结摘要，
     载荷本身只通过共享缓存被后续请求读取。
 
-    ``payload_observer``（盘中机会提示器专用）：预热成功后把本次载荷的
-    **独立深拷贝**交给观察者做纯内存的事实检测——零新增取数，绝不改写
-    缓存。观察者按合同永不抛出，这里仍兜一层：预热节奏永远优先。
+    ``payload_enricher`` / ``payload_observer``（盘中机会提示器专用）：
+    核心 single-flight 结束后，先把载荷深拷贝，再对这份副本做有界的
+    near-P0 报价增强，最后交给观察者。因此不改写 60 秒共享缓存，
+    也不把外部报价耗时纳入核心扫描 lease。增强或观察失败均不影响
+    预热节奏；增强失败时观察者仍收到原始副本并 fail closed。
     """
 
     key, factory = _intraday_top_key_and_factory(
@@ -4541,9 +5627,31 @@ def warm_default_intraday_top_scan(
         initiator="warm_scheduler",
         meta_out=meta,
     )
+    original_payload_copy = copy.deepcopy(result)
+    observed_payload = original_payload_copy
+    if payload_enricher is not None:
+        try:
+            enriched = payload_enricher(copy.deepcopy(original_payload_copy))
+            if isinstance(enriched, dict):
+                observed_payload = enriched
+            else:
+                logger.warning(
+                    "[opportunities] intraday alert enricher returned %s; "
+                    "using original payload copy",
+                    type(enriched).__name__,
+                )
+        except Exception:  # noqa: BLE001 - warming must survive quote enrichment
+            observed_payload = original_payload_copy
+            logger.warning(
+                "[opportunities] intraday alert enrichment failed",
+                exc_info=True,
+            )
     if payload_observer is not None:
         try:
-            payload_observer(result)
+            # 告警时效必须按真正进入 observer 的时刻裁决，不能沿用慢扫描
+            # 开始前的 as_of，让 09:44 发起、09:46 才完成的 opening 迟到响铃。
+            observed_payload["alert_observed_at"] = _intraday_now().isoformat()
+            payload_observer(observed_payload)
         except Exception:  # noqa: BLE001 - alert detection must never break warming
             logger.debug(
                 "[opportunities] intraday alert observer failed", exc_info=True

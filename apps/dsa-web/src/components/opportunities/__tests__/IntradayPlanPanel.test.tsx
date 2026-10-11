@@ -153,7 +153,7 @@ describe('IntradayPlanPanel', () => {
     ).toBeNull();
     const hint = screen.getByLabelText(/按你自己的规则机械核对，不是买卖建议/);
     expect(hint.getAttribute('aria-label')).toContain(
-      '样本窗口仅 2026-04→07 一个市场状态',
+      '活动策略为 INTRA-0-7/v1',
     );
     expect(screen.queryByText(/本系统只读|不会下单|建议买入|可以进场|目标价|胜率/)).toBeNull();
   });
@@ -174,7 +174,7 @@ describe('IntradayPlanPanel', () => {
     expect(within(card).getByText('开仓时点')).toBeInTheDocument();
     expect(within(card).getByText('财报回避')).toBeInTheDocument();
     expect(within(card).getByText('近30分位移')).toBeInTheDocument();
-    expect(screen.getByText(/今日车道：日内可用（V2-E）/)).toBeInTheDocument();
+    expect(screen.getByText(/活动规则：INTRA-0-7 可用/)).toBeInTheDocument();
     // 不在深度层 → 逐条标缺，绝不静默放行。
     expect(screen.getByText(/未在今日深度层 · 扫描读数逐条标缺/)).toBeInTheDocument();
     // 中性失效位提示，不含任何价位目标。
@@ -187,11 +187,12 @@ describe('IntradayPlanPanel', () => {
       expect(screen.getByText(/还没有加入盘中计划的标的/)).toBeInTheDocument());
   });
 
-  it('requests 0DTE contracts on a 日内 day and 0–7DTE on an overnight day', async () => {
+  it('always requests and labels the full 0–7DTE contract window', async () => {
     useIntradayPlanStore.getState().promote('NVDA');
     const { unmount } = renderPanel();
     await waitFor(() =>
-      expect(fetchNearExpiryContracts).toHaveBeenCalledWith('NVDA', 0, { refresh: false }));
+      expect(fetchNearExpiryContracts).toHaveBeenCalledWith('NVDA', 7, { refresh: false }));
+    expect(await screen.findByText(/合约候选 · 0–7DTE（INTRA-0-7/)).toBeInTheDocument();
     unmount();
 
     vi.mocked(fetchNearExpiryContracts).mockClear();
@@ -200,7 +201,7 @@ describe('IntradayPlanPanel', () => {
     });
     await waitFor(() =>
       expect(fetchNearExpiryContracts).toHaveBeenCalledWith('NVDA', 7, { refresh: false }));
-    expect(await screen.findByText(/合约候选 · 4-7DTE（V2-B 过夜车道）/)).toBeInTheDocument();
+    expect(await screen.findByText(/合约候选 · 0–7DTE（INTRA-0-7/)).toBeInTheDocument();
   });
 
   it('highlights the $2-8 sweet spot, greys and warns <$1, and shows 张数/手续费', async () => {
@@ -277,7 +278,7 @@ describe('IntradayPlanPanel', () => {
     expect(screen.getByText(/报价以逐行 as-of 时点为准/)).toBeInTheDocument();
   });
 
-  it('shows both compliant DTE windows when the lane is unknown — never a silent 0DTE default', async () => {
+  it('shows every 0..7DTE group when policy availability is unknown', async () => {
     useIntradayPlanStore.getState().promote('NVDA');
     const base = contractsResponse([contractRow({ code: 'ZERO', dte: 0 })], 7);
     base.item.expiries = [
@@ -295,7 +296,7 @@ describe('IntradayPlanPanel', () => {
         state: 'ready',
         contractCount: 1,
         observedQuoteCount: 1,
-        contracts: [contractRow({ code: 'FORBIDDEN13', dte: 2, expiry: '2026-08-07' })],
+        contracts: [contractRow({ code: 'TWO_DTE', dte: 2, expiry: '2026-08-07' })],
       },
       {
         expiry: '2026-08-10',
@@ -303,19 +304,17 @@ describe('IntradayPlanPanel', () => {
         state: 'ready',
         contractCount: 1,
         observedQuoteCount: 1,
-        contracts: [contractRow({ code: 'OVERNIGHT', dte: 5, expiry: '2026-08-10' })],
+        contracts: [contractRow({ code: 'FIVE_DTE', dte: 5, expiry: '2026-08-10' })],
       },
     ];
     vi.mocked(fetchNearExpiryContracts).mockResolvedValue(base);
     renderPanel({ top: top({ laneAvailability: null }) });
 
-    // 车道未知：请求 0..7 全窗口，而不是默认 0DTE。
     await waitFor(() =>
       expect(fetchNearExpiryContracts).toHaveBeenCalledWith('NVDA', 7, { refresh: false }));
-    expect(await screen.findByText(/今日车道未知/)).toBeInTheDocument();
-    // 两个合规窗口都显示；1-3DTE 与车道无关地绝不显示（V2-C①）。
+    expect(await screen.findByText(/合约候选 · 0–7DTE（INTRA-0-7/)).toBeInTheDocument();
     await findContractRow('ZERO');
-    await findContractRow('OVERNIGHT');
-    expect(document.querySelector('[data-contract-code="FORBIDDEN13"]')).toBeNull();
+    await findContractRow('TWO_DTE');
+    await findContractRow('FIVE_DTE');
   });
 });

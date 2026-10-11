@@ -2,10 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   INTRADAY_PLAN_MAX_TICKERS,
   etMarketDate,
-  selectManualIntradayTickets,
-  selectManualOvernightPositions,
   selectPlanTickers,
-  useIntradayManualBudgetStore,
   useIntradayPlanStore,
 } from '../intradayPlanStore';
 
@@ -13,7 +10,6 @@ describe('intradayPlanStore', () => {
   beforeEach(() => {
     window.localStorage.clear();
     useIntradayPlanStore.getState().clear();
-    useIntradayManualBudgetStore.getState().reset();
   });
 
   afterEach(() => {
@@ -67,30 +63,5 @@ describe('intradayPlanStore', () => {
     useIntradayPlanStore.getState().promote('MU');
     expect(selectPlanTickers(useIntradayPlanStore.getState())).toEqual(['MU']);
     expect(useIntradayPlanStore.getState().marketDate).toBe(etMarketDate());
-  });
-
-  it('manual budget counters increment, floor at zero, and are day-scoped', () => {
-    const { bump } = useIntradayManualBudgetStore.getState();
-    bump('intraday_tickets', 1);
-    bump('intraday_tickets', 1);
-    bump('overnight_positions', 1);
-    expect(selectManualIntradayTickets(useIntradayManualBudgetStore.getState())).toBe(2);
-    expect(selectManualOvernightPositions(useIntradayManualBudgetStore.getState())).toBe(1);
-
-    bump('intraday_tickets', -1);
-    expect(selectManualIntradayTickets(useIntradayManualBudgetStore.getState())).toBe(1);
-    bump('overnight_positions', -5);
-    expect(selectManualOvernightPositions(useIntradayManualBudgetStore.getState())).toBe(0);
-
-    // 超过 V2-D 上限是事实，如实计数（面板转警示样式，不夹回上限）。
-    for (let i = 0; i < 8; i += 1) bump('intraday_tickets', 1);
-    expect(selectManualIntradayTickets(useIntradayManualBudgetStore.getState())).toBe(9);
-
-    useIntradayManualBudgetStore.setState({ marketDate: '1999-01-04' });
-    expect(selectManualIntradayTickets(useIntradayManualBudgetStore.getState())).toBe(0);
-    expect(selectManualOvernightPositions(useIntradayManualBudgetStore.getState())).toBe(0);
-    // 换日后第一次 +1 从 0 起算，不接着昨天的数。
-    useIntradayManualBudgetStore.getState().bump('intraday_tickets', 1);
-    expect(selectManualIntradayTickets(useIntradayManualBudgetStore.getState())).toBe(1);
   });
 });

@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
-"""今日车道可用性（day-type）的纯判定层。
+"""今日临期合约可用性的纯判定层。
 
-回答一个问题：**今天这批标的到底有没有 0DTE 可用**——有则日内车道
-（V2-A）成立，没有则日内车道关闭、只剩过夜车道（V2-B）或不做。
+活动策略自 2026-09-01 起是 ``INTRA-0-7``：0–7DTE 都可进入候选池，但
+任何持仓必须在同一 ET 交易日平仓。旧 ``day_type`` / ``zero_dte_tickers``
+字段继续保留一版作为 wire 兼容与 0DTE 市场事实；新消费者必须读取 additive
+``policy_*`` 字段，绝不能再把“没有 0DTE”解释为“日内关闭、改做隔夜”。
 
 为什么需要这一层（写给未来的自己）
 --------------------------------------
@@ -26,8 +28,8 @@
 - 行为缺口：恰恰在过夜车道是唯一好选择的两天，本人几乎没用它——周二 1 笔、
   周四 11 笔。
 
-以上已写入 Playbook 候选「V2-E · 按合约可用性决定今天做不做日内
-（周二/周四＝过夜日）」。本模块是 V2-E 的盘面读数层。
+以上是已冻结的历史 V2-E 取证背景，不再是活动建议。模块继续返回旧
+``day_type`` 只是为了 wire 兼容；当前策略判定只看 ``policy_*``。
 
 判定纪律
 --------
@@ -43,11 +45,12 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
-FORMULA_VERSION = "lane-availability/v1"
+FORMULA_VERSION = "lane-availability/v2"
 
-#: 车道可用性观察窗口：0..7 DTE 覆盖日内车道（0DTE）与过夜车道（4-7DTE）
-#: 两条车道的全部合法期限，同时是 Moomoo 链窗口的单窗口上限（<30 天）。
+#: 活动策略的合约期限窗口；DTE 是合约期限，不是持仓周期。
 LANE_AVAILABILITY_MAX_DTE = 7
+INTRADAY_POLICY_VERSION = "INTRA-0-7/v1"
+INTRADAY_HOLDING_POLICY = "same_et_day_only"
 
 #: 判定依据（随响应回显，供前端与文档引用同一句话）。
 DAY_TYPE_BASIS = (
@@ -55,9 +58,10 @@ DAY_TYPE_BASIS = (
 )
 
 DAY_TYPE_LIMITATIONS = (
-    "车道可用性只回答「今天有没有 0DTE 可用」，不评价标的、不预测方向、不构成建议。",
-    "到期日来自 Moomoo 期权链元数据；任一标的链读不到即显式 unknown，绝不以「读不到」冒充「没有 0DTE」。",
-    "只覆盖今日深度层中有界的前若干个标的（超出上限或本轮额度预算的标的列在 deferred_tickers），不代表全部 universe 今日没有 0DTE。",
+    "活动策略只允许 0-7DTE 且必须同一 ET 交易日平仓；DTE 不代表允许隔夜。",
+    "到期日来自 Moomoo 期权链元数据；任一标的链读不到即显式 unknown，绝不以「读不到」冒充「窗口内无到期」。",
+    "只覆盖今日深度层中有界的前若干个标的（超出上限或本轮额度预算的标的列在 deferred_tickers），不代表全部 universe 在 0-7DTE 内无合约。",
+    "可用到期日只证明静态链元数据存在；实际推荐仍须通过实时 Bid/Ask、Delta、点差和报价新鲜度门禁。",
     "DTE 以 America/New_York 交易日为基准按自然日计算，未接入交易所假日日历。",
 )
 
@@ -94,6 +98,7 @@ def build_ticker_availability(
             "ticker": symbol,
             "state": "unavailable",
             "has_zero_dte": None,
+            "has_eligible_0_7": None,
             "available_dte_list": [],
             "expiries": [],
             "unavailable_reason": (
@@ -130,6 +135,7 @@ def build_ticker_availability(
         "ticker": symbol,
         "state": "ready",
         "has_zero_dte": 0 in dte_list,
+        "has_eligible_0_7": bool(dte_list),
         "available_dte_list": dte_list,
         "expiries": rows,
         "unavailable_reason": None,
@@ -139,14 +145,14 @@ def build_ticker_availability(
 def derive_day_type(
     tickers: Sequence[TickerAvailability],
 ) -> tuple[str, str, list[str]]:
-    """从逐标的可用性聚合出 ``(day_type, reason, zero_dte_tickers)``。
+    """聚合 legacy 0DTE 三态，供旧客户端兼容；不代表当前持仓策略。
 
     三态，顺序即优先级：
 
     1. 任一标的**确证**存在 0DTE → ``intraday_available``。正向证据不因
        别的标的读不到而作废（读不到的标的只可能再增加 0DTE，不会减少）。
-    2. 没有任何 0DTE 且**全部标的都读到了链** → ``overnight_only``。这是
-       V2-E 说的「过夜日」：日内车道关闭，只剩过夜车道或不做。
+    2. 没有任何 0DTE 且**全部标的都读到了链** → ``overnight_only``。
+       这个名称是旧 wire 枚举；当前 INTRA-0-7 绝不能据此关闭日内车道。
     3. 其余（一个标的都没查、或没查到 0DTE 但存在读不到的标的）→
        ``unknown`` + 原因。**未知不等于「今天没有 0DTE」**，也不等于安全。
     """
@@ -186,7 +192,49 @@ def derive_day_type(
         )
     return (
         "overnight_only",
-        f"{len(tickers)} 个深度层标的今日均无 0DTE 到期，日内车道关闭（V2-E）",
+        f"{len(tickers)} 个深度层标的今日均无 0DTE 到期（legacy 0DTE 事实；不代表日内关闭）",
+        [],
+    )
+
+
+def derive_intraday_policy(
+    tickers: Sequence[TickerAvailability],
+) -> tuple[str, str, list[str]]:
+    """聚合 INTRA-0-7 可用性；正向证据优先，未知绝不冒充空态。"""
+
+    eligible = [
+        str(item.get("ticker") or "")
+        for item in tickers
+        if item.get("state") == "ready"
+        and any(
+            isinstance(dte, int)
+            and not isinstance(dte, bool)
+            and 0 <= dte <= LANE_AVAILABILITY_MAX_DTE
+            for dte in (item.get("available_dte_list") or ())
+        )
+    ]
+    if eligible:
+        return (
+            "available",
+            f"{len(eligible)} 个深度层标的存在 0-7DTE 到期（{'、'.join(eligible)}）",
+            eligible,
+        )
+    if not tickers:
+        return "unknown", "今日没有可查的深度层标的", []
+    unavailable = [
+        str(item.get("ticker") or "")
+        for item in tickers
+        if item.get("state") != "ready"
+    ]
+    if unavailable:
+        return (
+            "unknown",
+            f"{len(unavailable)} 个标的的到期日读不到（{'、'.join(unavailable)}），未知≠无合约",
+            [],
+        )
+    return (
+        "unavailable",
+        f"{len(tickers)} 个深度层标的在 0-7DTE 窗口内均无到期日",
         [],
     )
 
@@ -208,6 +256,7 @@ def build_lane_availability(
 
     ordered = list(tickers)
     day_type, reason, zero_dte = derive_day_type(ordered)
+    policy_state, policy_reason, eligible_tickers = derive_intraday_policy(ordered)
     readable = [item for item in ordered if item.get("state") == "ready"]
     return {
         "formula_version": FORMULA_VERSION,
@@ -215,6 +264,13 @@ def build_lane_availability(
         "max_dte": max(0, int(max_dte)),
         "day_type": day_type,
         "day_type_reason": reason,
+        "policy_version": INTRADAY_POLICY_VERSION,
+        "holding_policy": INTRADAY_HOLDING_POLICY,
+        "eligible_dte_min": 0,
+        "eligible_dte_max": LANE_AVAILABILITY_MAX_DTE,
+        "policy_state": policy_state,
+        "policy_state_reason": policy_reason,
+        "eligible_tickers": eligible_tickers,
         "basis": DAY_TYPE_BASIS,
         "checked_scope": checked_scope,
         "checked_count": len(ordered),

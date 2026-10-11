@@ -56,6 +56,7 @@ from src.opportunities.intraday_bursts import (
     compute_speed_state,
     compute_window_efficiency,
     filter_regular_session_bars,
+    filter_completed_bars_as_of,
     select_distinct_legs,
     normalize_bar_label_convention,
     split_burst_session_bars,
@@ -252,6 +253,26 @@ class TestCalibrationRegression:
         assert normalize_bar_label_convention(
             junk, source="MoomooFetcher"
         )[0]["date"] == "not-a-time"
+
+    def test_filter_completed_bars_excludes_forming_five_minute_bar(self):
+        bars = [
+            {"date": "2026-08-31T09:55:00-04:00", "close": 1.0},
+            {"date": "2026-08-31T10:00:00-04:00", "close": 2.0},
+            {"date": "2026-08-31T10:05:00-04:00", "close": 3.0},
+        ]
+        completed = filter_completed_bars_as_of(
+            bars,
+            as_of="2026-08-31T10:02:30-04:00",
+        )
+        assert [row["close"] for row in completed] == [1.0]
+        assert filter_completed_bars_as_of(
+            bars,
+            as_of="2026-08-31T10:05:00-04:00",
+        ) == bars[:2]
+        assert filter_completed_bars_as_of(
+            bars,
+            as_of="2026-08-31T10:05:00",
+        ) == []
 
     def test_googl_best_leg_stays_below_mu_plunge(self, labeled_bars):
         """v1 失败样本保持修复：GOOGL 的最佳波段必须弱于 MU 的跳水。"""
@@ -519,6 +540,53 @@ class TestFailClosed:
         )
         assert len(rows) == 1
         assert rows[0]["session_date_et"] == "2026-07-28"
+
+    @pytest.mark.parametrize(
+        ("open_", "high", "low", "close"),
+        [
+            (100.0, 0.0, 99.0, 100.0),
+            (100.0, 101.0, 0.0, 100.0),
+            (100.0, 101.0, 99.0, 0.0),
+            (98.0, 101.0, 99.0, 100.0),
+            (102.0, 101.0, 99.0, 100.0),
+            (100.0, 101.0, 99.0, 98.0),
+            (100.0, 101.0, 99.0, 102.0),
+        ],
+        ids=[
+            "nonpositive_high",
+            "nonpositive_low",
+            "nonpositive_close",
+            "open_below_low",
+            "open_above_high",
+            "close_below_low",
+            "close_above_high",
+        ],
+    )
+    def test_malformed_ohlc_is_dropped_before_burst_math(
+        self, open_, high, low, close
+    ):
+        bars = [_flat_bar("09:30"), _flat_bar("09:35")]
+        bars.append(
+            _bar(
+                "2026-07-28T09:40:00-04:00",
+                open_=open_,
+                high=high,
+                low=low,
+                close=close,
+                volume=1_000_000_000,
+            )
+        )
+
+        profile = compute_session_burst_profile(
+            bars,
+            market_date_et="2026-07-28",
+            quote_session_scope="current_session",
+        )
+
+        assert profile["bar_count"] == 2
+        assert profile["state"] == "insufficient_bars"
+        assert profile["current"] is None
+        assert profile["legs"] == []
 
     def test_two_bars_only_is_insufficient(self):
         bars = [_flat_bar("09:30"), _flat_bar("09:35")]

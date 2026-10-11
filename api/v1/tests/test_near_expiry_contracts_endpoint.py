@@ -119,7 +119,7 @@ def test_disabled_is_explicit_and_never_queries_moomoo(monkeypatch):
     assert item["state"] == "not_configured"
     assert item["spot"] is None
     assert item["expiries"] == []
-    assert item["max_dte"] == 3
+    assert item["max_dte"] == 7
     assert any("不构成合约推荐" in value for value in item["limitations"])
     assert any("券商实时盘口" in value for value in item["limitations"])
 
@@ -565,7 +565,7 @@ def test_earnings_calendar_cache_is_shared_with_scan_lane(monkeypatch):
     assert second.json()["item"]["earnings_proximity"]["within_blackout"] is True
 
 
-# --- 今日车道可用性（V2-E）的 additive 契约 ---------------------------------
+# --- 0-7DTE 可用性证据的 additive 契约 --------------------------------------
 
 
 def test_availability_fields_report_no_zero_dte_when_chain_is_readable(monkeypatch):
@@ -650,7 +650,7 @@ def test_availability_empty_window_is_false_not_unknown(monkeypatch):
 def test_availability_is_unknown_when_chain_is_unreadable(monkeypatch, enabled):
     """链读不到（未配置或适配器失败）→ has_zero_dte 显式 None + 原因。
 
-    绝不以「读不到」冒充「今天没有 0DTE」——那正是 V2-E 要防的误读。
+    绝不以「读不到」冒充「今天没有 0DTE」或「当前 0-7DTE 车道不可用」。
     """
 
     monkeypatch.setattr(

@@ -21,7 +21,7 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,6 +37,31 @@ from src.services.system_config_service import SystemConfigService
 logger = logging.getLogger(__name__)
 
 
+def _enrich_intraday_alert_payload(
+    payload: dict[str, Any],
+    friction_service: Any,
+) -> dict[str, Any]:
+    """Add optional opening quote context, never legacy 5m near-P0 reads."""
+
+    from src.services.alert_tiering import (
+        opening_probe_direction,
+    )
+
+    selected_tickers = []
+    for candidate in payload.get("candidates") or ():
+        if not isinstance(candidate, dict):
+            continue
+        if opening_probe_direction(payload, candidate) is None:
+            continue
+        ticker = str(candidate.get("ticker") or "").strip()
+        if ticker:
+            selected_tickers.append(ticker)
+    return friction_service.enrich_payload(
+        payload,
+        selected_tickers=selected_tickers,
+    )
+
+
 @asynccontextmanager
 async def app_lifespan(app: FastAPI):
     """Initialize and release shared services for the app lifecycle."""
@@ -45,7 +70,10 @@ async def app_lifespan(app: FastAPI):
     premarket_scheduler = None
     outcome_scheduler = None
     intraday_warm_scheduler = None
+    intraday_signal_scheduler = None
     intraday_alerter = None
+    intraday_option_friction_service = None
+    intraday_p0_2m_monitor = None
     try:
         from src.config import get_config
 
@@ -100,70 +128,294 @@ async def app_lifespan(app: FastAPI):
             # Warm the page's default intraday-top poll through the exact
             # single-flight path the endpoint uses; join-not-duplicate.
             from api.v1.endpoints.opportunities import (
+                set_opening_signal_universe,
+                warm_opening_impulse_scan,
                 warm_default_intraday_top_scan,
             )
             from src.services.intraday_warm_cache_scheduler import (
                 IntradayWarmCacheScheduler,
                 execute_intraday_warm_tick,
+                resolve_intraday_signal_symbols,
             )
 
-            warm_runner = warm_default_intraday_top_scan
-            if bool(getattr(config, "intraday_alerts_enabled", False)):
-                # 盘中机会提示器：只挂在预热载荷上（零新增取数），预热
-                # 关闭时本分支不可达——提示器随之零检测（文档已注明）。
-                from src.notification_sender.telegram_sender import (
-                    TelegramSender,
+            signal_symbols = resolve_intraday_signal_symbols(config)
+            set_opening_signal_universe(signal_symbols)
+            app.state.intraday_signal_symbols = signal_symbols
+            warm_runner_fn = warm_default_intraday_top_scan
+            legacy_alerts_enabled = bool(
+                getattr(config, "intraday_alerts_enabled", False)
+            )
+            p0_research_enabled = bool(
+                getattr(config, "intraday_p0_2m_enabled", True)
+                and getattr(config, "intraday_watchlist", None)
+            )
+            p0_action_requested = bool(
+                getattr(config, "intraday_p0_2m_action_enabled", False)
+            )
+            p0_shadow_mobile_requested = bool(
+                getattr(
+                    config,
+                    "intraday_p0_2m_shadow_mobile_enabled",
+                    False,
+                )
+            )
+            telegram_ready = bool(
+                getattr(config, "telegram_bot_token", None)
+                and getattr(config, "telegram_chat_id", None)
+            )
+
+            # The strict 2m observer is also the persistent shadow ledger host.
+            # It must exist without Telegram credentials and without the legacy
+            # alert switch; those settings govern delivery, not signal facts.
+            if legacy_alerts_enabled or p0_research_enabled:
+                from src.services.intraday_alert_context import (
+                    default_daily_realized_pnl_provider,
+                    default_gate_state_provider,
+                    default_open_positions_provider,
                 )
                 from src.services.intraday_opportunity_alerter import (
                     IntradayOpportunityAlerter,
                 )
 
-                # 凭据缺失时不构造提示器：否则 TelegramSender 会对每条消息
-                # 各刷一行 WARNING（最多日上限条/天）——对抗复核修正为一次
-                # 启动警告 + 干净禁用。
-                if not (
-                    getattr(config, "telegram_bot_token", None)
-                    and getattr(config, "telegram_chat_id", None)
+                telegram_sender = None
+                send_text = lambda _text: False
+                send_silent_text = None
+                send_text_with_deadline = None
+                if telegram_ready:
+                    from src.notification_sender.telegram_sender import (
+                        TelegramSender,
+                    )
+
+                    telegram_sender = TelegramSender(config)
+                    send_text = telegram_sender.send_to_telegram
+                    send_text_with_deadline = lambda text, deadline: (
+                        telegram_sender.send_to_telegram(
+                            text,
+                            delivery_deadline=deadline,
+                        )
+                    )
+                    send_silent_text = lambda text: (
+                        telegram_sender.send_to_telegram(
+                            text, disable_notification=True
+                        )
+                    )
+                elif (
+                    legacy_alerts_enabled
+                    or p0_action_requested
+                    or p0_shadow_mobile_requested
                 ):
                     logger.warning(
-                        "INTRADAY_ALERTS_ENABLED=true 但 Telegram 凭据缺失"
-                        "（TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID）；提示器已禁用"
+                        "Telegram 凭据缺失"
+                        "（TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID）；"
+                        "手机投递已 fail closed，严格 2m shadow 仍继续入网页/台账"
                     )
-                else:
-                    intraday_alerter = IntradayOpportunityAlerter(
-                        TelegramSender(config).send_to_telegram,
-                        max_alerts_per_day=getattr(
-                            config, "intraday_alerts_max_per_day", 20
+
+                option_supplement_provider = None
+                if telegram_ready and (
+                    legacy_alerts_enabled or p0_action_requested
+                ):
+                    from src.services.intraday_option_friction import (
+                        IntradayOptionFrictionService,
+                    )
+
+                    intraday_option_friction_service = (
+                        IntradayOptionFrictionService()
+                    )
+                    app.state.intraday_option_friction_service = (
+                        intraday_option_friction_service
+                    )
+                    option_supplement_provider = (
+                        lambda ticker, direction: (
+                            intraday_option_friction_service.get_candidate_supplement(
+                                ticker, direction, max_candidates=3
+                            )
+                        )
+                    )
+
+                intraday_alerter = IntradayOpportunityAlerter(
+                    send_text,
+                    send_silent_text=send_silent_text,
+                    send_text_with_deadline=send_text_with_deadline,
+                    gate_state_provider=default_gate_state_provider,
+                    open_positions_provider=default_open_positions_provider,
+                    daily_pnl_provider=default_daily_realized_pnl_provider,
+                    max_alerts_per_day=getattr(
+                        config, "intraday_alerts_max_per_day", 20
+                    ),
+                    p0_shadow_mobile_enabled=(
+                        p0_shadow_mobile_requested and telegram_ready
+                    ),
+                    option_supplement_provider=option_supplement_provider,
+                )
+                intraday_alerter.start()
+                app.state.intraday_opportunity_alerter = intraday_alerter
+
+                if p0_research_enabled:
+                    from src.journal.ledger.p0_2m_shadow_repository import (
+                        append_p0_2m_shadow_observations,
+                        ensure_p0_2m_live_shadow_enrollment,
+                    )
+                    from src.services.intraday_p0_2m_monitor import (
+                        IntradayP02mMonitor,
+                    )
+
+                    try:
+                        opend_port = int(
+                            (os.environ.get("MOOMOO_OPEND_PORT") or "11111").strip()
+                        )
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "MOOMOO_OPEND_PORT 非法；2m P0 monitor 已禁用"
+                        )
+                    else:
+                        intraday_p0_2m_monitor = IntradayP02mMonitor(
+                            signal_symbols,
+                            getattr(
+                                intraday_alerter,
+                                "observe_p0_2m",
+                                intraday_alerter.observe,
+                            ),
+                            action_enabled=p0_action_requested,
+                            delivery_ready=telegram_ready,
+                            delivery_unavailable_reason=(
+                                "ready"
+                                if telegram_ready
+                                else "telegram_credentials_missing"
+                            ),
+                            activation_artifact=getattr(
+                                config,
+                                "intraday_p0_2m_activation_artifact",
+                                None,
+                            ),
+                            host=(
+                                os.environ.get("MOOMOO_OPEND_HOST")
+                                or "127.0.0.1"
+                            ).strip(),
+                            port=opend_port,
+                            system_notifier=(
+                                intraday_alerter.notify_system
+                                if telegram_ready
+                                else None
+                            ),
+                            shadow_recorder=append_p0_2m_shadow_observations,
+                            shadow_enroller=ensure_p0_2m_live_shadow_enrollment,
+                        )
+                        intraday_p0_2m_monitor.start()
+                        app.state.intraday_p0_2m_monitor = (
+                            intraday_p0_2m_monitor
+                        )
+
+                set_opening_signal_universe(
+                    signal_symbols,
+                    current_1m_reader=getattr(
+                        intraday_p0_2m_monitor, "get_completed_1m_bars", None,
+                    ),
+                    stream_health_reader=getattr(
+                        intraday_p0_2m_monitor, "health_snapshot", None,
+                    ),
+                )
+
+                def fast_signal_runner():
+                    # Subscription-backed 2m and strict 1m opening evidence
+                    # never wait for the page Top scan or option quote warming.
+                    p0_summary = (
+                        intraday_p0_2m_monitor.scan_once()
+                        if intraday_p0_2m_monitor is not None
+                        else {}
+                    )
+                    # The opening lane also consumes completed 1m bars only.
+                    opening_summary = (
+                        warm_opening_impulse_scan(
+                            payload_observer=intraday_alerter.observe_opening,
+                            target_symbols=signal_symbols,
+                            current_1m_reader=getattr(
+                                intraday_p0_2m_monitor,
+                                "get_completed_1m_bars",
+                                None,
+                            ),
+                        )
+                        if legacy_alerts_enabled else {}
+                    )
+                    pending_count = int(
+                        opening_summary.get("pending_count") or 0
+                    )
+                    retryable_pending_count = int(
+                        opening_summary.get("retryable_pending_count") or 0
+                    )
+                    return {
+                        "led_flight": False,
+                        "generated_in_seconds": None,
+                        "generated_by": "intraday_signal_clock",
+                        "opening_pending_count": (
+                            retryable_pending_count if pending_count > 0 else 0
+                        ),
+                        "p0_2m_candidate_count": p0_summary.get(
+                            "candidate_count", 0
+                        ),
+                    }
+
+                def alerting_page_warm_runner():
+                    if legacy_alerts_enabled:
+                        # Only the slow host may warm opening history.  The
+                        # endpoint is idle after 09:30, so no critical-minute
+                        # provider reads can delay the independent fast clock.
+                        warm_opening_impulse_scan(
+                            target_symbols=signal_symbols,
+                            prewarm_only=True,
+                        )
+                    return warm_default_intraday_top_scan(
+                        payload_observer=(
+                            intraday_alerter.observe
+                            if legacy_alerts_enabled
+                            else None
+                        ),
+                        payload_enricher=(
+                            (lambda payload: _enrich_intraday_alert_payload(
+                                payload,
+                                intraday_option_friction_service,
+                            ))
+                            if legacy_alerts_enabled
+                            and intraday_option_friction_service is not None
+                            else None
                         ),
                     )
-                    intraday_alerter.start()
-                    app.state.intraday_opportunity_alerter = intraday_alerter
-                    observer = intraday_alerter.observe
 
-                    def warm_runner():  # noqa: D401 - closure over the warm scan
-                        return warm_default_intraday_top_scan(
-                            payload_observer=observer
-                        )
+                warm_runner_fn = alerting_page_warm_runner
 
             # 通道看门狗：Moomoo 熔断器打开/闭合时给手机各推一次系统通知
             # （2026-08-14 OpenD 崩溃后静默降级 6 天无人知晓——G-31 修复）。
-            # 仅在提示器存在（Telegram 可用）时接线。
+            # 仅在 Telegram 真正可用时接线手机通道看门狗。
             channel_watch = None
             channel_notifier = None
-            if intraday_alerter is not None:
+            if intraday_alerter is not None and telegram_ready:
                 from src.services.moomoo_runtime import MOOMOO_RPC_BREAKER
 
                 channel_watch = lambda: MOOMOO_RPC_BREAKER.is_tripped  # noqa: E731
                 channel_notifier = intraday_alerter.notify_system
 
+            if intraday_alerter is not None:
+                intraday_signal_scheduler = IntradayWarmCacheScheduler(
+                    lambda: execute_intraday_warm_tick(
+                        warm_runner=fast_signal_runner,
+                    ),
+                    thread_name="dsa-intraday-signal-clock",
+                    channel_watch=channel_watch,
+                    channel_notifier=channel_notifier,
+                    interval_seconds=60,
+                )
+                intraday_signal_scheduler.start()
+                app.state.intraday_signal_scheduler = intraday_signal_scheduler
+
             intraday_warm_scheduler = IntradayWarmCacheScheduler(
                 lambda: execute_intraday_warm_tick(
-                    warm_runner=warm_runner,
+                    warm_runner=warm_runner_fn,
+                    defer_during_opening=(
+                        legacy_alerts_enabled and intraday_signal_scheduler is not None
+                    ),
                 ),
-                channel_watch=channel_watch,
-                channel_notifier=channel_notifier,
+                align_to_minute_closes=False,
                 interval_seconds=getattr(
-                    config, "intraday_refresh_interval_seconds", 45
+                    config, "intraday_refresh_interval_seconds", 60
                 ),
             )
             intraday_warm_scheduler.start()
@@ -172,7 +424,9 @@ async def app_lifespan(app: FastAPI):
     finally:
         for scheduler_name, scheduler in (
             ("moomoo_premarket_prefetch", premarket_evidence_scheduler),
+            ("intraday_signal_clock", intraday_signal_scheduler),
             ("intraday_warm_cache", intraday_warm_scheduler),
+            ("intraday_p0_2m", intraday_p0_2m_monitor),
             ("intraday_opportunity_alerter", intraday_alerter),
             ("opportunity_outcome", outcome_scheduler),
             ("premarket_research", premarket_scheduler),
@@ -189,8 +443,19 @@ async def app_lifespan(app: FastAPI):
                 )
         if hasattr(app.state, "intraday_warm_cache_scheduler"):
             delattr(app.state, "intraday_warm_cache_scheduler")
+        if hasattr(app.state, "intraday_signal_scheduler"):
+            delattr(app.state, "intraday_signal_scheduler")
+        if hasattr(app.state, "intraday_p0_2m_monitor"):
+            delattr(app.state, "intraday_p0_2m_monitor")
         if hasattr(app.state, "intraday_opportunity_alerter"):
             delattr(app.state, "intraday_opportunity_alerter")
+        if hasattr(app.state, "intraday_option_friction_service"):
+            delattr(app.state, "intraday_option_friction_service")
+        if hasattr(app.state, "intraday_signal_symbols"):
+            from api.v1.endpoints.opportunities import set_opening_signal_universe
+
+            set_opening_signal_universe(None)
+            delattr(app.state, "intraday_signal_symbols")
         if hasattr(app.state, "opportunity_outcome_scheduler"):
             delattr(app.state, "opportunity_outcome_scheduler")
         if hasattr(app.state, "premarket_research_scheduler"):
@@ -204,17 +469,17 @@ async def app_lifespan(app: FastAPI):
 def create_app(static_dir: Optional[Path] = None) -> FastAPI:
     """
     创建并配置 FastAPI 应用实例
-    
+
     Args:
         static_dir: 静态文件目录路径（可选，默认为项目根目录下的 static）
-        
+
     Returns:
         配置完成的 FastAPI 应用实例
     """
     # 默认静态文件目录
     if static_dir is None:
         static_dir = Path(__file__).parent.parent / "static"
-    
+
     # 创建 FastAPI 实例
     app = FastAPI(
         title="Daily Stock Analysis API",
@@ -230,29 +495,29 @@ def create_app(static_dir: Optional[Path] = None) -> FastAPI:
         version="1.0.0",
         lifespan=app_lifespan,
     )
-    
+
     # ============================================================
     # CORS 配置
     # ============================================================
-    
+
     allowed_origins = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
     ]
-    
+
     # 从环境变量添加额外的允许来源
     extra_origins = os.environ.get("CORS_ORIGINS", "")
     if extra_origins:
         allowed_origins.extend([o.strip() for o in extra_origins.split(",") if o.strip()])
-    
+
     # 允许所有来源（开发/演示用）
     allow_all_origins = os.environ.get("CORS_ALLOW_ALL", "").lower() == "true"
     allow_credentials = not allow_all_origins
     if allow_all_origins:
         allowed_origins = ["*"]
-    
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=allowed_origins,
@@ -262,20 +527,20 @@ def create_app(static_dir: Optional[Path] = None) -> FastAPI:
     )
 
     add_auth_middleware(app)
-    
+
     # ============================================================
     # 注册路由
     # ============================================================
-    
+
     app.include_router(api_v1_router)
     add_error_handlers(app)
-    
+
     # ============================================================
     # 根路由和健康检查
     # ============================================================
-    
+
     has_frontend = static_dir.exists() and (static_dir / "index.html").exists()
-    
+
     if has_frontend:
         @app.get("/", include_in_schema=False)
         async def root():
@@ -313,7 +578,7 @@ def create_app(static_dir: Optional[Path] = None) -> FastAPI:
         async def root():
             """根路由 - 前端未构建时返回引导页面"""
             return HTMLResponse(content=_FRONTEND_NOT_BUILT_HTML)
-    
+
     @app.get(
         "/api/health",
         response_model=HealthResponse,
@@ -327,17 +592,17 @@ def create_app(static_dir: Optional[Path] = None) -> FastAPI:
             status="ok",
             timestamp=datetime.now().isoformat()
         )
-    
+
     # ============================================================
     # 静态文件托管（前端 SPA）
     # ============================================================
-    
+
     if has_frontend:
         # 挂载静态资源目录
         assets_dir = static_dir / "assets"
         if assets_dir.exists():
             app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
-        
+
         # SPA 路由回退
         @app.get("/{full_path:path}", include_in_schema=False)
         async def serve_spa(request: Request, full_path: str):
@@ -347,16 +612,16 @@ def create_app(static_dir: Optional[Path] = None) -> FastAPI:
                     status_code=404,
                     content={"error": "not_found", "message": f"API endpoint /{full_path} not found"}
                 )
-            
+
             file_path = static_dir / full_path
             if file_path.exists() and file_path.is_file():
                 # Issue #520: Explicitly resolve MIME type to avoid
                 # browsers rejecting JS modules served as text/plain.
                 content_type, _ = mimetypes.guess_type(str(file_path))
                 return FileResponse(file_path, media_type=content_type)
-            
+
             return FileResponse(static_dir / "index.html")
-    
+
     return app
 
 

@@ -403,7 +403,7 @@ class MoomooOptionUnderlyingOverview:
 
 @dataclass(frozen=True)
 class MoomooNearExpiryContract:
-    """One near-the-money contract row for the near-expiry (0–3 DTE) panel.
+    """One near-the-money contract row for the bounded 0–7DTE pool.
 
     静态字段（code/expiry/dte/right/strike）来自期权链元数据；动态报价
     字段逐字段 nullable：快照缺行、``option_valid`` 无效或字段非法时保持
@@ -1746,6 +1746,8 @@ def fetch_near_expiry_chain_moomoo(
     symbol: str,
     max_dte: int = 3,
     ref_date: Optional[date] = None,
+    *,
+    lane_wait_seconds: Optional[float] = None,
 ) -> Optional[MoomooNearExpiryChainSnapshot]:
     """Fetch near-the-money contract rows for expiries within ``max_dte``.
 
@@ -1788,7 +1790,10 @@ def fetch_near_expiry_chain_moomoo(
         return None
 
     try:
-        with _lease_wall_context() as leased:
+        with _lease_wall_context(
+            lane_wait_seconds,
+            busy_error=lane_wait_seconds is not None,
+        ) as leased:
             if leased is None:
                 return None
             ctx, context_lock = leased
@@ -1960,6 +1965,10 @@ def fetch_near_expiry_chain_moomoo(
             excluded_nonstandard_count=excluded_nonstandard,
             excluded_unknown_standard_type_count=unknown_standard,
         )
+    except MoomooWallLaneBusyError:
+        # 盘中 warm 调用方用短等待并把 busy 解释为「下一 tick 再试」；
+        # 交互式端点沿用缺省等待，不会走到这里。
+        raise
     except Exception as exc:  # noqa: BLE001 - quote failures degrade to unavailable
         logger.warning(
             "[moomoo_options] near-expiry chain(%s) failed: %s",

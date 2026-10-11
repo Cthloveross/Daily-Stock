@@ -478,8 +478,9 @@ export interface NearExpiryContractItem {
   };
   expiries: NearExpiryExpiryGroup[];
   /**
-   * 今日车道可用性（V2-E，additive）：链已读到即由已在手的到期日分组推导。
-   * `null`/缺省＝链读不到（未知），**不是**「今天没有 0DTE」。
+   * 0–7DTE 可用性证据（additive）：链已读到即由已在手的到期日分组推导。
+   * `hasZeroDte` 是兼容保留的 0DTE 事实；`null`/缺省＝链读不到（未知）。
+   * 当前策略读取 `availableDteList`，不能把「无 0DTE」误读成车道关闭。
    */
   hasZeroDte?: boolean | null;
   availableDteList?: number[];
@@ -817,7 +818,11 @@ export interface IntradayBurstSpeed {
   unavailableReason: string | null;
 }
 
-/** v3 财报临近标记：前向 5 天窗口内最近财报日；within_blackout=null 表示未知。 */
+/**
+ * 财报临近上下文：仅 `daysToEarnings === 0` 是当前 INTRA-0-7 硬拦；
+ * 未来财报为中性上下文，且必须同一 ET 日平仓、不跨事件。
+ * `withinBlackout`/`blackoutDays` 仅保留用于兼容旧 API 载荷；null 表示未知。
+ */
 export interface IntradayEarningsProximity {
   state: 'ready' | 'unavailable';
   daysToEarnings: number | null;
@@ -927,8 +932,76 @@ export interface IntradayFizzleFlag {
   reference: IntradayFizzleReference;
 }
 
-/** 波段爆发（v2 主信号）：当前窗口 + 当日（或最近一个交易时段）波段列表。 */
+/**
+ * P1-O legacy/final 原生完整 5m 开盘画像。顺序 v2 见 openingProgressive；
+ * 它只识别 Stock in Play 候选；
+ * `qualified` 不等于已突破 opening range，也不等于已触发期权入场。
+ */
+export interface IntradayOpeningImpulse {
+  state: 'qualified' | 'not_qualified' | 'pending' | 'unavailable';
+  alertQualified: boolean;
+  ruleVersion: 'opening_impulse_v1';
+  barStartEt: '09:30';
+  barEndEt: '09:35';
+  completedAsOf: string | null;
+  open: number | null;
+  high: number | null;
+  low: number | null;
+  close: number | null;
+  volume: number | null;
+  dollarVolume: number | null;
+  direction: 'up' | 'down' | 'flat' | null;
+  bodyPercent: number | null;
+  bodyAtr: number | null;
+  rangeAtr: number | null;
+  bodyEfficiency: number | null;
+  directionalCloseLocation: number | null;
+  openingVolumeRvol20d: number | null;
+  openingRangeRatio20d: number | null;
+  openingBodyRatio20d: number | null;
+  volumePercentile20d: number | null;
+  rangePercentile20d: number | null;
+  bodyPercentile20d: number | null;
+  referenceSessionCount: number;
+  referenceMedianVolume: number | null;
+  referenceMedianRange: number | null;
+  referenceMedianAbsBody: number | null;
+  priorClose: number | null;
+  gapPercent: number | null;
+  closedVsPriorPercent: number | null;
+  reclaimedPriorClose: boolean | null;
+  openingMid: number | null;
+  qualityScore: number | null;
+  failedChecks: string[];
+  thresholds: Record<string, number>;
+  unavailableReason: string | null;
+  source?: string | null;
+  referenceSource?: string | null;
+  currentSource?: string | null;
+  basis: string;
+  limitations: string[];
+}
+
+/** 09:31–09:35 顺序开盘画像：早期双确认，09:35 用五根完整 1m 累计确认。 */
+export interface IntradaySequentialOpeningImpulse
+  extends Omit<IntradayOpeningImpulse, 'ruleVersion' | 'barEndEt'> {
+  ruleVersion: 'opening_impulse_v2';
+  barEndEt: string;
+  checkpoint: number | null;
+  checkpointLabel: string | null;
+  completedCheckpoints: Array<Record<string, unknown>>;
+  confirmationPoints: number[];
+  confirmationLabels: string[];
+  confirmationMode: 'consecutive_1m' | 'completed_1m_cumulative' | null;
+  currentCheckpointPass: boolean | null;
+  retryablePending: boolean;
+}
+
+/** Legacy 5m 波段读数：只供 API 兼容展示和复盘研究。 */
 export interface IntradaySessionBursts {
+  /** v9 current payloads set this; optional only for cached v8 compatibility. */
+  legacy?: true;
+  legacyUsage?: 'api_compatibility_and_research_display_only';
   state: 'ready' | 'insufficient_bars' | 'unavailable';
   sessionDateEt: string | null;
   barCount: number;
@@ -941,6 +1014,10 @@ export interface IntradaySessionBursts {
   speed: IntradayBurstSpeed;
   /** v7 哑火形态（additive）：描述 current 窗口；旧载荷可省略。 */
   fizzleFlag?: IntradayFizzleFlag | null;
+  /** P1-O legacy/final 原生完整 5m 画像（additive；旧载荷可省略）。 */
+  openingImpulse?: IntradayOpeningImpulse | null;
+  /** P1-O 顺序 v2 画像（additive；旧载荷可省略）。 */
+  openingProgressive?: IntradaySequentialOpeningImpulse | null;
   unavailableReason: string | null;
   source: string | null;
   fetchedAt: string | null;
@@ -1098,12 +1175,14 @@ export interface IntradayTrimmedLaneEntry {
 }
 
 /**
- * 今日车道可用性（V2-E）的三态。
+ * 旧版今日车道可用性（legacy `day_type`）三态。
  *
- * - `intraday_available`：≥1 个深度层标的今日确证有 0DTE → 日内车道成立；
- * - `overnight_only`：全部标的都读到了链且都没有 0DTE → 日内车道关闭；
+ * - `intraday_available`：≥1 个深度层标的今日确证有 0DTE；
+ * - `overnight_only`：全部标的都读到了链且都没有 0DTE；
  * - `unknown`：一个都没查，或没查到 0DTE 但存在读不到的标的。
- *   **未知不等于「今天没有 0DTE」**，也不等于安全。
+ *
+ * 当前 INTRA-0-7/v1 不以该字段开关车道：新 policy 字段优先；缺席时从逐标的
+ * 0..7DTE 到期列表推导。尤其 `overnight_only` 绝不等于当前车道关闭。
  */
 export type IntradayLaneDayType =
   | 'intraday_available'
@@ -1115,6 +1194,8 @@ export interface IntradayTickerLaneAvailability {
   ticker: string;
   state: 'ready' | 'unavailable';
   hasZeroDte: boolean | null;
+  /** INTRA-0-7/v1：该标的是否确证存在任一 0..7DTE 到期；旧载荷缺席。 */
+  hasEligible0_7?: boolean | null;
   availableDteList: number[];
   expiries: { expiry: string; dte: number }[];
   unavailableReason: string | null;
@@ -1125,6 +1206,14 @@ export interface IntradayLaneAvailability {
   formulaVersion: string;
   marketDateEt: string;
   maxDte: number;
+  /** 新规则字段优先；均为 additive，旧服务端载荷可以缺席。 */
+  policyVersion?: 'INTRA-0-7/v1' | string;
+  holdingPolicy?: 'same_et_day_only' | string;
+  eligibleDteMin?: number;
+  eligibleDteMax?: number;
+  policyState?: 'available' | 'unavailable' | 'unknown';
+  policyStateReason?: string;
+  eligibleTickers?: string[];
   dayType: IntradayLaneDayType;
   dayTypeReason: string;
   basis: 'per_ticker_option_expiry_metadata_within_0_7_dte_v1';
@@ -1214,6 +1303,23 @@ export interface IntradayTopRecentOptionEvent {
   strategyType: string | null;
 }
 
+/** 服务端交易所日历确认的手动执行窗口；不是 P0 信号条件。 */
+export interface IntradayExecutionPolicy {
+  policyVersion: 'intraday_execution_policy_v1';
+  state: 'ready' | 'closed' | 'unavailable';
+  asOf: string;
+  expiresAt: string | null;
+  marketDateEt: string;
+  reason: string;
+  entryStartEt: string | null;
+  ordinaryEntryCutoffEt: string | null;
+  zeroDteEntryCutoffEt: string | null;
+  exitDeadlineEt: string | null;
+  closeEt: string | null;
+  ordinaryEntryAllowed: boolean | null;
+  zeroDteEntryAllowed: boolean | null;
+}
+
 /** 盘中滚动 Top N：不冻结、不入统计，与盘前冻结榜互不替代。 */
 export interface IntradayTopResponse {
   schemaVersion: string;
@@ -1225,19 +1331,20 @@ export interface IntradayTopResponse {
   sessionStateBasis: 'america_new_york_clock_v1';
   sessionPhase: IntradaySessionPhase;
   sessionPhaseLabel: string;
-  sessionPhaseHintBasis: 'user_trading_history_hardcoded_v1';
+  sessionPhaseHintBasis: 'america_new_york_liquidity_context_neutral_v2';
   quoteSessionScope: 'current_session' | 'latest_prior_session';
   quoteSessionLabel: string;
   marketContext: IntradayMarketContext;
-  signalVersion: 'intraday_session_evidence_v8';
-  rankingMethod: 'burst_score_first_then_evidence_count' | 'rule_based_evidence_count';
+  signalVersion: 'intraday_session_evidence_v9';
+  rankingMethod: 'rule_based_evidence_count';
   statisticsTrack: 'none_intraday_v1_unscored';
   moomooEnabled: boolean;
   universe: string[];
   /** watchlist 两层模式（additive）：单层（现状）模式恒为 null/缺席。 */
   universeScan?: IntradayUniverseScan | null;
-  /** 今日车道可用性（V2-E，additive）：单层（现状）模式恒为 null/缺席。 */
+  /** INTRA-0-7 策略可用性（additive）：单层模式恒为 null/缺席。 */
   laneAvailability?: IntradayLaneAvailability | null;
+  executionPolicy?: IntradayExecutionPolicy | null;
   unsupportedSymbols: string[];
   requestedLimit: number;
   candidateCount: number;
@@ -1283,7 +1390,7 @@ export interface IntradayPulseResponse {
   sessionStateBasis: 'america_new_york_clock_v1';
   sessionPhase: IntradaySessionPhase;
   sessionPhaseLabel: string;
-  sessionPhaseHintBasis: 'user_trading_history_hardcoded_v1';
+  sessionPhaseHintBasis: 'america_new_york_liquidity_context_neutral_v2';
   items: IntradayPulseItem[];
   limitations: string[];
 }

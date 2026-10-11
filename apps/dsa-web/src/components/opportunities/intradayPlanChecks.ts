@@ -1,5 +1,6 @@
 import type {
   IntradayBurstWindow,
+  IntradayExecutionPolicy,
   IntradayLaneAvailability,
   IntradayTopCandidate,
 } from '../../types/opportunities';
@@ -7,10 +8,9 @@ import {
   earningsCheck,
   evaluateLaneChecklist,
   evaluateLaneDayType,
-  isIntradayLaneClosed,
   laneForDayType,
-  OVERNIGHT_MAX_DTE,
-  OVERNIGHT_MIN_DTE,
+  ACTIVE_DTE_MAX,
+  ACTIVE_DTE_MIN,
   type CheckStatus,
   type LaneDayTypeReading,
   type LaneId,
@@ -20,14 +20,15 @@ import {
  * 「盘中计划」逐标的的**机械核对**判定层（组件只渲染，判定全在这里）。
  *
  * 它把两类东西拼在一起，**都不是买卖建议**：
- * 1. 用户自己那套规则（V2-A/B/C/E）在**今天这个标的**上的逐条状态——车道规则
+ * 1. INTRA-0-7/v1 在**今天这个标的**上的逐条状态——车道规则
  *    与 ET 时钟直接复用 `laneChecklist.ts` 的同一套判定（不另写一份，避免两处
  *    规则漂移），财报回避复用同文件的 `earningsCheck`；
- * 2. 扫描已经算好的读数（近 30 分位移 / 速度 / 哑火 / 形态 / 波段 vs 大盘 /
- *    今日波段）——原样透出，不重算、不打分、不排序。
+ * 2. 扫描已经算好的研究读数（近 30 分位移，以及 legacy 5m 的速度 / 哑火 /
+ *    形态 / 波段 vs 大盘 / 今日波段）——原样透出，不重算、不打分、不排序；
+ *    legacy 读数一律 neutral，绝不参与 P0/P0-X 或手动合约分级。
  *
  * 五种状态：`pass` / `fail` / `missing`（查过了拿不到）/ `requirement`（系统
- * 已知的硬性要求，例如「今日只能 4-7DTE」）/ `neutral`（纯描述读数——近 30 分
+ * 已知的硬性要求，例如「必须同一 ET 交易日平仓」）/ `neutral`（纯描述读数——近 30 分
  * 位移对 0.5 ATR 参考线只描述、不判定，v8 循环性更正后不再有「符合/不符合」
  * 框架）。**没有概率、没有胜率、没有目标价**。
  *
@@ -42,7 +43,7 @@ export interface PlanCheckRow {
   status: CheckStatus;
   /** 一行原因。 */
   reason: string;
-  /** 规则编号（V2-A/B/C/E）；扫描读数没有规则编号时为 null，改标口径。 */
+  /** 规则编号；扫描读数没有规则编号时为 null，改标口径。 */
   ruleId: string | null;
   /** 读数口径（ruleId 为 null 时展示），例如「你自己 766 笔的 0.5 ATR 存活线」。 */
   basis: string | null;
@@ -50,7 +51,7 @@ export interface PlanCheckRow {
 
 export interface PlanTickerView {
   ticker: string;
-  /** 今日成立的车道（V2-E）；标缺/读取中为 null，不猜。 */
+  /** 今日唯一活动车道；标缺/不可用/读取中为 null，不猜。 */
   lane: LaneId | null;
   dayType: LaneDayTypeReading;
   /** 今日车道那一行文字（面板直接渲染）。 */
@@ -60,20 +61,34 @@ export interface PlanTickerView {
   checks: PlanCheckRow[];
   /** 今日波段 chips：原样透出服务端读数。 */
   legs: IntradayBurstWindow[];
-  /** 合约区请求的 DTE 上界（日内＝0，过夜＝7，车道未知＝7）。 */
+  /** 合约区固定请求 0..7DTE。 */
   contractMaxDte: number;
-  /** 合约区只看这个下界及以上的到期（过夜＝4，日内＝0，车道未知＝0）。 */
+  /** 合约区固定从 0DTE 开始显示。 */
   contractMinDte: number;
   /**
-   * 合约窗口口径：`unknown`＝今日车道标缺/读取中——**不默认日内**，同时
-   * 显示 0DTE（V2-A）与 4-7DTE（V2-B）两个窗口，1-3DTE 仍然绝不显示
-   * （V2-C① 与车道无关）。
+   * 合约窗口口径固定为唯一活动车道；0..7DTE 连续显示。
    */
-  contractWindowMode: 'intraday' | 'overnight' | 'unknown';
+  contractWindowMode: 'intra_0_7';
   contractDteLabel: string;
   /** 失效位参考（只给已有观测值，不算任何目标价）。 */
   invalidationReference: string | null;
+  /**
+   * 今日财报长权利金硬性警示：标的确证在当前 ET 日发布财报
+   * 且本面板合约候选为买入权利金时非空。只警示、
+   * 不禁止、不隐藏任何内容——系统只读。
+   */
+  earningsHardBlock: string | null;
 }
+
+/**
+ * 硬性警示文案（证据引用固定，测试锁定）：de Silva, Smith & So (2026,
+ * Rev. Finance)——财报前买权利金平均亏损 5-9%，高预期波动事件 10-14%。
+ */
+export const EARNINGS_PREMIUM_HARD_BLOCK_TEXT =
+  '硬性警示：今日财报 · 本面板车道为买入权利金——'
+  + '财报前买权利金是文献最确定亏损模式之一（IV 买贵＋点差＋拖延平仓）'
+  + '——de Silva, Smith & So (2026, Rev. Finance)：平均亏损 5-9%，'
+  + '高预期波动事件 10-14%。系统只读：只警示，不禁止任何操作。';
 
 /** 用户自己 766 笔回合推出的经验线（描述统计，不是预测）。 */
 export const DISPLACEMENT_SURVIVAL_LINE_ATR = 0.5;
@@ -91,25 +106,24 @@ function laneRuleChecks(
   laneAvailability: IntradayLaneAvailability | null,
   loading: boolean,
   nowMs?: number,
+  executionPolicy?: IntradayExecutionPolicy | null,
 ): PlanCheckRow[] {
   // 直接复用车道清单的判定（dte 留空 → 输出「今天的要求」而不是标缺）。
   const result = evaluateLaneChecklist({
     lane,
     dte: null,
-    intendsToCloseToday: false,
     pulseGeneratedAt,
     laneAvailability,
     loading,
     nowMs,
+    executionPolicy,
   });
   return result.checks.map((check) => ({
     id: check.id,
     label: check.label,
     status: check.status,
     reason: check.reason,
-    ruleId: check.id === 'dte'
-      ? (lane === 'intraday' ? 'V2-A' : 'V2-B')
-      : (lane === 'intraday' ? 'V2-A/C③' : 'V2-B'),
+    ruleId: 'INTRA-0-7/v1',
     basis: null,
   }));
 }
@@ -168,16 +182,16 @@ function speedRow(item: IntradayTopCandidate | null): PlanCheckRow {
     };
   }
   if (speed.state === 'accelerating') {
-    return { ...base, status: 'pass', reason: '加速中（当前窗口爆发分高于上一窗口）' };
+    return { ...base, status: 'neutral', reason: '加速中（观察值；不构成进场或持有指令）' };
   }
   if (speed.state === 'decelerating') {
     return {
       ...base,
-      status: 'fail',
-      reason: '减速中——对应你自己 R1 的离场提示，不是系统信号',
+      status: 'neutral',
+      reason: '减速中（观察值；不映射旧 R1，也不构成离场指令）',
     };
   }
-  return { ...base, status: 'fail', reason: '持平（两个窗口爆发分基本相同）' };
+  return { ...base, status: 'neutral', reason: '持平（观察值；两个窗口爆发分基本相同）' };
 }
 
 function fizzleRow(item: IntradayTopCandidate | null): PlanCheckRow {
@@ -199,15 +213,19 @@ function fizzleRow(item: IntradayTopCandidate | null): PlanCheckRow {
     const ref = flag.reference;
     return {
       ...base,
-      status: 'fail',
+      status: 'neutral',
       reason:
-        `当前窗口命中哑火形态：该形态 30 分钟内达到 ≥0.5 ATR 有利位移 `
+        `旧 5m 研究读数命中哑火形态：该形态 30 分钟内达到 ≥0.5 ATR 有利位移 `
         + `${(ref.inSampleRate * 100).toFixed(1)}%（样本内 n=${ref.nIn}）/ `
         + `${(ref.outOfSampleRate * 100).toFixed(1)}%（样本外 n=${ref.nOut}），`
         + `基准 ${(ref.baseRateIn * 100).toFixed(1)}%/${(ref.baseRateOut * 100).toFixed(1)}%`,
     };
   }
-  return { ...base, status: 'pass', reason: '当前窗口未命中哑火形态' };
+  return {
+    ...base,
+    status: 'neutral',
+    reason: '旧 5m 研究读数未命中哑火形态；不参与 P0/P0-X 或合约分级',
+  };
 }
 
 function setupRow(item: IntradayTopCandidate | null): PlanCheckRow {
@@ -230,20 +248,24 @@ function setupRow(item: IntradayTopCandidate | null): PlanCheckRow {
   if (profile.matchedSetups.length > 0) {
     return {
       ...base,
-      status: 'pass',
-      reason: `命中 ${profile.matchedSetups.join('/')}${
+      status: 'neutral',
+      reason: `旧 5m 研究标注命中 ${profile.matchedSetups.join('/')}${
         profile.partialSetups.length > 0 ? ` · 部分命中 ${profile.partialSetups.join('/')}` : ''
-      }`,
+      }；不参与分级`,
     };
   }
   if (profile.partialSetups.length > 0) {
     return {
       ...base,
-      status: 'fail',
-      reason: `仅部分命中 ${profile.partialSetups.join('/')}，无完整形态匹配`,
+      status: 'neutral',
+      reason: `旧 5m 研究标注仅部分命中 ${profile.partialSetups.join('/')}；不参与分级`,
     };
   }
-  return { ...base, status: 'fail', reason: '当前时段几何不匹配 S1/S2/S3 中的任何一个' };
+  return {
+    ...base,
+    status: 'neutral',
+    reason: '旧 5m 研究标注未匹配 S1/S2/S3；不参与分级',
+  };
 }
 
 function alignmentRow(item: IntradayTopCandidate | null): PlanCheckRow {
@@ -264,8 +286,16 @@ function alignmentRow(item: IntradayTopCandidate | null): PlanCheckRow {
     };
   }
   return alignment.state === 'aligned'
-    ? { ...base, status: 'pass', reason: '当前爆发方向与 SPY 会话 VWAP 位置同向' }
-    : { ...base, status: 'fail', reason: '当前爆发方向与 SPY 会话 VWAP 位置相逆' };
+    ? {
+      ...base,
+      status: 'neutral',
+      reason: '旧 5m 爆发方向与 SPY 会话 VWAP 位置同向；仅作研究上下文',
+    }
+    : {
+      ...base,
+      status: 'neutral',
+      reason: '旧 5m 爆发方向与 SPY 会话 VWAP 位置相逆；仅作研究上下文',
+    };
 }
 
 function legsRow(item: IntradayTopCandidate | null): PlanCheckRow {
@@ -273,7 +303,7 @@ function legsRow(item: IntradayTopCandidate | null): PlanCheckRow {
     id: 'legs',
     label: '今日波段',
     ruleId: null,
-    basis: '滚动 15 分钟推力×量比；strong=暴动口径 ≥8.0，medium=持续推升 ≥2.5',
+    basis: 'legacy 5m 滚动 15 分钟启发式；只作兼容研究，不参与提醒、排序或分级',
   };
   const bursts = item?.sessionBursts;
   if (!item || !bursts || bursts.state !== 'ready') {
@@ -288,17 +318,23 @@ function legsRow(item: IntradayTopCandidate | null): PlanCheckRow {
     };
   }
   if (bursts.legs.length === 0) {
-    return { ...base, status: 'fail', reason: '本时段无记录波段' };
+    return {
+      ...base,
+      status: 'neutral',
+      reason: 'legacy 5m 本时段无记录波段；不代表没有严格 2m P0',
+    };
   }
   const strong = bursts.legs.filter((leg) => leg.grade === 'strong').length;
   return {
     ...base,
-    status: 'pass',
-    reason: `本时段 ${bursts.legs.length} 段记录波段${strong > 0 ? `（其中暴动 ${strong} 段）` : ''}`,
+    status: 'neutral',
+    reason: `legacy 5m 本时段 ${bursts.legs.length} 段研究波段${
+      strong > 0 ? `（旧 strong 标签 ${strong} 段）` : ''
+    }；不参与 P0/P0-X 或合约分级`,
   };
 }
 
-/** 失效位参考：只引用已有观测值（会话低/高与最近一段反向波段），不算目标价。 */
+/** 失效位参考：只引用会话低/高；legacy 5m 波段不参与。 */
 function invalidationReference(
   item: IntradayTopCandidate | null,
 ): string | null {
@@ -306,11 +342,6 @@ function invalidationReference(
   const parts: string[] = [];
   if (item.sessionLow !== null) parts.push(`今日最低 ${item.sessionLow.toFixed(2)}`);
   if (item.sessionHigh !== null) parts.push(`今日最高 ${item.sessionHigh.toFixed(2)}`);
-  const legs = item.sessionBursts.state === 'ready' ? item.sessionBursts.legs : [];
-  const lastDown = [...legs].reverse().find((leg) => leg.direction === 'down');
-  const lastUp = [...legs].reverse().find((leg) => leg.direction === 'up');
-  if (lastDown) parts.push(`最近一段下行波段 ${lastDown.startEt}–${lastDown.endEt}`);
-  if (lastUp) parts.push(`最近一段上行波段 ${lastUp.startEt}–${lastUp.endEt}`);
   return parts.length > 0 ? parts.join(' · ') : null;
 }
 
@@ -319,6 +350,7 @@ export interface PlanTickerInput {
   candidates: IntradayTopCandidate[];
   laneAvailability: IntradayLaneAvailability | null;
   pulseGeneratedAt: string | null;
+  executionPolicy?: IntradayExecutionPolicy | null;
   loading?: boolean;
   /** 「现在」的毫秒时戳（测试注入用）；缺省取 `Date.now()`。 */
   nowMs?: number;
@@ -334,9 +366,10 @@ export function evaluatePlanTicker(input: PlanTickerInput): PlanTickerView {
     (candidate) => candidate.ticker.trim().toUpperCase() === wanted,
   ) ?? null;
 
-  // 今日车道未定（标缺/读取中）时，车道规则按「日内」写出要求并如实标注
-  // 车道可用性状态——绝不因为读不到就默认日内成立。
-  const effectiveLane: LaneId = lane ?? 'intraday';
+  // 活动车道只有一条；可用性未知时仍可写出固定要求，但 `lane` 保持 null，
+  // 绝不把未知冒充已放行。
+  const effectiveLane: LaneId = lane ?? 'intra_0_7';
+  const earnings = earningsCheck(wanted, input.candidates);
   const checks: PlanCheckRow[] = [
     ...laneRuleChecks(
       effectiveLane,
@@ -344,18 +377,16 @@ export function evaluatePlanTicker(input: PlanTickerInput): PlanTickerView {
       input.laneAvailability,
       loading,
       input.nowMs,
+      input.executionPolicy,
     ),
-    (() => {
-      const check = earningsCheck(wanted, input.candidates);
-      return {
-        id: check.id,
-        label: check.label,
-        status: check.status,
-        reason: check.reason,
-        ruleId: null,
-        basis: '你自己的财报回避窗（服务端 blackout_days）；未知≠安全',
-      };
-    })(),
+    {
+      id: earnings.id,
+      label: earnings.label,
+      status: earnings.status,
+      reason: earnings.reason,
+      ruleId: null,
+      basis: 'INTRA-0-7 当前规则：仅当日财报硬拦；未来事件不跨越；未知≠安全',
+    },
     displacementRow(item),
     speedRow(item),
     fizzleRow(item),
@@ -364,12 +395,8 @@ export function evaluatePlanTicker(input: PlanTickerInput): PlanTickerView {
     legsRow(item),
   ];
 
-  // 合约窗口跟随今日车道；车道未知（标缺/读取中）时**不默认日内**：
-  // 同时显示 0DTE 与 4-7DTE 两个窗口，并把「今日车道未知」写在标题上
-  // （1-3DTE 与车道无关地绝不显示，V2-C①）。
-  const overnight = isIntradayLaneClosed(dayType) || lane === 'overnight';
-  const contractWindowMode: PlanTickerView['contractWindowMode'] =
-    lane === null ? 'unknown' : overnight ? 'overnight' : 'intraday';
+  // 合约候选永远读取完整 0..7DTE；可用性未知也不再拆成旧日内/过夜窗口。
+  const contractWindowMode: PlanTickerView['contractWindowMode'] = 'intra_0_7';
   return {
     ticker: wanted,
     lane,
@@ -378,17 +405,14 @@ export function evaluatePlanTicker(input: PlanTickerInput): PlanTickerView {
     inDeepLane: item !== null,
     checks,
     legs: item && item.sessionBursts.state === 'ready' ? item.sessionBursts.legs : [],
-    contractMaxDte: contractWindowMode === 'intraday' ? 0 : OVERNIGHT_MAX_DTE,
-    contractMinDte: contractWindowMode === 'overnight' ? OVERNIGHT_MIN_DTE : 0,
+    contractMaxDte: ACTIVE_DTE_MAX,
+    contractMinDte: ACTIVE_DTE_MIN,
     contractWindowMode,
-    contractDteLabel:
-      contractWindowMode === 'overnight'
-        ? `${OVERNIGHT_MIN_DTE}-${OVERNIGHT_MAX_DTE}DTE（V2-B 过夜车道）`
-        : contractWindowMode === 'intraday'
-          ? '0DTE（V2-A 日内车道）'
-          : `今日车道未知 · 同时显示 0DTE（V2-A）与 `
-            + `${OVERNIGHT_MIN_DTE}-${OVERNIGHT_MAX_DTE}DTE（V2-B）两个窗口`
-            + '——绝不 1-3DTE（V2-C①）',
+    contractDteLabel: '0–7DTE（INTRA-0-7 · 必须同一 ET 交易日平仓）',
     invalidationReference: invalidationReference(item),
+    // earningsCheck 只在确证“今日财报”时 fail；未来事件不跨越，不做硬拦。
+    earningsHardBlock: earnings.status === 'fail'
+      ? EARNINGS_PREMIUM_HARD_BLOCK_TEXT
+      : null,
   };
 }

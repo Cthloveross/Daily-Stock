@@ -66,6 +66,15 @@ import src.journal.ledger.artifact_gc_models as _artifact_gc_models  # noqa: F40
 # intentionally left out of the append-only guard list (see its docstring).
 import src.journal.ledger.review_flow_models as _review_flow_models  # noqa: F401
 
+# Register the Phase B push ledger (blueprint 17 §三(e)-4): every alert
+# decision and delivery outcome is an immutable row guarded by deny triggers.
+import src.journal.ledger.push_models as _push_models  # noqa: F401
+
+# Register strict-2m live-forward observations on the same shared metadata.
+# The table is separate from the user-facing push feed but uses the identical
+# append-only SQLite guard contract.
+import src.journal.ledger.p0_2m_shadow_models as _p0_2m_shadow_models  # noqa: F401
+
 __all__ = [
     "DEFAULT_LEDGER_ACCOUNT_KEY",
     "LEDGER_APPEND_ONLY_GUARD_MESSAGE",
@@ -133,6 +142,11 @@ _APPEND_ONLY_TABLE_NAMES = (
     "journal_v2_artifact_gc_receipts",
     "journal_v2_daily_review_sessions",
     "journal_v2_episode_excursions",
+    "journal_v2_push_events",
+    "journal_v2_p0_2m_shadow_observations",
+    "journal_v2_p0_2m_shadow_enrollments",
+    "journal_v2_p0_2m_shadow_export_attestations",
+    "journal_v2_p0_2m_activation_artifact_attestations",
 )
 _LEDGER_SCHEMA_LOCK = threading.RLock()
 
@@ -408,6 +422,26 @@ _EXCURSION_COPY_COLUMNS = (
     "missing_sessions_json, computed_at"
 )
 
+_PUSH_TABLE_NAME = "journal_v2_push_events"
+_PUSH_LEGACY_TABLE_NAME = "journal_v2_push_events_pre_p0x"
+_PUSH_SCOPE_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS ix_jv2_push_events_scope ON "
+    f"{_PUSH_TABLE_NAME} (et_date, record_kind, tier)"
+)
+_PUSH_TICKER_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS ix_jv2_push_events_ticker ON "
+    f"{_PUSH_TABLE_NAME} (et_date, ticker)"
+)
+# Every pre-P0X column, in stable copy order. ``session_scope`` is appended
+# during migration so existing immutable rows retain their original ids and
+# payloads while honestly remaining unscoped.
+_PUSH_PRE_P0X_COPY_COLUMNS = (
+    "id, push_id, record_kind, et_date, ts, tier, rule, ticker, text, "
+    "dedupe_key_json, conditions_json, lane_rule_id, playbook_ref, "
+    "option_mid, option_spread_pct, gate_state, delivery_channel, "
+    "suppressed, suppressed_reason, message_key, telegram_ok, created_at"
+)
+
 
 def _migrate_excursion_attempt_column(engine: Any) -> None:
     """One-time SQLite rebuild adding ``attempt`` to the excursion table.
@@ -460,6 +494,7 @@ def _migrate_excursion_attempt_column(engine: Any) -> None:
         raw.commit()
     finally:
         raw.close()
+
     # 新表由 create_all 按当前模型创建（含 attempt 与新唯一键）。
     Base.metadata.create_all(engine)
     raw = engine.raw_connection()
@@ -485,12 +520,115 @@ def _migrate_excursion_attempt_column(engine: Any) -> None:
         raw.close()
 
 
+def _migrate_push_p0x_schema(engine: Any) -> None:
+    """Idempotently add P0X and its explicit session evidence to SQLite.
+
+    SQLite cannot alter a CHECK constraint in place.  The original push
+    table rejects ``P0X`` and has no ``session_scope`` column, so rebuild it
+    with the current SQLAlchemy model, copy every immutable row verbatim, and
+    reinstall the two named indexes.  A retained legacy table is treated as
+    an interrupted migration and resumed by id, matching the excursion-table
+    rebuild contract above.
+    """
+    raw = engine.raw_connection()
+    try:
+        cursor = raw.cursor()
+        legacy_exists = cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (_PUSH_LEGACY_TABLE_NAME,),
+        ).fetchone() is not None
+        if not legacy_exists:
+            current = cursor.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                (_PUSH_TABLE_NAME,),
+            ).fetchone()
+            if current is None:
+                return
+            table_sql = str(current[0] or "")
+            columns = {
+                str(row[1])
+                for row in cursor.execute(
+                    f"PRAGMA table_info({_PUSH_TABLE_NAME})"
+                )
+            }
+            if (
+                "session_scope" in columns
+                and "P0X" in table_sql
+                and "ck_jv2_push_event_p0x_session_scope" in table_sql
+                and "session_scope IS NOT NULL" in table_sql
+            ):
+                # ``create_all`` skips indexes on an existing table; repair
+                # either index if an interrupted/manual operation removed it.
+                cursor.execute(_PUSH_SCOPE_INDEX_DDL)
+                cursor.execute(_PUSH_TICKER_INDEX_DDL)
+                raw.commit()
+                return
+
+        # Trigger names are global in SQLite.  Drop them both for a fresh
+        # rename and for a resumed migration where one may still target the
+        # retained legacy table; init_ledger_schema reinstalls them below.
+        for operation in ("UPDATE", "DELETE"):
+            cursor.execute(
+                "DROP TRIGGER IF EXISTS "
+                + ledger_guard_trigger_name(_PUSH_TABLE_NAME, operation)
+            )
+        if not legacy_exists:
+            cursor.execute(
+                f"ALTER TABLE {_PUSH_TABLE_NAME} "
+                f"RENAME TO {_PUSH_LEGACY_TABLE_NAME}"
+            )
+        # SQLite index names are database-global and survive table RENAME.
+        cursor.execute("DROP INDEX IF EXISTS ix_jv2_push_events_scope")
+        cursor.execute("DROP INDEX IF EXISTS ix_jv2_push_events_ticker")
+        raw.commit()
+    finally:
+        raw.close()
+
+    # Build the destination with the authoritative model (new tier CHECK,
+    # session column, and P0X-outside-regular constraint).
+    Base.metadata.create_all(engine)
+
+    raw = engine.raw_connection()
+    try:
+        cursor = raw.cursor()
+        cursor.execute("PRAGMA foreign_keys=OFF")
+        legacy_columns = {
+            str(row[1])
+            for row in cursor.execute(
+                f"PRAGMA table_info({_PUSH_LEGACY_TABLE_NAME})"
+            )
+        }
+        if "session_scope" in legacy_columns:
+            target_columns = (
+                f"{_PUSH_PRE_P0X_COPY_COLUMNS}, session_scope"
+            )
+            source_columns = target_columns
+        else:
+            target_columns = (
+                f"{_PUSH_PRE_P0X_COPY_COLUMNS}, session_scope"
+            )
+            source_columns = f"{_PUSH_PRE_P0X_COPY_COLUMNS}, NULL"
+        cursor.execute(
+            f"INSERT INTO {_PUSH_TABLE_NAME} ({target_columns}) "
+            f"SELECT {source_columns} FROM {_PUSH_LEGACY_TABLE_NAME} "
+            f"WHERE id NOT IN (SELECT id FROM {_PUSH_TABLE_NAME})"
+        )
+        cursor.execute(f"DROP TABLE {_PUSH_LEGACY_TABLE_NAME}")
+        cursor.execute(_PUSH_SCOPE_INDEX_DDL)
+        cursor.execute(_PUSH_TICKER_INDEX_DDL)
+        raw.commit()
+        cursor.execute("PRAGMA foreign_keys=ON")
+    finally:
+        raw.close()
+
+
 def init_ledger_schema() -> None:
     """Create only missing tables; existing legacy Journal rows are untouched."""
     with _LEDGER_SCHEMA_LOCK:
         db = get_db()
         if db._engine.dialect.name == "sqlite":
             _migrate_excursion_attempt_column(db._engine)
+            _migrate_push_p0x_schema(db._engine)
         Base.metadata.create_all(db._engine)
         if db._engine.dialect.name == "sqlite":
             with db._engine.begin() as connection:

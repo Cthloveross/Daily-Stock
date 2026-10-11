@@ -12,7 +12,6 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 
 from src.opportunities.intraday_bursts import (
-    BURST_SUPPORT_MIN,
     DISPLACEMENT_ATR_BASIS_DAILY,
     DISPLACEMENT_ATR_BASIS_PROXY,
     DISPLACEMENT_SURVIVAL_LINE_ATR,
@@ -27,7 +26,6 @@ from src.opportunities.intraday_top import (
     GAP_BASIS_SNAPSHOT_PREV_CLOSE,
     INTRADAY_STATISTICS_TRACK,
     INTRADAY_TOP_SIGNAL_VERSION,
-    RANKING_METHOD_BURST_FIRST,
     RANKING_METHOD_EVIDENCE_COUNT,
     IntradayDailyContext,
     IntradayQuoteInput,
@@ -345,35 +343,36 @@ class TestRunAssembly:
         run = self._run()
         assert run["schema_version"] == "intraday-top/1.0"
         assert run["signal_version"] == INTRADAY_TOP_SIGNAL_VERSION
-        assert run["signal_version"] == "intraday_session_evidence_v8"
-        # 盘中（current_session scope）＝爆发分优先；休市＝最近交易时段的
-        # 最强波段分（缺波段读数的行退回证据计数序）。
-        assert run["ranking_method"] == RANKING_METHOD_BURST_FIRST
+        assert run["signal_version"] == "intraday_session_evidence_v9"
+        # v9 起所有时段都按非 legacy 证据排序；5m burst 只作复盘展示。
+        assert run["ranking_method"] == RANKING_METHOD_EVIDENCE_COUNT
         assert self._run(session_state="closed")["ranking_method"] == (
-            RANKING_METHOD_BURST_FIRST
+            RANKING_METHOD_EVIDENCE_COUNT
         )
         assert run["statistics_track"] == INTRADAY_STATISTICS_TRACK
         assert run["unsupported_symbols"] == ["600519"]
         assert any("不冻结" in text for text in run["limitations"])
         assert any("不推断开平仓" in text for text in run["limitations"])
-        assert any("波段爆发" in text for text in run["limitations"])
+        assert any("burst_score" in text for text in run["limitations"])
         # v3 设计规则随响应携带：系统标注，用户过滤。
         assert any("系统标注，用户过滤" in text for text in run["limitations"])
-        # 休市排序口径文案与实际实现一致（v2 起按最近时段最强波段分），
-        # 不得再声称「休市退回证据计数排序」。
-        assert not any("休市退回证据计数排序" in text for text in run["limitations"])
-        assert any(
-            "休市按最近交易时段的最强波段分排序" in text
-            for text in run["limitations"]
-        )
+        assert any("不再进入支持项计数、排序" in text for text in run["limitations"])
 
     def test_run_session_phase_from_as_of_clock(self):
-        # _AS_OF = 2026-07-28（周二）14:30 UTC = 10:30 ET → prime（主战场）。
+        # _AS_OF = 2026-07-28（周二）14:30 UTC = 10:30 ET → prime。
         run = self._run()
         assert run["session_phase"] == "prime"
-        assert "主战场" in run["session_phase_label"]
-        assert run["session_phase_hint_basis"] == "user_trading_history_hardcoded_v1"
-        # 周六休市：时段标签同样诚实为休市/复盘。
+        assert run["session_phase_label"] == (
+            "10:00–11:00 · 上午流动性与波动环境"
+        )
+        assert run["session_phase_hint_basis"] == (
+            "america_new_york_liquidity_context_neutral_v2"
+        )
+        assert not any(
+            text in run["session_phase_label"]
+            for text in ("主战场", "默认观望", "轻仓")
+        )
+        # 周六休市：时段标签同样诚实为休市/历史行情查看。
         saturday = build_intraday_top_run(
             symbols=["NVDA"],
             unsupported_symbols=[],
@@ -389,6 +388,13 @@ class TestRunAssembly:
         )
         assert saturday["session_phase"] == "closed"
         assert "休市" in saturday["session_phase_label"]
+
+    def test_limitations_do_not_map_clock_or_speed_to_trade_instructions(self):
+        limitations = " ".join(self._run()["limitations"])
+        assert "默认观望" not in limitations
+        assert "离场提示" not in limitations
+        assert "不包含轻仓、进场、观望、持有或离场建议" in limitations
+        assert "不映射任何离场规则" in limitations
 
     def test_run_market_context_and_candidate_alignment(self):
         spy = _quote(
@@ -461,12 +467,20 @@ class TestRunAssembly:
 
 
 class TestBurstEvidence:
-    def test_supports_at_threshold_both_directions(self):
-        below = _candidate(burst_profile=_burst_profile(BURST_SUPPORT_MIN - 0.01))
-        at = _candidate(burst_profile=_burst_profile(BURST_SUPPORT_MIN))
+    def test_legacy_score_is_neutral_at_every_value(self):
+        below = _candidate(burst_profile=_burst_profile(5.99))
+        at = _candidate(burst_profile=_burst_profile(20.0))
         assert _evidence_status(below, "session_momentum_burst") == "neutral"
-        assert _evidence_status(at, "session_momentum_burst") == "supports"
-        assert at["supporting_evidence_count"] == below["supporting_evidence_count"] + 1
+        assert _evidence_status(at, "session_momentum_burst") == "neutral"
+        assert at["supporting_evidence_count"] == below["supporting_evidence_count"]
+        item = next(
+            row for row in at["evidence"] if row["metric"] == "session_momentum_burst"
+        )
+        assert item["actionability"] == "legacy_context"
+        assert at["session_bursts"]["legacy"] is True
+        assert at["session_bursts"]["legacy_usage"] == (
+            "api_compatibility_and_research_display_only"
+        )
 
     def test_missing_profile_is_unknown_and_never_blocks_aggregates(self):
         candidate = _candidate(burst_profile=None)
@@ -565,24 +579,24 @@ class TestBurstRanking:
             burst_profiles=burst_profiles,
         )
 
-    def test_in_session_higher_burst_outranks_higher_evidence_count(self):
-        # NVDA 拿满聚合证据；TSLA 证据更少但当前爆发分更高 → TSLA 在前。
+    def test_in_session_burst_never_outranks_nonlegacy_evidence(self):
+        # NVDA 非 legacy 证据更多；TSLA 的高 burst 分不再改变顺序。
         run = self._run(
             burst_profiles={
                 "NVDA": _burst_profile(6.5),
                 "TSLA": _burst_profile(20.0),
             }
         )
-        assert [item["ticker"] for item in run["candidates"]] == ["TSLA", "NVDA"]
-        assert run["ranking_method"] == RANKING_METHOD_BURST_FIRST
+        assert [item["ticker"] for item in run["candidates"]] == ["NVDA", "TSLA"]
+        assert run["ranking_method"] == RANKING_METHOD_EVIDENCE_COUNT
 
-    def test_in_session_missing_burst_falls_behind_scored_rows(self):
+    def test_in_session_missing_burst_does_not_change_order(self):
         run = self._run(
             burst_profiles={"TSLA": _burst_profile(6.5)}
         )
-        assert [item["ticker"] for item in run["candidates"]] == ["TSLA", "NVDA"]
+        assert [item["ticker"] for item in run["candidates"]] == ["NVDA", "TSLA"]
 
-    def test_closed_session_ranks_by_strongest_session_leg(self):
+    def test_closed_session_legacy_legs_do_not_change_order(self):
         legs = [
             {
                 "start_et": "09:40",
@@ -606,15 +620,15 @@ class TestBurstRanking:
         run = self._run(
             session_state="closed",
             burst_profiles={
-                # 休市按最近交易时段的最强波段分排序：TSLA（50.0）在前，
-                # NVDA（最强腿 9.33）在后；波段列表仍完整携带供复盘。
+                # TSLA 虽有更高 legacy 分，NVDA 仍按非 legacy 证据在前；
+                # 波段列表继续完整携带供复盘。
                 "NVDA": _burst_profile(1.0, legs=legs),
                 "TSLA": _burst_profile(50.0),
             },
         )
-        assert run["ranking_method"] == RANKING_METHOD_BURST_FIRST
-        assert [item["ticker"] for item in run["candidates"]] == ["TSLA", "NVDA"]
-        nvda = run["candidates"][1]
+        assert run["ranking_method"] == RANKING_METHOD_EVIDENCE_COUNT
+        assert [item["ticker"] for item in run["candidates"]] == ["NVDA", "TSLA"]
+        nvda = run["candidates"][0]
         assert [leg["start_et"] for leg in nvda["session_bursts"]["legs"]] == [
             "09:40",
             "15:15",

@@ -269,7 +269,7 @@ describe('IntradayTrackingPanel', () => {
     expect(screen.getAllByText('标缺 · Moomoo 未启用')).toHaveLength(2);
   });
 
-  it('polls every 60s only while the tab is visible and the session is open', async () => {
+  it('polls every 3 minutes only while the tab is visible and the session is open', async () => {
     vi.useFakeTimers();
     render(<IntradayTrackingPanel candidates={[candidate()]} />);
     await act(async () => {
@@ -287,7 +287,7 @@ describe('IntradayTrackingPanel', () => {
       setDocumentVisibility('hidden');
     });
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(180_000);
+      await vi.advanceTimersByTimeAsync(60_000);
     });
     expect(fetchIntradayTracking).toHaveBeenCalledTimes(2);
 

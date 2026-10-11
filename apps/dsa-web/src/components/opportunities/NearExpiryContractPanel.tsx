@@ -37,12 +37,11 @@ function formatCount(value: number | null): string {
 }
 
 /**
- * v3 财报临近头标（与扫描表财报列同一套语义与样式）：
- * - 回避窗内（≤blackoutDays 天）→ 醒目警示「财报 N 天内 · 期权贵 ·
- *   你的回避规则」（0 天 →「今日财报…」），在看合约的瞬间可见；
- * - ready 且在回避窗外 → 不渲染任何标注（不制造噪音）；
- * - 日历不可得（或旧缓存载荷缺字段）→ 小字「财报日历标缺 · 未知≠安全」，
- *   绝不以缺失冒充安全。
+ * 财报上下文（与扫描表同一套当前规则）：
+ * - 今日财报 → 醒目硬拦截；
+ * - 未来财报 → 中性提示，并重申 INTRA-0-7 当日平仓、不跨事件；
+ * - 前向窗口内无财报 → 不制造噪音；
+ * - 日历不可得（或旧缓存载荷缺字段）→ 显式标缺，绝不冒充安全。
  */
 function EarningsProximityBadge({
   proximity,
@@ -54,14 +53,19 @@ function EarningsProximityBadge({
       <span className="text-caption text-text-3">财报日历标缺 · 未知≠安全</span>
     );
   }
-  if (!proximity.withinBlackout || proximity.daysToEarnings === null) {
+  if (proximity.daysToEarnings === null) {
     return null;
   }
+  const isToday = proximity.daysToEarnings === 0;
   return (
-    <span className="inline-block rounded-ds-sm border border-[color:var(--warn-muted)] bg-bg-0 px-1.5 py-0.5 text-caption font-medium text-warning">
-      {proximity.daysToEarnings === 0
-        ? '今日财报 · 期权贵 · 你的回避规则'
-        : `财报 ${proximity.daysToEarnings} 天内 · 期权贵 · 你的回避规则`}
+    <span
+      className={isToday
+        ? 'inline-block rounded-ds-sm border border-[color:var(--warn-muted)] bg-bg-0 px-1.5 py-0.5 text-caption font-medium text-warning'
+        : 'inline-block rounded-ds-sm border border-subtle bg-bg-0 px-1.5 py-0.5 text-caption text-text-2'}
+    >
+      {isToday
+        ? '今日财报 · INTRA-0-7 硬拦截'
+        : `距财报 ${proximity.daysToEarnings} 天 · 当日平仓，不跨事件`}
     </span>
   );
 }
@@ -204,7 +208,7 @@ function ContractTable({ group }: { group: NearExpiryExpiryGroup }) {
  */
 export function NearExpiryContractPanel({
   symbol,
-  maxDte = 3,
+  maxDte = 7,
 }: {
   symbol: string;
   maxDte?: number;
