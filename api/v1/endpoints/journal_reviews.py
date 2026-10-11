@@ -79,7 +79,7 @@ from src.journal.ledger.repository import (
 )
 from src.journal.personal_edge import (
     PersonalEdgeResult,
-    RULE_SET_V2_ADOPTED_AT,
+    RULE_SET_INTRA_0_7_EFFECTIVE_AT,
     RuleComplianceSlice,
     get_personal_edge_stats,
 )
@@ -388,6 +388,12 @@ def _personal_edge_response(
         rule_compliance=PersonalEdgeRuleComplianceModel(
             rule_set_id=result.rule_compliance.rule_set_id,
             adopted_at=result.rule_compliance.adopted_at,
+            active_rule_set_id=result.rule_compliance.active_rule_set_id,
+            active_rule_set_effective_at=(
+                result.rule_compliance.active_rule_set_effective_at
+            ),
+            forward_slice_start=result.rule_compliance.forward_slice_start,
+            classification_basis=result.rule_compliance.classification_basis,
             clean_basis_start=result.rule_compliance.clean_basis_start,
             clean_basis_reason=result.rule_compliance.clean_basis_reason,
             population_n=result.rule_compliance.population_n,
@@ -433,11 +439,12 @@ def get_personal_edge(
         pattern=r"^[A-Za-z0-9_.:-]+$",
     ),
     since: str = Query(
-        RULE_SET_V2_ADOPTED_AT,
+        RULE_SET_INTRA_0_7_EFFECTIVE_AT,
         pattern=r"^\d{4}-\d{2}-\d{2}$",
         description=(
-            "车道遵守度前向切片的起点（ET 自然日）；默认＝规则 v2 采纳日。"
-            "只影响 rule_compliance.since_adoption，不影响任何既有字段。"
+            "车道遵守度前向切片的起点（ET 自然日）；默认＝"
+            "INTRA-0-7 生效日。只影响 rule_compliance.since_adoption，"
+            "不改变每个回合按入场日选择规则版本的结果。"
         ),
     ),
 ) -> PersonalEdgeResponse:
@@ -446,8 +453,8 @@ def get_personal_edge(
     Per-underlying / hold-time / DTE / monthly buckets plus the additive
     ``discipline`` block (规模与频率：每美元回报 + 仓位 + 频率 + 本体/尾部 +
     成交明细来源，按月与近 20 个交易日窗口) and the additive ``rule_compliance``
-    block (车道遵守度：把本人规则 v2 的车道判定与合规/违规每美元读数按干净口径
-    摊开，全历史 + 采纳后两个切片) recomputed from the same effective default
+    block (车道遵守度：按 ET 入场日在冻结的 V2 与当前 INTRA-0-7
+    之间选择，再摊开全历史 + 前向切片) recomputed from the same effective default
     build the other journal reads use, cached in-process for ~10 minutes per
     ``(account_key, since)``.  Descriptive only — never a signal, never a
     filter, and no order is ever placed; the endogeneity, reconstructed-fill,
@@ -497,6 +504,10 @@ def _rules_evidence_response(
         clean_basis_start=result.clean_basis_start,
         clean_basis_reason=result.clean_basis_reason,
         rule_set_adopted_at=result.rule_set_adopted_at,
+        historical_rule_set_id=result.historical_rule_set_id,
+        active_rule_set_id=result.active_rule_set_id,
+        active_rule_set_effective_at=result.active_rule_set_effective_at,
+        classification_basis=result.classification_basis,
         sample_episode_count=result.sample_episode_count,
         excluded_before_clean_basis=result.excluded_before_clean_basis,
         excluded_aggregate_or_unknown_basis=(

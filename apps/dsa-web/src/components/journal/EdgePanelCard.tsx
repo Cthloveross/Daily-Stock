@@ -77,8 +77,13 @@ export const EdgePanelCard: React.FC = () => {
   const discipline = panel?.discipline ?? null;
   const evidence = panel?.edge?.evidence ?? null;
   const expectancy = panel?.edge?.expectancy ?? null;
-  const overCap = discipline !== null && discipline.trades_today > discipline.daily_cap;
-  const feeRed = discipline?.fee_ratio != null && discipline.fee_ratio > 0.3;
+  const legacyThresholdsActive = discipline?.rule_thresholds_active === true;
+  const overCap = legacyThresholdsActive
+    && discipline !== null
+    && discipline.trades_today > discipline.daily_cap;
+  const feeRed = legacyThresholdsActive
+    && discipline?.fee_ratio != null
+    && discipline.fee_ratio > 0.3;
 
   return (
     <section
@@ -237,19 +242,19 @@ export const EdgePanelCard: React.FC = () => {
               </p>
             )}
 
-            {/* 纪律行：R2 频率硬顶（超限标红，不禁止）与 R3 费率红灯。 */}
+            {/* 描述统计：旧 R2/R3 阈值已退役，不再生成当前交易警告。 */}
             {discipline && (
               <div className="flex flex-wrap items-center gap-x-6 gap-y-1 border-t border-subtle pt-3 text-body-sm">
                 <span className={overCap ? 'text-down-strong' : 'text-text-1'}>
                   今日{' '}
                   <span className="font-mono tabular-nums">
-                    {discipline.trades_today}/{discipline.daily_cap}
+                    {discipline.trades_today}
                   </span>{' '}
                   笔
                   {overCap && <span className="ml-1 text-caption">超出 R2 频率硬顶</span>}
                 </span>
                 <span className={feeRed ? 'text-down-strong' : 'text-text-1'}>
-                  本月费率{' '}
+                  本月费用/毛利比{' '}
                   <span className="font-mono tabular-nums">
                     {discipline.fee_ratio == null
                       ? MISSING
@@ -257,6 +262,9 @@ export const EdgePanelCard: React.FC = () => {
                   </span>
                   {feeRed && <span className="ml-1 text-caption">超过 30% 红线 (R3)</span>}
                 </span>
+                {!legacyThresholdsActive && (
+                  <span className="text-caption text-text-3">旧 R2/R3 阈值已退役 · 仅作描述统计</span>
+                )}
                 <span className="text-caption text-text-3">
                   本月费用 {fmtSignedUsd(discipline.month_fees)} / 毛利{' '}
                   {fmtSignedUsd(discipline.month_gross)}

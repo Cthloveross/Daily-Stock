@@ -291,6 +291,12 @@ def test_rule_compliance_block_is_additive_and_keeps_existing_fields():
     compliance = body["rule_compliance"]
     assert compliance["rule_set_id"] == "v2"
     assert compliance["adopted_at"] == "2026-08-05"
+    assert compliance["active_rule_set_id"] == "INTRA-0-7"
+    assert compliance["active_rule_set_effective_at"] == "2026-09-01"
+    assert compliance["forward_slice_start"] == "2026-09-01"
+    assert compliance["classification_basis"] == (
+        "opened_et_date_effective_rule_set"
+    )
     assert compliance["clean_basis_start"] == "2026-04-21"
     assert compliance["exclude_top_n"] == 5
     assert compliance["exclude_top_n_min_episode_count"] == 15
@@ -358,7 +364,7 @@ def test_rule_compliance_since_adoption_is_empty_and_says_so():
     forward = client.get(URL).json()["rule_compliance"]["since_adoption"]
     assert forward["state"] == "no_episodes_since_adoption"
     assert forward["n"] == 0
-    assert "2026-08-05" in forward["state_reason"]
+    assert "2026-09-01" in forward["state_reason"]
     assert all(lane["n"] == 0 for lane in forward["lanes"])
     assert all(lane["gross_pct"] is None for lane in forward["lanes"])
 
@@ -368,7 +374,8 @@ def test_rule_compliance_since_query_moves_only_the_forward_slice():
     client = _client()
     body = client.get(URL, params={"since": "2026-05-07"}).json()
     compliance = body["rule_compliance"]
-    assert compliance["adopted_at"] == "2026-05-07"
+    assert compliance["adopted_at"] == "2026-08-05"
+    assert compliance["forward_slice_start"] == "2026-05-07"
     # 全历史切片不受影响。
     assert compliance["all_history"]["n"] == 6
     forward = compliance["since_adoption"]
@@ -395,6 +402,7 @@ def test_rule_compliance_rejects_a_malformed_since():
     client = _client()
     assert client.get(URL, params={"since": "20260805"}).status_code == 422
     assert client.get(URL, params={"since": "not-a-date"}).status_code == 422
+    assert client.get(URL, params={"since": "2026-99-99"}).status_code == 422
 
 
 def test_activating_a_newer_build_busts_the_personal_edge_cache():

@@ -116,6 +116,11 @@ def test_ready_response_carries_every_evidence_table():
     assert body["data_state"] == "ready"
     assert body["sample_episode_count"] == 4
     assert body["build_id"] >= 1
+    assert body["rule_set_adopted_at"] == "2026-08-05"
+    assert body["historical_rule_set_id"] == "v2"
+    assert body["active_rule_set_id"] == "INTRA-0-7"
+    assert body["active_rule_set_effective_at"] == "2026-09-01"
+    assert body["classification_basis"] == "opened_et_date_effective_rule_set"
     assert body["first_trading_day"] == "2026-05-04"
     assert body["last_trading_day"] == "2026-05-06"
     # 每张表都在，前端不需要自己算任何一个数。

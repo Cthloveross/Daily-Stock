@@ -18,9 +18,11 @@ import queue
 import statistics
 import threading
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from io import StringIO
 from typing import Any, Callable, Optional
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,26 @@ _CBOE_VIX_HISTORY_URL = (
 _MOOMOO_CAPABILITY_MISS_TTL_SECONDS = 600.0
 _moomoo_capability_misses: dict[str, float] = {}
 _moomoo_capability_lock = threading.Lock()
+_CORE_DAILY_SYMBOLS = {"SPY", "VIX", "^VIX"}
+_CORE_DAILY_CACHE_MAX_ENTRIES = 8
+_YFINANCE_CORE_TIMEOUT_SECONDS = 5.0
+_CBOE_VIX_ATTEMPTS = 2
+_CBOE_VIX_ATTEMPT_TIMEOUT_SECONDS = 2.5
+_NEW_YORK = ZoneInfo("America/New_York")
+
+
+@dataclass(frozen=True)
+class _CoreDailyCacheEntry:
+    frame: Any
+    source: str
+    latest_observation_date: date
+    stored_at: float
+
+
+_core_daily_cache: dict[
+    tuple[str, date, int], _CoreDailyCacheEntry
+] = {}
+_core_daily_cache_lock = threading.Lock()
 
 
 def _safe_import_yf():
@@ -75,6 +97,7 @@ class RegimeDataFetcher:
         yf=_UNSET,
         manager=_UNSET,
         request_budget_seconds: float = 18.0,
+        shared_core_cache: Optional[bool] = None,
     ):
         yf_was_explicit = yf is not self._UNSET
         # yfinance: lazy import unless caller wires something else.
@@ -82,6 +105,15 @@ class RegimeDataFetcher:
         self._deadline = time.monotonic() + max(1.0, float(request_budget_seconds))
         self._daily_cache: dict[tuple[str, date, int], tuple[Any, Optional[str]]] = {}
         self._manager_owned = False
+        # Production fetchers share proved core daily frames across the 09:12
+        # primary and 09:17 recovery attempts.  Explicitly injected providers
+        # default to isolation so tests and callers with custom data sources do
+        # not inherit process state unless they opt in deliberately.
+        self._shared_core_cache = (
+            not yf_was_explicit and manager is self._UNSET
+            if shared_core_cache is None
+            else bool(shared_core_cache)
+        )
 
         # Production uses the same provider layer as the rest of the project,
         # including its enabled MoomooFetcher and shared QuoteContext.  Tests
@@ -246,7 +278,7 @@ class RegimeDataFetcher:
 
         ok, value = self._bounded_call(
             fetch,
-            timeout_seconds=3.0,
+            timeout_seconds=_YFINANCE_CORE_TIMEOUT_SECONDS,
             label=f"yfinance-{yf_symbol}",
         )
         if not ok:
@@ -260,16 +292,43 @@ class RegimeDataFetcher:
         target_date: date,
         lookback_days: int,
     ):
-        """Read the official Cboe daily VIX close file with a hard timeout."""
-        timeout = min(3.0, self._remaining_budget())
-        if timeout <= 0:
-            return None
+        """Read official VIX history with two budget-bounded transport tries."""
         try:
             import pandas as pd
             import requests
 
-            response = requests.get(_CBOE_VIX_HISTORY_URL, timeout=timeout)
-            response.raise_for_status()
+            response = None
+            last_transport_error: Optional[Exception] = None
+            for attempt in range(1, _CBOE_VIX_ATTEMPTS + 1):
+                timeout = min(
+                    _CBOE_VIX_ATTEMPT_TIMEOUT_SECONDS,
+                    self._remaining_budget(),
+                )
+                if timeout <= 0:
+                    break
+                try:
+                    response = requests.get(
+                        _CBOE_VIX_HISTORY_URL,
+                        timeout=timeout,
+                    )
+                    response.raise_for_status()
+                    break
+                except requests.RequestException as exc:
+                    last_transport_error = exc
+                    response = None
+                    logger.info(
+                        "Regime official Cboe VIX attempt %s/%s failed: %s",
+                        attempt,
+                        _CBOE_VIX_ATTEMPTS,
+                        exc,
+                    )
+            if response is None:
+                if last_transport_error is not None:
+                    logger.info(
+                        "Regime official Cboe VIX fallback exhausted: %s",
+                        last_transport_error,
+                    )
+                return None
             frame = pd.read_csv(StringIO(response.text))
             normalized = {str(column).strip().upper(): column for column in frame.columns}
             date_column = normalized.get("DATE")
@@ -300,11 +359,19 @@ class RegimeDataFetcher:
         if key in self._daily_cache:
             return self._daily_cache[key]
 
+        if self._shared_core_cache and symbol.upper() in _CORE_DAILY_SYMBOLS:
+            cached = _get_core_daily_cache(key, target_date)
+            if cached is not None:
+                self._daily_cache[key] = cached
+                return cached
+
         frame = None
         source: Optional[str] = None
         if self.manager is not None:
             try:
                 frame = self._fetch_moomoo_daily(symbol, target_date, lookback_days)
+                if self._shared_core_cache and symbol.upper() in _CORE_DAILY_SYMBOLS:
+                    frame = _validated_core_daily_frame(frame, target_date)
                 if frame is not None and not frame.empty:
                     source = "MoomooFetcher"
             except Exception as exc:  # noqa: BLE001
@@ -322,6 +389,8 @@ class RegimeDataFetcher:
             and symbol.upper() in {"VIX", "^VIX"}
         ):
             frame = self._fetch_cboe_vix_daily(target_date, lookback_days)
+            if self._shared_core_cache:
+                frame = _validated_core_daily_frame(frame, target_date)
             if frame is not None and not frame.empty:
                 source = "Cboe"
 
@@ -329,14 +398,25 @@ class RegimeDataFetcher:
         # series.  Eleven sector ETFs must not fan out into eleven slow Yahoo
         # requests when the local read-only source is unavailable.
         allow_remote_fallback = (
-            self.manager is None or symbol.upper() == "SPY"
+            self.manager is None
+            or symbol.upper() in {"SPY", "VIX", "^VIX"}
         )
         if (frame is None or frame.empty) and allow_remote_fallback:
             frame = self._fetch_yfinance_daily(symbol, target_date, lookback_days)
+            if self._shared_core_cache and symbol.upper() in _CORE_DAILY_SYMBOLS:
+                frame = _validated_core_daily_frame(frame, target_date)
             if frame is not None and not frame.empty:
                 source = "yfinance"
 
         result = (frame, source)
+        if (
+            self._shared_core_cache
+            and symbol.upper() in _CORE_DAILY_SYMBOLS
+            and frame is not None
+            and not frame.empty
+            and source is not None
+        ):
+            _put_core_daily_cache(key, frame, source, target_date)
         self._daily_cache[key] = result
         return result
 
@@ -756,6 +836,199 @@ class RegimeDataFetcher:
         except Exception as exc:  # noqa: BLE001
             logger.warning("yfinance history(%s) failed: %s", symbol, exc)
             return []
+
+
+def _validated_core_daily_frame(
+    frame: Any,
+    target_date: date,
+):
+    """Return a causally filtered frame only when it reaches the exact session."""
+    if frame is None or frame.empty:
+        return None
+    expected_session = _latest_completed_xnys_session(target_date)
+    if expected_session is None:
+        return None
+    try:
+        eligible = _daily_frame_through(frame, target_date)
+    except Exception as exc:  # noqa: BLE001 - invalid evidence fails closed
+        logger.info("Regime core daily frame validation failed: %s", exc)
+        return None
+    latest = _latest_daily_observation_date(eligible)
+    if latest != expected_session:
+        logger.info(
+            "Regime core daily frame is not current: latest=%s expected=%s",
+            latest,
+            expected_session,
+        )
+        return None
+    return eligible
+
+
+def _get_core_daily_cache(
+    key: tuple[str, date, int],
+    target_date: date,
+) -> Optional[tuple[Any, str]]:
+    """Return a copied core frame only when its newest session is still exact."""
+    expected_session = _latest_completed_xnys_session(target_date)
+    if expected_session is None:
+        return None
+    with _core_daily_cache_lock:
+        entry = _core_daily_cache.get(key)
+        if entry is None:
+            return None
+        if entry.latest_observation_date != expected_session:
+            # Keep stale entries from accumulating or being reconsidered on
+            # every request.  An exact target-date key can never become fresh
+            # again once the expected completed session has advanced.
+            _core_daily_cache.pop(key, None)
+            return None
+        try:
+            frame = entry.frame.copy(deep=True)
+        except TypeError:
+            frame = entry.frame.copy()
+    logger.info(
+        "Regime core daily shared-cache hit: %s through %s",
+        key[0],
+        entry.latest_observation_date,
+    )
+    return frame, f"{entry.source}:shared-core-cache"
+
+
+def _put_core_daily_cache(
+    key: tuple[str, date, int],
+    frame: Any,
+    source: str,
+    target_date: date,
+) -> None:
+    """Cache only complete, causally dated SPY/VIX histories.
+
+    The cache is deliberately process-local: it bridges the canonical 09:12
+    and 09:17 attempts without creating a new persistence contract.  A frame
+    is accepted only when its newest row equals the authoritative latest
+    completed XNYS session.  Undated, stale, or future-only data is ignored.
+    """
+    expected_session = _latest_completed_xnys_session(target_date)
+    if expected_session is None:
+        return
+    try:
+        eligible = _daily_frame_through(frame, target_date)
+    except Exception as exc:  # noqa: BLE001 - cache is optional
+        logger.debug("Regime core daily cache validation failed: %s", exc)
+        return
+    if eligible is None or eligible.empty:
+        return
+    latest = _latest_daily_observation_date(eligible)
+    if latest != expected_session:
+        logger.info(
+            "Regime core daily cache rejected for %s: latest=%s expected=%s",
+            key[0],
+            latest,
+            expected_session,
+        )
+        return
+    minimum_rows = 51 if key[0] == "SPY" else 6
+    if len(eligible) < minimum_rows:
+        return
+    try:
+        stored_frame = eligible.copy(deep=True)
+    except TypeError:
+        stored_frame = eligible.copy()
+    entry = _CoreDailyCacheEntry(
+        frame=stored_frame,
+        source=source,
+        latest_observation_date=latest,
+        stored_at=time.monotonic(),
+    )
+    with _core_daily_cache_lock:
+        _core_daily_cache[key] = entry
+        while len(_core_daily_cache) > _CORE_DAILY_CACHE_MAX_ENTRIES:
+            oldest_key = min(
+                _core_daily_cache,
+                key=lambda cache_key: _core_daily_cache[cache_key].stored_at,
+            )
+            _core_daily_cache.pop(oldest_key, None)
+
+
+def _clear_core_daily_cache_for_tests() -> None:
+    with _core_daily_cache_lock:
+        _core_daily_cache.clear()
+
+
+def _latest_completed_xnys_session(
+    target_date: date,
+    *,
+    now: Optional[datetime] = None,
+) -> Optional[date]:
+    """Resolve the newest XNYS session completed by ``now`` and <= target.
+
+    Calendar failure returns ``None`` so cache reuse fails closed.  This is
+    stricter than guessing from weekdays, which would mishandle holidays and
+    early closes.
+    """
+    observed_at = _aware_utc(now or datetime.now(timezone.utc))
+    market_now = observed_at.astimezone(_NEW_YORK)
+    if target_date > market_now.date():
+        return None
+    try:
+        import exchange_calendars as xcals
+
+        calendar = xcals.get_calendar("XNYS")
+        if calendar.is_session(target_date):
+            session = calendar.date_to_session(target_date, direction="none")
+            if target_date == market_now.date():
+                session_close = calendar.session_close(session)
+                if hasattr(session_close, "to_pydatetime"):
+                    session_close = session_close.to_pydatetime()
+                session_close_utc = _aware_utc(session_close)
+                if observed_at < session_close_utc:
+                    session = calendar.previous_session(session)
+        else:
+            session = calendar.date_to_session(target_date, direction="previous")
+        if hasattr(session, "to_pydatetime"):
+            session = session.to_pydatetime()
+        if isinstance(session, datetime):
+            return session.date()
+        if isinstance(session, date):
+            return session
+        return date.fromisoformat(str(session)[:10])
+    except Exception as exc:  # noqa: BLE001 - freshness must fail closed
+        logger.warning(
+            "Regime core daily cache cannot resolve XNYS session for %s: %s",
+            target_date,
+            exc,
+        )
+        return None
+
+
+def _latest_daily_observation_date(frame: Any) -> Optional[date]:
+    date_column = next(
+        (column for column in ("date", "Date") if column in frame.columns),
+        None,
+    )
+    if date_column is not None:
+        observed = [
+            value
+            for value in (
+                _daily_observation_date(raw) for raw in frame[date_column]
+            )
+            if value is not None
+        ]
+        return max(observed) if observed else None
+    try:
+        import pandas as pd
+
+        if isinstance(frame.index, pd.DatetimeIndex):
+            observed = [
+                value
+                for value in (
+                    _daily_observation_date(raw) for raw in frame.index
+                )
+                if value is not None
+            ]
+            return max(observed) if observed else None
+    except Exception:  # noqa: BLE001 - optional cache validation only
+        return None
+    return None
 
 
 def _optional_float(value: Any) -> Optional[float]:

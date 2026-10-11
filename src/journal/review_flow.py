@@ -112,8 +112,10 @@ REVIEW_FLOW_LIMITATIONS: tuple[str, ...] = (
     "揭示顺序（reveal_after_seal 与时间戳）本身入库",
     "车道判定纯机械（classify_rule_lane）：只读 DTE、ET 入场小时与 ET 自然日，"
     "不声称知道进场当时的意图",
-    "过程指标缺失即标缺（推送依从率、有效点差支付待 Phase B/C），"
-    "手填自评永不冒充自动值",
+    "过程指标缺失即标缺（有效点差支付待 Phase B/C；推送依从率自 Phase B 起由"
+    "推送台账机械关联点亮，台账当日无记录仍标缺），手填自评永不冒充自动值",
+    "推送依从率是机械关联（同 ET 日同标的、推送不晚于开仓）：只证明行动相关，"
+    "不证明因果——无法区分「看到推送后进场」与「本来就要进场」",
     "这是对本人自身历史的过程记账，不是因果结论、不是信号、不构成建议；"
     "本系统只读，不下单",
 )
@@ -574,16 +576,36 @@ def get_daily_review_flow(
     # --- 七项过程指标 ------------------------------------------------------
     metrics: list[ProcessMetric] = []
 
-    # 1 推送依从率 —— Phase B 才有 push ledger，标缺（可手填自评）。
-    metrics.append(
-        _missing_metric(
-            1,
-            "push ledger 未建（Phase B 起自动）；手填仅作自评，不冒充自动值",
-            manual_allowed=True,
-            manual_value=manual_by_metric.get(1),
-            basis="manual" if 1 in manual_by_metric else "missing",
-        )
+    # 1 推送依从率 —— Phase B：推送台账 × 今日新开回合的机械关联。
+    # 台账当日无记录（提示器未运行/未启用）或今日无新开回合 → 标缺（可手填
+    # 自评）；关联只证明行动相关、不证明因果（reason 原样携带诚实边界）。
+    from src.journal.push_metrics import compute_push_compliance
+
+    push_compliance = compute_push_compliance(
+        target_date,
+        [(row.underlying, row.opened_at) for row in opened_today_rows],
     )
+    if push_compliance.status == "ready":
+        metrics.append(
+            _auto_metric(
+                1,
+                value_ratio=push_compliance.ratio,
+                numerator=float(push_compliance.pushed_episodes),
+                denominator=float(push_compliance.total_episodes),
+                reason=push_compliance.reason,
+            )
+        )
+    else:
+        metrics.append(
+            _missing_metric(
+                1,
+                push_compliance.reason
+                or "推送台账不可得；手填仅作自评，不冒充自动值",
+                manual_allowed=True,
+                manual_value=manual_by_metric.get(1),
+                basis="manual" if 1 in manual_by_metric else "missing",
+            )
+        )
 
     # 2 结构依从率：今日新开回合按 |opening_cash_flow| 加权的合规风险占比。
     if not opened_today_rows:

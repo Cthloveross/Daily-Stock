@@ -28,6 +28,13 @@ import type {
 const RULES_BANNER_FALLBACK =
   '这一页是你自己的历史统计，不是建议；规则由这段样本推出，前向验证见 /journal 规则遵守度';
 
+/** 2026-09-01 前的 V2/V3 候选保留为审计历史，不再混入当前候选。 */
+const RETIRED_V2_V3_TITLE = /^V(?:2(?:-[A-E0])?|3)(?:\s|·|$)/i;
+
+function isRetiredV2V3Candidate(title: string): boolean {
+  return RETIRED_V2_V3_TITLE.test(title.trim());
+}
+
 const NUMBER_FORMAT = new Intl.NumberFormat('en-US', {
   maximumFractionDigits: 0,
 });
@@ -219,11 +226,27 @@ export const RulesPage: React.FC = () => {
   }, [load]);
 
   const activeRules = useMemo(
-    () => (playbook?.rules ?? []).filter((rule) => rule.isLatestVersion),
+    () => (playbook?.rules ?? []).filter(
+      (rule) => rule.isLatestVersion && rule.status === 'active',
+    ),
     [playbook],
   );
   const openCandidates = useMemo(
-    () => (playbook?.candidates ?? []).filter((candidate) => !candidate.promoted),
+    () => (playbook?.candidates ?? []).filter(
+      (candidate) => !candidate.promoted && !isRetiredV2V3Candidate(candidate.title),
+    ),
+    [playbook],
+  );
+  const retiredRules = useMemo(
+    () => (playbook?.rules ?? []).filter(
+      (rule) => rule.isLatestVersion && rule.status === 'retired',
+    ),
+    [playbook],
+  );
+  const historicalCandidates = useMemo(
+    () => (playbook?.candidates ?? []).filter(
+      (candidate) => isRetiredV2V3Candidate(candidate.title),
+    ),
     [playbook],
   );
 
@@ -305,42 +328,82 @@ export const RulesPage: React.FC = () => {
           <Section
             eyebrow="Playbook"
             title="规则清单"
-            description="规则原文与状态来自 Playbook，本页只读；提升与退役仍在 /journal 完成。"
+            description="当前规则与候选来自 Playbook；已取消的 V2/V3 候选只在历史/已退役区保留审计原文。"
           >
             {!playbook && (
               <p className="text-body-sm text-text-3">Playbook 暂不可读，证据表不受影响。</p>
             )}
             {playbook && activeRules.length === 0 && openCandidates.length === 0 && (
-              <p className="text-body-sm text-text-3">还没有任何候选或已采纳的规则。</p>
+              <p className="text-body-sm text-text-3">当前没有已采纳规则或开放候选。</p>
             )}
             {playbook && (
-              <ul className="space-y-2">
-                {activeRules.map((rule) => (
-                  <li key={rule.ruleKey} className="border-l-2 border-up-strong pl-3">
-                    <div className="flex flex-wrap items-baseline gap-2">
-                      <span className="text-body-sm text-text-1">{rule.title}</span>
-                      <span className="rounded-ds-sm bg-bg-3 px-1.5 text-caption text-text-2">
-                        已采纳 · v{rule.version} · {rule.status}
-                      </span>
-                    </div>
-                    <p className="mt-0.5 text-body-sm text-text-2">{rule.ruleText}</p>
-                  </li>
-                ))}
-                {openCandidates.map((candidate) => (
-                  <li
-                    key={candidate.candidateKey}
-                    className="border-l-2 border-[color:var(--warn-muted)] pl-3"
-                  >
-                    <div className="flex flex-wrap items-baseline gap-2">
-                      <span className="text-body-sm text-text-1">{candidate.title}</span>
-                      <span className="rounded-ds-sm bg-bg-3 px-1.5 text-caption text-text-2">
-                        候选
-                      </span>
-                    </div>
-                    <p className="mt-0.5 text-body-sm text-text-2">{candidate.ruleText}</p>
-                  </li>
-                ))}
-              </ul>
+              <>
+                <ul className="space-y-2" aria-label="当前规则与候选">
+                  {activeRules.map((rule) => (
+                    <li key={rule.ruleKey} className="border-l-2 border-up-strong pl-3">
+                      <div className="flex flex-wrap items-baseline gap-2">
+                        <span className="text-body-sm text-text-1">{rule.title}</span>
+                        <span className="rounded-ds-sm bg-bg-3 px-1.5 text-caption text-text-2">
+                          已采纳 · v{rule.version} · {rule.status}
+                        </span>
+                      </div>
+                      <p className="mt-0.5 text-body-sm text-text-2">{rule.ruleText}</p>
+                    </li>
+                  ))}
+                  {openCandidates.map((candidate) => (
+                    <li
+                      key={candidate.candidateKey}
+                      className="border-l-2 border-[color:var(--warn-muted)] pl-3"
+                    >
+                      <div className="flex flex-wrap items-baseline gap-2">
+                        <span className="text-body-sm text-text-1">{candidate.title}</span>
+                        <span className="rounded-ds-sm bg-bg-3 px-1.5 text-caption text-text-2">
+                          候选
+                        </span>
+                      </div>
+                      <p className="mt-0.5 text-body-sm text-text-2">{candidate.ruleText}</p>
+                    </li>
+                  ))}
+                </ul>
+
+                {(retiredRules.length > 0 || historicalCandidates.length > 0) && (
+                  <details className="mt-4 border-t border-subtle pt-3">
+                    <summary className="cursor-pointer text-body-sm font-medium text-text-2">
+                      历史/已退役（{retiredRules.length + historicalCandidates.length}）
+                    </summary>
+                    <p className="mt-1 text-caption text-text-3">
+                      仅保留原文与状态供审计；这些条目不属于当前规则或开放候选。
+                    </p>
+                    <ul className="mt-3 space-y-2" aria-label="历史/已退役规则">
+                      {retiredRules.map((rule) => (
+                        <li key={rule.ruleKey} className="border-l-2 border-subtle pl-3">
+                          <div className="flex flex-wrap items-baseline gap-2">
+                            <span className="text-body-sm text-text-2">{rule.title}</span>
+                            <span className="rounded-ds-sm bg-bg-3 px-1.5 text-caption text-text-3">
+                              已退役 · v{rule.version}
+                            </span>
+                          </div>
+                          <p className="mt-0.5 text-body-sm text-text-3">{rule.ruleText}</p>
+                        </li>
+                      ))}
+                      {historicalCandidates.map((candidate) => (
+                        <li
+                          key={candidate.candidateKey}
+                          className="border-l-2 border-subtle pl-3"
+                        >
+                          <div className="flex flex-wrap items-baseline gap-2">
+                            <span className="text-body-sm text-text-2">{candidate.title}</span>
+                            <span className="rounded-ds-sm bg-bg-3 px-1.5 text-caption text-text-3">
+                              历史候选 · 已退役
+                            </span>
+                          </div>
+                          <p className="mt-0.5 text-body-sm text-text-3">{candidate.ruleText}</p>
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
+              </>
             )}
           </Section>
 

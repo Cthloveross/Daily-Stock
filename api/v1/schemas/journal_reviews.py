@@ -480,10 +480,15 @@ class RuleComplianceSliceModel(BaseModel):
 
 
 class PersonalEdgeRuleComplianceModel(BaseModel):
-    """车道遵守度：把本人规则 v2 变成可前向证伪的记账（描述统计，非建议）。"""
+    """车道遵守度：按 ET 入场日选择历史 V2 或当前 INTRA-0-7。"""
 
+    # Legacy V2 metadata stays frozen for backward compatibility.
     rule_set_id: str
     adopted_at: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    active_rule_set_id: Literal["INTRA-0-7"]
+    active_rule_set_effective_at: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    forward_slice_start: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    classification_basis: Literal["opened_et_date_effective_rule_set"]
     clean_basis_start: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     clean_basis_reason: str
     population_n: int = Field(ge=0)
@@ -673,7 +678,13 @@ class RulesEvidenceResponse(BaseModel):
     computed_at: Optional[datetime] = None
     clean_basis_start: Optional[str] = None
     clean_basis_reason: Optional[str] = None
+    # ``rule_set_adopted_at`` is the legacy V2 field.  The active version is
+    # explicit below so clients never infer current policy from that date.
     rule_set_adopted_at: Optional[str] = None
+    historical_rule_set_id: Optional[str] = None
+    active_rule_set_id: Optional[str] = None
+    active_rule_set_effective_at: Optional[str] = None
+    classification_basis: Optional[str] = None
     sample_episode_count: int = Field(default=0, ge=0)
     excluded_before_clean_basis: int = Field(default=0, ge=0)
     excluded_aggregate_or_unknown_basis: int = Field(default=0, ge=0)

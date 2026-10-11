@@ -23,6 +23,8 @@ from src.journal.personal_edge import (
     DISCIPLINE_BODY_MIN_EPISODE_COUNT,
     DISCIPLINE_EXCLUDE_TOP_N,
     FILL_DETAILED_GOVERNS,
+    INTRA_0_7_MAX_DTE,
+    INTRA_0_7_MIN_DTE,
     INTRADAY_LANE_DTE,
     INTRADAY_LANE_ET_CUTOFF_HOUR,
     MONTH_BASIS_UTC_MINUS_4,
@@ -37,7 +39,10 @@ from src.journal.personal_edge import (
     RULE_COMPLIANCE_LANE_RULE_IDS,
     RULE_COMPLIANCE_LANE_VERDICTS,
     RULE_COMPLIANCE_LIMITATIONS,
+    RULE_CLASSIFICATION_BASIS,
     RULE_LANES,
+    RULE_SET_INTRA_0_7_EFFECTIVE_AT,
+    RULE_SET_INTRA_0_7_ID,
     RULE_SET_V2_ADOPTED_AT,
     RULE_VERDICTS,
     classify_rule_lane,
@@ -891,7 +896,7 @@ def test_discipline_limitations_carry_reconstructed_fill_and_gate_notes():
 
 
 # ---------------------------------------------------------------------------
-# 车道遵守度（rule_compliance）：规则 v2 的机械判定 + 前向切片
+# 车道遵守度（rule_compliance）：按 ET 入场日版本化 + 前向切片
 # ---------------------------------------------------------------------------
 
 
@@ -945,7 +950,29 @@ def test_classify_rule_lane_truth_table_covers_every_boundary():
     assert _lane(-1, 9, same, same) == "unknown"
     assert _lane(0, None, same, same) == "unknown"
     assert _lane(5, 9, same, None) == "unknown"
-    assert _lane(5, 9, None, later) == "unknown"
+    assert _lane(5, 9, None, later) == "policy_version_unknown"
+
+
+def test_classify_rule_lane_intra_0_7_effective_boundary_and_truth_table():
+    """9/1 起只做日内 0..7DTE；9/1 前仍完整保留 V2 语义。"""
+    before = "2026-08-31"
+    effective = RULE_SET_INTRA_0_7_EFFECTIVE_AT
+    later = "2026-09-02"
+
+    # 生效日前：5DTE 同日平仍是 V2-C②，不追溯改写。
+    assert _lane(5, 13, before, before) == "bought_time_unused"
+    # 生效日起：0 和 7 是合规边界，不再有午后 0DTE 禁令。
+    assert _lane(0, 23, effective, effective) == "intra_0_7_same_day"
+    assert _lane(7, 9, effective, effective) == "intra_0_7_same_day"
+    # 任何跨 ET 日均违规，包括 0DTE 与规则范围外的 8DTE。
+    assert _lane(0, 9, effective, later) == "intra_0_7_cross_day"
+    assert _lane(8, 9, effective, later) == "intra_0_7_cross_day"
+    # 同日但 >7DTE 是未覆盖，不冒充违规。
+    assert _lane(8, 9, effective, effective) == "intra_0_7_out_of_range"
+    # DTE / 入场小时 / 平仓 ET 日任一缺失均 fail closed。
+    assert _lane(None, 9, effective, effective) == "intra_0_7_unknown"
+    assert _lane(3, None, effective, effective) == "intra_0_7_unknown"
+    assert _lane(3, 9, effective, None) == "intra_0_7_unknown"
 
 
 def test_classify_rule_lane_same_day_boundary_is_calendar_not_duration():
@@ -998,6 +1025,11 @@ def _may(day: int, hour: int = 14) -> datetime:
     return datetime(2026, 5, day, hour, 0, tzinfo=timezone.utc)
 
 
+def _sep(day: int, hour: int = 14) -> datetime:
+    """September UTC moment under the module's ET≈UTC−4 compliance basis."""
+    return datetime(2026, 9, day, hour, 0, tzinfo=timezone.utc)
+
+
 def test_rule_compliance_buckets_and_verdict_rollups():
     """车道桶与合规/违规汇总同口径：gross=净+费用，risk=|开仓现金流|。"""
     _seed_build(
@@ -1033,6 +1065,10 @@ def test_rule_compliance_buckets_and_verdict_rollups():
     compliance = result.rule_compliance
     assert compliance.rule_set_id == "v2"
     assert compliance.adopted_at == RULE_SET_V2_ADOPTED_AT
+    assert compliance.active_rule_set_id == RULE_SET_INTRA_0_7_ID
+    assert compliance.active_rule_set_effective_at == RULE_SET_INTRA_0_7_EFFECTIVE_AT
+    assert compliance.forward_slice_start == RULE_SET_INTRA_0_7_EFFECTIVE_AT
+    assert compliance.classification_basis == RULE_CLASSIFICATION_BASIS
     assert compliance.clean_basis_start == RULE_COMPLIANCE_CLEAN_BASIS_START
     assert compliance.population_n == 8
 
@@ -1070,6 +1106,52 @@ def test_rule_compliance_buckets_and_verdict_rollups():
     assert verdicts["unknown"].n == 1
     # 每一条边界原文下发，消费端不得自行改写。
     assert compliance.limitations == RULE_COMPLIANCE_LIMITATIONS
+
+
+def test_rule_compliance_post_effective_episodes_use_separate_intra_0_7_lanes():
+    """Post-effective rows aggregate under INTRA-0-7 without rewriting V2 buckets."""
+    _seed_build(
+        [
+            _compliance_spec(_sep(1), "100", dte=0),
+            _compliance_spec(_sep(2), "50", dte=7),
+            _compliance_spec(_sep(3), "-40", dte=4, hold_seconds=90_000),
+            _compliance_spec(_sep(5), "10", dte=8),
+            {
+                "underlying": "AAA",
+                "opened_at": _sep(7),
+                "hold_seconds": 1_200,
+                "realized_pnl_net": Decimal("5"),
+                "total_fee": Decimal("1"),
+                "dte_at_entry": None,
+                "opening_cash_flow": Decimal("1000"),
+                "evidence_summary_json": _evidence_summary(3),
+            },
+        ]
+    )
+
+    result = get_personal_edge_stats()
+    assert result is not None
+    compliance = result.rule_compliance
+    assert compliance.since_adoption.start_date == RULE_SET_INTRA_0_7_EFFECTIVE_AT
+    assert compliance.since_adoption.n == 5
+    lanes = {item.key: item for item in compliance.since_adoption.lanes}
+    assert lanes["intra_0_7_same_day"].n == 2
+    assert lanes["intra_0_7_same_day"].verdict == "compliant"
+    assert lanes["intra_0_7_same_day"].rule_id == RULE_SET_INTRA_0_7_ID
+    assert lanes["intra_0_7_cross_day"].n == 1
+    assert lanes["intra_0_7_cross_day"].verdict == "violation"
+    assert lanes["intra_0_7_out_of_range"].n == 1
+    assert lanes["intra_0_7_out_of_range"].verdict == "uncovered"
+    assert lanes["intra_0_7_unknown"].n == 1
+    assert lanes["intra_0_7_unknown"].verdict == "unknown"
+    # The old V2 bucket exists for transport stability but receives no new rows.
+    assert lanes["intraday_0dte"].n == 0
+
+    verdicts = {item.key: item for item in compliance.since_adoption.verdicts}
+    assert verdicts["compliant"].n == 2
+    assert verdicts["violation"].n == 1
+    assert verdicts["uncovered"].n == 1
+    assert verdicts["unknown"].n == 1
 
 
 def test_rule_compliance_empty_bucket_says_no_sample_not_zero():
@@ -1182,7 +1264,10 @@ def test_rule_compliance_since_cutoff_slices_forward_only():
     result = get_personal_edge_stats(rule_compliance_since="2026-05-20")
     assert result is not None
     compliance = result.rule_compliance
-    assert compliance.adopted_at == "2026-05-20"
+    # Legacy adoption metadata is frozen; the query only moves the explicit
+    # forward slice and never changes per-episode policy routing.
+    assert compliance.adopted_at == RULE_SET_V2_ADOPTED_AT
+    assert compliance.forward_slice_start == "2026-05-20"
     assert compliance.all_history.n == 3
     assert compliance.all_history.state == "ready"
     assert compliance.all_history.start_date == RULE_COMPLIANCE_CLEAN_BASIS_START
@@ -1207,7 +1292,7 @@ def test_rule_compliance_since_adoption_empty_is_explicit_not_zeroed():
     assert forward.state == "no_episodes_since_adoption"
     assert forward.n == 0
     assert forward.state_reason is not None
-    assert RULE_SET_V2_ADOPTED_AT in forward.state_reason
+    assert RULE_SET_INTRA_0_7_EFFECTIVE_AT in forward.state_reason
     # 每条车道都在，但都是「无样本」而不是 0%。
     for lane in forward.lanes:
         assert lane.n == 0
@@ -1219,6 +1304,8 @@ def test_rule_compliance_since_rejects_a_non_date_cutoff():
     _seed_build([_compliance_spec(_may(4), "100", dte=0)])
     with pytest.raises(EpisodeRepositoryError):
         get_personal_edge_stats(rule_compliance_since="not-a-date")
+    with pytest.raises(EpisodeRepositoryError):
+        get_personal_edge_stats(rule_compliance_since="2026-99-99")
 
 
 def test_rule_compliance_daily_budget_block_is_removed():
@@ -1234,6 +1321,10 @@ def test_rule_compliance_daily_budget_block_is_removed():
 def test_rule_compliance_constants_match_the_adopted_rule_set():
     """UI 引用规则编号，数值只此一处真源——常量漂移会立刻被这条测试抓到。"""
     assert RULE_SET_V2_ADOPTED_AT == "2026-08-05"
+    assert RULE_SET_INTRA_0_7_ID == "INTRA-0-7"
+    assert RULE_SET_INTRA_0_7_EFFECTIVE_AT == "2026-09-01"
+    assert (INTRA_0_7_MIN_DTE, INTRA_0_7_MAX_DTE) == (0, 7)
+    assert RULE_CLASSIFICATION_BASIS == "opened_et_date_effective_rule_set"
     assert RULE_COMPLIANCE_CLEAN_BASIS_START == "2026-04-21"
     assert INTRADAY_LANE_DTE == 0
     assert INTRADAY_LANE_ET_CUTOFF_HOUR == 12

@@ -1104,7 +1104,7 @@ export interface PersonalEdgeDiscipline {
   fillDetailedGoverns?: string | null;
 }
 
-// --- rule compliance (车道遵守度): 规则 v2 的前向证伪记账 ---------------------
+// --- rule compliance: 按 ET 入场日在历史 V2 / 当前 INTRA-0-7 间版本化 ---
 
 export type RuleComplianceVerdict = 'compliant' | 'violation' | 'uncovered' | 'unknown';
 
@@ -1115,7 +1115,12 @@ export type RuleComplianceLane =
   | 'bought_time_unused'
   | 'late_0dte'
   | 'other'
-  | 'unknown';
+  | 'unknown'
+  | 'intra_0_7_same_day'
+  | 'intra_0_7_cross_day'
+  | 'intra_0_7_out_of_range'
+  | 'intra_0_7_unknown'
+  | 'policy_version_unknown';
 
 /**
  * 一个车道桶（或合规/违规汇总）的口径读数。
@@ -1157,8 +1162,13 @@ export interface RuleComplianceSlice {
 }
 
 export interface PersonalEdgeRuleCompliance {
+  /** Legacy V2 metadata, frozen for backward compatibility. */
   ruleSetId: string;
   adoptedAt: string;
+  activeRuleSetId?: 'INTRA-0-7';
+  activeRuleSetEffectiveAt?: string;
+  forwardSliceStart?: string;
+  classificationBasis?: 'opened_et_date_effective_rule_set';
   cleanBasisStart: string;
   cleanBasisReason: string;
   populationN: number;
@@ -1174,8 +1184,7 @@ export interface PersonalEdgeRuleCompliance {
   overnightLaneWeakEntryEtHours: number[];
   allHistory: RuleComplianceSlice;
   sinceAdoption: RuleComplianceSlice;
-  // dailyBudget（V2-D 额度读数）已于 2026-08 移除：Journal 永远不含「今天」，
-  // 该读数恒为过期；当日额度由 useIntradayManualBudgetStore 手动计数承载。
+  // dailyBudget（V2-D 额度读数）已退役；INTRA-0-7/v1 不设手动交易次数上限。
   limitations: string[];
 }
 
@@ -1311,7 +1320,12 @@ export interface RulesEvidenceResponse {
   computedAt: string | null;
   cleanBasisStart: string | null;
   cleanBasisReason: string | null;
+  /** Legacy V2 adoption date; use the active fields for current policy. */
   ruleSetAdoptedAt: string | null;
+  historicalRuleSetId?: string | null;
+  activeRuleSetId?: string | null;
+  activeRuleSetEffectiveAt?: string | null;
+  classificationBasis?: string | null;
   sampleEpisodeCount: number;
   excludedBeforeCleanBasis: number;
   excludedAggregateOrUnknownBasis: number;
@@ -1399,6 +1413,7 @@ export interface EdgePanelEdge {
 export interface EdgePanelDiscipline {
   trades_today: number;
   daily_cap: number;
+  rule_thresholds_active: boolean;
   month_fees: number;
   month_gross: number;
   fee_ratio: number | null;

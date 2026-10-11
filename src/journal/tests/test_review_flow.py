@@ -194,6 +194,69 @@ def test_daily_flow_verdicts_metrics_and_blind_payload():
     assert metrics[7].basis == "auto"
 
 
+def test_metric1_lights_up_from_push_ledger_with_honest_limits():
+    """Phase B：推送台账当日有记录时，指标 1 由机械关联点亮（自动值）。
+
+    夹具三回合均在 2026-08-20 开仓（AAA 09:45 / BBB 10:15 / CCC 10:30 ET）。
+    台账：AAA 开仓前有已投递 P1 → 依从；CCC 只有开仓后的推送 → 不依从；
+    BBB 无推送 → freelance。比率 = 1/3；reason 携带机械关联的诚实边界。
+    """
+    from datetime import datetime as _dt, timezone as _tz
+
+    from src.journal.ledger.push_ledger_repository import (
+        PushDecisionInput,
+        PushDeliveryInput,
+        append_push_events,
+        new_push_id,
+    )
+
+    _seed()
+
+    def _push(ticker, hour_utc, tier="P1", channel="telegram_silent"):
+        # 「已投递」＝decision 行 + telegram_ok=true 的 delivery 行（D8）。
+        message_key = new_push_id()
+        return (
+            PushDecisionInput(
+                push_id=new_push_id(),
+                et_date=DAY,
+                ts=_dt(2026, 8, 20, hour_utc, 0, tzinfo=_tz.utc),
+                tier=tier,
+                rule="p1_near_miss",
+                ticker=ticker,
+                text=f"{ticker} …",
+                delivery_channel=channel,
+                dedupe_key=("p1_near_miss", ticker),
+                message_key=message_key,
+            ),
+            PushDeliveryInput(
+                push_id=new_push_id(),
+                et_date=DAY,
+                ts=_dt(2026, 8, 20, hour_utc, 1, tzinfo=_tz.utc),
+                tier=tier,
+                message_key=message_key,
+                telegram_ok=True,
+                text="…",
+                channel=channel,
+            ),
+        )
+
+    aaa_decision, aaa_delivery = _push("AAA", 13)  # 09:00 ET，早于 AAA 开仓
+    ccc_decision, ccc_delivery = _push("CCC", 20)  # 16:00 ET，晚于 CCC 开仓
+    append_push_events(
+        [aaa_decision, ccc_decision],
+        [aaa_delivery, ccc_delivery],
+    )
+    flow = get_daily_review_flow(et_date=DAY)
+    assert flow is not None
+    metric1 = {m.metric_id: m for m in flow.process_metrics}[1]
+    assert metric1.basis == "auto"
+    assert metric1.value_ratio == pytest.approx(1 / 3)
+    assert metric1.numerator == 1.0 and metric1.denominator == 3.0
+    # 诚实边界：机械关联≠因果，reason 里必须可见。
+    assert "机械关联" in metric1.reason
+    assert metric1.manual_allowed is False
+
+
 def test_exit_plan_registration_lights_up_open_position():
     build_id, ids = _seed()
     append_review_annotation(
@@ -260,7 +323,8 @@ def test_episode_verdict_and_counterfactuals():
 def test_est_entry_hour_uses_real_eastern_time_not_utc_minus_4():
     """复核修复 6：EST（冬令时）下车道判定用真实 ET。
 
-    2026-12-01 16:30 UTC = 11:30 EST（UTC−5）。UTC−4 近似会算成 12:30，
+    选用 INTRA-0-7 生效日之前的 2026-02-02，确保这条仍能检测 V2
+    的 12:00 分界。2026-02-02 16:30 UTC = 11:30 EST（UTC−5）；UTC−4 会算成 12:30，
     把合规的 0DTE 上午单误判为 late_0dte；真实 ET 必须判 intraday_0dte。
     """
     from datetime import timezone as _tz
@@ -268,19 +332,40 @@ def test_est_entry_hour_uses_real_eastern_time_not_utc_minus_4():
 
     from src.journal.review_flow import _et_day, _et_hour, _lane_of
 
-    est_open = datetime(2026, 12, 1, 16, 30, tzinfo=_tz.utc)
+    est_open = datetime(2026, 2, 2, 16, 30, tzinfo=_tz.utc)
     assert _et_hour(est_open) == 11
     row = SimpleNamespace(
         opened_at=est_open,
-        closed_at=datetime(2026, 12, 1, 20, 0, tzinfo=_tz.utc),
+        closed_at=datetime(2026, 2, 2, 20, 0, tzinfo=_tz.utc),
         dte_at_entry=0,
     )
     assert _lane_of(row) == "intraday_0dte"
 
-    # 自然日边界：2026-12-01 04:30 UTC = 11-30 23:30 EST（UTC−4 会给 12-01）。
-    assert _et_day(datetime(2026, 12, 1, 4, 30, tzinfo=_tz.utc)) == "2026-11-30"
+    # 自然日边界：2026-02-02 04:30 UTC = 02-01 23:30 EST（UTC−4 会给 02-02）。
+    assert _et_day(datetime(2026, 2, 2, 4, 30, tzinfo=_tz.utc)) == "2026-02-01"
     # 夏令时（EDT=UTC−4）行为不变。
     assert _et_hour(datetime(2026, 8, 20, 13, 45, tzinfo=_tz.utc)) == 9
+
+
+def test_review_flow_uses_intra_0_7_for_post_effective_episodes():
+    """Daily/episode review inherits the shared effective-date policy router."""
+    from datetime import timezone as _tz
+    from types import SimpleNamespace
+
+    from src.journal.review_flow import _lane_of
+
+    same_day = SimpleNamespace(
+        opened_at=datetime(2026, 9, 1, 14, 0, tzinfo=_tz.utc),
+        closed_at=datetime(2026, 9, 1, 19, 0, tzinfo=_tz.utc),
+        dte_at_entry=7,
+    )
+    cross_day = SimpleNamespace(
+        opened_at=datetime(2026, 9, 1, 14, 0, tzinfo=_tz.utc),
+        closed_at=datetime(2026, 9, 2, 14, 0, tzinfo=_tz.utc),
+        dte_at_entry=4,
+    )
+    assert _lane_of(same_day) == "intra_0_7_same_day"
+    assert _lane_of(cross_day) == "intra_0_7_cross_day"
 
 
 def test_metric6_excludes_exit_plan_only_annotations():

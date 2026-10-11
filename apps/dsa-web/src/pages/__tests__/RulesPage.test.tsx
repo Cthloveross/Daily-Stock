@@ -195,6 +195,18 @@ const PLAYBOOK: PlaybookListResponse = {
       promoted: false,
       createdAt: '2026-08-01T00:00:00Z',
     },
+    {
+      id: 3,
+      candidateKey: 'cand-3',
+      accountKey: 'default_moomoo_us',
+      title: 'INTRA-0-7 滑点门槛待验证',
+      ruleText: '记录实际成交滑点，样本足够后再决定是否提升。',
+      sourceBucket: null,
+      evidenceSnapshot: {},
+      evidenceSnapshotSha256: 'c'.repeat(64),
+      promoted: false,
+      createdAt: '2026-09-01T00:00:00Z',
+    },
   ],
   rules: [
     {
@@ -207,12 +219,29 @@ const PLAYBOOK: PlaybookListResponse = {
       promotedFromCandidateId: 1,
       promotedFromCandidateKey: 'cand-1',
       previousRuleId: null,
-      title: 'V2-A 日内车道只做 0DTE',
-      ruleText: 'ET 12:00 之后不开新的 0DTE。',
+      title: 'INTRA-0-7 全部同日平仓',
+      ruleText: '0–7DTE 均可进入候选，但必须在同一 ET 交易日平仓。',
       evidenceSnapshot: {},
       evidenceSnapshotSha256: 'a'.repeat(64),
       isLatestVersion: true,
       createdAt: '2026-08-01T00:00:00Z',
+    },
+    {
+      id: 2,
+      ruleKey: 'rule-2',
+      lineageKey: 'lin-2',
+      accountKey: 'default_moomoo_us',
+      version: 2,
+      status: 'retired',
+      promotedFromCandidateId: 4,
+      promotedFromCandidateKey: 'cand-4',
+      previousRuleId: 3,
+      title: '旧版时段限制',
+      ruleText: '该规则已经退役。',
+      evidenceSnapshot: {},
+      evidenceSnapshotSha256: 'd'.repeat(64),
+      isLatestVersion: true,
+      createdAt: '2026-09-01T00:00:00Z',
     },
   ],
 } as PlaybookListResponse;
@@ -249,16 +278,31 @@ describe('RulesPage', () => {
     );
   });
 
-  it('renders the live playbook rules and candidates with their status', async () => {
+  it('keeps only active rules and current candidates in the current list', async () => {
     renderPage();
 
     const section = await screen.findByLabelText('规则清单');
-    expect(within(section).getByText('V2-A 日内车道只做 0DTE')).toBeInTheDocument();
-    expect(within(section).getByText(/已采纳/)).toBeInTheDocument();
+    const current = within(section).getByLabelText('当前规则与候选');
+    expect(within(current).getByText('INTRA-0-7 全部同日平仓')).toBeInTheDocument();
+    expect(within(current).getByText(/已采纳/)).toBeInTheDocument();
+    expect(within(current).getByText('INTRA-0-7 滑点门槛待验证')).toBeInTheDocument();
+    expect(within(current).getByText('候选')).toBeInTheDocument();
+    expect(within(current).queryByText('旧版时段限制')).not.toBeInTheDocument();
     expect(
-      within(section).getByText('V2-E 按合约可用性决定今天做不做日内'),
+      within(current).queryByText('V2-E 按合约可用性决定今天做不做日内'),
+    ).not.toBeInTheDocument();
+  });
+
+  it('preserves V2/V3 candidates and retired rules only under history', async () => {
+    renderPage();
+
+    const history = await screen.findByLabelText('历史/已退役规则');
+    expect(within(history).getByText('旧版时段限制')).toBeInTheDocument();
+    expect(within(history).getByText('已退役 · v2')).toBeInTheDocument();
+    expect(
+      within(history).getByText('V2-E 按合约可用性决定今天做不做日内'),
     ).toBeInTheDocument();
-    expect(within(section).getByText('候选')).toBeInTheDocument();
+    expect(within(history).getByText('历史候选 · 已退役')).toBeInTheDocument();
   });
 
   it('renders the contract price band table with its headline', async () => {

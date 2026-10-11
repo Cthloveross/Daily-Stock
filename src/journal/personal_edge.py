@@ -85,15 +85,15 @@ the trailing ``DISCIPLINE_WINDOW_TRADING_DAYS`` trading days.  It stays
 descriptive: it is a mirror, not advice, and every ratio fails closed (null +
 reason) rather than showing a number its denominator cannot support.
 
-车道遵守度（``rule_compliance`` block, 2026-08-04）
---------------------------------------------------
+车道遵守度（``rule_compliance`` block，按 ET 入场日版本化）
+-------------------------------------------------------------------
 
-Why this block exists — the user derived a two-lane rule set ("规则 v2",
-Playbook candidates 「V2-0」…「V2-D」) from their own clean-basis history and
-adopted it.  This block is the **forward falsification instrument**: it
-classifies every closed episode into a lane purely mechanically and reports
-合规单 vs 违规单 per-dollar edge, so the rule set can be confirmed or refuted
-by the user's own subsequent trades rather than by argument.
+Why this block exists — the historical V2 Playbook remains the immutable
+interpretation for episodes opened before 2026-09-01.  From that ET date,
+INTRA-0-7 replaces it for new episodes: entry DTE 0..7 plus a same-ET-day close
+is compliant, while a cross-day close is a violation.  This block classifies
+each closed episode under the rule effective on its entry date and reports
+合规单 vs 违规单 per-dollar edge without rewriting historical verdicts.
 
 Clean basis (``RULE_COMPLIANCE_CLEAN_BASIS_START``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -134,10 +134,10 @@ Hard boundaries of this block
 * the exclude-top-N readings reuse the discipline block's machinery
   (:func:`_exclude_top_n_readings`) and its ``n >= 15`` gate verbatim — a bucket
   below the gate returns null + reason, never a truncated number;
-* two slices ship side by side: ``all_history`` (the whole clean basis, i.e.
-  how the rules were derived) and ``since_adoption`` (from
-  ``RULE_SET_V2_ADOPTED_AT``, the forward test).  The forward slice is
-  legitimately empty at first and says so explicitly
+* two slices ship side by side: ``all_history`` (the whole clean basis, with
+  distinct V2 and INTRA-0-7 lane keys) and ``since_adoption`` (a movable
+  forward slice that defaults to ``RULE_SET_INTRA_0_7_EFFECTIVE_AT``).  The
+  forward slice is legitimately empty at first and says so explicitly
   (``no_episodes_since_adoption``) instead of rendering zeros;
 * everything is descriptive: a single trader, a single market regime
   (2026-04→07, SPY rising — overnight longs were structurally favoured), n=65
@@ -174,6 +174,8 @@ __all__ = [
     "DISCIPLINE_WINDOW_TRADING_DAYS",
     "DTE_BUCKETS",
     "FILL_DETAILED_GOVERNS",
+    "INTRA_0_7_MAX_DTE",
+    "INTRA_0_7_MIN_DTE",
     "INTRADAY_LANE_DTE",
     "INTRADAY_LANE_ET_CUTOFF_HOUR",
     "OVERNIGHT_LANE_MAX_DTE",
@@ -187,7 +189,10 @@ __all__ = [
     "RULE_COMPLIANCE_LANE_RULE_IDS",
     "RULE_COMPLIANCE_LANE_VERDICTS",
     "RULE_COMPLIANCE_LIMITATIONS",
+    "RULE_CLASSIFICATION_BASIS",
     "RULE_LANES",
+    "RULE_SET_INTRA_0_7_EFFECTIVE_AT",
+    "RULE_SET_INTRA_0_7_ID",
     "RULE_SET_V2_ADOPTED_AT",
     "RULE_SET_V2_ID",
     "RULE_VERDICTS",
@@ -265,16 +270,25 @@ PERSONAL_EDGE_LIMITATIONS = (
 )
 
 # ---------------------------------------------------------------------------
-# 车道遵守度（rule_compliance）常量：本人规则 v2 的机器可判定部分
+# 车道遵守度（rule_compliance）常量：按 ET 入场日版本化
 #
-# 这些常量是 Playbook 候选「V2-0」…「V2-D」里数字的唯一代码真源；UI 文案引用
-# 规则编号，数值一律从这里（经端点）读出来，前端不硬编码。
+# V2 在 2026-09-01 前的历史语义冻结，不回写；自 2026-09-01 起新回合
+# 改用 INTRA-0-7。两套规则使用不同 lane key，防止聚合时把新旧语义
+# 混成一个桶。UI 只渲染后端下发的 rule_id/阈值，不自行重算。
 # ---------------------------------------------------------------------------
 RULE_SET_V2_ID = "v2"
 
 # 规则采纳日（ET 自然日，用户的下一个交易日）。它是「前向验证」的起点：
 # 在这一天之前的回合只说明规则从哪里推出来，之后的回合才能证伪或确认它。
 RULE_SET_V2_ADOPTED_AT = "2026-08-05"
+
+# 当前活动规则：只做日内，入场 DTE 0..7，必须同一 ET 日平仓。
+# 生效日是硬边界：不追溯重分类旧回合。
+RULE_SET_INTRA_0_7_ID = "INTRA-0-7"
+RULE_SET_INTRA_0_7_EFFECTIVE_AT = "2026-09-01"
+RULE_CLASSIFICATION_BASIS = "opened_et_date_effective_rule_set"
+INTRA_0_7_MIN_DTE = 0
+INTRA_0_7_MAX_DTE = 7
 
 # 干净口径起点：4/20–21 是券商明细成交保留窗口的边界（CSV 导出日前约 90 天），
 # 不是行情或行为边界；更早的回合由汇总 ORDER 行构建，风险金额分母被低估。
@@ -295,13 +309,12 @@ OVERNIGHT_LANE_MIN_DTE = 4
 OVERNIGHT_LANE_MAX_DTE = 7
 # V2-B：隔夜单在这两个 ET 小时明显偏弱（−1.76% / −2.99%），其余时段 +21%…+36%。
 OVERNIGHT_LANE_WEAK_ENTRY_ET_HOURS: tuple[int, ...] = (11, 13)
-# V2-D 的两个额度上限（日内 6 笔/日、过夜并发 3 个）不再由本模块下发：
-# Journal 只有导入的历史成交，永远不含「今天」，据它算出的当日额度读数
-# 恒为过期（as_of 永远落在过去）——一个永远过期的读数等于没有。当日计数
-# 由前端手动维护（useIntradayManualBudgetStore，按 ET 日作用域），
-# 原 daily_budget 区块已于 2026-08 移除（additive 字段，无历史消费方）。
+# V2-D 的交易笔数/并发额度属于已退役历史规则：当前 INTRA-0-7 不设活动
+# 交易笔数上限，Web 也不再维护手动计数。原 daily_budget 区块已于 2026-08
+# 移除（additive 字段，无历史消费方）；历史回合仍可在证据表中按原样审计。
 
-# 车道标识（合规两条 + 违规三条 + 规则未覆盖 + 不可判定）。
+# 车道标识。V2 七条保持原样；INTRA-0-7 使用独立四条；
+# policy_version_unknown 表示缺入场 ET 日，连应用哪套规则都无法确定。
 RULE_LANES: tuple[str, ...] = (
     "intraday_0dte",
     "overnight_4_7",
@@ -310,6 +323,11 @@ RULE_LANES: tuple[str, ...] = (
     "late_0dte",
     "other",
     "unknown",
+    "intra_0_7_same_day",
+    "intra_0_7_cross_day",
+    "intra_0_7_out_of_range",
+    "intra_0_7_unknown",
+    "policy_version_unknown",
 )
 
 # 判定：合规 / 违规 / 规则未覆盖 / 不可判定。
@@ -323,6 +341,11 @@ RULE_COMPLIANCE_LANE_VERDICTS: dict[str, str] = {
     "late_0dte": "violation",
     "other": "uncovered",
     "unknown": "unknown",
+    "intra_0_7_same_day": "compliant",
+    "intra_0_7_cross_day": "violation",
+    "intra_0_7_out_of_range": "uncovered",
+    "intra_0_7_unknown": "unknown",
+    "policy_version_unknown": "unknown",
 }
 RULE_VERDICTS: tuple[str, ...] = (
     "compliant",
@@ -340,10 +363,18 @@ RULE_COMPLIANCE_LANE_RULE_IDS: dict[str, str] = {
     "late_0dte": "V2-C③",
     "other": "V2-0",
     "unknown": "V2-0",
+    "intra_0_7_same_day": RULE_SET_INTRA_0_7_ID,
+    "intra_0_7_cross_day": RULE_SET_INTRA_0_7_ID,
+    "intra_0_7_out_of_range": RULE_SET_INTRA_0_7_ID,
+    "intra_0_7_unknown": RULE_SET_INTRA_0_7_ID,
+    "policy_version_unknown": "UNVERSIONED",
 }
 
 # 每一个消费面都必须原文携带的边界（与 PERSONAL_EDGE_LIMITATIONS 同一约定）。
 RULE_COMPLIANCE_LIMITATIONS: tuple[str, ...] = (
+    f"车道规则按 opened_at 的 ET 自然日版本化：{RULE_SET_INTRA_0_7_EFFECTIVE_AT} "
+    f"之前冻结按 {RULE_SET_V2_ID} 判定，当日起按 {RULE_SET_INTRA_0_7_ID} "
+    "判定；缺入场 ET 日时无法选择版本，必须标缺",
     "样本窗口仅 2026-04→07 一个市场状态（SPY 上行），隔夜多头在该状态下天然占优，"
     "下跌市可能完全不同",
     "唯一尾部稳健的组合（4-7DTE 隔夜）n=65 偏小，隔夜跳空风险在该窗口内未被充分体现",
@@ -614,10 +645,19 @@ class RuleComplianceSlice:
 
 @dataclass(frozen=True)
 class PersonalEdgeRuleCompliance:
-    """车道遵守度：把本人规则 v2 变成可前向证伪的记账。"""
+    """车道遵守度：按 ET 入场日套用当时生效规则。
+
+    ``rule_set_id`` / ``adopted_at`` 是已发布 API 的 V2 历史字段，
+    保留原值避免破坏旧客户端。当前活动规则、生效日与可移动的
+    前向切片起点由新增字段明示，不再复用 ``adopted_at``。
+    """
 
     rule_set_id: str
     adopted_at: str
+    active_rule_set_id: str
+    active_rule_set_effective_at: str
+    forward_slice_start: str
+    classification_basis: str
     clean_basis_start: str
     clean_basis_reason: str
     population_n: int
@@ -1122,17 +1162,28 @@ class _ComplianceEpisode:
     premium: Decimal
 
 
-def classify_rule_lane(
+def _valid_et_day(value: Optional[str]) -> bool:
+    """Return whether ``value`` is a real ISO calendar day (not just shape-valid)."""
+    if value is None or not _ISO_DATE.fullmatch(value):
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
+
+def _classify_rule_lane_v2(
     *,
     dte: Optional[int],
     opened_et_hour: Optional[int],
     opened_trading_day: Optional[str],
     closed_trading_day: Optional[str],
 ) -> str:
-    """Classify one episode into a 规则 v2 车道, purely mechanically.
+    """Frozen V2 classifier for episodes opened before 2026-09-01.
 
     The decision order is fixed and total (every input maps to exactly one of
-    ``RULE_LANES``):
+    the seven historical V2 lane keys):
 
     1. ``dte`` unknown or negative → ``unknown`` （负 DTE 是坏数据，不当作 0）;
     2. ``dte == 0`` → needs the ET entry hour: unknown → ``unknown``;
@@ -1171,6 +1222,65 @@ def classify_rule_lane(
     if OVERNIGHT_LANE_MIN_DTE <= dte <= OVERNIGHT_LANE_MAX_DTE:
         return "overnight_4_7"
     return "other"
+
+
+def _classify_rule_lane_intra_0_7(
+    *,
+    dte: Optional[int],
+    opened_et_hour: Optional[int],
+    opened_trading_day: str,
+    closed_trading_day: Optional[str],
+) -> str:
+    """Classify an episode under INTRA-0-7, failing closed on missing facts."""
+    if (
+        dte is None
+        or dte < 0
+        or opened_et_hour is None
+        or not 0 <= opened_et_hour <= 23
+        or not _valid_et_day(closed_trading_day)
+    ):
+        return "intra_0_7_unknown"
+    # The policy is explicitly intraday: every different ET close date is a
+    # violation, including DTE > 7.  Missing/invalid facts above take priority.
+    if closed_trading_day != opened_trading_day:
+        return "intra_0_7_cross_day"
+    if INTRA_0_7_MIN_DTE <= dte <= INTRA_0_7_MAX_DTE:
+        return "intra_0_7_same_day"
+    return "intra_0_7_out_of_range"
+
+
+def classify_rule_lane(
+    *,
+    dte: Optional[int],
+    opened_et_hour: Optional[int],
+    opened_trading_day: Optional[str],
+    closed_trading_day: Optional[str],
+) -> str:
+    """Classify by the rule set effective on the episode's ET entry date.
+
+    * before ``RULE_SET_INTRA_0_7_EFFECTIVE_AT``: frozen V2 truth table;
+    * on/after the effective date: DTE 0..7 + same ET close day is compliant,
+      every cross-ET-day close is a violation, DTE > 7 same-day is uncovered;
+    * missing/invalid entry day cannot select a policy version and therefore
+      returns ``policy_version_unknown``.
+
+    No episode is retrospectively reinterpreted when the active rule changes.
+    """
+    if not _valid_et_day(opened_trading_day):
+        return "policy_version_unknown"
+    if opened_trading_day < RULE_SET_INTRA_0_7_EFFECTIVE_AT:
+        return _classify_rule_lane_v2(
+            dte=dte,
+            opened_et_hour=opened_et_hour,
+            opened_trading_day=opened_trading_day,
+            closed_trading_day=closed_trading_day,
+        )
+    return _classify_rule_lane_intra_0_7(
+        dte=dte,
+        opened_et_hour=opened_et_hour,
+        opened_trading_day=opened_trading_day,
+        closed_trading_day=closed_trading_day,
+    )
 
 
 def _compliance_stat(key: str, members: list[_ComplianceEpisode]) -> RuleComplianceStat:
@@ -1298,18 +1408,26 @@ def _compliance_slice(
 def _build_rule_compliance(
     members: list[_ComplianceEpisode],
     *,
-    adopted_at: str,
+    forward_slice_start: str,
     excluded_before_clean_basis_count: int,
     excluded_aggregate_or_unknown_basis_count: int,
     excluded_missing_premium_count: int,
 ) -> PersonalEdgeRuleCompliance:
-    """All-history + since-adoption slices over the same clean-basis rows."""
+    """All-history + movable forward slice over the same versioned rows."""
     forward = [
-        episode for episode in members if episode.opened_trading_day >= adopted_at
+        episode
+        for episode in members
+        if episode.opened_trading_day >= forward_slice_start
     ]
     return PersonalEdgeRuleCompliance(
+        # Legacy fields remain frozen for response compatibility.  Consumers
+        # should use the explicit active/forward metadata below for new UI.
         rule_set_id=RULE_SET_V2_ID,
-        adopted_at=adopted_at,
+        adopted_at=RULE_SET_V2_ADOPTED_AT,
+        active_rule_set_id=RULE_SET_INTRA_0_7_ID,
+        active_rule_set_effective_at=RULE_SET_INTRA_0_7_EFFECTIVE_AT,
+        forward_slice_start=forward_slice_start,
+        classification_basis=RULE_CLASSIFICATION_BASIS,
         clean_basis_start=RULE_COMPLIANCE_CLEAN_BASIS_START,
         clean_basis_reason=RULE_COMPLIANCE_CLEAN_BASIS_REASON,
         population_n=len(members),
@@ -1340,10 +1458,10 @@ def _build_rule_compliance(
         ),
         since_adoption=_compliance_slice(
             forward,
-            start_date=adopted_at,
+            start_date=forward_slice_start,
             empty_state="no_episodes_since_adoption",
             empty_reason=(
-                f"规则采纳日（{adopted_at}，ET）之后尚无已平仓回合进入该 build："
+                f"前向切片起点（{forward_slice_start}，ET）之后尚无已平仓回合进入该 build："
                 "前向样本为空是事实，不以 0 冒充读数"
             ),
         ),
@@ -1383,7 +1501,7 @@ def get_personal_edge_stats(
     account_key: str = DEFAULT_LEDGER_ACCOUNT_KEY,
     *,
     min_underlying_episode_count: int = DEFAULT_MIN_UNDERLYING_EPISODE_COUNT,
-    rule_compliance_since: str = RULE_SET_V2_ADOPTED_AT,
+    rule_compliance_since: str = RULE_SET_INTRA_0_7_EFFECTIVE_AT,
 ) -> Optional[PersonalEdgeResult]:
     """Aggregate the default build's closed episodes into personal stats.
 
@@ -1391,14 +1509,14 @@ def get_personal_edge_stats(
     happens in one session and issues only SELECT statements.
 
     ``rule_compliance_since`` (ET ``YYYY-MM-DD``) moves the forward slice of the
-    车道遵守度 block; it defaults to ``RULE_SET_V2_ADOPTED_AT`` and never affects
-    the all-history slice or any pre-existing field.
+    车道遵守度 block; it defaults to ``RULE_SET_INTRA_0_7_EFFECTIVE_AT`` and never
+    changes the effective-date routing used to classify an episode.
     """
     if min_underlying_episode_count < 1:
         raise EpisodeRepositoryError(
             "min_underlying_episode_count must be positive"
         )
-    if not _ISO_DATE.fullmatch(rule_compliance_since):
+    if not _valid_et_day(rule_compliance_since):
         raise EpisodeRepositoryError(
             "rule_compliance_since must be an ET calendar date (YYYY-MM-DD)"
         )
@@ -1648,7 +1766,7 @@ def get_personal_edge_stats(
         discipline=_build_discipline(discipline_episodes),
         rule_compliance=_build_rule_compliance(
             compliance_episodes,
-            adopted_at=rule_compliance_since,
+            forward_slice_start=rule_compliance_since,
             excluded_before_clean_basis_count=(
                 compliance_excluded_before_clean_basis
             ),

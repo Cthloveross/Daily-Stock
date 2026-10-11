@@ -11,8 +11,9 @@ that the ``/journal`` web card renders, combining
 * ``edge``  — DTE-bucket expectancy, overall expectancy CI and the H1
   evidence read (2-7DTE daily P&L t-stat vs the Harvey-Liu-Zhu t >= 3.0
   hurdle) from :mod:`src.journal.edge_stats`;
-* ``discipline`` — R2 frequency cap dial and the R3 fee dashboard for the
-  current calendar month.
+* ``discipline`` — descriptive trade-count and fee-drag readings for the
+  current calendar month.  The old R2/R3 thresholds are retained only as
+  legacy wire values and are not active trading rules after 2026-09-01.
 
 Fail-closed rules (contract, fixed):
 
@@ -67,7 +68,7 @@ ET = ZoneInfo("America/New_York")
 
 #: Harvey, Liu & Zhu (2016, RFS) multiple-testing hurdle for a "new factor".
 HLZ_HURDLE = 3.0
-#: R2 frequency hard cap (doc 16 §4): entries per day before the dial turns red.
+#: Retired R2 reference retained for backward-compatible payloads only.
 DAILY_CAP = 8
 
 # A 20-trading-day simple return needs 21 closes.
@@ -323,6 +324,7 @@ def build_edge_panel(
     discipline = {
         "trades_today": trades_today,
         "daily_cap": DAILY_CAP,
+        "rule_thresholds_active": False,
         "month_fees": drag["total_fees"],
         "month_gross": drag["total_gross"],
         "fee_ratio": drag["fee_to_gross_ratio"],

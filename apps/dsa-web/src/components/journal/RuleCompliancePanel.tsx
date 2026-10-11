@@ -12,8 +12,8 @@ import { InfoHint } from '../common/InfoHint';
 import { Tooltip } from '../common/Tooltip';
 
 /**
- * 「规则遵守度」：规模与频率的同层兄弟区块，把用户自己那套两车道规则
- * （Playbook 候选「V2-0」…「V2-D」）变成**可前向证伪的记账**。
+ * 「规则遵守度」：按 ET 入场日记录当时生效的规则。历史 V2
+ * 语义冻结，新回合从生效日起使用 INTRA-0-7，两者不混桶。
  *
  * 数据来自 `GET /journal/v2/personal-edge` 的 `rule_compliance` 块（当前默认
  * build 实时重算，前端不硬编码任何数字）。车道判定是纯机械的：只读
@@ -49,6 +49,11 @@ const LANE_LABELS: Record<string, string> = {
   late_0dte: '午后 0DTE',
   other: '≥8DTE 隔夜',
   unknown: '不可判定',
+  intra_0_7_same_day: '日内 0-7DTE',
+  intra_0_7_cross_day: '跨 ET 日',
+  intra_0_7_out_of_range: '同日但 DTE > 7',
+  intra_0_7_unknown: 'INTRA-0-7 不可判定',
+  policy_version_unknown: '生效规则不可判定',
 };
 
 const VERDICT_LABELS: Record<string, string> = {
@@ -299,19 +304,36 @@ export const RuleCompliancePanel: React.FC = () => {
 
         {!error && compliance && (
           <>
-            <p className="text-caption text-text-3">
+            <p className="text-caption text-text-3" data-policy="mechanical-basis">
               车道判定<strong className="text-text-2">纯机械</strong>：只读 <code className="font-mono text-mono-xs">dte_at_entry</code>、
               <code className="mx-1 font-mono text-mono-xs">opened_at</code> 的 ET 小时、
               <code className="mx-1 font-mono text-mono-xs">opened_at</code>/
               <code className="mx-1 font-mono text-mono-xs">closed_at</code> 的 ET 自然日与{' '}
               <code className="font-mono text-mono-xs">ABS(opening_cash_flow)</code>
-              ——它无从知道进场当时的意图，因此也不声称知道。日内 0DTE ＝ 0DTE 且 ET{' '}
-              {compliance.intradayLaneEtCutoffHour}:00 前开仓（V2-A）；过夜 ＝{' '}
-              {compliance.overnightLaneMinDte}-{compliance.overnightLaneMaxDte}DTE 且跨自然日平仓（V2-B）；
-              违规三条为 1-3DTE（V2-C①）、≥4DTE 当日平（V2-C②）、ET{' '}
-              {compliance.intradayLaneEtCutoffHour}:00 后开 0DTE（V2-C③）。毛每美元 ＝
+              ——它无从知道进场当时的意图，因此也不声称知道。毛每美元 ＝
               （净盈亏 ＋ 费用）÷ Σ|开仓现金流|；「剔除最好 {excludeTopN} 笔」与规模与频率同一实现、
               同一 n≥{compliance.excludeTopNMinEpisodeCount} 门槛，样本不足时缺席并给出原因。
+            </p>
+
+            {compliance.activeRuleSetId && compliance.activeRuleSetEffectiveAt && (
+              <p
+                className="rounded-ds-sm border border-up-strong/25 bg-up-subtle px-3 py-2 text-body-sm text-text-2"
+                data-policy="active"
+              >
+                <strong>当前规则 {compliance.activeRuleSetId}</strong> · 自{' '}
+                {compliance.activeRuleSetEffectiveAt} ET 起：入场 DTE 0-7 且同一 ET
+                日平仓＝合规；任何跨 ET 日＝违规；DTE 或入场/平仓时间缺失＝不可判定。
+              </p>
+            )}
+
+            <p className="text-caption text-text-3" data-policy="historical">
+              <strong className="text-text-2">历史 {compliance.ruleSetId} 语义冻结</strong>：
+              {compliance.activeRuleSetEffectiveAt ?? '当前规则生效日'} 之前仍按旧表判定——
+              0DTE 且 ET {compliance.intradayLaneEtCutoffHour}:00 前开仓（V2-A）；
+              {compliance.overnightLaneMinDte}-{compliance.overnightLaneMaxDte}DTE 且跨日平仓（V2-B）；
+              1-3DTE（V2-C①）、≥4DTE 当日平（V2-C②）、ET{' '}
+              {compliance.intradayLaneEtCutoffHour}:00 后开 0DTE（V2-C③）仍保留原判定，不追溯改写。
+              规则由这段样本推出，因此它必然好看；不可当成当前过夜建议。
             </p>
 
             <p className="text-caption text-text-3" data-basis="clean">
@@ -325,15 +347,15 @@ export const RuleCompliancePanel: React.FC = () => {
 
             <Slice
               slice={compliance.sinceAdoption}
-              title="采纳后（前向验证）"
-              caption={`自 ${compliance.adoptedAt} 起 · 这一列才能证伪或确认这套规则`}
+              title="前向切片（活动规则）"
+              caption={`自 ${compliance.forwardSliceStart ?? compliance.adoptedAt} 起 · 分类仍以每笔入场 ET 日的生效规则为准`}
               excludeTopN={excludeTopN}
             />
 
             <Slice
               slice={compliance.allHistory}
-              title="全历史（规则从这里推出来）"
-              caption={`自 ${compliance.cleanBasisStart} 起 · 规则由这段样本推出，因此它必然好看`}
+              title="全历史（按生效日版本化）"
+              caption={`自 ${compliance.cleanBasisStart} 起 · V2 与 INTRA-0-7 使用不同车道，不混桶`}
               excludeTopN={excludeTopN}
             />
           </>

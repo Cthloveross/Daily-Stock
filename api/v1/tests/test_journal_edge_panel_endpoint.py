@@ -198,6 +198,7 @@ def test_edge_panel_contract_shape(monkeypatch):
     discipline = body["discipline"]
     assert discipline["trades_today"] == 2
     assert discipline["daily_cap"] == 8
+    assert discipline["rule_thresholds_active"] is False
     assert discipline["month_fees"] >= 5.0
     assert discipline["fee_ratio"] is None or discipline["fee_ratio"] > 0.0
 
@@ -250,6 +251,7 @@ def test_edge_panel_empty_journal(monkeypatch):
     assert discipline == {
         "trades_today": 0,
         "daily_cap": 8,
+        "rule_thresholds_active": False,
         "month_fees": 0.0,
         "month_gross": 0.0,
         "fee_ratio": None,

@@ -57,7 +57,12 @@ from src.journal.personal_edge import (
     DISCIPLINE_BODY_MIN_EPISODE_COUNT,
     RULE_COMPLIANCE_CLEAN_BASIS_REASON,
     RULE_COMPLIANCE_CLEAN_BASIS_START,
+    RULE_COMPLIANCE_LANE_VERDICTS,
+    RULE_CLASSIFICATION_BASIS,
+    RULE_SET_INTRA_0_7_EFFECTIVE_AT,
+    RULE_SET_INTRA_0_7_ID,
     RULE_SET_V2_ADOPTED_AT,
+    RULE_SET_V2_ID,
     _et_hour_utc_minus_4,
     _trading_day_utc_minus_4,
     _utc,
@@ -91,8 +96,9 @@ RULES_EVIDENCE_BANNER = (
 RULES_EVIDENCE_LIMITATIONS = (
     "全部为描述统计，不是建议、不是预测，也不构成投资意见。",
     "样本只覆盖 2026-04→07 单一行情段（单一 regime），换一段行情结论可能不成立。",
-    "规则由这段样本推出，属样本内拟合；样本内显著不等于前向有效，"
-    f"前向验证以规则采纳日 {RULE_SET_V2_ADOPTED_AT} 之后的回合为准。",
+    "规则由这段样本推出，属样本内拟合；样本内显著不等于前向有效。"
+    f"ET 入场日在 {RULE_SET_INTRA_0_7_EFFECTIVE_AT} 前冻结按 {RULE_SET_V2_ID} "
+    f"判定，当日起按 {RULE_SET_INTRA_0_7_ID} 判定，不追溯重写历史。",
     "每美元读数为金额加权（合计盈亏 / 合计风险金额），与逐笔平均不同，两者不可混读。",
     "毛口径 = realized_pnl_net + total_fee；净口径已扣费。费用是恒定过路费，"
     "毛口径低于费用门槛即净口径为负。",
@@ -294,7 +300,12 @@ class RulesEvidenceResult:
     computed_at: datetime
     clean_basis_start: str
     clean_basis_reason: str
+    # Legacy V2 adoption field retained for transport compatibility.
     rule_set_adopted_at: str
+    historical_rule_set_id: str
+    active_rule_set_id: str
+    active_rule_set_effective_at: str
+    classification_basis: str
     sample_episode_count: int
     excluded_before_clean_basis: int
     excluded_aggregate_or_unknown_basis: int
@@ -673,8 +684,12 @@ def _position_evidence(
 
 
 def _correlation(members: list[_Episode], *, max_concurrent: int) -> CorrelationEvidence:
+    # Do not hard-code V2 lane names: post-effective episodes use distinct
+    # INTRA-0-7 keys, while the verdict map preserves the shared meaning.
     compliant = [
-        item for item in members if item.lane in ("intraday_0dte", "overnight_4_7")
+        item
+        for item in members
+        if RULE_COMPLIANCE_LANE_VERDICTS[item.lane] == "compliant"
     ]
     counts: dict[str, int] = {}
     for item in compliant:
@@ -850,6 +865,10 @@ def get_rules_evidence(
         clean_basis_start=RULE_COMPLIANCE_CLEAN_BASIS_START,
         clean_basis_reason=RULE_COMPLIANCE_CLEAN_BASIS_REASON,
         rule_set_adopted_at=RULE_SET_V2_ADOPTED_AT,
+        historical_rule_set_id=RULE_SET_V2_ID,
+        active_rule_set_id=RULE_SET_INTRA_0_7_ID,
+        active_rule_set_effective_at=RULE_SET_INTRA_0_7_EFFECTIVE_AT,
+        classification_basis=RULE_CLASSIFICATION_BASIS,
         sample_episode_count=len(members),
         excluded_before_clean_basis=excluded_before_clean_basis,
         excluded_aggregate_or_unknown_basis=excluded_basis,

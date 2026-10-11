@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from typing import Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from src.journal.analytics import reality_test
 from src.journal.models import JournalPhaseState, JournalTrade
@@ -38,18 +38,6 @@ def get_journal_snapshot_tool(
         )
         phase_row = session.get(JournalPhaseState, 1)
         current_phase = int(phase_row.phase) if phase_row else 0
-        # Weekly 0DTE count for "quota near limit" warnings used by option_trader skill.
-        one_week_ago = datetime.combine(date.today() - timedelta(days=7), datetime.min.time())
-        zero_dte_week = (
-            session.execute(
-                select(func.count(JournalTrade.id))
-                .where(JournalTrade.portfolio_label == portfolio)
-                .where(JournalTrade.dte_bucket == "0DTE")
-                .where(JournalTrade.entry_time >= one_week_ago)
-            )
-            .scalar_one()
-        )
-
         trade_dicts = [
             {
                 "id": t.id,
@@ -74,7 +62,6 @@ def get_journal_snapshot_tool(
         "closed_trades": len(closed),
         "win_rate": (wins / len(closed)) if closed else None,
         "dte_counts": by_bucket,
-        "zero_dte_trades_last_week": int(zero_dte_week or 0),
         "reality_test": reality_test(trade_dicts, top_n=5),
         "current_phase": current_phase,
     }

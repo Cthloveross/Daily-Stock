@@ -65,11 +65,13 @@ def _macro_event_strings(events: dict) -> list[str]:
 def _warnings_from(result: RegimeResult) -> list[str]:
     warnings: list[str] = []
     if result.label == "no_trade":
-        warnings.append("Regime below 35 -> stand aside, no new risk.")
+        warnings.append(
+            "Adverse Regime context; this is not a DTE or underlying-signal gate."
+        )
     if result.d3_macro_penalty <= -30:
-        warnings.append("Major macro event day; avoid held overnight deltas.")
+        warnings.append("Major macro event day; intraday event and jump risk is elevated.")
     if result.d2_volatility == -15:
-        warnings.append("VIX in crisis regime; size down and widen stops.")
+        warnings.append("VIX in crisis regime; volatility and liquidity risk is elevated.")
     return warnings
 
 
@@ -80,7 +82,12 @@ def format_brief(result: RegimeResult) -> str:
     ctx = {
         "date": result.date.isoformat() if hasattr(result.date, "isoformat") else str(result.date),
         "score": int(result.score),
-        "label": result.label,
+        "label": {
+            "aggressive": "supportive",
+            "standard": "mixed",
+            "cautious": "higher_risk",
+            "no_trade": "adverse",
+        }.get(result.label, result.label),
         "action_hint": result.action_hint,
         "d1_direction": int(result.d1_direction),
         "d2_volatility": int(result.d2_volatility),

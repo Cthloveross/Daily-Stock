@@ -112,8 +112,8 @@ function emptyForwardSlice(): RuleComplianceSlice {
   return {
     state: 'no_episodes_since_adoption',
     stateReason:
-      '规则采纳日（2026-08-05，ET）之后尚无已平仓回合进入该 build：前向样本为空是事实，不以 0 冒充读数',
-    startDate: '2026-08-05',
+      '前向切片起点（2026-09-01，ET）之后尚无已平仓回合进入该 build：前向样本为空是事实，不以 0 冒充读数',
+    startDate: '2026-09-01',
     n: 0,
     lanes: [
       lane('intraday_0dte', 'compliant', 'V2-A'),
@@ -152,6 +152,10 @@ function ready(
     ruleCompliance: {
       ruleSetId: 'v2',
       adoptedAt: '2026-08-05',
+      activeRuleSetId: 'INTRA-0-7',
+      activeRuleSetEffectiveAt: '2026-09-01',
+      forwardSliceStart: '2026-09-01',
+      classificationBasis: 'opened_et_date_effective_rule_set',
       cleanBasisStart: '2026-04-21',
       cleanBasisReason: '样本＝已平仓、净盈亏与开仓现金流均已知、且由明细成交构建',
       populationN: 1407,
@@ -253,14 +257,14 @@ describe('RuleCompliancePanel', () => {
     const forward: RuleComplianceSlice = {
       state: 'ready',
       stateReason: null,
-      startDate: '2026-08-05',
+      startDate: '2026-09-01',
       n: 3,
       lanes: [
-        lane('intraday_0dte', 'compliant', 'V2-A', {
+        lane('intra_0_7_same_day', 'compliant', 'INTRA-0-7', {
           n: 2, risk: 8000, gross: 240, grossPct: 0.03, tollPct: 0.012,
           winRate: 0.5, ratioReason: null,
         }),
-        lane('dte_1_3', 'violation', 'V2-C①', {
+        lane('intra_0_7_cross_day', 'violation', 'INTRA-0-7', {
           n: 1, risk: 4000, gross: -120, grossPct: -0.03, tollPct: 0.012,
           winRate: 0, ratioReason: null,
         }),
@@ -274,13 +278,15 @@ describe('RuleCompliancePanel', () => {
     render(<RuleCompliancePanel />);
 
     await waitFor(() =>
-      expect(screen.getByText(/采纳后（前向验证）/)).toBeInTheDocument(),
+      expect(screen.getByText(/前向切片（活动规则）/)).toBeInTheDocument(),
     );
     expect(
       document.querySelector('[data-empty-slice="no_episodes_since_adoption"]'),
     ).toBeNull();
     // 两个切片各渲染一次同名车道行。
-    expect(document.querySelectorAll('[data-lane="intraday_0dte"]')).toHaveLength(2);
+    expect(document.querySelectorAll('[data-lane="intra_0_7_same_day"]')).toHaveLength(1);
+    expect(laneRow('intra_0_7_same_day')).toHaveTextContent('日内 0-7DTE');
+    expect(laneRow('intra_0_7_cross_day')).toHaveTextContent('跨 ET 日');
     expect(document.querySelectorAll('[data-headline="compliant"]')).toHaveLength(2);
   });
 
@@ -303,6 +309,25 @@ describe('RuleCompliancePanel', () => {
     expect(hint.getAttribute('aria-label')).toContain(LIMITATION);
     // 「规则由这段样本推出，因此它必然好看」必须写明。
     expect(screen.getByText(/规则由这段样本推出，因此它必然好看/)).toBeInTheDocument();
+  });
+
+  it('shows the active INTRA-0-7 rule while keeping historical V2 semantics visible', async () => {
+    vi.mocked(fetchPersonalEdge).mockResolvedValue(ready());
+    render(<RuleCompliancePanel />);
+
+    await waitFor(() =>
+      expect(document.querySelector('[data-policy="active"]')).toBeInTheDocument(),
+    );
+    const activePolicy = document.querySelector('[data-policy="active"]') as HTMLElement;
+    const historicalPolicy = document.querySelector('[data-policy="historical"]') as HTMLElement;
+    expect(activePolicy).toHaveTextContent('当前规则 INTRA-0-7');
+    expect(activePolicy).toHaveTextContent('2026-09-01');
+    expect(activePolicy).toHaveTextContent('入场 DTE 0-7');
+    expect(activePolicy).toHaveTextContent('任何跨 ET 日＝违规');
+    expect(activePolicy).toHaveTextContent('DTE 或入场/平仓时间缺失＝不可判定');
+    expect(historicalPolicy).toHaveTextContent('历史 v2 语义冻结');
+    expect(historicalPolicy).toHaveTextContent('V2-B');
+    expect(historicalPolicy).toHaveTextContent('不追溯改写');
   });
 
   it('says the block is 标缺 when the endpoint omits it, and explains not_built', async () => {

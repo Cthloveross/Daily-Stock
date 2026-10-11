@@ -64,6 +64,7 @@ class EdgePanelEdge(BaseModel):
 class EdgePanelDiscipline(BaseModel):
     trades_today: int
     daily_cap: int = 8
+    rule_thresholds_active: bool = False
     month_fees: float
     month_gross: float
     fee_ratio: Optional[float] = None

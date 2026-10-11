@@ -46,6 +46,7 @@ function payload(over: Partial<EdgePanelResponse> = {}): EdgePanelResponse {
     discipline: {
       trades_today: 3,
       daily_cap: 8,
+      rule_thresholds_active: false,
       month_fees: 1200.0,
       month_gross: 8000.0,
       fee_ratio: 0.15,
@@ -80,9 +81,10 @@ describe('EdgePanelCard', () => {
     expect(card).toHaveTextContent('证据不足');
     expect(card).toHaveTextContent('距统计显著还差 159 笔');
     expect(card).toHaveTextContent('CI95 [−$12, +$288]');
-    // 纪律行：额度内不标红。
-    expect(card).toHaveTextContent('今日 3/8 笔');
-    expect(card).toHaveTextContent('本月费率 15%');
+    // 描述行：旧阈值已退役，不再标红。
+    expect(card).toHaveTextContent('今日 3 笔');
+    expect(card).toHaveTextContent('旧 R2/R3 阈值已退役');
+    expect(card).toHaveTextContent('本月费用/毛利比 15%');
     expect(card).not.toHaveTextContent('超出 R2 频率硬顶');
     expect(card).not.toHaveTextContent('超过 30% 红线');
   });
@@ -133,15 +135,16 @@ describe('EdgePanelCard', () => {
     expect(features).toEqual(['—', '—', '—']);
     // Journal 侧读数照常渲染——整卡红色降档但绝不留白。
     expect(card).toHaveTextContent('0-1DTE');
-    expect(card).toHaveTextContent('今日 3/8 笔');
+    expect(card).toHaveTextContent('今日 3 笔');
   });
 
-  it('turns the R2 cap and R3 fee ratio red when over their lines', async () => {
+  it('keeps retired R2/R3 thresholds descriptive even above legacy lines', async () => {
     vi.mocked(fetchEdgePanel).mockResolvedValue(
       payload({
         discipline: {
           trades_today: 11,
           daily_cap: 8,
+          rule_thresholds_active: false,
           month_fees: 5100.0,
           month_gross: 5000.0,
           fee_ratio: 1.02,
@@ -151,10 +154,11 @@ describe('EdgePanelCard', () => {
     render(<EdgePanelCard />);
 
     const card = await screen.findByRole('region', { name: '今日武器档位' });
-    await waitFor(() => expect(card).toHaveTextContent('今日 11/8 笔'));
-    expect(card).toHaveTextContent('超出 R2 频率硬顶');
-    expect(card).toHaveTextContent('本月费率 102%');
-    expect(card).toHaveTextContent('超过 30% 红线 (R3)');
+    await waitFor(() => expect(card).toHaveTextContent('今日 11 笔'));
+    expect(card).not.toHaveTextContent('超出 R2 频率硬顶');
+    expect(card).not.toHaveTextContent('超过 30% 红线');
+    expect(card).toHaveTextContent('本月费用/毛利比 102%');
+    expect(card).toHaveTextContent('旧 R2/R3 阈值已退役');
   });
 
   it('shows the API error state instead of a blank card', async () => {

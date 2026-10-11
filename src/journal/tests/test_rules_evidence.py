@@ -17,6 +17,7 @@ from src.journal.rules_evidence import (
     DTE_HOLD_EXCLUDE_TOP_N,
     _Episode,
     _aggregate,
+    _correlation,
     _dte_hold_lanes,
     _et_hours,
     _fee_threshold,
@@ -443,3 +444,36 @@ class TestPositionEvidence:
 
         assert result.params == params
         assert result.framing == "你选择的参数 + 它们的含义"
+
+
+def test_correlation_compliance_follows_versioned_verdict_not_v2_lane_names():
+    """INTRA-0-7 合规车道也必须进相关性暴露统计。"""
+    result = _correlation(
+        [
+            _episode(
+                pnl="1",
+                fee="0",
+                risk="100",
+                underlying="AAA",
+                lane="intraday_0dte",
+            ),
+            _episode(
+                pnl="1",
+                fee="0",
+                risk="100",
+                underlying="BBB",
+                lane="intra_0_7_same_day",
+            ),
+            _episode(
+                pnl="1",
+                fee="0",
+                risk="100",
+                underlying="CCC",
+                lane="intra_0_7_cross_day",
+            ),
+        ],
+        max_concurrent=2,
+    )
+
+    assert result.compliant_episode_count == 2
+    assert {item.ticker for item in result.tickers} == {"AAA", "BBB"}

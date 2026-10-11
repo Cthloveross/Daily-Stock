@@ -213,6 +213,7 @@ def test_build_edge_panel_full_payload():
     discipline = payload["discipline"]
     assert discipline["trades_today"] == 2
     assert discipline["daily_cap"] == 8
+    assert discipline["rule_thresholds_active"] is False
     assert discipline["month_fees"] == pytest.approx(29.0)
     assert discipline["month_gross"] == pytest.approx(sum(_H1_PNLS) + 24.0 + 55.0 - 50.0 + 10.0)
     assert discipline["fee_ratio"] == pytest.approx(29.0 / (sum(_H1_PNLS) + 24.0 + 55.0 - 50.0 + 10.0))
