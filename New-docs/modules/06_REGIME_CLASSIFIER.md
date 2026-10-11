@@ -1,5 +1,11 @@
 # 06 · Regime Classifier
 
+> **策略语义覆盖声明（2026-09-08）**：本文保留 Regime 模块的历史设计与工程说明，
+> 但“能否交易”、开盘 30 分钟禁做等交易授权语义已退役。现行 Regime 仅是
+> `INTRA-0-7/v1` 的期限相关门禁之一；以
+> [`../phase1/20_INTRADAY_0_7DTE_RULE_MIGRATION.md`](../phase1/20_INTRADAY_0_7DTE_RULE_MIGRATION.md)
+> 为准，不能单独授权开仓或隔夜。
+
 > **模块**：可交易日判断器（Market Regime Classifier）  
 > **位置**：`src/regime/` + 复用 `data_provider/` + 接入 `bot/` + 注册为 Agent skill  
 > **前置**：`02_ARCHITECTURE_OVERVIEW.md`、`04_OPTION_SUPPORT_EXTENSION.md`  

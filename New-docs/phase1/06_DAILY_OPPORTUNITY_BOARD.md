@@ -1,5 +1,15 @@
 # Phase 1.6 · 每日机会研究看板
 
+> **当前覆盖合同（2026-09-10）**：`p0_2m_signal_v1` 已取代本文件所述旧 5m
+> P0 七条件。现行 P0 只看严格数据完整性、8m 同钟价格分位、8m RVOL、同向
+> 18m/0.5 ATR 四项；RTH 为 P0，盘前/盘后为 P0-X，不再受 09:45–15:15、
+> Regime、DTE 或合约摩擦决定。P1-O 仍是独立开盘发现，但 09:35 已改为五根
+> 完整 1m 累计证据，不再等待原生 5m。完整真源见
+> [`22_P0_2M_SIGNAL_AND_CALIBRATION.md`](22_P0_2M_SIGNAL_AND_CALIBRATION.md)。
+> 0–7DTE、同一 ET 日平仓及尾盘退出线仍是用户的执行纪律，不属于 P0 信号数学。
+> 旧 V2-A/B/C/E、4-7DTE 隔夜车道、周末持仓提示和手动日内/隔夜额度只保留
+> 为历史取证，不再驱动当前页面或推送。0DTE 采用更严格的盘口阈值。
+>
 > 状态：Watchlist Top 5 确定性基础榜、Top 5 直出 Moomoo 0–45 DTE 期权墙、全候选期权概览、单票专业研究页、Moomoo 最近交易时段异常期权成交，以及旧 v1 盘前机会快照与 5/20 XNYS 交易日结果学习已接线；Canonical Premarket Research Cycle 已具备服务端研究池、持久化 attempt/stage/lease、XNYS 09:12/09:17 低噪声 scheduler，以及 append-only 三轨 qualification，并于 2026-07-24 真实窗口完成自动触发、原子回滚、自动恢复、冻结发布和幂等验收。5D/20D 标的结果由 `xnys-close-qualified-raw-path-v2` 在目标交易日收盘后自动回填，完整研究命中率另受更严格 track 门禁。draft/finalizer、服务端 last-good 与期权增强冻结仍未完成；当天 Finnhub/Alpaca 权限导致辅助 Regime 数据降级，场外/TRF 大额成交仍未配置，策略 edge 仍未验证。
 >
 > 安全边界：只读行情研究，不解锁、不下单、不改单、不撤单。
@@ -37,6 +47,7 @@
 - UI 将 `available / expected` 明确称为“数据完整度”，并另列数据域覆盖；这个计数包含基础日线/技术/Regime 指标，不再误称为纯“量价证据”，期权流、暗池和 Playbook 缺失时也不会显示成“证据完整”。
 - 候选排名合同中的 `unusual_options_flow` 与 `off_exchange_prints` 仍不以 0 参与排序；前者虽已有独立实时研究面板，但在完成历史保存、延迟测量和结果验证前不会悄悄改写基础榜权重。
 - 个人风格在结构化 Playbook 尚未经用户确认前保持 `unknown`，不从单笔盈利或旧 heuristic 标签伪造“高度匹配”。
+- `/intraday` 的盘中计划、钉选与 `STOCK_LIST` 核心标的（合并后最多 20 票）使用 P1-O 顺序开盘发现：09:31-09:34 每分钟仅看完成的 1m K，连续两个相邻 checkpoint 同向通过才响铃（最早 09:32）；09:35 使用 09:30 起五根完整 1m 累计证据最终确认。每个累计区间都和目标日前精确 20 个交易日的相同区间比较；通过者最多 3 票/日，先发标的细节与开盘锚，0-7DTE 期权盘口随后静默补充。它是 setup 发现而非 P0 或市价追单，研究与 TSLA 2026-08-31 回放见 [`21_OPENING_5M_ALERT_RESEARCH.md`](21_OPENING_5M_ALERT_RESEARCH.md)。
 
 ### 2.1 期权墙计算合同
 
@@ -163,7 +174,7 @@ TradingView 面向个人网站账户没有公开的自选列表 REST API；其�
 
 盘前计划一旦生成即视为冻结基准；「盘中跟踪」区块（`IntradayTrackingPanel`，位于机会看板下方）只把当日实时行情对照这份冻结计划，**不重新排序、不生成买卖信号、不改变盘前排名**，页头明示「跟踪冻结的盘前计划 · 不是信号 · 不改变盘前排名」并全程带数据时点。
 
-数据由 `POST /api/v1/opportunities/intraday-tracking`（最多 5 个美股期权 underlying）返回，实时字段复用与期权墙相同的 Moomoo `get_market_snapshot` Quote-only 机制；服务端 30 秒 TTL + single-flight 与兄弟接口一致，日线派生输入（ATR14、20 日量能中位）按 (symbol, ET market date) 另行 15 分钟记忆，避免 60 秒轮询反复触发日线数据源。每标的列：现价（as-of）、距确认位、距失效位、VWAP 上/下方、量能节奏、盘段状态。
+数据由 `POST /api/v1/opportunities/intraday-tracking`（最多 5 个美股期权 underlying）返回，实时字段复用与期权墙相同的 Moomoo `get_market_snapshot` Quote-only 机制；服务端 30 秒 TTL + single-flight 与兄弟接口一致，日线派生输入（ATR14、20 日量能中位）按 (symbol, ET market date) 另行 15 分钟记忆，避免自动轮询反复触发日线数据源。每标的列：现价（as-of）、距确认位、距失效位、VWAP 上/下方、量能节奏、盘段状态。
 
 指标定义与诚实边界（G-4 首批，相对强度 vs SPY 后续交付）：
 
@@ -180,30 +191,33 @@ TradingView 面向个人网站账户没有公开的自选列表 REST API；其�
 2026-08-02 起，原先单一的机会看板显式拆成两种互不替代的研究口径：
 
 - **周内 Top 5 · 盘前冻结**（`/regime`，本文档 §2.1–§2.7 的既有看板）：基于上一完整交易日日线结构，研究周期数日至数周；官方版本在盘前窗口冻结，进入 qualification 与 5D/20D 结果统计。页头副标题 2026-08-02 起如实标注「基于上一完整交易日日线结构 · 数日至数周研究周期」，并提供「进入日内工作台 →」入口。
-- **日内工作台**（`/intraday`，导航首位）：盘中交易时段的单屏主界面，盘中滚动、不冻结、不入统计。
+- **日内工作台**（`/intraday`，导航首位）：盘中交易时段的单屏主界面。旧 Top 研究表盘中滚动、不冻结、不入 qualification/5D/20D 统计；严格 2m P0/P0-X 由独立全自选 monitor 评估并进入推送台账，不能把 Top 5/8 的页面限制误当成 P0 universe 限制。
 
 `/intraday` 页面自上而下：
 
-1. **市场脉搏**（sticky 顶栏）：**时段上下文标签**（v3，条首醒目位，见下）+ SPY / QQQ / VIX 快照现价与当日涨跌（分母为快照自带前收，`change_basis=moomoo_snapshot_prev_close`）+ SPY/QQQ 会话 VWAP 位置（v3，累计额/量近似）、盘段状态、ET 数据时点与自动刷新指示。数据来自 `GET /api/v1/opportunities/intraday-pulse`（60 秒 TTL + single-flight）；VIX 与 SPY/QQQ 隔离请求，供应商快照不可得时逐代码显式标缺，不用其他来源或旧值冒充。
+1. **市场脉搏**（sticky 顶栏）：**中性 ET 时段环境标签**（只描述流动性/波动背景）+ SPY / QQQ / VIX 快照现价与当日涨跌（分母为快照自带前收，`change_basis=moomoo_snapshot_prev_close`）+ SPY/QQQ 会话 VWAP 位置（累计额/量近似）、盘段状态、ET 数据时点与自动刷新指示。数据来自 `GET /api/v1/opportunities/intraday-pulse`（60 秒 TTL + single-flight）；VIX 与 SPY/QQQ 隔离请求，供应商快照不可得时逐代码显式标缺，不用其他来源或旧值冒充。
 2. **今日计划**：冻结盘前 Top 5 的对照跟踪，直接复用 §2.7 的 `IntradayTrackingPanel`（该组件同时保留在 `/regime` 官方看板下方，行为不变；本页是它的主要使用场景）。今日没有已发布官方版本时显示诚实空态，不用预览榜冒充冻结计划。
-3. **日内扫描表**（核心）：`POST /api/v1/opportunities/intraday-top` 的盘中滚动 Top 5。2026-08-03 起改为**两级布局**：默认网格只保留交易关键读数，次要读数移入行内展开区，一键可达——重排可见性，不删除任何读数，标缺语义不变。默认 11 列（2026-08-15 现状，「你的战绩」按用户要求收尾）：**排名**（服务端排名，客户端列头排序不改写）/ 标的（次行小字合并深度位徽标与财报警示徽标：回避窗内「财报 N 天内 · 期权贵」实底警示、日历标缺显式「财报标缺 · 未知≠安全」）/ 涨跌%（现价与 as-of 为次行；**盘前时段**主行改示真实盘前变动「盘前 +2.4%」、标缺显式「盘前标缺」，副行如实标「昨日 +5.1%」——G-12：`session_change_percent` 此刻仍指向上一常规时段；列头排序同口径按盘前涨跌）/ **当前爆发**（爆发分 + 方向箭头 + 15 分钟推力% + 量比；v7 哑火徽标命中才渲染）/ **今日波段**（signal v5 分级波段 chips：「09:45↓ 强」实底警示＝爆发分 ≥8 暴动、「10:00↑ 中」描边＝≥2.5 持续推升，缺 grade 的旧载荷渲染无分级 chip；空＝「—」、不可得＝标缺；每波窗口/推力/爆发分/分级明细以可访问 aria-label 附带；休市显示最近一个交易时段）/ **速度**（v3：加速↑/减速↓/持平/标缺）/ **近30分位移**（v6，见 §2.13）/ **形态**（v4 styleMatch：S1/S2/S3 相似度徽标，见 §2.10）/ **期权墙**（2026-08-15：深度层每檔上一清算时段 OI 的未平仓分布事实，紧凑两行「C 210 · P 195」+「γ205 · 中心202.4」——C/P＝两侧最大 OI 行权价、γ＝1% 波动下 gross gamma 集中行权价、中心＝Σ(行权价×OI)÷Σ(OI) 描述性重心；单元格 tooltip 逐位给 OI 张数/占该侧%/距现价%/主力到期与 as-of；**不渲染任何「最可能收在 X」**——pinning/max pain 假说在用户数据上尚未验证（逐日快照 2026-08-04 起积累），该边界逐字挂列头与单元格 tooltip；数据经共享 hook `useDeepLaneOptionWalls` 与盘前期权异常面板共用同一次 option-walls 读取与缓存，深度层外/读取失败显式标缺）/ 详情按钮 / **你的战绩**（个人画像回灌，见 §2.12；2026-08-14 按用户要求移到最后一列——它是上下文标注，不是盘中交易关键读数，语义与列头 tooltip 不变）。次要读数（波段vs大盘 / 量能节奏 / 缺口 / 波幅扩张(ATR) / VWAP / 期权异动 / 财报全文 / 研究状态+证据计数）在行尾「详情」展开的「研究读数」网格中（临期合约面板上方）；仅快照次级列表默认只显示前 5 檔（「展开全部 N 檔」切换）；footer 收敛为一行排序与口径说明（含 v5 波段分级图例，2026-08-15 起可见行只留数据口径）+「完整口径」切换展开完整公式墙与「不是信号/非预测」类披露句（原文逐字保留，隐藏 ≠ 删除，见 §16 界面披露策略）。默认排序＝服务端排名（盘中爆发分优先），涨跌%/当前爆发列头可点做客户端排序（第三次点击回到服务端排名），行点击进入 `/regime/opportunity/:ticker` 即时扫描详情（不绑定 snapshotKey）。
+3. **日内扫描表**（核心）：`POST /api/v1/opportunities/intraday-top` 的盘中滚动 Top 5，采用两级布局。默认 11 列为排名 / 标的 / 涨跌% / 当前爆发 / 今日波段 / 速度 / 近 30 分钟位移 / 形态 / 期权墙 / 详情 / 你的战绩；次要读数在行内「研究读数」展开区。财报徽标当前只把今日财报显示为事件冲突，未来财报显示「距财报 N 天」中性上下文；速度只描述相邻窗口已经发生的变化。服务端从 v9 起按非 legacy 独立研究证据计数排序；旧 5m 爆发分和相关列只供兼容展示/复盘，客户端列头排序不改写服务端排名。缺失数据显式标缺，任何上下文字段都不充当 0-7DTE 的开仓授权或阻断条件。行点击进入 `/regime/opportunity/:ticker` 即时扫描详情（不绑定 snapshotKey）。
 4. **盘前期权异常面板**（侧栏，2026-08-14 起，见 §15）：深度层标的上一时段的 call/put 偏斜与大单事实——盘前 + 开盘 30 分钟自动展开，其后收起为次要参考。原**期权异动 feed**（跨自选池、按时间倒序的最近异动成交，≤20 条）同日移入 Journal 仓位复盘面（`JournalOptionEventReview` 包装组件，只读一次不轮询）：用户定位「期权异动是复盘证据，不是盘中决策输入」；feed 组件本体与「分类不证明开平仓方向」脚注原样保留。
+5. **今日提示流**：展示严格 2m P0/P0-X、P1-O、期权异步补充和被预算抑制/发送失败的决定。P3 只留在台账，不在普通提示流制造噪音。严格 P0 的事实真源是版本化四条件证据，不是上方 legacy 爆发列。
 
-`POST /api/v1/opportunities/intraday-top` 合同（`schema_version=intraday-top/1.0`，`signal_version=intraday_session_evidence_v4`）：
+> **当前覆盖（INTRA-0-7/v1）**：上方保留的 2026-08 界面沿革中，财报与速度旧文案不再是当前动作规则。今日财报可作为事件冲突硬拦截；未来财报只显示「距财报 N 天」的中性上下文。速度只描述已经发生的波动变化，不映射进场、观望、持有或离场动作。
+
+`POST /api/v1/opportunities/intraday-top` 合同（`schema_version=intraday-top/1.0`，`signal_version=intraday_session_evidence_v9`）：
 
 - 请求：`symbols`（≤20，空数组回退服务端 `STOCK_LIST`）、`limit`（默认 5，1–10）、`refresh`。非美股期权 underlying 不参与扫描并在 `unsupported_symbols` 中如实列出。
-- 装配全部复用 G-2 机制：会话快照来自与期权墙相同的 Moomoo Quote-only `get_market_snapshot`；ATR14 / 20 日量能中位 / 上一日结构（前收、前 20 日高低、EMA8/13）来自与每日榜相同的完成日线加载器（15 分钟逐标的记忆）；期权异动逐标的复用 `option-events` 的 30 秒缓存 key（每标最近一页 ≤10 条，失败只降级该标的）。波段爆发的 5m K 线走与 `/stocks/{code}/history?period=5m` 相同的服务端加载器，逐标的只取当前 + 上一交易时段常规时段（有界线程池并发 + 逐标的 60 秒 TTL 缓存；单标的失败只把该标的的波段爆发显式 `unavailable`，绝不阻塞聚合证据）。响应级 60 秒 TTL + single-flight，`refresh` 只绕过已完成 TTL。
-- 每个候选带与每日榜同构的 evidence 数组（source / observed_at / fetched_at / observation_window / quality_state / limitations）。`ranking_method` 盘中为 `burst_score_first_then_evidence_count`（当前爆发分优先，其次证据计数，再次研究状态），休市退回 `rule_based_evidence_count`（但候选仍附最近一个交易时段的波段列表，晚间复盘可见「今日走了几波」）。
+- 装配全部复用 G-2 机制：会话快照来自与期权墙相同的 Moomoo Quote-only `get_market_snapshot`；ATR14 / 20 日量能中位 / 上一日结构（前收、前 20 日高低、EMA8/13）来自与每日榜相同的完成日线加载器（15 分钟逐标的记忆）；期权异动逐标的复用 `option-events` 的 30 秒缓存 key（每标最近一页 ≤10 条，失败只降级该标的）。Legacy 波段展示的 5m K 线走与 `/stocks/{code}/history?period=5m` 相同的服务端加载器，逐标的只取当前 + 上一交易时段常规时段（有界线程池并发 + 逐标的 60 秒 TTL 缓存；单标的失败只将 legacy 字段标为 `unavailable`，不阻塞其余证据）。响应级 60 秒 TTL + single-flight，`refresh` 只绕过已完成 TTL。
+- 每个候选带与每日榜同构的 evidence 数组（source / observed_at / fetched_at / observation_window / quality_state / limitations）。所有时段固定 `ranking_method=rule_based_evidence_count`；`session_bursts.legacy=true` 且 `legacy_usage=api_compatibility_and_research_display_only`，其证据状态只可能是 `neutral/unknown`，不会进入支持项计数、排序、提醒或 P0 分级。
 
-**波段爆发（v2 主排序信号，`src/opportunities/intraday_bursts.py`）**：对当日常规时段（09:30–16:00 ET）的 5m K 线取滚动 3 根（15 分钟）窗口，`thrust_norm = |窗口末收 − 窗口首开| ÷ 当日 5m 波幅（high−low）中位数`，`vol_norm = 窗口成交量 ÷ (3 × 当日 5m 量中位数)`，`burst_score = thrust_norm × vol_norm`，方向取推力符号。当日不足 6 根 K 线时中位数基准回退上一交易时段并显式标注 `median_basis=prior_session_fallback`。**当前爆发**＝最新窗口；**今日波段**＝`burst_score ≥ LEG_MIN_SCORE(8.0)` 且窗口起点相隔 ≥30 分钟的 top 独立窗口（≤4 个，按时间正序）。证据项「波段爆发」在当前窗口 `burst_score ≥ BURST_SUPPORT_MIN(6.0)` 时记 supports。
+**历史波段爆发（legacy 展示，`src/opportunities/intraday_bursts.py`）**：旧实现对当日常规时段（09:30–16:00 ET）的 5m K 线取滚动 3 根（15 分钟）窗口，`thrust_norm = |窗口末收 − 窗口首开| ÷ 当日 5m 波幅（high−low）中位数`，`vol_norm = 窗口成交量 ÷ (3 × 当日 5m 量中位数)`，`burst_score = thrust_norm × vol_norm`。这些数值继续显示是为了旧 API 和复盘可读性；从 v9 起，无论分数多高都不再记为 supports，也不参与排序、提醒或 P0/P0-X。
 
 校准记录（2026-07-31 周五常规时段，机会由用户标注；K 线固化为永久回归 fixture `src/opportunities/tests/fixtures/intraday_5m_2026-07-31_regular.json`）：MU ~09:45 跳水（−5.2%/15min @4.6× 量）爆发分 35.5、AMZN 09:30 开盘波 18.7、NVDA 09:40 波 9.3、NVDA 15:15 波 8.6——`LEG_MIN_SCORE=8.0` 是四个标注波段全部通过的最大整数档（约束项＝NVDA 15:15 的 8.6）；`BURST_SUPPORT_MIN=6.0` 低一档，让发展中的爆发提前一根 K 线点亮（NVDA 09:35 前奏窗口 6.3）。GOOGL 是 v1 失败样本：全时段聚合曾把它排第一，但其当日最佳窗口仅 15.2，远低于 MU 跳水的 35.5——该修复由校准回归测试永久钉住。阈值均为 v2 启发式，不是验证过的 edge；改动必须重新校准并升 `signal_version`。
 
-v2 聚合证据阈值（保留 v1 语义，退居次要排序因子；代码内常量注释文档化；修改必须升 `signal_version`）：
+v9 聚合研究证据（仅用于网页研究排序，不等于 P0；修改必须升 `signal_version`）：
 
 | 证据 | 记为 supports 的条件 | 口径说明 |
 |---|---|---|
-| 波段爆发 | 当前 15 分钟窗口 burst_score ≥ 6.0 | 推力×量比，中位数归一化；阈值按 2026-07-31 标注样本校准 |
+| Legacy 波段爆发 | 永不记 supports | 仅兼容展示；分数和旧阈值不进入计数或排序 |
 | 量能节奏 | ≥ 1.5× | 当日累计 ÷ 前 20 交易日全日中位（未按时点折算，同 G-2） |
 | 缺口 | \|开盘−参考前收\| ≥ 0.75×ATR14，或 \|缺口%\| ≥ 1.5% | 参考前收＝日线加载器上一完整日收盘；休市时段切换为快照自带前收并显式改 `gap_basis` |
 | 波幅扩张 | (session high − session low) ÷ ATR14 ≥ 1.0 | ATR14＝已完成日线 Wilder 平滑 |
@@ -212,39 +226,39 @@ v2 聚合证据阈值（保留 v1 语义，退居次要排序因子；代码内�
 
 研究状态（`research_state`）：`active`（盘中活跃，≥2 项独立支持）/ `watch`（观察）/ `insufficient`（数据不足——缺可用现价快照时 fail-closed，无论其他证据如何）。上一日结构（前 20 日区间位置、EMA 排列）只作 `research_context` 证据，永不参与盘中排序计数。
 
-**v3 上下文信号（2026-08-02，`intraday_session_evidence_v3`）**：把用户自己的交易纪律（Playbook 候选 R1/R3，按其 1,653 笔已平仓交易统计数据核验）编码为四类诚实**上下文标注**。设计规则固定为「**系统标注，用户过滤**」：这些信号只加标签，绝不自动过滤行、绝不隐藏候选、绝不阻断任何操作，也不参与排序键或 supporting_evidence_count。
+**当前上下文语义（2026-09-01，INTRA-0-7/v1）**：2026-08-02 的 v3 曾把用户历史统计和动作纪律写进时段/速度文案；该文案现已**历史冻结**，不再代表当前 UI/API 合同，也不回写历史快照。当前四类字段仅作上下文标注，不参与排序、不隐藏候选、不授权或阻断 0-7DTE 合约。
 
-1. **时段上下文**（`session_phase`，pulse 与 intraday-top 响应均携带）：常规时段按 ET 时钟再切分为 `opening_probe`（09:30–10:00）/ `prime`（10:00–11:00）/ `midday`（11:00–13:00）/ `noise`（13:00–14:00）/ `afternoon`（14:00–15:00）/ `power_hour`（15:00–16:00），盘前/盘后/休市沿用原盘段。每个 phase 带中文标签 + 用户历史统计提示（`session_phase_hint_basis=user_trading_history_hardcoded_v1`，硬编码 v1 文案）：开盘试错「仅轻仓 S2 · 你的历史此时段净亏」、主战场「你的历史最大净盈利时段」、午间震荡「你的历史净亏损时段 · 默认观望」、尾盘趋势「你的历史最高单笔均值时段」。标签在市场脉搏条首醒目展示；时钟口径与盘段相同（`america_new_york_clock_v1`，未接假日日历）。
-2. **财报临近标记**（`earnings_proximity`，逐候选）：Finnhub 财报日历一次**区间调用**（当日 → +5 天）覆盖整个 universe，按 ET 日期缓存（成功 1 小时 / 失败 10 分钟），从中取每个候选窗口内最近的财报日（`days_to_earnings`，0=今日）。`days_to_earnings ≤ 3`（`EARNINGS_BLACKOUT_DAYS=3`，用户「财报日及临近数日不交易、权利金过贵」规则的 v1 启发式）时前端醒目标注「财报 N 天内 · 期权贵」。日历不可得时 `state=unavailable`、`within_blackout=null`——显式标缺，绝不以「无财报」冒充安全；日历成功但窗口内无财报才是诚实的 `within_blackout=false`。
-3. **大盘对齐**（`market_alignment`，逐候选 + 响应级 `market_context`）：用户 setup 显式依赖大盘情绪，因此 SPY 并入 intraday-top 的同一批快照（不新增请求次数），由累计成交额 ÷ 累计成交量近似出 SPY 会话 VWAP 位置；候选**当前爆发方向** vs SPY VWAP 位置得出 `aligned`（顺势：up+above 或 down+below）/ `against`（逆势）/ `unknown`（任一侧 flat/缺失，附 reason）。列「大盘」显示 顺势/逆势/标缺；VWAP 近似口径显式标注（`session_turnover_over_volume`），不是逐笔官方 VWAP。
-4. **速度分级**（`session_bursts.speed`，逐候选）：用户纪律 R1「日内只交易加速；2 分钟级速度的波在 1 分钟速度熄火时离场」。本仓库 K 线为 5m 粒度，诚实 v1 只能给出 5m 窗口级近似：相邻两个滚动 15 分钟窗口的爆发分之差（`consecutive_rolling_15m_window_burst_score_delta_5m_bars`）→ `accelerating` / `decelerating` / `flat`；窗口不足或缺分数显式 `unknown`。列「速度」显示 加速/减速/持平/标缺，表格 footer 附「减速=你的离场信号（R1）」——这是用户自己的离场提示，不是系统信号。
+1. **时段上下文**（`session_phase`）：常规时段仍按 ET 时钟切分为 `opening_probe`（09:30–10:00）/ `prime`（10:00–11:00）/ `midday`（11:00–13:00）/ `noise`（13:00–14:00）/ `afternoon`（14:00–15:00）/ `power_hour`（15:00–16:00）。`session_phase_hint_basis=america_new_york_liquidity_context_neutral_v2`；标签只陈述对应时段的流动性/波动环境，尤其 13:00–14:00 不再给出观望、仓位或其他动作建议。
+2. **财报临近**（`earnings_proximity`）：Finnhub 前向窗口与缺失语义不变；今日财报可标记事件冲突，未来财报只显示「距财报 N 天」并重申同一 ET 日平仓、不跨事件，不再把未来财报机械解释成权利金结论或禁止交易。
+3. **大盘对齐**（`market_alignment`）：SPY 会话 VWAP 仍是累计成交额 ÷ 累计成交量的近似背景；`aligned` / `against` / `unknown` 只描述当前读数，不是开仓许可。
+4. **速度分级**（`session_bursts.speed`）：相邻两个滚动 15 分钟窗口爆发分之差仍显示 `accelerating` / `decelerating` / `flat` / `unknown`，但只描述已发生的变化，不映射任何离场规则。
 
-前端：扫描表新增「速度」（当前爆发旁）「大盘」（VWAP 旁）「财报」（期权异动前，按距财报天数可排序，标缺行恒排最后）三列，footer 公式行同步扩展并写明设计规则；市场脉搏条首展示时段标签（tooltip 说明其为用户历史统计的硬编码文案）。全部四类信号的口径与「硬编码用户历史提示、不是市场统计、不是信号」限制随响应 `limitations` 固定携带。
+前端在市场脉搏条展示中性时段环境标签；扫描表的财报、大盘和速度继续显式标缺。上述字段均为「系统标注，用户过滤」的研究上下文。严格 2m underlying P0/P0-X 不受 09:45–15:15、0DTE 14:30、DTE 或盘口门禁决定；0–7DTE、同一 ET 日平仓、尾盘退出与实时盘口核对只约束用户后续合约选择和持仓纪律。
 
-诚实合同（响应 `limitations` 固定携带，页头同句展示）：盘中滚动、不冻结、不写快照/qualification/5D/20D 结果（`statistics_track=none_intraday_v1_unscored`）、期权异动不证明方向、盘中排序＝爆发分优先 + 证据计数次之（均为确定性研究度量而非胜率模型，不是买卖信号）。休市时段接口仍可用，但 `quote_session_scope=latest_prior_session`、证据口径标注「最近一个交易时段」、排序退回证据计数。前端自动刷新与 §2.7 相同：60 秒、仅页面可见且盘段为盘前/盘中。
+诚实合同（响应 `limitations` 固定携带，页头同句展示）：Top 表盘中滚动、不冻结、不写 qualification/5D/20D 结果（`statistics_track=none_intraday_v1_unscored`），期权异动不证明方向，v9 固定按非 legacy 证据计数排序；旧爆发分不再参与排序或 P0。休市时段接口仍可用，但 `quote_session_scope=latest_prior_session`、证据口径标注「最近一个交易时段」。前端自动刷新与 §2.7 相同：60 秒、仅页面可见且盘段为盘前/盘中。严格 2m monitor 另按 XNYS 盘段运行，不依赖页面是否打开。
 
-### 2.9 临期合约面板（G-8：0–3 DTE 合约选择支持）
+### 2.9 临期合约面板（G-8：0–7 DTE 合约选择支持）
 
 从「选中标的」到「选中合约」之间此前是空白：系统研究 underlying，但不给任何合约级 bid/ask、点差、流动性或逐行权价 IV。临期合约面板（2026-08-02）补的就是这一层，并且**只是合约选择支持，不是推荐引擎**：不给合约打分、不做偏好排序（只有按 expiry / strike / right 的中性排序）、不生成买卖建议；页头固定「合约选择参考 · 不构成推荐 · 以券商实时盘口为准」。
 
 `POST /api/v1/opportunities/near-expiry-contracts` 合同（`schema_version=near-expiry-contracts/1.0`）：
 
-- 请求：`symbol`（单个美股期权 underlying，`US.` 前缀规范化移除，非法 422）、`max_dte`（默认 3、上限 7、含 0DTE）、`refresh`。
+- 请求：`symbol`（单个美股期权 underlying，`US.` 前缀规范化移除，非法 422）、`max_dte`（默认 7、上限 7、含 0DTE）、`refresh`。
 - 数据路径复用既有 Moomoo 链机制：1 次 `get_option_expiration_date` + 1 次 `get_option_chain` 日期窗口（`max_dte ≤ 7 < 30` 天恒为单窗口，占 §2.1 记录的 10 次/30 秒链额度中的 1 次）+ 1 次 underlying 快照（含 `update_time` 作 spot as-of）+ 近价窗口合约的 `get_market_snapshot`（典型规模远小于单批 400 上限，即 1 个快照批次）。整个读取走与期权墙相同的独占 QuoteContext lane，不与墙扫描交叉使用同一 SDK context。
 - **bid/ask 来源**：`get_market_snapshot` 对期权 code 本就返回 `bid_price` / `ask_price`（单到期 `fetch_chain_via_moomoo` 一直在读；期权墙适配器只是没保留这两个字段）。本面板直接从同一批快照读取，不需要额外的 per-expiry 链调用。
 - 近价窗口：`abs(strike/spot−1) ≤ 5%` 与现价上下各最近 8 档行权价的并集（`src/opportunities/near_expiry_contracts.py`，边界含 1e-9 浮点容差）。窗口只约束供应商请求规模，不是价值判断。
 - 逐合约字段：`code / right / strike / dte / expiry / bid / ask / mid / spread_percent / last_price / session_volume / open_interest / iv_percent / delta / quote_as_of`。`spread_percent = (ask−bid)/mid`；bid/ask 任一缺失时 mid 与 spread 显式 null + reason（`bid_or_ask_unavailable`），**绝不 0 回填**；交叉盘口（ask < bid）保留 mid、点差标缺（`crossed_quote`）。快照缺行或 `option_valid` 无效的合约保留静态行并逐字段标缺（`quote_state=unavailable` + `snapshot_missing/snapshot_invalid`），逐到期隔离：一个到期日的快照失败不影响另一个到期日（组内 `ready / partial / unavailable`）。
 - 时间口径：OI 显式标 T-1 清算口径（`open_interest_as_of` 用 XNYS 上一 session）；volume 为当日累计；IV 为供应商百分数模型值；spot 与逐合约 `quote_as_of` 来自快照自带 `update_time`。与期权墙同一标准合约边界：显式 `NON_STANDARD` 排除、缺 `option_standard_type` 单独计数排除。
-- 额度安全：30 秒完成态 TTL + single-flight，key =（symbol, max_dte, Moomoo 启用状态, ET 日期）；`refresh` 只绕过已完成 TTL、仍复用在途请求。窗口内没有到期日（只有周五到期的标的在周末查 0–3 天窗口时会出现）返回诚实 `empty` 状态，不是失败。
+- 额度安全：30 秒完成态 TTL + single-flight，key =（symbol, max_dte, Moomoo 启用状态, ET 日期）；`refresh` 只绕过已完成 TTL、仍复用在途请求。0–7DTE 窗口内没有到期日时返回诚实 `empty` 状态，不是失败，也不回退到 8+DTE。
 - 响应固定携带 limitations：OI 结算口径、点差与流动性随时变化、IV 为供应商模型值、面板不构成合约推荐或买卖建议、执行前以券商实时盘口为准。
 
 前端（`NearExpiryContractPanel`）：
 
 - `/intraday` 日内扫描表交互取「行点击不变 + 每行显式按钮」：整行点击仍是既有的即时扫描详情页导航，行尾「临期合约」按钮在该行下方展开内联面板（同一时刻只展开一行，保持表格可用）。选这个方案而不是改行点击语义，是为了不破坏既有肌肉记忆、也不牺牲表格扫读。
 - 面板按到期日分组（`0 DTE / 1 DTE / …` 小节），列：行权价（ATM 行高亮 + 位置标记 badge）/ Call|Put / Bid×Ask（点差%）/ 最新价 / 当日量 / OI（T-1）/ IV / as-of。点差 > 15% 标「流动性差」——这是 v1 启发式展示阈值（`SPREAD_ILLIQUID_THRESHOLD_PERCENT`，未经交易结果验证），只提示点差成本显著；缺 bid/ask 显示「标缺」。
-- `/regime/opportunity/:ticker` 详情页「期权墙」标签底部提供「查看临期合约（0–3 DTE）」按钮，按需展开同一面板组件；只有显式点击才发起读取。
+- `/regime/opportunity/:ticker` 详情页「期权墙」标签底部提供「查看临期合约（0–7 DTE）」按钮，按需展开同一面板组件；只有显式点击才发起读取。
 - 客户端 30 秒缓存 + 在途去重，与服务端 TTL 对齐，不用长缓存冻结盘中读数。
-- 财报临近（2026-08-02）：响应新增 additive `earnings_proximity` 字段（与 §2.8 扫描表候选同形状，复用同一份逐 ET 日 Finnhub 日历缓存，零新增抓取路径）；面板页头在回避窗内（≤3 天）醒目标注「财报 N 天内 · 期权贵 · 你的回避规则」（0 天为「今日财报…」），ready 且窗外不加任何标注，日历不可得时小字「财报日历标缺 · 未知≠安全」——未知绝不冒充安全。
+- 财报临近：响应 additive `earnings_proximity` 字段与 §2.8 同源。今日财报显示事件冲突硬拦截；未来财报显示「距财报 N 天 · 当日平仓，不跨事件」的中性上下文；日历不可得时显示「财报日历标缺 · 未知≠安全」。
 
 真实验收（2026-08-02 周日休市，TestClient 连本机 OpenD）：MU `max_dte=3` 返回 2026-08-03 / 2026-08-05 两个到期日、64/64 张全部观测报价（MU/NVDA 现有周一/周三/周五到期，周末 3 天窗口并不为空）；NVDA `max_dte=7` 三个到期日 96/96；0 失败批次、0 非标准合约排除。spot as-of 与逐合约报价 as-of 如实显示上一时段（周五 15:59 / 盘后 20:01 ET）、`open_interest_as_of=2026-07-31`。样本行同时覆盖窄点差（NVDA 08-07 ATM Call 3.1%）与将被标「流动性差」的宽点差深度 ITM/OTM 行（NVDA 08-03 P185000 33.3%）。该数值是当次环境证据，不是 SLA。
 
@@ -272,11 +286,11 @@ Playbook 只读对应：服务端从 journal_v2 Playbook 候选表读取标题�
 
 ### 2.11 watchlist v1 两层扫描（宽层快照 → 异动闸门 → 深度层）
 
-用户的完整 TradingView 清单约 69 档美股（equities/ETF），远超日内扫描原有 ≤20 档单层 universe；把 69 档全部塞进深度管线会同时打爆 5m K 线额度与 60 秒轮询节奏。2026-08 起采用专业扫描器的标准分层：**宽而便宜的快照层 → 异动闸门 → 窄而昂贵的深度层**。
+用户的完整 TradingView 清单约 69 档美股（equities/ETF），远超日内扫描原有 ≤20 档单层 universe；把 69 档全部塞进深度管线会同时打爆 5m K 线额度与常规轮询节奏。2026-08 起采用专业扫描器的标准分层：**宽而便宜的快照层 → 异动闸门 → 窄而昂贵的深度层**。
 
 **启用条件（回滚 = 取消设置 `INTRADAY_WATCHLIST`）**：仅当服务端配置了 `INTRADAY_WATCHLIST`（逗号分隔清单，服务端上限 200 档，超出显式截断并标注 `watchlist_truncated`）且客户端 `symbols` 为空时启用；显式 `symbols`（≤20）或未配置清单时行为与既有单层扫描逐字节一致（`universe_scan` 恒为 null，候选无 `scan_tier` / `deep_lane_reason`——由回归测试锁定）。`INTRADAY_DEEP_LANE_MAX`（默认 12，1..20 双端钳制）只约束异动晋升名额。
 
-**宽层（tier-1）**：整个清单 + 当日冻结盘前计划标的 + SPY 并入**每 60 秒周期仅 1 次** Moomoo `get_market_snapshot` 批量快照（官方单次上限 400 个代码；清单有界 200，恒为单请求，无需分片）。宽层只产出快照可得字段：现价 / 当日涨跌%（快照前收口径）/ 当日高低 / 量 / 额 / as-of。宽层行**没有**爆发、形态、速度、异动、财报字段——缺席即缺席，不以 null 占位冒充「已分析」。
+**宽层（tier-1）**：整个清单 + 当日冻结盘前计划标的 + SPY 并入**每个扫描周期仅 1 次** Moomoo `get_market_snapshot` 批量快照（默认最长 60 秒；官方单次上限 400 个代码；清单有界 200，恒为单请求，无需分片）。宽层只产出快照可得字段：现价 / 当日涨跌%（快照前收口径）/ 当日高低 / 量 / 额 / as-of。宽层行**没有**爆发、形态、速度、异动、财报字段——缺席即缺席，不以 null 占位冒充「已分析」。
 
 **异动闸门 v2（2026-08-04 起，非盘前时段默认，`gate_basis=momentum15m_then_day_change_v2`）**：K 个异动名额拆成两个子额度——**ceil(2K/3) 档按 `|mom15|`（最近 15 分钟动量，「谁现在在动」）降序**，其余名额按 `|当日涨跌幅|`（「谁今天最大」）降序兜底；动量侧先占位再去重，两侧各以成交额次序、代码字典序兜底（确定性）。`mom15 = (last / price_15min_ago − 1)×100`，由宽层每轮批量快照喂养的**进程内**价格滚动历史推导（零新增供应商请求）：取 12–18 分钟回看窗内「最老」样本作基准；窗内无足龄样本（服务重启 / 开盘冷启动 / 样本过期）时该标的 `mom15=None`，只能走当日涨跌子额度。整批皆无 `mom15` 时闸门**显式回退** v1 当日涨跌口径，并在 `universe_scan.gate_warnings` 携带 `momentum_history_warming_up_ranking_by_day_change`——绝不静默假装在按动量排序。动量历史仅常规时段喂养、ET 日期切换即清空（绝不跨日比价）、重启即冷启动。
 
@@ -682,7 +696,12 @@ Qualification v2 进一步令方向性标的路径与实际回填合同一致：
 
 样本为单一交易者、单一 regime、92 个交易日的描述统计，**不是因果结论、不构成建议**。`basis_break` 区间的每美元读数**只能自比，不可跨组比较**，也不得进入任何排序、信号或过滤。月度口径仍为 ET≈UTC−4 近似（3 月初 EST 为 UTC−5，边界样本可能偏移 ±1 小时）。本区块的样本＝该 build 全部**已平仓且有净盈亏**的回合（含少量正股回合），与上述只取期权回合的研究样本不同，绝对值会有差异、方向一致。
 
-## 9. 车道检查清单 + 规则遵守度统计（规则 v2 的前向证伪，2026-08-04）
+## 9. 历史车道检查 + 规则遵守度统计（V2 冻结，2026-08-04）
+
+> 本节记录旧 V2 分类器的产生过程与历史验收，只服务于旧交易的归因和版本化
+> 前向比较。`intraday_0dte`、`overnight_4_7`、V2-A/B/C/D 及手动双车道
+> 额度均不再驱动当前 `/intraday`。当前开仓前检查见 §10 的
+> `INTRA-0-7/v1` 合同。
 
 用户从自身干净口径历史推出并采纳了一套**两车道规则**（Playbook 候选「V2-0」…「V2-D」，id 13–17，append-only 未晋升）。本节记录把这套规则落到盘面与账本上的两件东西：**开仓前对照清单**（`/intraday`）与**规则遵守度记账**（Journal）。两者都不下单、不推荐、不含概率；系统只读。
 
@@ -766,9 +785,13 @@ Qualification v2 进一步令方向性标的路径与实际回填合同一致：
 
 样本为**单一交易者、单一市场状态（2026-04→07，SPY 上行）**的描述统计，**不是因果结论、不构成建议**；过夜车道 n=65 偏小，隔夜跳空风险在该窗口内未被充分体现。车道判定是机械的结果标签，不代表进场意图。这两个面板不排序、不打分、不产生信号、不进入任何过滤，也**不下任何单**——系统全程只读。真正的检验只有一个：采纳后那一列。
 
-## 10. 今日车道可用性（day-type，V2-E，2026-08-04）
+## 10. 今日 0-7DTE 纯日内可用性（`INTRA-0-7/v1`；2026-09-01）
 
-### 10.1 为什么做：星期效应其实是合约可用性
+> 本节中保留的 `day_type`、`has_zero_dte` 与 V2-E 文案是兼容字段及历史
+> 验收记录；**当前消费者只以 `policy_state` 和逐标的 0-7DTE 到期事实判定**。
+> 没有 0DTE 不再等于“过夜日”，只要存在 1-7DTE 合约，纯日内车道仍可用。
+
+### 10.1 历史取证：星期效应与合约可用性（不再是当前规则）
 
 对用户自身**干净口径**历史（build #3，ET 入场日 ≥ 2026-04-21、仅 `fill_allocations > 0` 的明细成交回合，**n=1,407**；`gross = realized_pnl_net + total_fee`，`risk = ABS(opening_cash_flow)`，口径同 §9.1）的取证得到一个反直觉结论：**用户全部的「星期效应」都是合约可用性造成的合约选择问题。**
 
@@ -793,9 +816,9 @@ Qualification v2 进一步令方向性标的路径与实际回填合同一致：
 
 另外两个事实：周二/周四真做的 0DTE 中 **QQQ 占 43/88 笔**（毛 −0.45%），而 QQQ 属用户历史负边际标的（见 Playbook R3）；**行为缺口**——恰恰在过夜车道是唯一好选择的两天，用户几乎没用它：周二 1 笔、周四 11 笔 4-7DTE 隔夜单。
 
-以上已写入 Playbook 候选 **「V2-E · 按合约可用性决定今天做不做日内（周二/周四＝过夜日）」**（id 18，append-only 未晋升）。本节记录把 V2-E 落到盘面上的读数层。
+以上曾写入 Playbook 候选 **「V2-E · 按合约可用性决定今天做不做日内（周二/周四＝过夜日）」**（id 18，append-only 未晋升）。该候选现已冻结为历史；星期和“过夜日”都不参与 `INTRA-0-7/v1` 当前判定。
 
-### 10.2 判定规则：从当日真实到期日推导，不含任何星期逻辑
+### 10.2 当前判定：从当日真实到期日推导 0-7DTE 纯日内池
 
 **星期规则是错的实现方式**：假日、节前特殊到期、标的新增周二/周四到期都会让「周二＝过夜日」失效。因此判定输入一律是**当日真实期权到期日元数据**。
 
@@ -808,10 +831,21 @@ Qualification v2 进一步令方向性标的路径与实际回填合同一致：
 | 窗口内一个到期日都没有 | `ready` | `false` | 诚实空态，不是失败 |
 | 链读不到 | `unavailable` | **`null`** | + `unavailable_reason`；**未知 ≠「今天没有 0DTE」** |
 
-聚合 `day_type`（`derive_day_type`），顺序即优先级：
+当前聚合 `policy_state`（`derive_intraday_policy`）的优先级：
+
+1. 任一可读标的确证存在 `0 ≤ DTE ≤ 7` → `available`，并列入
+   `eligible_tickers`；其他标的读不到不能推翻这项正向证据。
+2. 全部参与标的均已可读、但都没有 0-7DTE 到期 → `unavailable`。
+3. 尚无正向证据且至少一个标的未读/延后 → `unknown`，未知绝不冒充不可用。
+
+响应同时回显 `policy_version="INTRA-0-7/v1"`、
+`holding_policy="same_et_day_only"`、`eligible_dte_min=0` 与
+`eligible_dte_max=7`。旧 `day_type` 仅为兼容保留：
 
 1. **任一标的确证有 0DTE** → `intraday_available`。正向证据不因别的标的读不到而作废（读不到只可能再**增加** 0DTE）。
-2. 没有任何 0DTE **且全部标的都读到了链** → `overnight_only`。这就是 V2-E 的「过夜日」：日内车道关闭，只剩过夜车道（V2-B）或不做。
+2. 没有任何 0DTE **且全部标的都读到了链** → 旧字段仍可能返回
+   `overnight_only`；该值只表达“无 0DTE”的历史事实，**不得解释为当前日内
+   车道关闭，更不得据此开隔夜仓位**。
 3. 其余（一个都没查，或没查到 0DTE 但存在读不到的标的）→ `unknown` + 原因。**fail closed**：绝不以「读不到」冒充「今天没有 0DTE」。
 
 ### 10.3 数据路径与额度护栏（零新增抓取路径）
@@ -821,8 +855,8 @@ Qualification v2 进一步令方向性标的路径与实际回填合同一致：
 
 额度护栏（对齐 §2.1 记录的 10 次链查询 / 30 秒；常量见 `api/v1/endpoints/opportunities.py` 的 `_LANE_AVAILABILITY_*`）：
 
-- **逐标的按 ET 交易日缓存 1 小时**（到期日一天最多变一次）——同一交易日内的 60 秒轮询稳态命中缓存、**零供应商请求**；失败只短缓存 5 分钟，避免一次抖动把一整天钉死在 `unknown`。
-- **单轮新增读取上限 8**（60 秒轮询周期内 ≤8 次 < 10 次/30 秒）；超出的标的本轮显式记为 `unavailable` + `deferred_provider_quota_budget` 并列入 `deferred_tickers`，**下一轮补齐**——绝不为了凑齐结论而把「没查」说成「没有 0DTE」。
+- **逐标的按 ET 交易日缓存 1 小时**（到期日一天最多变一次）——同一交易日内的常规轮询稳态命中缓存、**零供应商请求**；失败只短缓存 5 分钟，避免一次抖动把一整天钉死在 `unknown`。
+- **单轮新增读取上限 8**（当前 60 秒轮询周期内 ≤8 次）；超出的标的本轮显式记为 `unavailable` + `deferred_provider_quota_budget` 并列入 `deferred_tickers`，**下一轮补齐**——绝不为了凑齐结论而把「没查」说成「没有 0DTE」。
 - **单轮参与判定的标的上限 12**（＝ `INTRADAY_DEEP_LANE_MAX` 默认值），**只覆盖深度层，绝不向宽层全清单扇出**。
 
 ### 10.4 端点合同（additive，既有字段一字不改）
@@ -832,6 +866,10 @@ Qualification v2 进一步令方向性标的路径与实际回填合同一致：
 | 字段 | 含义 |
 | --- | --- |
 | `day_type` / `day_type_reason` | `intraday_available` / `overnight_only` / `unknown` + 一行原因 |
+| `policy_version` / `holding_policy` | 固定为 `INTRA-0-7/v1` / `same_et_day_only` |
+| `eligible_dte_min` / `eligible_dte_max` | 当前期限边界 0 / 7 |
+| `policy_state` / `policy_state_reason` | `available` / `unavailable` / `unknown` + 当前纯日内判定原因 |
+| `eligible_tickers` | 确证至少有一个 0-7DTE 到期的标的 |
 | `basis` | `per_ticker_option_expiry_metadata_within_0_7_dte_v1`（判定依据回显，不是星期规则） |
 | `checked_scope` / `checked_count` / `readable_count` / `unavailable_count` | 判定范围与可读性计数 |
 | `zero_dte_tickers` | **确证**有 0DTE 的标的（用户直接看到「今天是哪几个」） |
@@ -841,37 +879,54 @@ Qualification v2 进一步令方向性标的路径与实际回填合同一致：
 
 **`POST /api/v1/opportunities/near-expiry-contracts`**（§2.9）新增三个 additive 字段，由**已在手的到期日分组**推导，**零额外抓取**：`has_zero_dte`、`available_dte_list`、`availability_unavailable_reason`。链读不到（`not_configured` / `unavailable`）时 `has_zero_dte` 显式 `null` + `near_expiry_chain_unavailable`；`state=empty`（链可读、窗口内无到期日）时为 `false`。
 
-### 10.5 消费面：车道检查清单的第一行
+### 10.5 消费面：唯一纯日内车道的第一行
 
-`LaneChecklistPanel`（§9.4）新增**面板第一行**的车道日类型，它决定「今天这条车道到底开不开」，必须在用户选车道之前就看到。四种呈现：
+`LaneChecklistPanel`（§9.4）当前不再提供日内/过夜切换，第一行直接显示
+`INTRA-0-7/v1` 的 0-7DTE 可用性：
 
 | 状态 | 文案 |
 | --- | --- |
-| `intraday_available` | 「今日：日内车道可用（NVDA/TSLA/MU 有 0DTE）」——直接点名是**哪几个**标的 |
-| `overnight_only` | 「今日：过夜日 · 无 0DTE · 日内车道关闭（V2-E）」 |
-| `blacklist_only` | 「今日仅黑名单标的有 0DTE（QQQ）· 日内车道实际关闭（V2-E）」 |
-| `unknown` | 「今日：车道可用性标缺 · …」+ 原因（区块缺席 / 链读不到 / 本轮未查） |
+| `available` | 「今日：0-7DTE 纯日内池可用」并点名 `eligible_tickers` |
+| `unavailable` | 「今日：深度层无可用 0-7DTE 到期」；不回退到 8+DTE 或隔夜 |
+| `unknown` | 「今日：0-7DTE 可用性标缺」+ 原因（区块缺席 / 链读不到 / 本轮未查） |
 
-tooltip 一律以 **`规则出处：V2-E · 按合约可用性决定今天做不做日内（周二/周四＝过夜日）`** 起头，与既有 V2-A/B/C/D 的引用模式一致。
+tooltip 以 **`规则出处：INTRA-0-7/v1 · 0-7DTE · 同一 ET 日平仓`** 起头。
 
-**硬阻断**：选中**日内**车道且 `day_type = overnight_only` 时给出 `V2-E` 硬阻断，一行写清证据——「绝不退而买 1-3DTE（周二/周四历史 −2.61%/−3.74%，1DTE 当日 −4.97%，n=313，胜率 25.2%）」。选中**过夜**车道不阻断——它正是今天该走的车道。
+**手动合约执行参考（不参与 underlying P0/P0-X）**：当前只推荐查看 `0–7DTE`
+并要求同一 ET 日平仓；负 DTE、超过 7DTE 或不承诺当日平仓不属于本纯日内工作流。
+旧 09:45–15:15、0DTE 14:30 与半日市等距开仓截止不再阻止严格 2m 信号成立，
+只可作为用户自行选择合约时的历史纪律参考。close−30 分钟未平仓检查和
+close−15 分钟退出提醒仍用于落实同日平仓，不能反向篡改已发生的 P0 事实。
 
-**黑名单叠加**：仓库内此前没有黑名单配置项，故在 `laneChecklist.ts` 定义为**有出处的常量** `BLACKLIST_TICKERS = ['PLTR', 'AMD', 'QQQ', 'SMCI']`，出处即用户自己的规则文本——Playbook R3「标的黑名单」（PLTR −$5.3 万、QQQ −$4.1 万）、V2-E 附带禁令（周二/周四 0DTE 中 QQQ 占 43/88 笔，毛 −0.45%）、个人画像回灌 G-16 的「漏斗」标的。**黑名单是用户自己的规则，不是市场事实**，因此只在前端叠加：服务端 `day_type` 只回答「今天有没有 0DTE」。若确证有 0DTE 但**全部**落在黑名单上，面板显示 `blacklist_only` 并同样阻断日内车道（V2-E 附带禁令：不得因「今天只有它有 0DTE」而交易黑名单标的）；若同时存在非黑名单标的，则照常 `intraday_available`，黑名单标的在 tooltip 里如实提示、不静默。
+**历史黑名单叠加已取消**：旧 UI 曾在 `laneChecklist.ts` 以
+`BLACKLIST_TICKERS = ['PLTR', 'AMD', 'QQQ', 'SMCI']` 叠加 V2-E 阻断；该前端
+常量及 `blacklist_only` 开关已随双车道一起退出当前检查。标的历史表现仍可在
+Journal 中查看，但不能仅凭旧样本把 0-7DTE 到期可用性改写成不可用。
 
-### 10.6 真实读数（2026-08-04 周二，TestClient 连本机 OpenD）
+### 10.6 历史验收读数（2026-08-04 周二，TestClient 连本机 OpenD）
 
-第一轮轮询：深度层 16 个标的 → 参与判定 12 个（上限）、本轮读取 8 个（额度预算），`day_type=unknown`，4 个标的显式 `deferred_provider_quota_budget`。第二轮起全部 12 个可读、缓存命中零新增请求，**`day_type=overnight_only`**（「12 个深度层标的今日均无 0DTE 到期，日内车道关闭（V2-E）」）：
+第一轮轮询：深度层 16 个标的 → 参与判定 12 个（上限）、本轮读取 8 个（额度预算），`day_type=unknown`，4 个标的显式 `deferred_provider_quota_budget`。第二轮起全部 12 个可读、缓存命中零新增请求；当时旧实现返回 **`day_type=overnight_only`** 并误把它解释成日内关闭。当前响应仍兼容保留该枚举，但 reason 明确标为 legacy 0DTE 事实，并另外返回 `policy_state=available`：
 
 | 标的 | `available_dte_list` | `has_zero_dte` |
 | --- | --- | --- |
 | NVDA / TSLA / MU / AAPL | `[1, 3, 6]`（08-05 / 08-07 / 08-10） | `false` |
 | AAOI / PLTR / LITE / MRVL / GLW / ALAB / AMKR / ASTS | `[3]`（08-07） | `false` |
 
-与用户手动核对完全一致：主力名（NVDA/TSLA/MU/AAPL）今天只有 1/3/6DTE，中小盘只有周五（3DTE）——**2026-08-04 是一个标准的「过夜日」**。同日单独探测 QQQ 得 `[0, 1, 2, 3, 6, 7]`（确有 0DTE），但 QQQ 今日不在深度层，故不影响聚合；若它进入深度层，前端会呈现 `blacklist_only` 而不是放行。
+与用户手动核对完全一致：主力名（NVDA/TSLA/MU/AAPL）当天只有 1/3/6DTE，
+中小盘只有周五（3DTE）。旧 V2 因此曾把 2026-08-04 标为“过夜日”；按
+当前 `INTRA-0-7/v1`，同一批读数的 `policy_state` 应为 `available`，因为
+1/3/6DTE 都在纯日内合规期限池内，且仍必须当日平仓。同日单独探测 QQQ 得
+`[0, 1, 2, 3, 6, 7]`；该历史读数只说明到期日存在，不自动构成 P0。
 
 ### 10.7 诚实边界
 
-依据数字来自**单一交易者、单一市场状态（2026-04→07，SPY 上行）**的描述统计，4DTE / 7DTE 隔夜样本各仅 30 / 21 笔，隔夜跳空风险未充分体现——**不是因果结论，不构成建议**。车道可用性只回答「今天有没有 0DTE 可用」：不评价标的、不预测方向、不排序、不打分、不进入任何统计，也**不下任何单**。判定范围是今日深度层中有界的前若干个标的，**不代表全部 universe 今日没有 0DTE**；DTE 以 America/New_York 交易日按自然日计算，未接入交易所假日日历。链读不到时一律显式标缺——**未知不等于安全，也不等于「今天没有 0DTE」**。
+历史数字来自**单一交易者、单一市场状态（2026-04→07，SPY 上行）**的描述
+统计，不是因果结论。当前可用性只回答「深度层是否存在 0-7DTE 到期」，不
+评价标的、不预测方向、不排序、不打分。它也不证明盘口合格：期权异步补充仍须
+对候选合约核验 bid、点差、Delta 与报价新鲜度，但失败或无合约不会撤销 underlying
+P0。判定范围是今日深度层中有界的标的，
+不代表全部 universe；DTE 按 America/New_York 自然日计算。链读不到时一律
+显式标缺，未知不等于安全。
 
 ---
 
@@ -916,6 +971,9 @@ MU 不在清单里也被并入同一批快照并深扫，且没有挤掉异动�
 
 ### 11.5 逐标的卡片
 
+> 下述条目是 2026-08-05 UI 的历史快照。当前卡片已取消车道切换、过夜候选
+> 和手动双车道额度，期限固定为 0-7DTE，且要求同一 ET 日平仓。
+
 `IntradayPlanPanel.tsx` + 纯判定层 `intradayPlanChecks.ts`。**车道规则与 ET 时钟直接复用 `laneChecklist.ts` 的同一套判定**（`evaluateLaneChecklist` + `earningsCheck`），不另写一份，避免两处规则漂移。每张卡片：
 
 1. **今日车道**（V2-E）：日内可用 / 过夜日 · 日内关闭 / 标缺 / 读取中；
@@ -925,6 +983,8 @@ MU 不在清单里也被并入同一批快照并深扫，且没有挤掉异动�
 5. **失效位提示**：中性一行「进场前先写下失效位；说不清就不开（结构止损）」+ 当日**已有观测值**（今日最高/最低、最近一段上/下行波段的时间窗）。**不计算任何进出场价位**。
 
 ### 11.6 车道清单的六处修复
+
+> 历史记录：此表描述旧 V2 页面曾经做过的修复，不是当前规则需求清单。
 
 | # | 问题 | 修复 |
 | --- | --- | --- |
@@ -989,18 +1049,23 @@ TTL 过期、服务重启、显式刷新——任何缓存空窗都会让用户�
 `IntradayWarmCacheScheduler`：与 premarket/outcome host 同一模式的 daemon 线程
 （start 幂等、stop 无界 join、quiet-unless-incident）。语义：
 
-- **时窗闸门**：完全复用 `market_session_state`（`america_new_york_clock_v1`，
-  不新增时钟逻辑）——工作日 04:00–20:00 ET（盘前→盘后）内预热，之外 idle
-  零请求（周末/夜间每 tick 只是一次纯时钟判定）。
+- **时窗闸门**：使用 `exchange_calendars` 的 XNYS 官方 session——09:00 ET
+  至当天真实 close+15 分钟预热；假日/周末零请求，13:00 半日市于 13:15
+  停止。日历读取失败时 failed/fail-closed，不猜一个正常 16:00 收盘。
 - **预热目标**：`warm_default_intraday_top_scan()` 以「无显式 symbols、无
   focus、默认 limit=5」解析出与页面默认轮询**完全相同**的 key/工厂
   （`_intraday_top_key_and_factory`，端点与预热共用，无平行实现），并以
   `bypass_cache=True` 走 `_get_or_compute_scan`——与用户点「刷新」同语义：
   绕过已完成 TTL 条目、仍加入同 key 在途请求。**join-not-duplicate**：用户
   在 leader 时预热只加入等待，绝不并发第二个工厂（有慢工厂确定性测试钉住）。
-- **节奏**：`INTRADAY_REFRESH_INTERVAL_SECONDS`（默认 45，低于 30——基础
-  单飞租约——钳制到 30）。装配超时（>45s 租约）折叠为 failed tick，孤儿计算
-  照常迟到发布（§12.1 合同不变）。
+- **节奏**：`INTRADAY_REFRESH_INTERVAL_SECONDS` 默认 60 秒（低于 30 秒会
+  按基础单飞租约钳制到 30 秒）。09:31–09:35 开盘关键窗固定在每个整分钟后约
+  5 秒探测；严格 2m 车道每分钟读取，但只评估新的完整 2m `window_end`。
+  若上一轮慢扫描跨过当前 probe，下一轮立即补跑而不是再等完整间隔。任一开盘
+  checkpoint 在首读时仅因供应商尚未定稿而 pending，慢 Top/期权扫描先让路，
+  每 2 秒补抓、最多 4 次；格式错误、缺历史或来源不一致直接 fail closed，不进入
+  重试。装配超时（>45s 租约）折叠为 failed tick，孤儿计算照常迟到发布（§12.1
+  合同不变）。
 - **断路器兼容**：`MOOMOO_RPC_BREAKER` 打开时工厂快速失败，预热 tick 折叠为
   `failed:<error_type>` 并保持节奏；host 只在状态迁移时各写一行 INFO
   （idle→warming、warming→failed、恢复），绝不逐 tick 刷屏、绝不刷 error。
@@ -1028,20 +1093,51 @@ env 开关（或置 false）重启。
 
 ## 14. 盘中机会提示器：Telegram 事实推送（2026-08-14）
 
+> **历史实现说明**：本节 §14 的旧 5m burst/P0 七条件、≤1/日/≤3/周预算和
+> 09:45–15:15 P0 时窗均已退役，只用于解释旧台账。当前严格 2m P0/P0-X 规则、
+> 2/日与 7/周预算以及 activation gate 见
+> [`22_P0_2M_SIGNAL_AND_CALIBRATION.md`](22_P0_2M_SIGNAL_AND_CALIBRATION.md)。
+
+> **Phase B 更新（2026-08-25）**：本节描述的「六条规则直推 Telegram」是
+> v1 行为，已被四级推送协议取代——六类宽松事实提示现在是 **P2 观察级**，只
+> 出现在 `/intraday` 页面「今日提示流」，**不再直推手机**；Telegram 保留
+> P1-O 开盘发现（响铃）、strict-2m P0/P0-X 标的事实（响铃）、普通 P1 预备级
+> （静默）与系统通知。旧“P0 行动级”称呼只解释历史台账，不再是当前消息语义。
+> 是否响铃以台账 `delivery_channel` 为真源，而不是仅看 P1 标签。分级决定全部
+> 落 append-only 推送台账，重启后当日去重与预算从台账重建（v1 的「中途
+> 重启会重复提示」缺陷已修复）。分级协议、预算、台账 DDL 与偏差清单的
+> 真源见 `New-docs/phase1/19_PUSH_TIERING_PHASE_B.md`；本节保留的检测
+> 规则（§14.2）仍然准确——它们如今产出的是 P2 台账行而非 Telegram 消息。
+
 ### 14.1 诉求与架构
 
 用户诉求：「盘前盘中的时候知道什么票有机会，比如高开的、放量的」——人不必
 盯盘，手机收提示。实现为**预热载荷的观察者**（`src/services/
 intraday_opportunity_alerter.py`）：§13 的预热循环每 tick 经 single-flight
-算出两层扫描载荷后，把该独立深拷贝交给提示器做纯内存检测（
-`warm_default_intraday_top_scan(payload_observer=...)`），**零新增供应商
-请求、零新增时钟逻辑**。因此提示器**依赖预热循环**：
+09:00 起先为盘中计划、钉选与 `STOCK_LIST` 核心标的预热日线和 20 日同槽基准；
+在 09:31-09:35 的快速路径只补当前短 K 线，使用已缓存的精确 20 日同累计区间
+基准计算 P1-O；09:31-09:34 要求相邻同向双确认，09:35 用五根完整 1m 累计结果最终确认。
+它不等待完整排名、期权链或 P0 上下文。每个 warm tick 先由独立 strict-2m monitor
+扫描完整 `INTRADAY_WATCHLIST`，只对新的完整 2m `window_end` 评估四条件；成立的
+underlying P0 先入队，0–7DTE 合约候选随后异步补充，补充失败不撤销信号。之后
+P1-O 快路径和两层 Top 研究扫描继续运行；六类 P2 事实检测仍是零新增请求，旧
+5m burst 只作兼容展示，不再参与 P0。页面缓存与 strict-2m 全自选 monitor 彼此
+独立。因此所有盘中监控都**依赖预热循环**：
 `INTRADAY_REFRESH_SCHEDULER_ENABLED=false` 时没有载荷可观察，提示器零检测。
-检测窗口即预热窗口（工作日 09:00–16:15 ET）。发送复用既有
+P1-O 早期确认只能在对应的 09:32–09:34 墙钟分钟响铃；此前未确认时，09:35
+最终画像仍只消费五根完整 1m 累计证据。严格 P0/P0-X 按盘前、RTH、盘后三个
+合法盘段判断，不受旧 09:45–15:15 或 0DTE 14:30 截止约束；15:30/15:45
+仍只属于未平仓检查和同日退出纪律。发送复用既有
 `TelegramSender`（`src/notification_sender/telegram_sender.py`），不新建
 发送通道。
 
 ### 14.2 六条检测规则（v1 启发式，全部只读载荷已有字段）
+
+这六条仍是 P2 页面事实。会响铃的 `opening_impulse_v2` 是独立的顺序开盘严格
+交集：累计波幅 ≥0.40 ATR、实体 ≥0.30 ATR、实体效率 ≥60%、顺势收盘位置
+≥68%、目标日前精确 20 日相同累计区间量比 ≥1.0、成交量分位 ≥80%、波幅分位
+≥90%。09:32-09:34 另需相邻两次同向通过；09:35 五根完整 1m 累计结果可单次最终确认。
+任一标缺、来源不一致或门槛未过都不响铃。
 
 阈值沿用扫描面板已校准的常量，**全部是 v1 启发式，不是验证过的交易边际**；
 数字与口径原样透传，不重算（唯一乘法是位移美元换算，见规则 4）：
@@ -1065,9 +1161,10 @@ intraday_opportunity_alerter.py`）：§13 的预热循环每 tick 经 single-fl
    每方向每日一次）→「{T} 近30分位移 {±$X.XX}（{±0.xx} ATR）」。美元换算
    沿用前端扫描表同一口径：仅 `atr_basis="atr14_daily"` 时 `net × atr14`，
    其余标尺不可横向比较，只报 ATR 值。
-5. **日型提醒**（每日一次）：`lane_availability.day_type` 一旦不再
-   `unknown` →「今日有 0DTE：日内车道可用」或「今日无 0DTE：过夜日 ·
-   日内关闭」。未知≠没有，unknown 期间不提醒。
+5. **期限池提醒**（每日一次）：优先读取 `lane_availability.policy_state`；
+   `available` 表示深度层至少一个标的存在 0-7DTE 到期，`unavailable`
+   表示全部已读且没有合规到期，`unknown` 表示尚不能下结论。旧
+   `day_type` 只为兼容保留，不再把“无 0DTE”解释成过夜日或日内关闭。
 6. **盘前期权大单**（仅 premarket；每标的每日一次，2026-08-14 起）：
    候选 `option_activity.max_single_turnover ≥ $1M`
    （`PREMARKET_LARGE_PRINT_MIN_TURNOVER`，与 §15 面板同值的 v1 圆整
@@ -1085,22 +1182,37 @@ intraday_opportunity_alerter.py`）：§13 的预热循环每 tick 经 single-fl
 
 ### 14.3 防骚扰与诚实合同
 
-- （标的 × 规则）× ET 日去重，进程内、ET 日期翻转清零；**中途重启后最坏
-  情况会重复提示**（接受的代价，不落库）。
-- 单 tick 多条提示合并为**一条** Telegram 消息（头行「【盘中提示 ·
-  HH:MM ET】」取载荷 `as_of` 的 ET 时刻）。
-- 全局日上限 `INTRADAY_ALERTS_MAX_PER_DAY`（默认 20，最小 1）：触顶后在
-  同一条消息内补「今日提示已达上限 N 条」，当日不再发送。
+- （标的 × 规则）× ET 日去重，ET 日期翻转清零；**Phase B 起去重键与预算
+  计数落 append-only 推送台账并在重启后重建**——v1 的「中途重启最坏情况
+  会重复提示」缺陷已修复（台账不可读时如实降级回进程内去重并记一行
+  日志，见 phase1/19 §3）。
+- 单 tick 多条提示按出口合并：P1-O 最多 3 票组成一条「顺序开盘候选」
+  响铃，严格 P0/P0-X 是事实型标的异常响铃，普通 P1 为静默；均取载荷
+  `as_of`/`window_end` 的 ET 时刻。
+- 全局日上限 `INTRADAY_ALERTS_MAX_PER_DAY`（默认 20，最小 1）：Phase B
+  起只约束 P0/P1 的 Telegram 行数（P2/P3 不推手机不占额）；触顶后随首个
+  越界批附「今日提示已达上限 N 条」，当日 Telegram 出口关闭，被抑制的
+  P0/P1 以 `daily_cap_reached` 落台账。
 - 每条消息末尾固定一行「事实描述，非买卖信号」；全文永不出现概率、建议、
   目标价或买卖措辞。
+- 旧 P0 行动级正文曾附具体合约代码、DTE、Call/Put、Mid、点差、
+  Delta 和报价龄；候选硬要求 bid>0、`0.35 ≤ |Delta| ≤ 0.65`。0DTE
+  点差不得超过 8% 且报价龄不得超过 30 秒；1-7DTE 点差不得超过 10%
+  且报价龄不得超过 90 秒。这些条件现在只筛选异步期权补充，不再决定
+  strict-2m underlying P0/P0-X 是否成立。
+- P1-O 第一条正文会附触发 checkpoint 的累计 OHLC、成交量/成交额、ATR 标准化
+  实体/波幅、历史相同累计区间量比与分位、缺口/前收收复及高低中位锚；不因期权链变慢而延迟。完整
+  warm 后若有合规 0-7DTE 合约，只发送一次静默盘口补充。
 - 发送在独立 daemon 线程消化有界队列（满则丢弃本 tick 消息并按状态变化记
   一行日志）；Telegram 失败/恢复同样只在状态变化时各记一行
   （quiet-unless-incident），任何异常都不上抛、不阻塞预热节奏。
 
-配置：`INTRADAY_ALERTS_ENABLED`（默认 false ＝行为零变化）+
-`INTRADAY_ALERTS_MAX_PER_DAY`，由 Web/API lifespan 在预热调度器分支内托管，
-需要 `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`，修改后需重启进程。
-回滚＝去掉 `INTRADAY_ALERTS_ENABLED`（或置 false）重启。
+配置分两路：`INTRADAY_ALERTS_ENABLED` 控制 P1-O 与旧 P2/P1 提示流；严格 2m
+研究由 `INTRADAY_P0_2M_ENABLED` 控制，不依赖旧开关。strict-2m 手机发送还必须
+同时满足 `INTRADAY_P0_2M_ACTION_ENABLED=true`、匹配且通过的 activation artifact、
+Telegram 凭据和运行时门禁。两路都由 Web/API lifespan 在预热调度器分支内托管，
+都要求 `INTRADAY_REFRESH_SCHEDULER_ENABLED=true`。回滚 strict-2m 手机出口时只需
+将 `INTRADAY_P0_2M_ACTION_ENABLED=false` 并重启，研究与台账可继续。
 
 ## 15. 盘前期权异常面板：昨日 call/put 偏斜与大单事实（2026-08-14）
 

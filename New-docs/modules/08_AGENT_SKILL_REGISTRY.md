@@ -1,5 +1,10 @@
 # 08 · Agent Skill Registry
 
+> **历史策略注册说明（2026-09-08）**：本文所列 7–90DTE、LEAP、固定 Regime
+> 禁止线及旧 `option_trader` 参数不再是现行合同。当前 Agent/策略文件必须服从
+> `INTRA-0-7/v1`：只推荐 0–7DTE 且同一 ET 日退出；规则真源见
+> [`../phase1/20_INTRADAY_0_7DTE_RULE_MIGRATION.md`](../phase1/20_INTRADAY_0_7DTE_RULE_MIGRATION.md)。
+
 > **模块**：新增三个 Agent Skill（`option_trader` / `leap_explorer` / `trend_follower`）  
 > **位置**：`strategies/*.yaml` + `.claude/skills/*/SKILL.md` + 原项目 Agent orchestrator  
 > **前置**：04 / 05 / 06 / 07 文档（提供底层数据 / 工具）  

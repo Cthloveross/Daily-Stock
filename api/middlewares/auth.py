@@ -5,16 +5,11 @@ Auth middleware: protect /api/v1/* when admin auth is enabled.
 
 from __future__ import annotations
 
-import logging
-from typing import Callable
-
 from fastapi import Request
 from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from src.auth import COOKIE_NAME, is_auth_enabled, verify_session
-
-logger = logging.getLogger(__name__)
 
 EXEMPT_PATHS = frozenset({
     "/api/v1/auth/login",
@@ -33,35 +28,49 @@ def _path_exempt(path: str) -> bool:
     return normalized in EXEMPT_PATHS
 
 
-class AuthMiddleware(BaseHTTPMiddleware):
-    """Require valid session for /api/v1/* when auth is enabled."""
+class AuthMiddleware:
+    """Pure ASGI auth guard for ``/api/v1/*``.
 
-    async def dispatch(
-        self,
-        request: Request,
-        call_next: Callable,
-    ):
+    Keeping this middleware at the ASGI message layer is important for file and
+    streaming responses: downstream body messages pass through unchanged,
+    including their original ``more_body`` termination flag.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
         if not is_auth_enabled():
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
-        path = request.url.path
+        path = scope.get("path", "")
         if _path_exempt(path):
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
         if not path.startswith("/api/v1/"):
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
+        request = Request(scope)
         cookie_val = request.cookies.get(COOKIE_NAME)
         if not cookie_val or not verify_session(cookie_val):
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=401,
                 content={
                     "error": "unauthorized",
                     "message": "Login required",
                 },
             )
+            await response(scope, receive, send)
+            return
 
-        return await call_next(request)
+        await self.app(scope, receive, send)
 
 
 def add_auth_middleware(app):

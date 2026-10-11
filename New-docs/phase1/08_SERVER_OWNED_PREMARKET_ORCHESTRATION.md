@@ -37,6 +37,19 @@
 
 SPY、VIX、板块与昨日结构使用的日线在计算 close、MA 和涨跌前先过滤 provider 返回的未来行：有 `date/Date` 列或 `DatetimeIndex` 时，只保留 observation date `<= target_date`，无法解析日期的有日期列记录也不进入计算。这样即使 provider 或测试 fixture 意外混入下一交易日行，也不会污染当日 Regime。没有任何日期字段的 legacy frame 为兼容保留原行为，因为系统无法从中证明未来泄漏；它不能被引用为“已通过日期因果校验”的更强证据。
 
+### 2.2 09:12 / 09:17 核心日线韧性（2026-09-01）
+
+SPY/VIX 成功日线在进程内按 `symbol + target_date + lookback`共享，用于桥接
+09:12 首次 attempt 和 09:17 恢复 attempt；缓存只接受“最新 observation date
+精确等于截至当前时刻最近已完成 XNYS session”的带日期证据。过期、未来、
+无日期或日历不可解析均 fail closed，绝不用旧数据冒充 ready。共享默认只对
+生产 provider 图开启；显式注入的测试/自定义 provider 默认隔离，避免跨请求污染。
+
+VIX 先读 Moomoo，再读 Cboe 官方日线；Cboe transport 最多两次，每次最长
+2.5 秒且始终受 18 秒整体请求预算约束，两次均失败后独立回退 `^VIX`
+yfinance。SPY 的 yfinance hard bound 为 5 秒。这些回退只改善可用性，不改变
+上述精确 session 新鲜度门禁；服务重启后进程缓存消失，不引入持久化旧值。
+
 ## 3. 服务端研究池
 
 API：

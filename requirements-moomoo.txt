@@ -1,0 +1,5 @@
+# Cloud/VPS runtime for the intraday alert service.
+# Keep the optional broker SDK out of the generic Python dependency contract,
+# while ensuring the Moomoo-backed service image includes a compatible SDK.
+-r requirements.txt
+moomoo-api>=10.9.6908

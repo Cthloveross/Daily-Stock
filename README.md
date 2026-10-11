@@ -29,7 +29,7 @@
 > - 🔒 **Moomoo 永久只读**：只查账户列表、历史订单、逐笔成交与费用；不读取交易密码，不解锁、不下单、不改单、不撤单。
 > - ✅ **真实读取已验证**：新增独立只读探测/导出，显式选择稳定账户、按 7 天分块、按稳定 ID 去重、分批获取费用，并且默认不写 Journal 数据库。只有订单/成交的代码、方向、数量、加权均价和费用全部对账通过才返回 `analysis_ready=true`；盘中费用延迟不会混进稳定分析。
 > - 🧾 **证据生命周期已启用**：Moomoo CSV 先只读预览，再由用户明确确认追加到可信证据账本（内部表名保留为 `journal_v2_*`）；当前 CSV 基线已生成 append-only PositionEpisode build。OpenAPI JSON 的 plan/confirm 只使用最新 accepted CSV baseline，并把 observations、identity provenance 与 canonical set 原子、幂等追加；另一个显式 preview/confirm 可重放冻结 canonical set，生成不自动替换默认 CSV build 的对比构建。当前真实基线为 574 个 aggregate order events + 5,400 个真实 fill、1,441 个生命周期，USD 151,750.75 费用守恒。没有已验证的期初持仓快照时，条件性 P&L 仍标记 `assumed_flat_unverified` 并排除在 headline 之外。旧 live writer 继续暂停。
-> - 🛑 **Always-on 暂停验收**：2026-07-20 审计发现旧 LaunchAgent 在 OpenD 离线时会无限重连并产生数 GB 日志，三项服务已卸载。连接快速失败和日志轮转已修复，但完成离线/在线 smoke 与观察前，不要执行 `scripts/install_launchagents.sh` 恢复常驻。
+> - 🛑 **历史 macOS LaunchAgent 审计状态（2026-07-20）**：当时旧 LaunchAgent 在 OpenD 离线时会无限重连并产生数 GB 日志，三项服务因此卸载。连接快速失败和日志轮转后来已修复；是否恢复本机 LaunchAgent 必须以当前 smoke 与状态检查为准。这不等于云端常驻已经启用；本机关闭后要继续接收盘中提示，仍需按下文 Linux VPS 手册另行部署。
 > - 🧱 **现有能力保留**：Journal / Reality Test / Regime / Breakout / Options / Web 页面仍是后续演进起点；旧文档中预设的 LEAP、0DTE 与交易频率目标均降级为待真实数据验证的假设。
 >
 > **当前受控启动（Moomoo 用户）**：
@@ -327,8 +327,76 @@ LITELLM_MODEL=openai/deepseek-chat
 
 如果同时启用了高级模型路由 YAML（`LITELLM_CONFIG`），YAML 主要用于定义可用模型和路由规则（`model_list`）；运行时主模型 / 备选模型 / Vision / Temperature 仍由 `LITELLM_MODEL`、`LITELLM_FALLBACK_MODELS`、`VISION_MODEL`、`LLM_TEMPERATURE` 等字段决定。渠道编辑器只保存渠道条目，不会覆盖这些运行时字段的选择。
 
-> Docker 部署、定时任务配置请参考 [完整指南](New-docs/user-guide/full-guide.md)
+> Docker 部署、定时任务配置请参考 [完整指南](New-docs/user-guide/full-guide.md)；本地电脑关机后仍要接收美股盘中 Telegram 提示，请按 [Linux VPS 常驻部署](New-docs/deployment/intraday-cloud.md) 验收 OpenD、P1-O 的 20 日开盘基准、strict-2m 的 60 日同钟基线和手机通知。
 > 桌面客户端打包请参考 [桌面端打包说明](New-docs/deployment/desktop-package.md)
+
+### 严格 2 分钟 P0 / P0-X 通知
+
+现行 P0 不再使用旧 5m `burst_score`。系统从原生 1m 严格聚合 2m K，以过去
+60 个交易日同盘段、同钟点基线核验 8m 价格分位、8m RVOL 和同向 18m/ATR14
+位移：RTH 命中记为 P0，盘前/盘后命中记为仅报告正股事实的 P0-X。P0 手机预算
+为 2 次/日、7 次/周；P0-X 当前仅走研究出口，每盘段 1 次/日、合计 5 次/周。预算只控制发送，
+不会改写信号事实；RTH 首条 underlying 提醒也不会等待 0–7DTE 期权补充。R6
+触发或状态标缺也不删除信号：手机仍发送事实型 underlying 消息，但去掉行动性措辞，
+并停止期权候选补充。
+
+严格 2m 子开关默认开启，但研究扫描只有在盘中 scheduler 已启用且自选非空时才会
+实际运行；正式 P0 手机出口默认关闭。只有固定 69 只 universe 完成
+60/80/40 历史切分和 20 日前瞻 shadow、全部上线门禁通过，并由运行时验证匹配的
+activation artifact 后才会发正式 RTH 手机提醒；单独打开开关无效。当前凭证仅覆盖
+RTH，盘外 P0-X 信号继续走研究提醒，不借 RTH 凭证升级。完整公式、数据时间合同、
+校准命令和上线条件见 [严格 2 分钟 P0 / P0-X 信号与上线校准](New-docs/phase1/22_P0_2M_SIGNAL_AND_CALIBRATION.md)。
+20 日是完整前瞻观测窗口，不是等满 20 天就自动启用；历史留出集、现场完整率、
+事件数、通知时延与重复率等门禁必须全部达标，缺口不能靠回放补齐。
+仓库当前没有一份已完成真实 69 只历史切分与未来 20 个交易日 shadow 的通过 artifact，
+因此默认 `INTRADAY_P0_2M_ACTION_ENABLED=false` 是当前正确状态，不能用单元测试 fixture
+或少量回放结果代替生产校准。若显式设置
+`INTRADAY_P0_2M_SHADOW_MOBILE_ENABLED=true` 且 Telegram 凭据可用，严格四条件命中会以
+独立 P2「尚未校准、不可据此行动」研究观察非静默响铃；它不查询期权、不占正式
+P0/P0-X 预算，也不改变校准通过率。研究 RTH 独立限 2 次/日、7 次/周，盘外每盘段
+1 次/日、合计 5 次/周；页面分别展示研究预算和正式预算，研究不代表已验证收益。
+该临时出口默认关闭，正式 P0 仍须满足上述
+activation 门禁。常驻部署用 `/api/v1/system/health-layers` 的
+`intraday_p0_2m` 层核对 stream、基线、`universe_hash`、artifact 与手机 eligible
+数量；action 关闭时该层显示 shadow/degraded 属预期，表示正式 P0 尚未启用，
+不妨碍显式开启的 P2 研究手机提醒。
+首次 live-forward enrollment 若在 RTH 发起会被拒绝，收盘后再以下一个 XNYS 交易日为
+首日冻结；已有 enrollment 可在盘中重启时恢复。交易日 20:00 ET 起或周末/休市日会预热
+下一个 XNYS 交易日的历史基线。每个 RTH endpoint 只能在结束后 0–75 秒（含）留存现场
+证据，过期不回填；具体运维边界见上述 Linux VPS 手册。
+
+历史下载完成 `history_loaded_count` 不等于当前同钟点已具备 60 日完整基线；
+`ready_count` 按当前盘段/窗口核验。固定前 60 日中的半日市缺少下午 RTH 时槽，
+不能借第 61 日补足。周末、休市及 04:00 前/20:00 后的 `ready_count=0` 不表示当前槽故障；
+盘段开始后不足 18 分钟仍在形成期，应看首个合法 18m endpoint。
+快信号时钟与慢页面/期权预热独立：前者每分钟结束后约 5 秒读取，
+后者使用 `INTRADAY_REFRESH_INTERVAL_SECONDS`，开盘关键窗不占用快时钟。
+开盘 1m 与全天 2m 共用启动时冻结的完整自选，不再截取前 20 只；开盘前预热基线，
+关键窗只读订阅和历史缓存。健康检查还核对快调度器及最近完成扫描时间，活动窗超过
+120 秒无完成扫描报异常（首次扫描宽限 120 秒），与 75 秒消息入队验收线分开。
+前瞻状态明确区分待开始、采集中、已结束和未知；旧轮结束不自动另开，也不继续写越界记录。
+60/80/40 是冻结历史审计：已选过的 TSLA/META 案例不能冒充未见样本；通过凭证不表示
+已验证盈利或期权收益。历史采集与复权检查入口见上述校准文档。
+
+当前定位是日内异常发现器＋人工期权复核，不是一套已验证入场、止损、止盈和仓位的交易
+策略。P95 是历史异常分位，不是 95% 胜率；论文支持同钟点标准化，不证明本项目联合阈值
+有效。手动执行窗口由后端 XNYS 日历统一返回，与 P0 资格分开：09:45 起、普通候选截至
+实际收盘前 45 分钟、0DTE 前 90 分钟；报价合格也不等于执行许可，R6 未知或触发不展示
+合约建议。窗口状态过期即标缺，不会因暂停页面刷新而一直显示通过。
+复权只在因子、价格和成交量口径及计算等价性可核验时通过；尾盘不足 20m 的事件保留在
+频次和预算中并单列收盘截尾。新前瞻保存准确窗口收盘价，按同轮同票同日精确 t+20m
+配对，不插值、不跨日；收益诊断不另开一条 P0 激活路径。
+
+Telegram 文本通道会在启动时缓存经 DNS 验证得到的 IPv4；普通域名请求发生连接错误时，
+可在仍验证 `api.telegram.org` TLS 身份的前提下直连该地址。严格 2m 必须在确认 accepted
+前原子提交 decision 与可恢复 outbox；数据库不可读/写失败则拒绝本次受理并允许下一 tick
+重检，不回退成无持久证据的内存去重。非 opening 消息在首次发送前持久化，最多 6 分钟内
+重试，窗口内重启可恢复正文，过期终止；补发明确标记延迟。opening 不跨 checkpoint 补发，
+09:35 最终提醒截止 09:36。响应超时等“可能已送达”的不确定结果也不
+自动重发，以免手机重复响铃。这只能覆盖短时 DNS/连接或服务重启，不能在电脑休眠、关机
+或整机断网时继续扫描，全天候运行仍需要上面的 Linux VPS 部署。
+页面把 decision 与回执按 `message_key` 关联显示等待、失败或结果未确认；
+“已受理”或“Telegram 已接收”都不能证明手机实际响铃或已读。仓库提供部署配置，不代表云端已部署。
 
 ## 📱 推送效果
 

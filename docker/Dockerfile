@@ -34,11 +34,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     && rm -rf /var/lib/apt/lists/*
 
-# 复制依赖文件
-COPY requirements.txt .
+# 复制依赖文件。云端盘中提示镜像必须包含 Moomoo SDK；OpenD 本体仍由
+# VPS 宿主机运行，镜像内不打包账户配置或 OpenD 二进制。
+COPY requirements.txt requirements-moomoo.txt ./
 
 # 安装 Python 依赖
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements-moomoo.txt
 
 # 复制应用代码
 COPY *.py ./
@@ -67,10 +68,12 @@ EXPOSE 8000
 # 数据卷（持久化数据）
 VOLUME ["/app/data", "/app/logs", "/app/reports"]
 
-# 健康检查（FastAPI 模式）
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:8000/api/health || curl -f http://localhost:8000/health \
-    || python -c "import sys; sys.exit(0)"
+# Liveness 只验证当前容器内 FastAPI。OpenD/行情/Telegram 属于 readiness，
+# 由 /api/v1/system/health-layers 与外部监控观察，不能用供应商短暂故障杀死 API。
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+    CMD curl -fsS --max-time 5 "http://127.0.0.1:${API_PORT:-8000}/api/health" >/dev/null || exit 1
 
-# 默认命令（可被覆盖）
-CMD ["python", "main.py", "--schedule"]
+# 前台单 worker 是盘中 scheduler 的部署合同：Uvicorn 必须作为 PID 1，
+# 进程失败才能触发容器 restart policy；多 worker 会复制进程内 scheduler。
+STOPSIGNAL SIGTERM
+CMD ["sh", "-c", "exec python -m uvicorn server:app --host \"${WEBUI_HOST:-0.0.0.0}\" --port \"${API_PORT:-8000}\" --workers 1"]

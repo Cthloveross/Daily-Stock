@@ -1,12 +1,54 @@
 # Daily Workflow Guide — 每日使用手册
 
+> **历史手册（现行交易策略已覆盖）**：本文保留 2026-04 的 UI/流程取证，其中的
+> 开盘禁做、下单次数、加仓倍数、DTE、隔夜持有、LEAP 与 Regime 授权语义均不得
+> 作为当前规则。现行交易合同是 0–7DTE、同一 ET 日平仓；现行 P0 信号则以
+> 严格 2m 四条件为准，DTE、Regime 和合约摩擦不决定 underlying 信号是否成立。请以
+> [`22_P0_2M_SIGNAL_AND_CALIBRATION.md`](../phase1/22_P0_2M_SIGNAL_AND_CALIBRATION.md)、
+> [`20_INTRADAY_0_7DTE_RULE_MIGRATION.md`](../phase1/20_INTRADAY_0_7DTE_RULE_MIGRATION.md)、
+> [`19_PUSH_TIERING_PHASE_B.md`](../phase1/19_PUSH_TIERING_PHASE_B.md) 和
+> [`21_OPENING_5M_ALERT_RESEARCH.md`](../phase1/21_OPENING_5M_ALERT_RESEARCH.md) 为准。
+
 > **文档定位**：系统上线后每天怎么用。从早上到晚上的标准流程 + 应急情境处理。
 > **目标读者**：3 个月后的你，系统已经跑起来，但可能在某个时刻陷入混乱
-> **最后更新**：2026-04-21（对齐 dsa-web UI v1.0 重构：`/regime` 主页、⌘K CommandMenu、`/watchlist`、`/stocks/:ticker`）
+> **最后更新**：2026-09-10（新增现行手机提醒快查；下方 UI 主体仍是 2026-04 取证）
 
 ---
 
 ## 零、新版 Web 界面速查（v1.0 以后）
+
+### 当前手机提醒快查（2026-10-10）
+
+- `P0`：RTH 严格 2m 四条件命中；最多 2 次/日、7 次/周。
+- `P0-X`：盘前或盘后严格 2m 四条件命中；每个盘段最多 1 次/日，合计
+  最多 5 次/周；只报告正股，不声称盘外期权可执行。
+- `forming`：8m 价格达到 P95、RVOL 达 1.5、方向一致，但 18m 位移仅在
+  0.30–0.50 ATR；只进网页，不响手机。
+- 相同标的、方向 30 分钟只发第一次；RTH 先发 underlying，再异步补充最多
+  3 个 0–7DTE 候选。无可执行合约不撤销 P0。
+- `P1-O` 是独立开盘发现提醒：09:31 起只读已完成 1m，09:32–09:34 要求
+  相邻两次同向严格通过，最早约 09:32 响铃；09:35 也只用从 09:30 起五根
+  完整 1m 累计证据，截止 09:36；跨 checkpoint 或停机错过的开盘提醒不补发。
+  它是 setup 发现，不会自动升级为 P0。
+- 正式 P0 手机 action 默认关闭；完整 69 只校准和 20 日 shadow 未全部通过时，
+  正式 P0/P0-X 只进网页和台账；20 日必须完整且全部门禁达标，不是等满时间就启用。
+  显式开启 `INTRADAY_P0_2M_SHADOW_MOBILE_ENABLED` 可发真实四条件研究提醒，
+  台账仍为 P2、未验证收益；独立预算为 RTH 2/日、7/周，盘外每盘段 1/日、合计 5/周。
+  状态与启用条件见
+  [`22_P0_2M_SIGNAL_AND_CALIBRATION.md`](../phase1/22_P0_2M_SIGNAL_AND_CALIBRATION.md)。
+- 页面分开显示研究/正式预算及发送状态。“已受理”或“Telegram 已接收”不是手机已响或已读。
+- 快信号每分钟结束后约 5 秒读取，不等慢页面/期权预热；历史下载完成不等于当前同槽
+  60 日 ready，半日市缺少的下午 RTH 样本不能借第 61 日补足。非扫描时段（周末、休市、
+  04:00 前或 20:00 后）`ready_count=0` 不表示同槽故障；盘段开始后不足 18 分钟仍在
+  形成期，应看首个合法 18m endpoint。
+- strict-2m 的 decision/outbox 原子持久化后才确认 accepted；数据库故障拒绝并重检。
+  普通消息可跨重启重试最多 6 分钟，过期终止，未知送达不自动重发。
+- 本机关闭后，本机进程不能继续扫描或发 Telegram。要全天候接收，必须把单 worker
+  服务、OpenD、持久 SQLite 和 Telegram 凭据部署在持续在线的 Linux VPS，并按
+  [`intraday-cloud.md`](../deployment/intraday-cloud.md) 验收；停机期间错过的窗口不会补发。
+
+下文从“每日标准时间表”起是 2026-04 历史流程，只用于 UI/行为取证；其中
+Regime 授权、开盘硬禁、固定交易次数和隔夜规则均不能覆盖上面的当前合同。
 
 > UI 在 2026-04 按 [`New-docs/design/Design_system.md`](../design/Design_system.md) 做了彻底重构（Linear-Dark 终端风）。下面是常用动作到界面的映射：
 
